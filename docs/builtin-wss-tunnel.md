@@ -164,4 +164,4 @@ The server suite performs actual HTTP enrollment, Ed25519 challenge-response ove
 - Request bodies are buffered rather than streamed end to end.
 - Route entries remain registered after all workers disconnect, but requests fail immediately with `503` until workers reconnect.
 - Requests that lose a connection are not replayed automatically; callers may retry idempotent operations.
-- Public deployment still requires validation in the actual rproxy Docker environment.
+- Public deployment still requires validation in the real reverse-proxy / Docker environment.
