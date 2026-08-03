@@ -29,9 +29,9 @@ Coding Tools MCP is a Rust + Tauri 2 desktop application. Select a project direc
 
 ```text
 Install the desktop app
-  → add a project directory
-  → start MCP and a public tunnel
-  → copy the Public MCP URL
+  → sidebar Quick setup (or add a workspace manually)
+  → choose a tunnel source and finish connection
+  → start MCP and copy the Public MCP URL
   → enable ChatGPT developer mode
   → create an MCP plugin and paste the URL
   → authorize it and start developing in a new conversation
@@ -40,6 +40,7 @@ Install the desktop app
 For a first connection, remember only this: **the desktop app turns the project into an MCP workspace, and ChatGPT connects to it through the public `/mcp` URL.**
 
 - [See the complete desktop setup](#get-started-in-five-minutes)
+- [Quick setup wizard](#2-quick-setup-recommended-for-first-use)
 - [Go directly to the ChatGPT plugin setup](#mcp-connector)
 
 ## Get started in five minutes
@@ -55,14 +56,41 @@ Download the package for your platform from this repository's Releases page:
 
 The macOS build is currently unsigned. If macOS blocks the first launch, allow it from System Settings → Privacy & Security.
 
-### 2. Add a project workspace
+### 2. Quick setup (recommended for first use)
+
+Open **Quick setup** in the sidebar (route `/quick-setup`) and follow the wizard. The flow matches the app implementation in five steps:
+
+| Step | What you do |
+| --- | --- |
+| **1. Tunnel source** | Choose **Built-in WSS** (recommended), **FRP**, or **Cloudflare** |
+| **2. Project** | Name the workspace (blank = first folder name), pick one or more project folders, create the workspace |
+| **3. Connection type** | Choose **MCP** or **Actions** (the wizard enables one service at a time) |
+| **4. Enable** | Fill source-specific fields, test the tunnel, start the service |
+| **5. Finish** | See the exact values to paste into ChatGPT (public URL, auth fields) with copy helpers |
+
+**What step 4 needs, by tunnel source:**
+
+| Source | You provide | The wizard does |
+| --- | --- | --- |
+| **Built-in WSS** | A **one-time enrollment link** from your server admin (`https://…/_tunnel/enroll/<code>`, HTTPS required) | Validates the link, registers the local device key, updates the public URL |
+| **FRP** | FRP server host/port and optional token | Checks/installs `frpc`; select or create a global FRP profile; MCP uses `/clients/<id>/mcp`, Actions needs its own subdomain |
+| **Cloudflare Quick** | No token | Checks/installs `cloudflared`; a temporary `trycloudflare.com` URL is created during the connection test |
+| **Cloudflare Named** | Tunnel token + fixed HTTPS public URL | Checks/installs `cloudflared`; saves token and fixed URL |
+
+Afterwards you can open the normal workspace UI for advanced options (auth, policies, running MCP and Actions together). **Quick setup does not** create server-side enrollment links, an FRPS instance, or a Cloudflare Named Tunnel for you—those remain server/console tasks.
+
+For self-hosted built-in WSS, see [3a. Built-in WSS](#3a-built-in-wss-self-hosted-server) and [`services/tunnel-server/README.md`](services/tunnel-server/README.md).
+
+### 3. Add a workspace manually (advanced)
+
+Without the wizard:
 
 1. Click **Add workspace** in the sidebar.
 2. Select the project root directory.
 3. Configure the workspace name, MCP port, and authentication mode.
 4. Save it. The workspace remains available in the sidebar across conversations and restarts.
 
-### 3. Configure a public tunnel
+### 4. Configure a public tunnel
 
 When the AI client is not on the same machine, expose MCP as a publicly reachable HTTPS URL. Each workspace can use one of three tunnel types (**new workspaces default to built-in WSS**):
 
@@ -126,7 +154,7 @@ If you do not have an FRPS server yet, follow this [FRPS server installation gui
 - Install or detect `cloudflared` from **Software management**.
 - Select Cloudflare in the workspace and configure a named-tunnel token or Quick Tunnel.
 
-### 4. Start MCP
+### 5. Start MCP
 
 Open the workspace and click **Start** in the MCP panel. The desktop client shows:
 
@@ -149,7 +177,7 @@ When a connection fails, inspect recent MCP requests without leaving the desktop
 
 *The log quickly confirms whether tool discovery, history bootstrap, and checkpoint calls reached the server.*
 
-### 5. Connect an AI client
+### 6. Connect an AI client
 
 Use the public MCP URL shown by the app. With OAuth enabled, the client follows the server metadata into the authorization flow; authorization codes, Client IDs, and secrets can be generated and managed from the desktop client. This release uses preconfigured OAuth clients, so select static/manual OAuth credentials when creating a ChatGPT plugin; CIMD is not required.
 
