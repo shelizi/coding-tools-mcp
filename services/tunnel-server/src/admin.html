@@ -1,0 +1,836 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Coding Tools Tunnel 管理</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --bg: #0b0f16;
+      --surface: #121823;
+      --surface-2: #171f2c;
+      --surface-3: #0e141e;
+      --border: #293548;
+      --border-soft: #202b3b;
+      --text: #edf3fb;
+      --muted: #91a0b5;
+      --accent: #6d9eff;
+      --accent-soft: #1c3157;
+      --success: #65d39a;
+      --warning: #f1bc61;
+      --danger: #f17882;
+      --shadow: 0 18px 45px rgba(0,0,0,.24);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: radial-gradient(circle at top, #121c2b 0, var(--bg) 42%); color: var(--text); min-height: 100vh; }
+    button, input, select { font: inherit; }
+    button { border: 1px solid transparent; border-radius: 10px; padding: 10px 14px; background: #477fe8; color: white; cursor: pointer; font-weight: 700; }
+    button:hover { filter: brightness(1.08); }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #91bbff; outline-offset: 2px; }
+    button:disabled { opacity: .55; cursor: wait; }
+    button.secondary { background: #202a39; border-color: #344157; }
+    button.danger { background: #923944; }
+    input, select { width: 100%; border: 1px solid #344157; border-radius: 10px; padding: 10px 11px; background: var(--surface-3); color: var(--text); }
+    label { display: grid; gap: 7px; color: #b8c3d3; font-size: .84rem; }
+    code { overflow-wrap: anywhere; color: #92bdff; }
+    [hidden] { display: none !important; }
+
+    .shell { width: min(1260px, calc(100% - 32px)); margin: 28px auto 64px; }
+    .topbar { display: flex; justify-content: space-between; gap: 20px; align-items: center; margin-bottom: 18px; }
+    .brand { display: flex; align-items: center; gap: 13px; }
+    .brand-mark { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 13px; background: linear-gradient(145deg, #5188f2, #315cb3); box-shadow: 0 9px 24px rgba(60,116,224,.3); font-weight: 900; }
+    h1, h2, h3 { margin: 0; }
+    h1 { font-size: 1.42rem; letter-spacing: -.02em; }
+    h2 { font-size: 1.05rem; }
+    h3 { font-size: .98rem; }
+    .muted { color: var(--muted); font-size: .88rem; }
+    .header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .updated { min-width: 150px; text-align: right; }
+
+    .primary-tabs { display: flex; gap: 5px; padding: 5px; margin-bottom: 22px; background: rgba(18,24,35,.86); border: 1px solid var(--border); border-radius: 14px; position: sticky; top: 8px; z-index: 5; backdrop-filter: blur(14px); box-shadow: 0 10px 35px rgba(0,0,0,.16); }
+    .primary-tab { flex: 0 1 auto; background: transparent; border-color: transparent; color: var(--muted); padding: 10px 17px; }
+    .primary-tab:hover { background: #1a2433; color: var(--text); filter: none; }
+    .primary-tab[aria-selected="true"] { color: var(--text); background: #24344c; border-color: #355078; box-shadow: inset 0 1px rgba(255,255,255,.04); }
+
+    .page-panel { animation: reveal .18s ease-out; }
+    @keyframes reveal { from { opacity: .4; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+    .panel { background: linear-gradient(180deg, rgba(23,31,44,.96), rgba(18,24,35,.96)); border: 1px solid var(--border); border-radius: 16px; padding: 20px; margin-bottom: 18px; box-shadow: var(--shadow); }
+    .toolbar { display: flex; justify-content: space-between; gap: 14px; align-items: center; margin-bottom: 14px; }
+    .toolbar-copy { display: grid; gap: 4px; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .metric { min-height: 112px; padding: 16px; background: linear-gradient(145deg, #172130, #111823); border: 1px solid var(--border); border-radius: 15px; box-shadow: 0 10px 25px rgba(0,0,0,.14); }
+    .metric strong { display: block; margin-top: 12px; font-size: 1.52rem; letter-spacing: -.025em; }
+    .health { display: inline-flex !important; align-items: center; gap: 8px; }
+    .health::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 5px rgba(101,211,154,.1); }
+    .health.degraded::before { background: var(--warning); box-shadow: 0 0 0 5px rgba(241,188,97,.1); }
+    .overview-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(300px, .75fr); gap: 18px; }
+
+    .table-wrap { overflow: auto; border: 1px solid var(--border-soft); border-radius: 12px; }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
+    th, td { text-align: left; padding: 11px 10px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
+    tr:last-child td { border-bottom: 0; }
+    th { color: var(--muted); background: #121a26; font-size: .75rem; text-transform: uppercase; letter-spacing: .055em; position: sticky; top: 0; }
+    td { font-size: .86rem; }
+    .compact-table table { min-width: 650px; }
+    .badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 8px; border-radius: 999px; background: #22344d; color: #bcd4fa; font-size: .73rem; white-space: nowrap; }
+    .badge.online { background: #173c30; color: #91e7ba; }
+    .badge.offline, .badge.revoked { background: #4b2830; color: #ffb5bc; }
+    .badge.warning { background: #49391d; color: #ffd187; }
+    .badge.service { background: #263047; color: #c6d5ee; }
+
+    .activity-list { display: grid; gap: 9px; max-height: 510px; overflow: auto; padding-right: 3px; }
+    .activity-item { padding: 10px 12px; background: #101722; border: 1px solid var(--border-soft); border-left: 3px solid #587399; border-radius: 10px; }
+    .activity-item.error { border-left-color: var(--danger); }
+    .activity-item.warning { border-left-color: var(--warning); }
+    .activity-item strong { display: block; margin-bottom: 4px; font-size: .88rem; }
+
+    .client-layout { display: grid; grid-template-columns: 245px minmax(0, 1fr); gap: 18px; align-items: start; }
+    .client-sidebar { position: sticky; top: 78px; }
+    .client-tabs { display: grid; gap: 7px; max-height: calc(100vh - 180px); overflow: auto; }
+    .client-tab { width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 8px; text-align: left; background: transparent; border-color: var(--border-soft); color: #c0cad8; padding: 11px 12px; }
+    .client-tab:hover { background: #1b2534; filter: none; }
+    .client-tab[aria-selected="true"] { background: var(--accent-soft); border-color: #3e6198; color: white; }
+    .client-dot { width: 8px; height: 8px; border-radius: 50%; background: #627084; flex: none; }
+    .client-dot.online { background: var(--success); box-shadow: 0 0 0 4px rgba(101,211,154,.1); }
+    .empty-state { padding: 28px 16px; text-align: center; color: var(--muted); border: 1px dashed #344157; border-radius: 12px; }
+    .client-heading { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 16px; }
+    .client-title { display: grid; gap: 5px; }
+    .client-title h2 { font-size: 1.28rem; }
+    .client-metrics { grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); }
+    .client-metrics .metric { min-height: 96px; }
+    .client-metrics .metric strong { font-size: 1.18rem; }
+
+    .log-filters { display: grid; grid-template-columns: minmax(220px, 2fr) minmax(130px, .7fr) minmax(130px, .8fr) auto; gap: 10px; align-items: end; margin-bottom: 12px; }
+    .system-log-filters { grid-template-columns: minmax(260px, 2fr) minmax(140px, .7fr) auto; }
+    .log-message { max-width: 570px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
+    .level-error { color: #ff9ca5; font-weight: 750; }
+    .level-warn, .level-warning { color: #ffd079; font-weight: 750; }
+    .level-info { color: #93beff; font-weight: 750; }
+    .correlation { display: flex; flex-wrap: wrap; gap: 5px; max-width: 340px; }
+    .correlation span { padding: 3px 7px; border-radius: 7px; background: #1d293a; color: #aebed5; font-size: .72rem; overflow-wrap: anywhere; }
+    .notice { min-height: 22px; margin-top: 10px; color: #ffb6bd; font-size: .86rem; }
+
+    .management-grid { display: grid; grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr); gap: 18px; align-items: start; }
+    .form-grid { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 11px; align-items: end; }
+    .result { display: none; margin-top: 14px; padding: 13px; background: var(--surface-3); border: 1px solid var(--border); border-radius: 11px; }
+    .result.visible { display: block; }
+    .url-row { display: flex; gap: 8px; align-items: center; }
+    .url-row code { flex: 1; }
+    .policy-tabs { display: flex; gap: 5px; border-bottom: 1px solid #334057; }
+    .policy-tab { padding: 9px 16px; border: 0; border-bottom: 2px solid transparent; border-radius: 8px 8px 0 0; background: transparent; color: var(--muted); }
+    .policy-tab:hover { background: #202838; color: #d9e2ef; filter: none; }
+    .policy-tab[aria-selected="true"] { border-bottom-color: var(--accent); background: #202838; color: var(--text); }
+    .service-policy { margin: 15px 0 0; padding: 16px; border: 1px solid var(--border); border-radius: 12px; }
+    .service-policy h3 { margin-bottom: 12px; }
+    .policy-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 11px; }
+    .policy-actions { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+
+    @media (max-width: 1000px) {
+      .overview-grid, .management-grid { grid-template-columns: 1fr; }
+      .client-layout { grid-template-columns: 1fr; }
+      .client-sidebar { position: static; }
+      .client-tabs { display: flex; overflow-x: auto; max-height: none; padding-bottom: 4px; }
+      .client-tab { min-width: 190px; }
+    }
+    @media (max-width: 740px) {
+      .shell { width: min(100% - 20px, 1260px); margin-top: 16px; }
+      .topbar { align-items: flex-start; flex-direction: column; }
+      .updated { text-align: left; }
+      .primary-tabs { overflow-x: auto; position: static; }
+      .primary-tab { white-space: nowrap; }
+      .log-filters, .system-log-filters, .form-grid, .policy-fields { grid-template-columns: 1fr; }
+      .client-heading { flex-direction: column; }
+      .panel { padding: 15px; border-radius: 13px; }
+    }
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">CT</div>
+      <div>
+        <h1>Coding Tools Tunnel</h1>
+        <div class="muted">管理者 <span id="current-user">載入中</span> · Client 私鑰不會離開裝置</div>
+      </div>
+    </div>
+    <div class="header-actions">
+      <span id="last-updated" class="muted updated">尚未更新</span>
+      <button id="refresh" class="secondary" type="button">重新整理</button>
+      <button id="logout" class="secondary" type="button">登出</button>
+    </div>
+  </header>
+
+  <nav class="primary-tabs" role="tablist" aria-label="管理介面區段">
+    <button id="overview-tab" class="primary-tab" type="button" role="tab" aria-selected="true" aria-controls="overview-panel" data-page-tab="overview">總覽</button>
+    <button id="clients-tab" class="primary-tab" type="button" role="tab" aria-selected="false" aria-controls="clients-panel" data-page-tab="clients" tabindex="-1">Clients</button>
+    <button id="system-logs-tab" class="primary-tab" type="button" role="tab" aria-selected="false" aria-controls="system-logs-panel" data-page-tab="system-logs" tabindex="-1">主要 Log</button>
+    <button id="management-tab" class="primary-tab" type="button" role="tab" aria-selected="false" aria-controls="management-panel" data-page-tab="management" tabindex="-1">管理設定</button>
+  </nav>
+
+  <section id="overview-panel" class="page-panel" role="tabpanel" aria-labelledby="overview-tab" data-page-panel="overview">
+    <section class="metrics" aria-label="伺服器健康度摘要">
+      <div class="metric"><span class="muted">健康度</span><strong id="health-status" class="health">載入中</strong></div>
+      <div class="metric"><span class="muted">已連線 Client</span><strong id="connected-clients">—</strong></div>
+      <div class="metric"><span class="muted">連線 Worker</span><strong id="connected-workers">—</strong></div>
+      <div class="metric"><span class="muted">Idle / Busy</span><strong id="worker-balance">—</strong></div>
+      <div class="metric"><span class="muted">處理中請求</span><strong id="in-flight">—</strong></div>
+      <div class="metric"><span class="muted">總請求</span><strong id="total-requests">—</strong></div>
+      <div class="metric"><span class="muted">錯誤率</span><strong id="error-rate">—</strong></div>
+    </section>
+
+    <div class="overview-grid">
+      <section class="panel compact-table">
+        <div class="toolbar">
+          <div class="toolbar-copy"><h2>即時 Worker 狀況</h2><span class="muted">跨 Client 的目前連線與負載</span></div>
+          <span id="worker-count" class="muted"></span>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th>Worker</th><th>Client / Service</th><th>狀態</th><th>完成請求</th><th>最後活動</th><th>最後錯誤</th></tr></thead><tbody id="workers"></tbody></table></div>
+      </section>
+      <section class="panel">
+        <div class="toolbar">
+          <div class="toolbar-copy"><h2>近期活動</h2><span class="muted">連線、請求與異常摘要</span></div>
+          <span id="uptime" class="muted"></span>
+        </div>
+        <div id="activities" class="activity-list"></div>
+      </section>
+    </div>
+  </section>
+
+  <section id="clients-panel" class="page-panel" role="tabpanel" aria-labelledby="clients-tab" data-page-panel="clients" hidden>
+    <div class="client-layout">
+      <aside class="panel client-sidebar">
+        <div class="toolbar-copy" style="margin-bottom:14px"><h2>Clients</h2><span id="client-count" class="muted">載入中</span></div>
+        <div id="client-tabs-list" class="client-tabs" role="tablist" aria-label="Client 清單"></div>
+      </aside>
+
+      <div id="client-detail">
+        <section class="panel">
+          <div class="client-heading">
+            <div class="client-title">
+              <h2 id="client-title">選擇 Client</h2>
+              <span id="client-subtitle" class="muted">查看連線、Worker 與專屬 Log</span>
+            </div>
+            <span id="client-status-badge" class="badge offline">離線</span>
+          </div>
+          <div class="metrics client-metrics">
+            <div class="metric"><span class="muted">連線 Worker</span><strong id="client-worker-count">—</strong></div>
+            <div class="metric"><span class="muted">Idle / Busy</span><strong id="client-worker-balance">—</strong></div>
+            <div class="metric"><span class="muted">可用服務</span><strong id="client-services">—</strong></div>
+            <div class="metric"><span class="muted">註冊裝置</span><strong id="client-device-count">—</strong></div>
+            <div class="metric"><span class="muted">最後活動</span><strong id="client-last-seen">—</strong></div>
+          </div>
+        </section>
+
+        <section class="panel compact-table">
+          <div class="toolbar"><div class="toolbar-copy"><h2>Client Worker</h2><span class="muted">只顯示目前選取 Client</span></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Worker</th><th>Service</th><th>狀態</th><th>完成請求</th><th>連線時間</th><th>最後活動</th><th>最後錯誤</th></tr></thead><tbody id="client-workers"></tbody></table></div>
+        </section>
+
+        <section class="panel" id="client-log-search">
+          <div class="toolbar">
+            <div class="toolbar-copy"><h2>Client Log</h2><span class="muted">連線、Gateway、Request 與 Worker 記錄集中於此</span></div>
+            <span id="client-log-count" class="muted"></span>
+          </div>
+          <form id="client-log-form" class="log-filters">
+            <label>關鍵字<input id="client-log-query" maxlength="256" placeholder="訊息、Worker 或 Request ID"></label>
+            <label>等級<select id="client-log-level"><option value="all">全部</option><option value="error">Error</option><option value="warn">Warn</option><option value="info">Info</option></select></label>
+            <label>服務<select id="client-log-service"><option value="all">全部</option><option value="mcp">MCP</option><option value="actions">Actions</option></select></label>
+            <button type="submit">搜尋</button>
+          </form>
+          <div class="table-wrap"><table><thead><tr><th>時間</th><th>等級</th><th>類別</th><th>訊息</th><th>關聯</th></tr></thead><tbody id="client-logs"></tbody></table></div>
+          <div id="client-log-notice" class="notice" role="status"></div>
+        </section>
+      </div>
+    </div>
+  </section>
+
+  <section id="system-logs-panel" class="page-panel" role="tabpanel" aria-labelledby="system-logs-tab" data-page-panel="system-logs" hidden>
+    <section class="panel" id="system-log-search">
+      <div class="toolbar">
+        <div class="toolbar-copy"><h2>主要 Log</h2><span class="muted">只顯示未歸屬到特定 Client 的 Server 與管理事件</span></div>
+        <span id="system-log-count" class="muted">保留最近 2,000 筆應用程式事件</span>
+      </div>
+      <form id="system-log-form" class="log-filters system-log-filters">
+        <label>關鍵字<input id="system-log-query" maxlength="256" placeholder="訊息、類別或 Request ID"></label>
+        <label>等級<select id="system-log-level"><option value="all">全部</option><option value="error">Error</option><option value="warn">Warn</option><option value="info">Info</option></select></label>
+        <button type="submit">搜尋</button>
+      </form>
+      <div class="table-wrap"><table><thead><tr><th>時間</th><th>等級</th><th>類別</th><th>訊息</th><th>關聯</th></tr></thead><tbody id="system-logs"></tbody></table></div>
+      <div id="system-log-notice" class="notice" role="status"></div>
+    </section>
+  </section>
+
+  <section id="management-panel" class="page-panel" role="tabpanel" aria-labelledby="management-tab" data-page-panel="management" hidden>
+    <div class="management-grid">
+      <section class="panel">
+        <div class="toolbar-copy" style="margin-bottom:15px"><h2>建立一次性註冊連結</h2><span class="muted">註冊後 Client 會出現在 Client 分頁</span></div>
+        <form id="enroll-form" class="form-grid">
+          <label>Client ID<input id="client-id" required maxlength="128" pattern="[A-Za-z0-9_-]+" placeholder="例如 desktop-main"></label>
+          <label>允許服務<select id="service"><option value="both">MCP + Actions</option><option value="mcp">僅 MCP</option><option value="actions">僅 Actions</option></select></label>
+          <label>有效秒數<input id="ttl" type="number" min="30" max="86400" value="600" required></label>
+          <button id="create" type="submit">建立連結</button>
+        </form>
+        <div id="enroll-result" class="result">
+          <div class="url-row"><code id="enroll-url"></code><button id="copy" class="secondary" type="button">複製</button></div>
+          <div id="expires" class="muted" style="margin-top:8px"></div>
+        </div>
+        <div id="form-notice" class="notice" role="status"></div>
+      </section>
+
+      <section class="panel" id="worker-policy-form">
+        <div class="toolbar-copy" style="margin-bottom:14px"><h2>動態 Worker Pool</h2><span class="muted">Server 統一管理；min idle ≤ start ≤ max idle ≤ max workers</span></div>
+        <div class="policy-tabs" role="tablist" aria-label="Worker Pool 服務">
+          <button id="mcp-policy-tab" class="policy-tab" type="button" role="tab" aria-selected="true" aria-controls="mcp-worker-policy" data-policy-tab="mcp">MCP</button>
+          <button id="actions-policy-tab" class="policy-tab" type="button" role="tab" aria-selected="false" aria-controls="actions-worker-policy" data-policy-tab="actions" tabindex="-1">Actions</button>
+        </div>
+        <form id="mcp-worker-policy" class="service-policy" data-policy-service="mcp" role="tabpanel" aria-labelledby="mcp-policy-tab">
+          <h3>MCP</h3>
+          <div class="policy-fields">
+            <label>啟動數<input id="mcp-start-workers" type="number" min="1" max="256" required></label>
+            <label>最小閒置<input id="mcp-min-idle-workers" type="number" min="1" max="256" required></label>
+            <label>最大閒置<input id="mcp-max-idle-workers" type="number" min="1" max="256" required></label>
+            <label>Worker 上限<input id="mcp-max-workers" type="number" min="1" max="256" required></label>
+            <label>單 Worker 最大請求<input id="mcp-max-requests-per-worker" type="number" min="0" max="1000000" required></label>
+            <label>最長壽命（秒）<input id="mcp-max-lifetime-seconds" type="number" min="0" max="604800" required></label>
+            <label>縮容等待（秒）<input id="mcp-scale-down-delay-seconds" type="number" min="0" max="3600" required></label>
+            <label>回收 Jitter（%）<input id="mcp-recycle-jitter-percent" type="number" min="0" max="50" required></label>
+          </div>
+          <div class="policy-actions"><button type="submit">儲存 MCP 政策</button><span id="mcp-policy-revision" class="muted"></span></div>
+        </form>
+        <form id="actions-worker-policy" class="service-policy" data-policy-service="actions" role="tabpanel" aria-labelledby="actions-policy-tab" hidden>
+          <h3>Actions</h3>
+          <div class="policy-fields">
+            <label>啟動數<input id="actions-start-workers" type="number" min="1" max="256" required></label>
+            <label>最小閒置<input id="actions-min-idle-workers" type="number" min="1" max="256" required></label>
+            <label>最大閒置<input id="actions-max-idle-workers" type="number" min="1" max="256" required></label>
+            <label>Worker 上限<input id="actions-max-workers" type="number" min="1" max="256" required></label>
+            <label>單 Worker 最大請求<input id="actions-max-requests-per-worker" type="number" min="0" max="1000000" required></label>
+            <label>最長壽命（秒）<input id="actions-max-lifetime-seconds" type="number" min="0" max="604800" required></label>
+            <label>縮容等待（秒）<input id="actions-scale-down-delay-seconds" type="number" min="0" max="3600" required></label>
+            <label>回收 Jitter（%）<input id="actions-recycle-jitter-percent" type="number" min="0" max="50" required></label>
+          </div>
+          <div class="policy-actions"><button type="submit">儲存 Actions 政策</button><span id="actions-policy-revision" class="muted"></span></div>
+        </form>
+        <div id="policy-notice" class="notice" role="status"></div>
+      </section>
+    </div>
+
+    <section class="panel">
+      <div class="toolbar">
+        <div class="toolbar-copy"><h2>已註冊裝置</h2><span class="muted">裝置依 Client ID 自動彙整至 Client 分頁；撤銷後可永久清除</span></div>
+        <div class="header-actions"><span id="device-count" class="muted"></span><button id="purge-revoked" class="danger" type="button" disabled>清除已撤銷</button></div>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>裝置</th><th>Client ID</th><th>權限</th><th>建立時間</th><th>最後連線</th><th>狀態</th><th>操作</th></tr></thead><tbody id="devices"></tbody></table></div>
+      <div id="device-notice" class="notice" role="status"></div>
+    </section>
+  </section>
+</main>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const formatTime = (value) => value ? new Date(value).toLocaleString() : "—";
+  const formatShortTime = (value) => value ? new Date(value).toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—";
+  const state = { page: "overview", devices: [], workers: [], clients: [], activeClientId: null };
+  let csrfToken = "";
+
+  const policyFields = [
+    "start_workers", "min_idle_workers", "max_idle_workers", "max_workers",
+    "max_requests_per_worker", "max_lifetime_seconds", "scale_down_delay_seconds",
+    "recycle_jitter_percent"
+  ];
+
+  async function api(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    const method = (options.method || "GET").toUpperCase();
+    if (options.body) headers.set("content-type", "application/json");
+    if (method !== "GET" && method !== "HEAD") headers.set("x-csrf-token", csrfToken);
+    const response = await fetch(path, { cache: "no-store", credentials: "same-origin", ...options, headers });
+    const value = await response.json().catch(() => ({}));
+    if (response.status === 401) {
+      location.replace("/");
+      throw new Error("登入已過期，請重新登入。");
+    }
+    if (!response.ok) throw new Error(value.error || `HTTP ${response.status}`);
+    return value;
+  }
+
+  function cell(row, text) {
+    const td = document.createElement("td");
+    td.textContent = text;
+    row.appendChild(td);
+    return td;
+  }
+
+  function badge(text, className = "") {
+    const value = document.createElement("span");
+    value.className = `badge${className ? ` ${className}` : ""}`;
+    value.textContent = text;
+    return value;
+  }
+
+  function setupStaticTabs(tabSelector, panelSelector, tabDataKey, panelDataKey, onActivate) {
+    const tabs = [...document.querySelectorAll(tabSelector)];
+    const panels = [...document.querySelectorAll(panelSelector)];
+    const activate = async (value, focus = false) => {
+      for (const tab of tabs) {
+        const selected = tab.dataset[tabDataKey] === value;
+        tab.setAttribute("aria-selected", String(selected));
+        tab.tabIndex = selected ? 0 : -1;
+        if (selected && focus) tab.focus();
+      }
+      for (const panel of panels) panel.hidden = panel.dataset[panelDataKey] !== value;
+      await onActivate?.(value);
+    };
+    for (const [index, tab] of tabs.entries()) {
+      tab.addEventListener("click", () => activate(tab.dataset[tabDataKey]));
+      tab.addEventListener("keydown", (event) => {
+        if (!event.key.startsWith("Arrow")) return;
+        if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+        event.preventDefault();
+        const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
+        const next = tabs[(index + (forward ? 1 : -1) + tabs.length) % tabs.length];
+        activate(next.dataset[tabDataKey], true);
+      });
+    }
+    return activate;
+  }
+
+  const activatePage = setupStaticTabs("[data-page-tab]", "[data-page-panel]", "pageTab", "pagePanel", async (page) => {
+    state.page = page;
+    if (page === "clients") await loadClientLogs();
+    if (page === "system-logs") await loadSystemLogs();
+  });
+
+  setupStaticTabs("[data-policy-tab]", "[data-policy-service]", "policyTab", "policyService");
+
+  const formatDuration = (seconds) => {
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return [days && `${days}天`, hours && `${hours}時`, minutes && `${minutes}分`].filter(Boolean).join(" ") || `${seconds}秒`;
+  };
+
+  function renderWorkerRows(target, workers, clientView = false) {
+    const body = $(target);
+    body.replaceChildren();
+    for (const worker of workers) {
+      const row = document.createElement("tr");
+      cell(row, worker.worker_id);
+      if (clientView) {
+        cell(row, worker.service);
+      } else {
+        cell(row, `${worker.client_id} / ${worker.service}`);
+      }
+      const status = cell(row, "");
+      status.appendChild(badge(worker.state, worker.state === "idle" ? "online" : worker.state === "busy" ? "warning" : ""));
+      cell(row, worker.requests_completed.toLocaleString());
+      if (clientView) cell(row, formatTime(worker.connected_at_unix_ms));
+      cell(row, formatTime(worker.last_seen_at_unix_ms));
+      cell(row, worker.last_error || "—");
+      body.appendChild(row);
+    }
+    if (!workers.length) {
+      const row = document.createElement("tr");
+      const empty = cell(row, clientView ? "此 Client 目前沒有已連線 Worker" : "目前沒有已連線 Worker");
+      empty.colSpan = clientView ? 7 : 6;
+      body.appendChild(row);
+    }
+  }
+
+  function renderActivities(activities) {
+    const target = $("activities");
+    target.replaceChildren();
+    for (const activity of activities) {
+      const item = document.createElement("div");
+      item.className = `activity-item ${activity.level}`;
+      const title = document.createElement("strong");
+      title.textContent = activity.title;
+      const detail = document.createElement("div");
+      detail.textContent = activity.detail;
+      const time = document.createElement("div");
+      time.className = "muted";
+      time.textContent = formatTime(activity.timestamp_unix_ms);
+      item.append(title, detail, time);
+      target.appendChild(item);
+    }
+    if (!activities.length) target.textContent = "尚無活動紀錄。";
+  }
+
+  function rebuildClients() {
+    const clients = new Map();
+    const ensure = (clientId) => {
+      if (!clients.has(clientId)) clients.set(clientId, { clientId, devices: [], workers: [], services: new Set(), lastSeen: 0 });
+      return clients.get(clientId);
+    };
+    for (const device of state.devices) {
+      const client = ensure(device.client_id);
+      client.devices.push(device);
+      if (device.allow_mcp) client.services.add("mcp");
+      if (device.allow_actions) client.services.add("actions");
+      client.lastSeen = Math.max(client.lastSeen, device.last_seen_at_unix_ms || device.created_at_unix_ms || 0);
+    }
+    for (const worker of state.workers) {
+      const client = ensure(worker.client_id);
+      client.workers.push(worker);
+      client.services.add(worker.service);
+      client.lastSeen = Math.max(client.lastSeen, worker.last_seen_at_unix_ms || 0);
+    }
+    state.clients = [...clients.values()].sort((left, right) => {
+      const online = Number(right.workers.length > 0) - Number(left.workers.length > 0);
+      return online || left.clientId.localeCompare(right.clientId);
+    });
+    if (!state.clients.some((client) => client.clientId === state.activeClientId)) state.activeClientId = state.clients[0]?.clientId || null;
+    renderClientTabs();
+    renderClientDetail();
+    $("client-count").textContent = `${state.clients.length} 個 Client`;
+    $("connected-clients").textContent = new Set(state.workers.map((worker) => worker.client_id)).size;
+  }
+
+  function renderClientTabs() {
+    const target = $("client-tabs-list");
+    target.replaceChildren();
+    for (const client of state.clients) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "client-tab";
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", String(client.clientId === state.activeClientId));
+      button.tabIndex = client.clientId === state.activeClientId ? 0 : -1;
+      const name = document.createElement("span");
+      name.textContent = client.clientId;
+      const dot = document.createElement("span");
+      dot.className = `client-dot${client.workers.length ? " online" : ""}`;
+      dot.title = client.workers.length ? "已連線" : "離線";
+      button.append(name, dot);
+      button.addEventListener("click", async () => {
+        state.activeClientId = client.clientId;
+        renderClientTabs();
+        renderClientDetail();
+        await loadClientLogs();
+      });
+      target.appendChild(button);
+    }
+    if (!state.clients.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty-state";
+      empty.textContent = "尚未註冊任何 Client。";
+      target.appendChild(empty);
+    }
+  }
+
+  function renderClientDetail() {
+    const client = state.clients.find((entry) => entry.clientId === state.activeClientId);
+    if (!client) {
+      $("client-title").textContent = "尚無 Client";
+      $("client-subtitle").textContent = "請先在管理設定建立註冊連結";
+      $("client-status-badge").className = "badge offline";
+      $("client-status-badge").textContent = "未設定";
+      for (const id of ["client-worker-count", "client-worker-balance", "client-services", "client-device-count", "client-last-seen"]) $(id).textContent = "—";
+      renderWorkerRows("client-workers", [], true);
+      renderLogs("client-logs", [], "選擇 Client 後顯示專屬 Log");
+      return;
+    }
+    const idle = client.workers.filter((worker) => worker.state === "idle").length;
+    const busy = client.workers.filter((worker) => worker.state === "busy").length;
+    $("client-title").textContent = client.clientId;
+    $("client-subtitle").textContent = `${client.devices.length} 個裝置 · ${[...client.services].map((value) => value.toUpperCase()).join(" + ") || "尚無服務"}`;
+    $("client-status-badge").className = `badge ${client.workers.length ? "online" : "offline"}`;
+    $("client-status-badge").textContent = client.workers.length ? "已連線" : "離線";
+    $("client-worker-count").textContent = client.workers.length;
+    $("client-worker-balance").textContent = `${idle} / ${busy}`;
+    $("client-services").textContent = [...client.services].map((value) => value.toUpperCase()).join(" + ") || "—";
+    $("client-device-count").textContent = client.devices.length;
+    $("client-last-seen").textContent = formatShortTime(client.lastSeen);
+    renderWorkerRows("client-workers", client.workers, true);
+  }
+
+  function renderLogs(targetId, logs, emptyText) {
+    const target = $(targetId);
+    target.replaceChildren();
+    for (const log of logs) {
+      const row = document.createElement("tr");
+      cell(row, formatTime(log.timestamp_unix_ms));
+      const level = cell(row, log.level.toUpperCase());
+      level.className = `level-${log.level}`;
+      cell(row, log.category);
+      const message = cell(row, log.message);
+      message.className = "log-message";
+      const relation = cell(row, "");
+      const values = [
+        log.service && `service: ${log.service}`,
+        log.worker_id && `worker: ${log.worker_id}`,
+        log.request_id && `request: ${log.request_id}`
+      ].filter(Boolean);
+      const wrapper = document.createElement("div");
+      wrapper.className = "correlation";
+      for (const value of values) {
+        const chip = document.createElement("span");
+        chip.textContent = value;
+        wrapper.appendChild(chip);
+      }
+      if (!values.length) wrapper.textContent = "—";
+      relation.appendChild(wrapper);
+      target.appendChild(row);
+    }
+    if (!logs.length) {
+      const row = document.createElement("tr");
+      const empty = cell(row, emptyText);
+      empty.colSpan = 5;
+      target.appendChild(row);
+    }
+  }
+
+  async function loadObservability() {
+    try {
+      const [dashboard, workersPayload, activityPayload] = await Promise.all([
+        api("/api/dashboard"), api("/api/workers"), api("/api/activity?limit=24")
+      ]);
+      state.workers = workersPayload.workers;
+      $("health-status").textContent = dashboard.status === "healthy" ? "正常" : "需注意";
+      $("health-status").className = `health${dashboard.status === "healthy" ? "" : " degraded"}`;
+      $("connected-workers").textContent = dashboard.connected_workers;
+      $("worker-balance").textContent = `${dashboard.idle_workers} / ${dashboard.busy_workers}`;
+      $("in-flight").textContent = dashboard.in_flight_requests;
+      $("total-requests").textContent = dashboard.total_requests.toLocaleString();
+      $("error-rate").textContent = `${dashboard.error_rate_percent.toFixed(1)}%`;
+      $("uptime").textContent = `運行 ${formatDuration(dashboard.uptime_seconds)}`;
+      $("worker-count").textContent = `${workersPayload.workers.length} 個已連線`;
+      renderWorkerRows("workers", workersPayload.workers);
+      renderActivities(activityPayload.activities);
+      rebuildClients();
+    } catch (error) {
+      $("system-log-notice").textContent = error.message;
+    }
+  }
+
+  async function loadDevices() {
+    $("device-notice").textContent = "";
+    $("device-notice").style.color = "";
+    try {
+      const payload = await api("/api/devices");
+      state.devices = payload.devices;
+      const revokedCount = payload.devices.filter((device) => device.revoked_at_unix_ms).length;
+      const body = $("devices");
+      body.replaceChildren();
+      $("device-count").textContent = `${payload.devices.length} 個裝置 · ${revokedCount} 個已撤銷`;
+      $("purge-revoked").disabled = revokedCount === 0;
+      $("purge-revoked").textContent = revokedCount ? `清除已撤銷 (${revokedCount})` : "清除已撤銷";
+      for (const device of payload.devices) {
+        const row = document.createElement("tr");
+        cell(row, device.device_name);
+        cell(row, device.client_id);
+        cell(row, [device.allow_mcp && "MCP", device.allow_actions && "Actions"].filter(Boolean).join(" + "));
+        cell(row, formatTime(device.created_at_unix_ms));
+        cell(row, formatTime(device.last_seen_at_unix_ms));
+        const status = cell(row, "");
+        status.appendChild(badge(device.revoked_at_unix_ms ? `已撤銷 ${formatTime(device.revoked_at_unix_ms)}` : "有效", device.revoked_at_unix_ms ? "revoked" : "online"));
+        const actions = cell(row, "");
+        if (!device.revoked_at_unix_ms) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "danger";
+          button.textContent = "撤銷";
+          button.addEventListener("click", async () => {
+            if (!confirm(`確定撤銷 ${device.device_name}（${device.client_id}）？`)) return;
+            button.disabled = true;
+            try {
+              await api(`/api/devices/${encodeURIComponent(device.device_id)}/revoke`, { method: "POST", body: "{}" });
+              await loadDevices();
+            } catch (error) {
+              $("device-notice").textContent = error.message;
+              button.disabled = false;
+            }
+          });
+          actions.appendChild(button);
+        } else {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "danger";
+          button.textContent = "永久清除";
+          button.addEventListener("click", async () => {
+            if (!confirm(`永久清除 ${device.device_name}（${device.client_id}）？此操作無法復原。`)) return;
+            button.disabled = true;
+            try {
+              await api(`/api/devices/${encodeURIComponent(device.device_id)}`, { method: "DELETE" });
+              await loadDevices();
+              $("device-notice").style.color = "#65d39a";
+              $("device-notice").textContent = `已永久清除 ${device.device_name}。`;
+            } catch (error) {
+              $("device-notice").textContent = error.message;
+              button.disabled = false;
+            }
+          });
+          actions.appendChild(button);
+        }
+        body.appendChild(row);
+      }
+      rebuildClients();
+    } catch (error) {
+      $("device-notice").textContent = error.message;
+    }
+  }
+
+  async function loadClientLogs() {
+    $("client-log-notice").textContent = "";
+    if (!state.activeClientId) {
+      $("client-log-count").textContent = "0 筆結果";
+      renderLogs("client-logs", [], "尚無 Client Log");
+      return;
+    }
+    const params = new URLSearchParams({ limit: "250", scope: "client", client_id: state.activeClientId });
+    if ($("client-log-query").value.trim()) params.set("q", $("client-log-query").value.trim());
+    if ($("client-log-level").value !== "all") params.set("level", $("client-log-level").value);
+    if ($("client-log-service").value !== "all") params.set("service", $("client-log-service").value);
+    try {
+      const payload = await api(`/api/logs?${params}`);
+      $("client-log-count").textContent = `${payload.logs.length} 筆結果`;
+      renderLogs("client-logs", payload.logs, "此 Client 沒有符合條件的 Log");
+    } catch (error) {
+      $("client-log-notice").textContent = error.message;
+    }
+  }
+
+  async function loadSystemLogs() {
+    $("system-log-notice").textContent = "";
+    const params = new URLSearchParams({ limit: "250", scope: "system" });
+    if ($("system-log-query").value.trim()) params.set("q", $("system-log-query").value.trim());
+    if ($("system-log-level").value !== "all") params.set("level", $("system-log-level").value);
+    try {
+      const payload = await api(`/api/logs?${params}`);
+      $("system-log-count").textContent = `${payload.logs.length} 筆結果`;
+      renderLogs("system-logs", payload.logs, "沒有符合條件的主要 Log");
+    } catch (error) {
+      $("system-log-notice").textContent = error.message;
+    }
+  }
+
+  function policyInputId(service, field) { return `${service}-${field.replaceAll("_", "-")}`; }
+  function fillPolicy(service, policy) {
+    for (const field of policyFields) $(policyInputId(service, field)).value = policy[field];
+    $(`${service}-policy-revision`).textContent = `revision ${policy.revision}`;
+  }
+  function readPolicy(service) {
+    const policy = {};
+    for (const field of policyFields) policy[field] = Number($(policyInputId(service, field)).value);
+    policy.revision = 1;
+    return policy;
+  }
+  async function loadPolicies() {
+    $("policy-notice").textContent = "";
+    try {
+      const policies = await api("/api/worker-policies");
+      fillPolicy("mcp", policies.mcp);
+      fillPolicy("actions", policies.actions);
+    } catch (error) {
+      $("policy-notice").textContent = error.message;
+    }
+  }
+
+  for (const form of document.querySelectorAll("[data-policy-service]")) {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const service = form.dataset.policyService;
+      const button = form.querySelector("button[type=submit]");
+      button.disabled = true;
+      $("policy-notice").textContent = "";
+      try {
+        const saved = await api(`/api/worker-policies/${service}`, { method: "PUT", body: JSON.stringify(readPolicy(service)) });
+        fillPolicy(service, saved);
+        $("policy-notice").style.color = "#65d39a";
+        $("policy-notice").textContent = `${service === "mcp" ? "MCP" : "Actions"} Worker 政策已更新。`;
+      } catch (error) {
+        $("policy-notice").style.color = "";
+        $("policy-notice").textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  }
+
+  $("enroll-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    $("create").disabled = true;
+    $("form-notice").textContent = "";
+    try {
+      const result = await api("/api/enrollments", {
+        method: "POST",
+        body: JSON.stringify({ client_id: $("client-id").value.trim(), service: $("service").value, ttl_seconds: Number($("ttl").value) })
+      });
+      $("enroll-url").textContent = result.enrollment_url;
+      $("expires").textContent = `到期時間：${formatTime(result.expires_at_unix_ms)}`;
+      $("enroll-result").classList.add("visible");
+      await loadDevices();
+    } catch (error) {
+      $("form-notice").textContent = error.message;
+    } finally {
+      $("create").disabled = false;
+    }
+  });
+
+  $("purge-revoked").addEventListener("click", async () => {
+    const revokedCount = state.devices.filter((device) => device.revoked_at_unix_ms).length;
+    if (!revokedCount || !confirm(`永久清除全部 ${revokedCount} 個已撤銷裝置？此操作無法復原。`)) return;
+    $("purge-revoked").disabled = true;
+    try {
+      const result = await api("/api/devices/revoked/purge", { method: "POST", body: "{}" });
+      await loadDevices();
+      $("device-notice").style.color = "#65d39a";
+      $("device-notice").textContent = `已永久清除 ${result.deleted} 個已撤銷裝置。`;
+    } catch (error) {
+      $("device-notice").textContent = error.message;
+      $("purge-revoked").disabled = false;
+    }
+  });
+
+  $("client-log-form").addEventListener("submit", async (event) => { event.preventDefault(); await loadClientLogs(); });
+  $("system-log-form").addEventListener("submit", async (event) => { event.preventDefault(); await loadSystemLogs(); });
+  $("copy").addEventListener("click", async () => {
+    await navigator.clipboard.writeText($("enroll-url").textContent);
+    $("copy").textContent = "已複製";
+    setTimeout(() => $("copy").textContent = "複製", 1200);
+  });
+  $("logout").addEventListener("click", async () => {
+    $("logout").disabled = true;
+    try { await api("/api/logout", { method: "POST", body: "{}" }); }
+    finally { location.replace("/"); }
+  });
+
+  async function loadVisibleLogs() {
+    if (state.page === "clients") await loadClientLogs();
+    if (state.page === "system-logs") await loadSystemLogs();
+  }
+
+  async function refreshAll() {
+    $("refresh").disabled = true;
+    try {
+      await Promise.all([loadDevices(), loadPolicies(), loadObservability()]);
+      await loadVisibleLogs();
+      $("last-updated").textContent = `更新於 ${new Date().toLocaleTimeString()}`;
+    } finally {
+      $("refresh").disabled = false;
+    }
+  }
+
+  $("refresh").addEventListener("click", refreshAll);
+
+  (async () => {
+    try {
+      const session = await api("/api/session");
+      csrfToken = session.csrf_token;
+      $("current-user").textContent = session.username;
+      await activatePage("overview");
+      await refreshAll();
+      setInterval(async () => {
+        await loadObservability();
+        await loadVisibleLogs();
+        $("last-updated").textContent = `更新於 ${new Date().toLocaleTimeString()}`;
+      }, 10000);
+    } catch (error) {
+      $("device-notice").textContent = error.message;
+    }
+  })();
+</script>
+</body>
+</html>

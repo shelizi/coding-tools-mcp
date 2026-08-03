@@ -1,0 +1,44 @@
+# Optional local / self-host example for coding-tools-tunnel-server.
+# Run from the repository root (see README.md).
+#
+# TLS is terminated outside this file (host Caddy or a sibling reverse-proxy
+# container). Published ports default to 127.0.0.1 so they are not exposed on
+# the public interface.
+
+services:
+  tunnel-server:
+    build:
+      context: ../..
+      dockerfile: services/tunnel-server/Dockerfile
+    image: ${TUNNEL_IMAGE:-coding-tools-tunnel-server:local}
+    restart: unless-stopped
+    ports:
+      - "${TUNNEL_PUBLIC_BIND:-127.0.0.1}:${TUNNEL_PUBLIC_PORT:-8088}:8088"
+      - "${TUNNEL_ADMIN_BIND:-127.0.0.1}:${TUNNEL_ADMIN_PORT:-8089}:8089"
+    environment:
+      CODING_TOOLS_TUNNEL_PUBLIC_ORIGIN: ${TUNNEL_PUBLIC_ORIGIN:?set TUNNEL_PUBLIC_ORIGIN}
+      CODING_TOOLS_TUNNEL_BIND: 0.0.0.0:8088
+      CODING_TOOLS_TUNNEL_ADMIN_BIND: 0.0.0.0:8089
+      CODING_TOOLS_TUNNEL_ADMIN_USERNAME: ${TUNNEL_ADMIN_USERNAME:-admin}
+      CODING_TOOLS_TUNNEL_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      CODING_TOOLS_TUNNEL_DB: /data/tunnel.db
+      CODING_TOOLS_TUNNEL_LOG_DIR: /data/logs
+      RUST_LOG: ${RUST_LOG:-coding_tools_tunnel_server=info}
+    volumes:
+      - tunnel-data:/data
+    secrets:
+      - admin_password
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8088/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  tunnel-data:
+
+secrets:
+  # Path is resolved relative to this compose file's directory when relative.
+  admin_password:
+    file: ${TUNNEL_ADMIN_PASSWORD_FILE:?set TUNNEL_ADMIN_PASSWORD_FILE}

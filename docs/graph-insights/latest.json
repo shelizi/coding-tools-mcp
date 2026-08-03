@@ -1,0 +1,37 @@
+{
+  "updated_at": "2026-07-13",
+  "project": "coding-tools-mcp-desktop",
+  "analysis_status": "partial",
+  "gitnexus": {
+    "indexed": true,
+    "nodes": 5338,
+    "edges": 10793,
+    "flows": 300,
+    "rust_symbol_queries_reliable": false
+  },
+  "architecture": {
+    "frontend": "SvelteKit + Tauri invoke",
+    "backend": "Rust + Tauri 2",
+    "state": ["AppState", "DataStore", "RuntimeSupervisor"],
+    "services": ["MCP Streamable HTTP", "ChatGPT Actions OpenAPI"],
+    "tunnels": ["FRP", "Cloudflare"]
+  },
+  "entrypoints": {
+    "tauri": "src-tauri/src/lib.rs",
+    "frontend_layout": "src/routes/+layout.svelte",
+    "workspace_page": "src/routes/workspace/[id]/+page.svelte",
+    "runtime_commands": "src-tauri/src/commands/runtime.rs"
+  },
+  "verification": {
+    "cargo_check": "passed_with_16_warnings",
+    "cargo_test_no_run": "passed",
+    "svelte_check": "passed",
+    "frontend_build": "passed"
+  },
+  "risks": [
+    "Secrets are currently serialized into data/profiles.json while documentation promises OS keyring storage.",
+    "Legacy settings/workspace/keyring compatibility APIs remain unused.",
+    "Architecture documentation is stale relative to the current Rust/Tauri implementation.",
+    "Runtime integration coverage is not yet demonstrated by the available checks."
+  ]
+}

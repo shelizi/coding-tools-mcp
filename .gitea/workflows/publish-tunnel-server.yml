@@ -1,0 +1,89 @@
+name: Publish Tunnel Server
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - crates/tunnel-protocol/**
+      - services/tunnel-server/**
+      - .dockerignore
+      - .gitea/workflows/publish-tunnel-server.yml
+  workflow_dispatch:
+
+concurrency:
+  group: publish-coding-tools-tunnel-${{ gitea.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: self-hosted
+    env:
+      IMAGE_REPOSITORY: coding-tools-tunnel-server
+      SOURCE_SHA: ${{ gitea.sha }}
+      SOURCE_REF: ${{ gitea.ref }}
+
+    steps:
+      - name: Checkout coding-tools-mcp
+        uses: https://gitea.com/actions/checkout@v4
+
+      - name: Validate source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Gitea did not provide a full lowercase source commit SHA" >&2
+            exit 1
+          fi
+
+      - name: Build local Tunnel Server image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image_sha="${IMAGE_REPOSITORY}:sha-${SOURCE_SHA}"
+          docker build \
+            --pull \
+            --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --label "org.opencontainers.image.version=sha-${SOURCE_SHA}" \
+            --file services/tunnel-server/Dockerfile \
+            --tag "$image_sha" \
+            .
+
+      - name: Tag local image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image_sha="${IMAGE_REPOSITORY}:sha-${SOURCE_SHA}"
+
+          if [[ "$SOURCE_REF" == "refs/heads/main" ]]; then
+            channel="latest"
+          else
+            channel="edge"
+          fi
+
+          docker tag "$image_sha" "${IMAGE_REPOSITORY}:local"
+          docker tag "$image_sha" "${IMAGE_REPOSITORY}:${channel}"
+
+      - name: Verify local image tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$SOURCE_REF" == "refs/heads/main" ]]; then
+            channel="latest"
+          else
+            channel="edge"
+          fi
+
+          expected_revision="$SOURCE_SHA"
+          for image in \
+            "${IMAGE_REPOSITORY}:sha-${SOURCE_SHA}" \
+            "${IMAGE_REPOSITORY}:local" \
+            "${IMAGE_REPOSITORY}:${channel}"; do
+            revision=$(docker image inspect \
+              --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+              "$image")
+            test "$revision" = "$expected_revision"
+          done

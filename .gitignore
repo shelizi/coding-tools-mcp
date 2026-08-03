@@ -1,0 +1,34 @@
+.DS_Store
+node_modules
+/build
+/.svelte-kit
+/package
+.env
+.env.*
+!.env.example
+/services/tunnel-server/admin-password.txt
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+_tauri-scaffold
+
+# 已归档的旧版实现，仅保留本地参考
+/old/
+
+# Rust
+src-tauri/target
+crates/*/target
+services/*/target
+
+# MCP Probe 临时图谱快照
+.mcp-probe-kit/graph-snapshots/
+
+# 当前桌面版不使用的 Tauri 移动端及中间图标资源
+src-tauri/icons/64x64.png
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/icons/icons/
+src-tauri/icons/logo-design.png
+
+docs/history-session/
+
+dist-portable/

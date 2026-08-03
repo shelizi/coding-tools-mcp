@@ -1,0 +1,8 @@
+*
+!crates/
+!crates/tunnel-protocol/
+!crates/tunnel-protocol/**
+!services/
+!services/tunnel-server/
+!services/tunnel-server/**
+**/target/

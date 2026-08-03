@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "projectRootEnv": "MCP_PROJECT_ROOT",
+  "indexPath": "AGENTS.md",
+  "contextRoot": "docs",
+  "modularDir": "docs/project-context",
+  "graphDir": "docs/graph-insights",
+  "indexStyle": "agents",
+  "generatedBy": "init_project_context",
+  "generatedAt": "2026-07-13T07:03:48.536Z",
+  "harness": {
+    "detected": [
+      "cursor",
+      "claude"
+    ],
+    "skillCanonical": ".agents/skills/mcp-probe-kit/SKILL.md",
+    "adapters": [
+      {
+        "id": "claude-pointer",
+        "kind": "claude-pointer",
+        "path": "CLAUDE.md"
+      }
+    ]
+  }
+}

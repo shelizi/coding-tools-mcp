@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build Portable"
+  short_description: "Build and verify the Windows portable release"
+  default_prompt: "Use $build-portable to build and verify the Windows portable ZIP."

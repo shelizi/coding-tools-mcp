@@ -1,0 +1,123 @@
+import assert from "node:assert/strict";
+import { readFile, readdir } from "node:fs/promises";
+import path from "node:path";
+import test from "node:test";
+import { parse } from "svelte/compiler";
+import ts from "typescript";
+
+const root = process.cwd();
+
+async function importTypeScriptModule(file) {
+  const source = await readFile(file, "utf8");
+  const compiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ES2022,
+    },
+  }).outputText;
+  return import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
+}
+
+async function sourceFiles(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const nested = await Promise.all(
+    entries.map(async (entry) => {
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) return sourceFiles(absolute);
+      return entry.name.endsWith(".svelte") ? [absolute] : [];
+    }),
+  );
+  return nested.flat();
+}
+
+function literalVisibleText(source) {
+  const ast = parse(source, { modern: true });
+  const values = [];
+
+  function visit(value, key = "") {
+    if (key === "attributes" || !value || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item));
+      return;
+    }
+    if (value.type === "Text" && value.data.trim()) {
+      values.push(value.data.trim());
+      return;
+    }
+    Object.entries(value).forEach(([childKey, child]) => visit(child, childKey));
+  }
+
+  visit(ast.fragment);
+  return values.filter((value) => /\p{L}/u.test(value));
+}
+
+test("i18n exposes complete four-locale messages with English defaults", async () => {
+  const { MESSAGES } = await importTypeScriptModule(
+    path.join(root, "src", "lib", "i18n", "catalog.ts"),
+  );
+
+  assert.ok(Object.keys(MESSAGES).length > 100);
+  for (const [key, translations] of Object.entries(MESSAGES)) {
+    assert.equal(translations.length, 4, `${key} must define en, zh-TW, zh-CN, and ja`);
+    translations.forEach((translation, index) => {
+      assert.equal(typeof translation, "string", `${key}[${index}] must be a string`);
+      assert.ok(translation.trim(), `${key}[${index}] must not be empty`);
+    });
+  }
+
+  const runtime = await readFile(path.join(root, "src", "lib", "i18n", "index.ts"), "utf8");
+  assert.match(runtime, /DEFAULT_LOCALE:\s*Locale\s*=\s*"en"/);
+  assert.match(runtime, /\["en",\s*"zh-TW",\s*"zh-CN",\s*"ja"\]/);
+  assert.match(runtime, /coding-tools\.locale/);
+
+  const appHtml = await readFile(path.join(root, "src", "app.html"), "utf8");
+  assert.match(appHtml, /<html lang="en"/);
+});
+
+test("language selector keeps native options legible in the dark sidebar", async () => {
+  const component = await readFile(
+    path.join(root, "src", "lib", "components", "LanguageSelect.svelte"),
+    "utf8",
+  );
+
+  assert.match(component, /class="language-select/);
+  assert.match(component, /color-scheme:\s*dark/);
+  assert.match(component, /\.language-select option\s*\{[^}]*background(?:-color)?:\s*#17243a/s);
+  assert.match(component, /\.language-select option\s*\{[^}]*color:\s*#eef4ff/s);
+});
+
+test("visible Svelte prose is routed through i18n without assuming a language", async () => {
+  const files = await sourceFiles(path.join(root, "src"));
+  const allowedTechnicalText = new Set([
+    "Coding Tools",
+    "Coding Tools MCP",
+    "v",
+    "Bearer Token",
+    "· docs/history-session",
+    "P95",
+    "FRP",
+    "Cloudflare",
+    "Token:",
+    "Quick Tunnel",
+    "Named Tunnel",
+    "MCP",
+    "Streamable HTTP ·",
+    "Actions",
+    "OpenAPI",
+    "docs/history-session",
+    "Token",
+    "· Token",
+  ]);
+
+  for (const file of files) {
+    const source = await readFile(file, "utf8");
+    const untranslated = literalVisibleText(source).filter(
+      (value) => !allowedTechnicalText.has(value),
+    );
+    assert.deepEqual(
+      untranslated,
+      [],
+      `${path.relative(root, file)} contains visible prose outside i18n`,
+    );
+  }
+});

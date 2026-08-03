@@ -1,0 +1,1278 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+
+use crate::tools::redaction::{is_sensitive_key, redact_sensitive_text};
+use crate::tools::registry::MUTATING_TOOLS;
+use crate::tunnel::append_profile_log_rotating;
+
+const MAX_LOG_VALUE_BYTES: usize = 16 * 1024;
+const MAX_LOG_STRING_CHARS: usize = 4 * 1024;
+const MAX_ARGUMENT_RECORD_BYTES: usize = 4 * 1024;
+const MAX_ARGUMENT_PREVIEW_BYTES: usize = 512;
+const TOOL_USAGE_LOG_FILE: &str = "mcp-tool-usage.jsonl";
+const TOOL_USAGE_LOG_SCHEMA_VERSION: u64 = 6;
+const TOOL_USAGE_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
+const TOOL_USAGE_LOG_RETAINED_FILES: usize = 5;
+const TOOL_USAGE_LOG_QUEUE_CAPACITY: usize = 1_024;
+const ACTIVITY_BURST_IDLE_MS: u64 = 120_000;
+
+type ToolUsageLogEntry = (String, String);
+
+static TOOL_USAGE_LOG_SENDER: OnceLock<Option<SyncSender<ToolUsageLogEntry>>> = OnceLock::new();
+static TOOL_USAGE_LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
+static TOOL_USAGE_CALL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_BOOT_ID: OnceLock<String> = OnceLock::new();
+static ACTIVITY_STATES: OnceLock<Mutex<HashMap<String, ActivityState>>> = OnceLock::new();
+
+#[derive(Default)]
+struct ActivityState {
+    last_completed_ts_ms: u64,
+    burst_id: u64,
+    burst_sequence: u64,
+    active_requests: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ToolRequestTiming {
+    pub previous_response_completed_ts_ms: Option<u64>,
+    pub orchestration_gap_ms: Option<u64>,
+    pub activity_burst_id: u64,
+    pub activity_burst_sequence: u64,
+    pub concurrent_request: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AsyncSessionTelemetry<'a> {
+    pub profile_id: &'a str,
+    pub session_id: &'a str,
+    pub command_kind: &'a str,
+    pub started_ts_ms: u64,
+    pub child_process_total_ms: u64,
+    pub first_output_ms: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub termination_reason: &'a str,
+    pub stdout_bytes: usize,
+    pub stderr_bytes: usize,
+}
+
+pub(crate) fn runtime_boot_id() -> &'static str {
+    RUNTIME_BOOT_ID
+        .get_or_init(|| uuid::Uuid::new_v4().to_string())
+        .as_str()
+}
+
+pub(crate) fn begin_tool_request(profile_id: &str, started_ts_ms: u128) -> ToolRequestTiming {
+    let started_ts_ms = started_ts_ms.min(u64::MAX as u128) as u64;
+    let states = ACTIVITY_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut states = states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = states.entry(profile_id.to_string()).or_default();
+    let concurrent_request = state.active_requests > 0;
+    let previous = (state.last_completed_ts_ms > 0).then_some(state.last_completed_ts_ms);
+    let gap = if concurrent_request {
+        None
+    } else {
+        previous.map(|completed| started_ts_ms.saturating_sub(completed))
+    };
+    if state.burst_id == 0 || gap.is_some_and(|gap| gap > ACTIVITY_BURST_IDLE_MS) {
+        state.burst_id = state.burst_id.saturating_add(1).max(1);
+        state.burst_sequence = 0;
+    }
+    state.burst_sequence = state.burst_sequence.saturating_add(1);
+    state.active_requests = state.active_requests.saturating_add(1);
+    ToolRequestTiming {
+        previous_response_completed_ts_ms: previous,
+        orchestration_gap_ms: gap,
+        activity_burst_id: state.burst_id,
+        activity_burst_sequence: state.burst_sequence,
+        concurrent_request,
+    }
+}
+
+fn complete_tool_request(profile_id: &str, completed_ts_ms: u128) {
+    let completed_ts_ms = completed_ts_ms.min(u64::MAX as u128) as u64;
+    let states = ACTIVITY_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut states = states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = states.entry(profile_id.to_string()).or_default();
+    state.last_completed_ts_ms = state.last_completed_ts_ms.max(completed_ts_ms);
+    state.active_requests = state.active_requests.saturating_sub(1);
+}
+
+pub(crate) struct ToolUsageInput<'a> {
+    pub profile_id: &'a str,
+    pub transport_mode: &'a str,
+    pub protocol_version: &'a str,
+    pub request_id: &'a Value,
+    pub method: &'a str,
+    pub tool_name: &'a str,
+    pub arguments: &'a Value,
+    pub request_json_bytes: usize,
+    pub rpc_fast_path: bool,
+    pub request_timing: &'a ToolRequestTiming,
+    pub started_ts_ms: u128,
+    pub duration_ms: u128,
+    pub outcome: &'a str,
+    pub response: Option<&'a Value>,
+    pub worker_error: Option<&'a str>,
+}
+
+pub(crate) fn format_log_value(value: &Value) -> String {
+    let sanitized = sanitize_log_value(value, None);
+    let mut serialized = serde_json::to_string(&sanitized).unwrap_or_else(|_| "null".to_string());
+    if serialized.len() > MAX_LOG_VALUE_BYTES {
+        let mut boundary = MAX_LOG_VALUE_BYTES;
+        while !serialized.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        serialized.truncate(boundary);
+        serialized.push_str("...[TRUNCATED]");
+    }
+    serialized
+}
+
+pub(crate) fn format_request_log_value(value: &Value) -> String {
+    let sanitized = sanitize_log_value(value, None);
+    let serialized = serde_json::to_vec(&sanitized).unwrap_or_default();
+    let preview = format_log_value(value);
+    let keys = sanitized
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    serde_json::to_string(&json!({
+        "payload_omitted": true,
+        "json_bytes": serialized.len(),
+        "sha256": format!("{:x}", Sha256::digest(&serialized)),
+        "keys": keys,
+        "path": sanitized.get("path").and_then(Value::as_str),
+        "workdir": sanitized.get("workdir").and_then(Value::as_str),
+        "preview": truncate_utf8(&preview, 256)
+    }))
+    .unwrap_or_else(|_| "null".to_string())
+}
+
+pub(crate) fn record_tool_usage(input: ToolUsageInput<'_>) {
+    let completed_ts_ms = input.started_ts_ms.saturating_add(input.duration_ms);
+    append_tool_usage_log(input.profile_id, build_tool_usage_record(&input));
+    complete_tool_request(input.profile_id, completed_ts_ms);
+}
+
+pub(crate) fn record_async_session_finalized(input: AsyncSessionTelemetry<'_>) {
+    append_tool_usage_log(
+        input.profile_id,
+        build_async_session_record(&input, unix_timestamp_ms()),
+    );
+}
+
+fn build_async_session_record(input: &AsyncSessionTelemetry<'_>, completed_ts_ms: u64) -> Value {
+    json!({
+        "schema_version": TOOL_USAGE_LOG_SCHEMA_VERSION,
+        "event": "async_session_finalized",
+        "workspace_id": input.profile_id,
+        "runtime_boot_id": runtime_boot_id(),
+        "server_version": env!("CARGO_PKG_VERSION"),
+        "session_id": input.session_id,
+        "command_kind": input.command_kind,
+        "started_ts_ms": input.started_ts_ms,
+        "completed_ts_ms": completed_ts_ms,
+        "child_process_total_ms": input.child_process_total_ms,
+        "first_output_ms": input.first_output_ms,
+        "exit_code": input.exit_code,
+        "termination_reason": input.termination_reason,
+        "stdout_bytes": input.stdout_bytes,
+        "stderr_bytes": input.stderr_bytes
+    })
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn sanitize_log_value(value: &Value, key: Option<&str>) -> Value {
+    if key.is_some_and(is_sensitive_key) {
+        return Value::String("[REDACTED]".to_string());
+    }
+
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), sanitize_log_value(value, Some(key))))
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| sanitize_log_value(value, None))
+                .collect(),
+        ),
+        Value::String(value) => {
+            let (redacted, _) = redact_sensitive_text(value);
+            let shortened: String = redacted.chars().take(MAX_LOG_STRING_CHARS).collect();
+            if shortened.chars().count() < redacted.chars().count() {
+                Value::String(format!("{shortened}...[TRUNCATED]"))
+            } else {
+                Value::String(shortened)
+            }
+        }
+        _ => value.clone(),
+    }
+}
+
+fn json_byte_len(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
+fn tool_family(tool_name: &str) -> &'static str {
+    if tool_name.starts_with("git_") {
+        "git"
+    } else if tool_name == "format_files" {
+        "quality"
+    } else if matches!(
+        tool_name,
+        "read_file"
+            | "read_many"
+            | "list_files"
+            | "apply_patch"
+            | "edit_file"
+            | "edit_many"
+            | "file_ops"
+            | "view_image"
+    ) {
+        "filesystem"
+    } else if matches!(tool_name, "search_text" | "project_map") {
+        "search"
+    } else if matches!(
+        tool_name,
+        "exec_command" | "wait_command" | "send_input" | "kill_session" | "read_output"
+    ) {
+        "process"
+    } else if tool_name.starts_with("history_session_") {
+        "history"
+    } else if matches!(
+        tool_name,
+        "server_info" | "set_default_cwd" | "request_permissions"
+    ) {
+        "runtime"
+    } else {
+        "other"
+    }
+}
+
+fn request_mutates(tool_name: &str, arguments: &Value) -> bool {
+    if tool_name == "format_files" {
+        return arguments.get("mode").and_then(Value::as_str) == Some("apply");
+    }
+    MUTATING_TOOLS.contains(&tool_name)
+}
+
+fn argument_command_preview(arguments: &Value) -> Option<String> {
+    if let Some(cmd) = arguments.get("cmd").and_then(Value::as_str) {
+        return Some(redact_sensitive_text(cmd).0);
+    }
+    if let Some(script) = arguments.get("script").and_then(Value::as_str) {
+        return Some(redact_sensitive_text(script).0);
+    }
+
+    let program = arguments.get("program").and_then(Value::as_str)?;
+    let mut command = program.to_string();
+    if let Some(args) = arguments.get("args").and_then(Value::as_array) {
+        for argument in args.iter().filter_map(Value::as_str) {
+            command.push(' ');
+            command.push_str(argument);
+        }
+    }
+    Some(redact_sensitive_text(&command).0)
+}
+
+pub(crate) fn command_kind(arguments: &Value) -> &'static str {
+    let text = argument_command_preview(arguments).unwrap_or_else(|| arguments.to_string());
+    classify_command_text(&text)
+}
+
+pub(crate) fn classify_command_text(command: &str) -> &'static str {
+    let command = command.to_ascii_lowercase();
+    if command.contains("wait-process")
+        || command.contains("get-process cargo")
+        || command.contains("start-sleep")
+    {
+        "wait_poll"
+    } else if command.contains("mcp-tool-usage")
+        || command.contains("mcp-requests.log")
+        || command.contains("query_tool_usage")
+    {
+        "log_query"
+    } else if command.contains("cargo test")
+        || command.contains("test-fast.ps1")
+        || command.contains("test-full.ps1")
+    {
+        "cargo_test"
+    } else if command.contains("cargo check") || command.contains("cargo-local.ps1 check") {
+        "cargo_check"
+    } else if command.contains("cargo build")
+        || command.contains("tauri build")
+        || command.contains("npm run build")
+        || command.contains("pnpm build")
+    {
+        "build"
+    } else if command.contains("rustfmt") || command.contains("cargo fmt") {
+        "format"
+    } else if command.trim_start().starts_with("git ")
+        || command.contains(" git ")
+        || command.contains("git.exe")
+    {
+        "git"
+    } else if command.contains("pytest") || command.contains("python -m pytest") {
+        "test"
+    } else if command.contains("powershell") || command.contains("pwsh") {
+        "shell"
+    } else if command.contains("python") {
+        "python"
+    } else {
+        "process"
+    }
+}
+
+fn insert_structured_metric(
+    record: &mut Map<String, Value>,
+    structured: &Value,
+    source: &str,
+    destination: &str,
+) {
+    if let Some(value) = structured.get(source) {
+        record.insert(destination.to_string(), value.clone());
+    }
+}
+
+fn insert_array_count(
+    record: &mut Map<String, Value>,
+    structured: &Value,
+    source: &str,
+    destination: &str,
+) {
+    if let Some(values) = structured.get(source).and_then(Value::as_array) {
+        record.insert(destination.to_string(), json!(values.len()));
+    }
+}
+
+fn insert_warning_severity_counts(record: &mut Map<String, Value>, structured: &Value) {
+    let Some(warnings) = structured.get("warnings").and_then(Value::as_array) else {
+        return;
+    };
+    let mut notice = 0u64;
+    let mut deprecation = 0u64;
+    let mut recoverable = 0u64;
+    let mut security = 0u64;
+    let mut data_loss = 0u64;
+    for warning in warnings.iter().filter_map(Value::as_str) {
+        let lowered = warning.to_ascii_lowercase();
+        if lowered.contains("deprecated") || lowered.contains("deprecation") {
+            deprecation += 1;
+        } else if ["security", "sandbox", "unsafe", "permission", "credential"]
+            .iter()
+            .any(|keyword| lowered.contains(keyword))
+        {
+            security += 1;
+        } else if ["data loss", "overwrite", "delete", "irreversible"]
+            .iter()
+            .any(|keyword| lowered.contains(keyword))
+        {
+            data_loss += 1;
+        } else if ["retry", "recover", "temporary", "retained"]
+            .iter()
+            .any(|keyword| lowered.contains(keyword))
+        {
+            recoverable += 1;
+        } else {
+            notice += 1;
+        }
+    }
+    record.insert("notice_count".into(), json!(notice));
+    record.insert("deprecation_count".into(), json!(deprecation));
+    record.insert("recoverable_warning_count".into(), json!(recoverable));
+    record.insert("security_warning_count".into(), json!(security));
+    record.insert("data_loss_warning_count".into(), json!(data_loss));
+}
+
+fn mcp_text_content_bytes(result: &Value) -> usize {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .map(str::len)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
+    let sanitized_arguments = sanitize_log_value(input.arguments, None);
+    let arguments_bytes = serde_json::to_vec(&sanitized_arguments).unwrap_or_default();
+    let arguments_sha256 = format!("{:x}", Sha256::digest(&arguments_bytes));
+    let mut record = Map::new();
+    record.insert(
+        "schema_version".into(),
+        json!(TOOL_USAGE_LOG_SCHEMA_VERSION),
+    );
+    record.insert("event".into(), json!("tool_call"));
+    record.insert("started_ts_ms".into(), json!(input.started_ts_ms));
+    record.insert(
+        "completed_ts_ms".into(),
+        json!(input.started_ts_ms.saturating_add(input.duration_ms)),
+    );
+    record.insert("workspace_id".into(), json!(input.profile_id));
+    record.insert("runtime_boot_id".into(), json!(runtime_boot_id()));
+    record.insert("server_version".into(), json!(env!("CARGO_PKG_VERSION")));
+    record.insert("transport_mode".into(), json!(input.transport_mode));
+    record.insert("protocol_version".into(), json!(input.protocol_version));
+    record.insert("request_id".into(), input.request_id.clone());
+    record.insert(
+        "call_sequence".into(),
+        json!(TOOL_USAGE_CALL_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1),
+    );
+    record.insert("method".into(), json!(input.method));
+    record.insert("tool".into(), json!(input.tool_name));
+    record.insert("tool_family".into(), json!(tool_family(input.tool_name)));
+    record.insert(
+        "mutating_tool".into(),
+        json!(request_mutates(input.tool_name, input.arguments)),
+    );
+    record.insert("deprecated_tool".into(), Value::Bool(false));
+    record.insert("rpc_fast_path".into(), json!(input.rpc_fast_path));
+    record.insert(
+        "previous_response_completed_ts_ms".into(),
+        json!(input.request_timing.previous_response_completed_ts_ms),
+    );
+    record.insert(
+        "orchestration_gap_ms".into(),
+        json!(input.request_timing.orchestration_gap_ms),
+    );
+    record.insert(
+        "activity_burst_id".into(),
+        json!(input.request_timing.activity_burst_id),
+    );
+    record.insert(
+        "activity_burst_sequence".into(),
+        json!(input.request_timing.activity_burst_sequence),
+    );
+    record.insert(
+        "concurrent_request".into(),
+        json!(input.request_timing.concurrent_request),
+    );
+    record.insert(
+        "orchestration_gap_semantics".into(),
+        json!("time from the previous completed tool response to this request being received; includes client, network, platform, and model orchestration"),
+    );
+    record.insert("duration_ms".into(), json!(input.duration_ms));
+    record.insert("outcome".into(), json!(input.outcome));
+    record.insert("request_json_bytes".into(), json!(input.request_json_bytes));
+    record.insert("arguments_json_bytes".into(), json!(arguments_bytes.len()));
+    record.insert("arguments_sha256".into(), json!(arguments_sha256));
+    record.insert(
+        "arguments_truncated".into(),
+        json!(arguments_bytes.len() > MAX_ARGUMENT_RECORD_BYTES),
+    );
+
+    if arguments_bytes.len() <= MAX_ARGUMENT_RECORD_BYTES {
+        record.insert("arguments".into(), sanitized_arguments);
+    } else {
+        let preview = format_log_value(input.arguments);
+        record.insert(
+            "arguments_preview".into(),
+            Value::String(truncate_utf8(&preview, MAX_ARGUMENT_PREVIEW_BYTES)),
+        );
+    }
+    if let Some(object) = input.arguments.as_object() {
+        let mut keys = object.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        let field_bytes = object
+            .iter()
+            .map(|(key, value)| (key.clone(), json!(json_byte_len(value))))
+            .collect::<Map<String, Value>>();
+        record.insert("argument_keys".into(), json!(keys));
+        record.insert("argument_field_bytes".into(), Value::Object(field_bytes));
+    }
+    if let Some(command) = argument_command_preview(input.arguments) {
+        record.insert("command_kind".into(), json!(command_kind(input.arguments)));
+        record.insert(
+            "command_preview".into(),
+            sanitize_log_value(&Value::String(command), None),
+        );
+    }
+    for field in ["reason", "workdir", "path", "output_mode"] {
+        if let Some(value) = input.arguments.get(field) {
+            record.insert(
+                format!("argument_{field}"),
+                sanitize_log_value(value, Some(field)),
+            );
+        }
+    }
+    if let Some(apply) = input.arguments.get("apply_proposal") {
+        record.insert("edit_proposal_apply_requested".into(), Value::Bool(true));
+        if let Some(id) = apply.get("proposal_id").and_then(Value::as_str) {
+            record.insert(
+                "edit_proposal_id_hash".into(),
+                json!(format!("{:x}", Sha256::digest(id.as_bytes()))),
+            );
+        }
+        record.insert(
+            "edit_proposal_patch_bytes".into(),
+            json!(apply
+                .get("patch")
+                .and_then(Value::as_str)
+                .map(str::len)
+                .unwrap_or(0)),
+        );
+        record.insert(
+            "edit_proposal_replacement_bytes".into(),
+            json!(apply
+                .get("replacement")
+                .and_then(Value::as_str)
+                .map(str::len)
+                .unwrap_or(0)),
+        );
+        record.insert(
+            "edit_proposal_requested_format".into(),
+            json!(if apply.get("patch").is_some() {
+                "patch"
+            } else if apply.get("replacement").is_some() {
+                "replacement"
+            } else {
+                "accept"
+            }),
+        );
+    }
+
+    if let Some(response) = input.response {
+        record.insert("response_json_bytes".into(), json!(json_byte_len(response)));
+        if let Some(error) = response.get("error") {
+            insert_structured_metric(&mut record, error, "code", "rpc_error_code");
+            if let Some(message) = error.get("message") {
+                record.insert(
+                    "rpc_error_message".into(),
+                    sanitize_log_value(message, Some("message")),
+                );
+            }
+            if let Some(data) = error.get("data") {
+                for field in ["stage", "reason", "retryable", "suggestion"] {
+                    if let Some(value) = data.get(field) {
+                        record.insert(
+                            format!("rpc_error_{field}"),
+                            sanitize_log_value(value, Some(field)),
+                        );
+                    }
+                }
+                if data.get("reason").and_then(Value::as_str) == Some("unknown_tool") {
+                    record.insert("error_code".into(), json!("UNKNOWN_TOOL"));
+                    record.insert("error_category".into(), json!("catalog"));
+                    record.insert("error_retryable".into(), Value::Bool(true));
+                }
+            }
+        }
+
+        if let Some(result) = response.get("result") {
+            record.insert("result_json_bytes".into(), json!(json_byte_len(result)));
+            record.insert(
+                "response_text_bytes".into(),
+                json!(mcp_text_content_bytes(result)),
+            );
+            record.insert(
+                "content_item_count".into(),
+                json!(result
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)),
+            );
+            insert_structured_metric(&mut record, result, "isError", "is_error");
+
+            if let Some(structured) = result.get("structuredContent") {
+                record.insert(
+                    "structured_content_json_bytes".into(),
+                    json!(json_byte_len(structured)),
+                );
+                if let Some(object) = structured.as_object() {
+                    record.insert("structured_field_count".into(), json!(object.len()));
+                }
+                record.insert(
+                    "tool_inline_fast".into(),
+                    Value::Bool(
+                        structured.get("execution_lane").and_then(Value::as_str)
+                            == Some("inline_fast"),
+                    ),
+                );
+                for field in [
+                    "ok",
+                    "transport_ok",
+                    "execution_ok",
+                    "command_ok",
+                    "verification_ok",
+                    "status",
+                    "termination_reason",
+                    "exit_code",
+                    "process_exit_code",
+                    "process_still_running",
+                    "process_timed_out",
+                    "request_timed_out",
+                    "recoverable",
+                    "task_required",
+                    "truncated",
+                    "stdout_truncated",
+                    "stderr_truncated",
+                    "has_more_output",
+                    "cursor_expired",
+                    "cursor",
+                    "next_cursor",
+                    "latest_cursor",
+                    "output_mode",
+                    "operation_id",
+                    "session_id",
+                    "harness_mode",
+                    "execution_mode",
+                    "execution_lane",
+                    "resumed_execution_lane",
+                    "blocking_queue_wait_ms",
+                    "admission_lane",
+                    "admission_limit",
+                    "global_admission_limit",
+                    "admission_scope",
+                    "workspace_admission_wait_ms",
+                    "global_admission_wait_ms",
+                    "admission_queue_wait_ms",
+                    "workspace_lock_scope",
+                    "workspace_lock_groups",
+                    "workspace_lock_wait_ms",
+                    "operation_lock_wait_ms",
+                    "resource_lock_wait_ms",
+                    "resource_lock_group",
+                    "resource_lock_target",
+                    "session_registry_wait_ms",
+                    "actual_wait_ms",
+                    "snapshot_ms",
+                    "active_session_limit",
+                    "active_session_slots_available",
+                    "execution_boundary",
+                    "sandbox_enforced",
+                    "program",
+                    "shell",
+                    "resolved_cwd",
+                    "child_process",
+                    "interactive",
+                    "stdin_open",
+                    "elapsed_ms",
+                    "returned_count",
+                    "total_matches",
+                    "scanned_files",
+                    "skipped_large_files",
+                    "bytes_read",
+                    "total_bytes",
+                    "total_lines",
+                    "total_stream_bytes",
+                    "total_retained_bytes",
+                    "retained_start_offset",
+                    "requested_offset",
+                    "offset",
+                    "limit",
+                    "clean",
+                    "applied",
+                    "dry_run",
+                    "proposal_ttl_seconds",
+                    "candidate_start_line",
+                    "candidate_end_line",
+                    "proposal_apply_format",
+                    "preferred_format",
+                    "preferred_format_reason",
+                    "replacement_bytes",
+                    "proposed_content_bytes",
+                    "proposed_content_included",
+                    "next_action",
+                    "failed_command_count",
+                    "skipped_command_count",
+                    "batch_summary",
+                    "wait_timeout_ms",
+                    "effective_wait_ms",
+                    "heartbeat_ms",
+                    "heartbeat",
+                    "deduplicated",
+                    "attached_to_session_id",
+                    "detached",
+                    "operation_id",
+                    "command_fingerprint",
+                    "process_id",
+                    "process_tree_contained",
+                    "process_tree_control",
+                    "resolved_by",
+                    "retention_seconds",
+                    "wait_until",
+                ] {
+                    insert_structured_metric(&mut record, structured, field, field);
+                }
+                if input.tool_name == "format_files" {
+                    for (source, destination) in [
+                        ("mode", "format_mode"),
+                        ("scope", "format_scope"),
+                        ("files_requested", "format_files_requested"),
+                        ("files_supported", "format_files_supported"),
+                        ("files_changed_count", "format_files_changed_count"),
+                        ("files_unchanged_count", "format_files_unchanged_count"),
+                        ("files_skipped_count", "format_files_skipped_count"),
+                        ("formatter_group_count", "format_formatter_group_count"),
+                        (
+                            "custom_formatter_group_count",
+                            "format_custom_formatter_group_count",
+                        ),
+                        ("diff_bytes", "format_diff_bytes"),
+                        ("diff_truncated", "format_diff_truncated"),
+                        ("applied", "format_applied"),
+                    ] {
+                        insert_structured_metric(&mut record, structured, source, destination);
+                    }
+                    insert_array_count(
+                        &mut record,
+                        structured,
+                        "unavailable_adapters",
+                        "format_unavailable_adapter_count",
+                    );
+                    insert_array_count(
+                        &mut record,
+                        structured,
+                        "unexpected_changes",
+                        "format_unexpected_change_count",
+                    );
+                }
+                if let Some(error) = structured.get("error") {
+                    insert_structured_metric(&mut record, error, "code", "error_code");
+                    insert_structured_metric(&mut record, error, "category", "error_category");
+                    insert_structured_metric(&mut record, error, "retryable", "error_retryable");
+                    if let Some(details) = error.get("details") {
+                        for field in [
+                            "stage",
+                            "reason",
+                            "suggestion",
+                            "recommended_tool",
+                            "recommended_format",
+                            "patch_bytes",
+                            "replacement_bytes",
+                            "actual_sha256",
+                            "expected_sha256",
+                            "actual_occurrences",
+                            "expected_occurrences",
+                            "recovery_reason",
+                        ] {
+                            if let Some(value) = details.get(field) {
+                                record.insert(
+                                    format!("error_{field}"),
+                                    sanitize_log_value(value, Some(field)),
+                                );
+                            }
+                        }
+                        insert_array_count(
+                            &mut record,
+                            details,
+                            "recovery_actions",
+                            "recovery_action_count",
+                        );
+                    }
+                }
+                if let Some(duration) = structured.get("duration_ms") {
+                    record.insert("tool_reported_duration_ms".into(), duration.clone());
+                }
+                for field in ["suggestion", "recovery_hint"] {
+                    if let Some(value) = structured.get(field) {
+                        record.insert(field.to_string(), sanitize_log_value(value, Some(field)));
+                    }
+                }
+                if let Some(stdout) = structured.get("stdout").and_then(Value::as_str) {
+                    record.insert("stdout_bytes".into(), json!(stdout.len()));
+                }
+                if let Some(stderr) = structured.get("stderr").and_then(Value::as_str) {
+                    record.insert("stderr_bytes".into(), json!(stderr.len()));
+                }
+                for (source, destination) in [
+                    ("warnings", "warning_count"),
+                    ("next_actions", "next_action_count"),
+                    ("recovery_actions", "recovery_action_count"),
+                    ("failed_command_ids", "failed_command_id_count"),
+                    ("skipped_command_ids", "skipped_command_id_count"),
+                    ("events", "event_count"),
+                    ("affected_files", "affected_file_count"),
+                    ("entries", "entry_count"),
+                    ("matches", "match_count"),
+                    ("commits", "commit_count"),
+                    ("files", "file_count"),
+                    ("would_create", "would_create_count"),
+                    ("would_modify", "would_modify_count"),
+                    ("would_delete", "would_delete_count"),
+                ] {
+                    insert_array_count(&mut record, structured, source, destination);
+                }
+                insert_warning_severity_counts(&mut record, structured);
+            }
+        }
+    }
+
+    if let Some(error) = input.worker_error {
+        record.insert(
+            "worker_error".into(),
+            sanitize_log_value(&Value::String(error.to_string()), Some("error")),
+        );
+    }
+    record.insert(
+        "outcome_class".into(),
+        json!(classify_outcome(&record, input.outcome)),
+    );
+
+    Value::Object(record)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}...[TRUNCATED]", &value[..boundary])
+}
+
+fn classify_outcome(record: &Map<String, Value>, outcome: &str) -> &'static str {
+    let code = record
+        .get("error_code")
+        .or_else(|| record.get("rpc_error_code"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if record.get("request_timed_out").and_then(Value::as_bool) == Some(true)
+        || record.get("process_timed_out").and_then(Value::as_bool) == Some(true)
+    {
+        "timeout"
+    } else if record.get("command_ok").and_then(Value::as_bool) == Some(false) {
+        if record.get("verification_ok").and_then(Value::as_bool) == Some(false) {
+            "verification_failure"
+        } else if record
+            .get("process_exit_code")
+            .and_then(Value::as_i64)
+            .is_some_and(|code| code != 0)
+        {
+            "process_failure"
+        } else {
+            "command_failure"
+        }
+    } else if outcome == "success" {
+        "success"
+    } else if code == "UNKNOWN_TOOL" {
+        "catalog_mismatch"
+    } else if code.contains("POLICY") || code.contains("PERMISSION") {
+        "policy_rejection"
+    } else if code.contains("VERSION_MISMATCH") {
+        "version_conflict"
+    } else if code.contains("TIMEOUT") {
+        "timeout"
+    } else if code.contains("CANCEL") {
+        "cancelled"
+    } else if code.contains("BUSY") || code.contains("LIMIT_REACHED") {
+        "admission_rejected"
+    } else if record
+        .get("process_exit_code")
+        .and_then(Value::as_i64)
+        .is_some_and(|code| code != 0)
+    {
+        "process_failure"
+    } else if record.get("error_category").and_then(Value::as_str) == Some("validation") {
+        "caller_argument_error"
+    } else {
+        "tool_internal_error"
+    }
+}
+
+fn tool_usage_log_sender() -> Option<&'static SyncSender<ToolUsageLogEntry>> {
+    TOOL_USAGE_LOG_SENDER
+        .get_or_init(|| {
+            let (sender, receiver) =
+                sync_channel::<ToolUsageLogEntry>(TOOL_USAGE_LOG_QUEUE_CAPACITY);
+            let worker = thread::Builder::new()
+                .name("mcp-tool-usage-log".into())
+                .spawn(move || {
+                    while let Ok((profile_id, line)) = receiver.recv() {
+                        append_profile_log_rotating(
+                            &profile_id,
+                            TOOL_USAGE_LOG_FILE,
+                            &line,
+                            TOOL_USAGE_LOG_MAX_BYTES,
+                            TOOL_USAGE_LOG_RETAINED_FILES,
+                        );
+                    }
+                });
+            worker.ok().map(|_| sender)
+        })
+        .as_ref()
+}
+
+fn append_tool_usage_log(profile_id: &str, mut record: Value) {
+    let dropped_before = TOOL_USAGE_LOG_DROPPED.swap(0, Ordering::Relaxed);
+    if dropped_before > 0 {
+        if let Some(object) = record.as_object_mut() {
+            object.insert("telemetry_dropped_before".into(), json!(dropped_before));
+        }
+    }
+
+    let Ok(line) = serde_json::to_string(&record) else {
+        TOOL_USAGE_LOG_DROPPED.fetch_add(dropped_before.saturating_add(1), Ordering::Relaxed);
+        return;
+    };
+
+    let Some(sender) = tool_usage_log_sender() else {
+        append_profile_log_rotating(
+            profile_id,
+            TOOL_USAGE_LOG_FILE,
+            &line,
+            TOOL_USAGE_LOG_MAX_BYTES,
+            TOOL_USAGE_LOG_RETAINED_FILES,
+        );
+        return;
+    };
+
+    match sender.try_send((profile_id.to_string(), line)) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            TOOL_USAGE_LOG_DROPPED.fetch_add(dropped_before.saturating_add(1), Ordering::Relaxed);
+        }
+        Err(TrySendError::Disconnected((profile_id, line))) => {
+            append_profile_log_rotating(
+                &profile_id,
+                TOOL_USAGE_LOG_FILE,
+                &line,
+                TOOL_USAGE_LOG_MAX_BYTES,
+                TOOL_USAGE_LOG_RETAINED_FILES,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        begin_tool_request, build_async_session_record, build_tool_usage_record,
+        classify_command_text, classify_outcome, complete_tool_request, format_log_value,
+        format_request_log_value, AsyncSessionTelemetry, ToolRequestTiming, ToolUsageInput,
+    };
+
+    #[test]
+    fn request_timing_tracks_gaps_and_splits_idle_bursts() {
+        let profile = format!("timing-test-{}", uuid::Uuid::new_v4());
+        let first = begin_tool_request(&profile, 1_000);
+        assert_eq!(first.orchestration_gap_ms, None);
+        assert_eq!(first.activity_burst_id, 1);
+        assert_eq!(first.activity_burst_sequence, 1);
+        complete_tool_request(&profile, 1_100);
+
+        let second = begin_tool_request(&profile, 2_000);
+        assert_eq!(second.orchestration_gap_ms, Some(900));
+        assert_eq!(second.activity_burst_id, 1);
+        assert_eq!(second.activity_burst_sequence, 2);
+        complete_tool_request(&profile, 2_100);
+
+        let after_idle = begin_tool_request(&profile, 200_000);
+        assert_eq!(after_idle.orchestration_gap_ms, Some(197_900));
+        assert_eq!(after_idle.activity_burst_id, 2);
+        assert_eq!(after_idle.activity_burst_sequence, 1);
+        complete_tool_request(&profile, 200_100);
+    }
+
+    #[test]
+    fn concurrent_requests_do_not_create_fake_orchestration_gaps() {
+        let profile = format!("concurrent-timing-test-{}", uuid::Uuid::new_v4());
+        let first = begin_tool_request(&profile, 1_000);
+        let concurrent = begin_tool_request(&profile, 1_050);
+
+        assert!(!first.concurrent_request);
+        assert!(concurrent.concurrent_request);
+        assert_eq!(concurrent.orchestration_gap_ms, None);
+        assert_eq!(concurrent.activity_burst_id, first.activity_burst_id);
+
+        complete_tool_request(&profile, 1_100);
+        complete_tool_request(&profile, 1_150);
+    }
+
+    #[test]
+    fn async_session_record_captures_real_child_process_lifetime() {
+        let record = build_async_session_record(
+            &AsyncSessionTelemetry {
+                profile_id: "workspace",
+                session_id: "session-1",
+                command_kind: "cargo_test",
+                started_ts_ms: 1_000,
+                child_process_total_ms: 5_250,
+                first_output_ms: Some(420),
+                exit_code: Some(0),
+                termination_reason: "exited",
+                stdout_bytes: 123,
+                stderr_bytes: 7,
+            },
+            6_250,
+        );
+
+        assert_eq!(record["schema_version"], 6);
+        assert_eq!(record["event"], "async_session_finalized");
+        assert_eq!(record["session_id"], "session-1");
+        assert_eq!(record["command_kind"], "cargo_test");
+        assert_eq!(record["started_ts_ms"], 1_000);
+        assert_eq!(record["completed_ts_ms"], 6_250);
+        assert_eq!(record["child_process_total_ms"], 5_250);
+        assert_eq!(record["first_output_ms"], 420);
+        assert_eq!(record["termination_reason"], "exited");
+    }
+
+    #[test]
+    fn command_kind_distinguishes_waiting_testing_and_log_queries() {
+        assert_eq!(classify_command_text("cargo test --lib"), "cargo_test");
+        assert_eq!(
+            classify_command_text("Get-Process cargo | Wait-Process"),
+            "wait_poll"
+        );
+        assert_eq!(
+            classify_command_text("cat mcp-tool-usage.jsonl"),
+            "log_query"
+        );
+    }
+
+    #[test]
+    fn command_text_secrets_are_redacted() {
+        let value = json!({
+            "cmd": "curl --token super-secret -H 'Authorization: Bearer abc.def.ghi' API_KEY=hidden"
+        });
+
+        let logged = format_log_value(&value);
+
+        assert!(logged.contains("--token [REDACTED]"));
+        assert!(logged.contains("Authorization: [REDACTED]"));
+        assert!(logged.contains("API_KEY=[REDACTED]"));
+        assert!(!logged.contains("super-secret"));
+        assert!(!logged.contains("abc.def.ghi"));
+        assert!(!logged.contains("hidden"));
+    }
+
+    #[test]
+    fn large_request_log_uses_a_digest_and_bounded_preview() {
+        let value = json!({
+            "path": "src/main.rs",
+            "patch": "x".repeat(32 * 1024)
+        });
+
+        let logged = format_request_log_value(&value);
+        let summary: serde_json::Value = serde_json::from_str(&logged).expect("request summary");
+        assert_eq!(summary["payload_omitted"], true);
+        assert_eq!(summary["path"], "src/main.rs");
+        assert_eq!(summary["sha256"].as_str().expect("digest").len(), 64);
+        assert!(logged.len() < 4 * 1024);
+    }
+
+    #[test]
+    fn successful_transport_does_not_hide_command_failure() {
+        let mut record = serde_json::Map::new();
+        record.insert("command_ok".into(), json!(false));
+        record.insert("verification_ok".into(), json!(true));
+        record.insert("process_exit_code".into(), json!(2));
+        assert_eq!(classify_outcome(&record, "success"), "process_failure");
+
+        record.insert("verification_ok".into(), json!(false));
+        assert_eq!(classify_outcome(&record, "success"), "verification_failure");
+    }
+
+    #[test]
+    fn usage_record_contains_payload_and_result_metrics() {
+        let arguments = json!({
+            "cmd": "cargo test --token hidden-value",
+            "reason": "verify changes",
+            "stdin": "do-not-log"
+        });
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {
+                "content": [{"type": "text", "text": "done"}],
+                "structuredContent": {
+                    "ok": true,
+                    "status": "exited",
+                    "duration_ms": 12,
+                    "operation_lock_wait_ms": 7,
+                    "resource_lock_wait_ms": 13,
+                    "resource_lock_group": "cargo-target:fixture",
+                    "deduplicated": true,
+                    "attached_to_session_id": "session-1",
+                    "heartbeat": true,
+                    "heartbeat_ms": 10000,
+                    "stdout": "done\n",
+                    "stderr": "",
+                    "warnings": ["example"],
+                    "returned_count": 3
+                },
+                "isError": false
+            }
+        });
+        let request_timing = ToolRequestTiming {
+            previous_response_completed_ts_ms: Some(250),
+            orchestration_gap_ms: Some(750),
+            activity_burst_id: 3,
+            activity_burst_sequence: 4,
+            concurrent_request: false,
+        };
+
+        let record = build_tool_usage_record(&ToolUsageInput {
+            profile_id: "workspace",
+            transport_mode: "streamable-http",
+            protocol_version: "2025-11-25",
+            request_id: &json!(7),
+            method: "tools/call",
+            tool_name: "exec_command",
+            arguments: &arguments,
+            request_json_bytes: 123,
+            rpc_fast_path: false,
+            request_timing: &request_timing,
+            started_ts_ms: 1_000,
+            duration_ms: 25,
+            outcome: "success",
+            response: Some(&response),
+            worker_error: None,
+        });
+
+        assert_eq!(record["schema_version"], 6);
+        assert!(record["runtime_boot_id"].as_str().is_some());
+        assert_eq!(record["rpc_fast_path"], false);
+        assert_eq!(record["tool_family"], "process");
+        assert_eq!(record["mutating_tool"], true);
+        assert_eq!(record["deprecated_tool"], false);
+        assert!(record["call_sequence"].as_u64().is_some());
+        assert_eq!(record["duration_ms"], 25);
+        assert_eq!(record["operation_lock_wait_ms"], 7);
+        assert_eq!(record["resource_lock_wait_ms"], 13);
+        assert_eq!(record["resource_lock_group"], "cargo-target:fixture");
+        assert_eq!(record["deduplicated"], true);
+        assert_eq!(record["attached_to_session_id"], "session-1");
+        assert_eq!(record["heartbeat"], true);
+        assert_eq!(record["heartbeat_ms"], 10_000);
+        assert_eq!(record["previous_response_completed_ts_ms"], 250);
+        assert_eq!(record["orchestration_gap_ms"], 750);
+        assert_eq!(record["activity_burst_id"], 3);
+        assert_eq!(record["activity_burst_sequence"], 4);
+        assert_eq!(record["concurrent_request"], false);
+        assert_eq!(record["command_kind"], "cargo_test");
+        assert_eq!(record["request_json_bytes"], 123);
+        assert_eq!(record["response_text_bytes"], 4);
+        assert_eq!(record["stdout_bytes"], 5);
+        assert_eq!(record["warning_count"], 1);
+        assert_eq!(record["notice_count"], 1);
+        assert_eq!(record["deprecation_count"], 0);
+        assert_eq!(record["returned_count"], 3);
+        assert_eq!(record["schema_version"], 6);
+        assert_eq!(record["arguments"]["stdin"], "[REDACTED]");
+        assert!(record["command_preview"]
+            .as_str()
+            .expect("command preview")
+            .contains("--token [REDACTED]"));
+        assert!(!record.to_string().contains("hidden-value"));
+        assert!(!record.to_string().contains("do-not-log"));
+    }
+
+    #[test]
+    fn usage_record_extracts_format_metrics_and_mutation_intent() {
+        let request_timing = ToolRequestTiming {
+            previous_response_completed_ts_ms: None,
+            orchestration_gap_ms: None,
+            activity_burst_id: 1,
+            activity_burst_sequence: 1,
+            concurrent_request: false,
+        };
+        let response = json!({
+            "result": {
+                "content": [{"type": "text", "text": "formatted"}],
+                "structuredContent": {
+                    "ok": true,
+                    "status": "checked",
+                    "mode": "check",
+                    "scope": "changed",
+                    "files_requested": 5,
+                    "files_supported": 4,
+                    "files_changed_count": 2,
+                    "files_unchanged_count": 2,
+                    "files_skipped_count": 1,
+                    "formatter_group_count": 3,
+                    "custom_formatter_group_count": 1,
+                    "unavailable_adapters": ["black"],
+                    "unexpected_changes": [],
+                    "diff_bytes": 120,
+                    "diff_truncated": false,
+                    "applied": false
+                },
+                "isError": false
+            }
+        });
+        let check_arguments = json!({"scope": "changed", "mode": "check"});
+        let check = build_tool_usage_record(&ToolUsageInput {
+            profile_id: "workspace",
+            transport_mode: "streamable-http",
+            protocol_version: "2025-11-25",
+            request_id: &json!(1),
+            method: "tools/call",
+            tool_name: "format_files",
+            arguments: &check_arguments,
+            request_json_bytes: 32,
+            rpc_fast_path: false,
+            request_timing: &request_timing,
+            started_ts_ms: 1,
+            duration_ms: 10,
+            outcome: "success",
+            response: Some(&response),
+            worker_error: None,
+        });
+        assert_eq!(check["schema_version"], 6);
+        assert_eq!(check["tool_family"], "quality");
+        assert_eq!(check["mutating_tool"], false);
+        assert_eq!(check["format_mode"], "check");
+        assert_eq!(check["format_scope"], "changed");
+        assert_eq!(check["format_files_changed_count"], 2);
+        assert_eq!(check["format_files_skipped_count"], 1);
+        assert_eq!(check["format_custom_formatter_group_count"], 1);
+        assert_eq!(check["format_unavailable_adapter_count"], 1);
+        assert_eq!(check["format_unexpected_change_count"], 0);
+        assert_eq!(check["format_diff_bytes"], 120);
+
+        let apply_arguments = json!({"paths": ["src/lib.rs"], "mode": "apply"});
+        let apply = build_tool_usage_record(&ToolUsageInput {
+            profile_id: "workspace",
+            transport_mode: "streamable-http",
+            protocol_version: "2025-11-25",
+            request_id: &json!(2),
+            method: "tools/call",
+            tool_name: "format_files",
+            arguments: &apply_arguments,
+            request_json_bytes: 32,
+            rpc_fast_path: false,
+            request_timing: &request_timing,
+            started_ts_ms: 1,
+            duration_ms: 10,
+            outcome: "success",
+            response: None,
+            worker_error: None,
+        });
+        assert_eq!(apply["mutating_tool"], true);
+    }
+}

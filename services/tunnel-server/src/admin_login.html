@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Coding Tools Tunnel 管理登入</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: #10131a; color: #edf1f7; }
+    main { width: min(430px, calc(100% - 32px)); }
+    .panel { background: #181d27; border: 1px solid #2b3442; border-radius: 16px; padding: 26px; box-shadow: 0 18px 42px rgba(0,0,0,.28); }
+    h1 { margin: 0 0 8px; font-size: 1.55rem; }
+    p { margin: 0 0 22px; color: #9aa6b5; line-height: 1.55; }
+    form, label { display: grid; gap: 9px; }
+    form { gap: 16px; }
+    label { color: #b8c1ce; font-size: .88rem; }
+    input, button { font: inherit; border-radius: 9px; border: 1px solid #3b4657; }
+    input { padding: 11px 12px; background: #0f141d; color: #edf1f7; }
+    button { padding: 11px 14px; background: #3f78e0; color: white; cursor: pointer; font-weight: 650; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .notice { min-height: 24px; margin-top: 12px; color: #ffb6bd; }
+  </style>
+</head>
+<body>
+<main>
+  <section class="panel">
+    <h1>Coding Tools Tunnel 管理</h1>
+    <p>僅限核准的內網或來源 IP。登入後才能存取裝置與註冊管理功能。</p>
+    <form id="login-form">
+      <label>管理帳號<input id="username" type="text" autocomplete="username" maxlength="128" required autofocus></label>
+      <label>管理密碼<input id="password" type="password" autocomplete="current-password" required></label>
+      <button id="login" type="submit">登入</button>
+    </form>
+    <div id="notice" class="notice" role="status"></div>
+  </section>
+</main>
+<script>
+  const form = document.getElementById("login-form");
+  const button = document.getElementById("login");
+  const notice = document.getElementById("notice");
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    button.disabled = true;
+    notice.textContent = "";
+    try {
+      const response = await fetch("/api/login", {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          username: document.getElementById("username").value,
+          password: document.getElementById("password").value
+        })
+      });
+      const value = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(value.error || `HTTP ${response.status}`);
+      location.replace("/");
+    } catch (error) {
+      notice.textContent = error.message;
+      button.disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
