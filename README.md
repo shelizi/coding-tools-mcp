@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="src-tauri/icons/128x128.png" width="96" alt="Coding Tools MCP 图标">
+  <img src="src-tauri/icons/128x128.png" width="96" alt="Coding Tools MCP 圖示">
 </p>
 
 <h1 align="center">Coding Tools MCP</h1>
 
 <p align="center">
-  把本地项目变成 AI 可直接开发、能够跨会话延续上下文的持久工作区。
+  把本機專案變成 AI 可直接開發、能跨對話延續上下文的持久工作區。
 </p>
 
 <p align="center">
@@ -16,94 +16,94 @@
 </p>
 
 <p align="center">
-  <a href="README.md">中文</a> · <a href="README.en.md">English</a> · Releases
+  <a href="README.md">繁體中文</a> · <a href="README.en.md">English</a> · Releases
 </p>
 
-Coding Tools MCP 是一个 Rust + Tauri 2 桌面应用。选择项目目录并启动服务后，AI Agent 就能通过 MCP 读取文件、修改代码、运行命令和测试、查看 Git 状态，并把关键进度保存为项目内的历史会话。它更接近“AI 打开一个会记住开发进度的 IDE 工作区”；普通开发工具不要求先创建 Task，历史会话则负责在新对话中恢复上下文。
+Coding Tools MCP 是一套 Rust + Tauri 2 桌面應用。選好專案目錄並啟動服務後，AI Agent 就能透過 MCP 讀取檔案、修改程式碼、執行指令與測試、查看 Git 狀態，並把關鍵進度存成專案內的歷史工作階段。它比較像「AI 打開一個會記住開發進度的 IDE 工作區」；一般開發工具不需要先建立 Task，歷史工作階段則負責在新對話中還原上下文。
 
-![Coding Tools MCP 工作区总览](docs/images/workspace-overview.png)
+![Coding Tools MCP 工作區總覽](docs/images/workspace-overview.png)
 
-*一个桌面端同时管理工作区、MCP 服务、连接信息与会话恢复提示词。*
+*一個桌面端同時管理工作區、MCP 服務、連線資訊與工作階段還原提示詞。*
 
-## 30 秒看懂怎么用
+## 30 秒看懂怎麼用
 
 ```text
-下载安装桌面端
-  → 添加项目目录
-  → 启动 MCP 和公网隧道
-  → 复制“公网 MCP 地址”
-  → ChatGPT 开启开发人员模式
-  → 新建 MCP 插件并粘贴地址
-  → 完成授权，在新对话中开始开发
+下載安裝桌面端
+  → 新增專案目錄
+  → 啟動 MCP 與公網隧道
+  → 複製「公網 MCP 位址」
+  → ChatGPT 開啟開發人員模式
+  → 新建 MCP 外掛並貼上位址
+  → 完成授權，在新對話中開始開發
 ```
 
-第一次使用只需要记住两件事：**桌面端负责把项目变成 MCP 工作区，ChatGPT 负责通过公网 `/mcp` 地址连接它。**
+第一次使用只要記住兩件事：**桌面端負責把專案變成 MCP 工作區，ChatGPT 負責透過公網 `/mcp` 位址連上它。**
 
-- [查看完整安装和桌面端启动步骤](#五分钟开始使用)
-- [直接查看 ChatGPT 插件配置](#mcp-connector)
+- [查看完整安裝與桌面端啟動步驟](#五分鐘開始使用)
+- [直接查看 ChatGPT 外掛設定](#mcp-connector)
 
-## 五分钟开始使用
+## 五分鐘開始使用
 
-### 1. 安装桌面客户端
+### 1. 安裝桌面用戶端
 
-从当前代码托管平台的 Releases 页面下载对应安装包：
+從目前程式碼託管平台的 Releases 頁面下載對應安裝包：
 
-| 系统 | 安装包 |
+| 系統 | 安裝包 |
 | --- | --- |
 | Windows 10/11 x64 | `Coding.Tools.MCP_*_x64-setup.exe` |
 | macOS Apple Silicon | `Coding Tools MCP_*_aarch64.dmg` |
 
-macOS 安装包目前未签名。如果系统阻止首次打开，请在“系统设置 → 隐私与安全性”中确认打开。
+macOS 安裝包目前尚未簽名。若系統阻擋首次開啟，請到「系統設定 → 隱私權與安全性」確認允許開啟。
 
-### 2. 添加项目工作区
+### 2. 新增專案工作區
 
-1. 点击左侧的“添加工作区”。
-2. 选择项目根目录。
-3. 设置工作区名称、MCP 端口和认证方式。
-4. 保存后，工作区会长期保留在左侧列表中。
+1. 點左側的「新增工作區」。
+2. 選擇專案根目錄。
+3. 設定工作區名稱、MCP 連接埠與驗證方式。
+4. 儲存後，工作區會長期保留在左側清單中。
 
-### 3. 配置公网隧道
+### 3. 設定公網隧道
 
-如果 AI 客户端不在本机，需要把本地 MCP 暴露为 HTTPS 地址：
+若 AI 用戶端不在本機，需要把本機 MCP 暴露成 HTTPS 位址：
 
-- 在“软件管理”中安装或识别 `frpc` / `cloudflared`。
-- 在“FRP 配置”中保存服务器、端口和 Token，或在工作区选择 Cloudflare。
-- 每个工作区填写独立子域名。应用会统一管理 FRP 进程和多条代理线路。
+- 在「軟體管理」中安裝或辨識 `frpc` / `cloudflared`。
+- 在「FRP 設定」中儲存伺服器、連接埠與 Token，或在工作區選擇 Cloudflare。
+- 每個工作區填寫獨立子網域。應用程式會統一管理 FRP 程序與多條代理線路。
 
-![FRP 配置页面](docs/images/frp-configuration.png)
+![FRP 設定頁面](docs/images/frp-configuration.png)
 
-*FRP 服务器配置集中保存，各工作区只需选择配置并填写自己的子域名。*
+*FRP 伺服器設定集中保存，各工作區只要選設定檔並填自己的子網域。*
 
-如果还没有可用的 FRPS 服务端，可以参考：[FRPS 服务端安装教程（微信公众号）](https://mp.weixin.qq.com/s/kmpQhHsvmHlaLfj4rw3A0Q)。安装完成后，把服务端地址、端口和 Token 填入客户端的“FRP 配置”即可。
+若還沒有可用的 FRPS 伺服端，可參考：[FRPS 伺服端安裝教學（微信公眾號）](https://mp.weixin.qq.com/s/kmpQhHsvmHlaLfj4rw3A0Q)。安裝完成後，把伺服端位址、連接埠與 Token 填入用戶端的「FRP 設定」即可。
 
-### 4. 启动 MCP
+### 4. 啟動 MCP
 
-进入工作区并点击 MCP 的“启动”。客户端会显示：
+進入工作區並點 MCP 的「啟動」。用戶端會顯示：
 
-- 本地 MCP 地址，例如 `http://127.0.0.1:28766/mcp`；
-- 公网 HTTPS MCP 地址；
-- ChatGPT 连接所需的认证信息；
-- 实时日志和健康检查结果。
+- 本機 MCP 位址，例如 `http://127.0.0.1:28766/mcp`；
+- 公網 HTTPS MCP 位址；
+- ChatGPT 連線所需的驗證資訊；
+- 即時日誌與健康檢查結果。
 
-![MCP 本地、公网与 ChatGPT 连接信息](docs/images/workspace-connection.png)
+![MCP 本機、公網與 ChatGPT 連線資訊](docs/images/workspace-connection.png)
 
-启动后可以直接检查本地与公网端点、OAuth 元数据和 MCP 受保护资源：
+啟動後可直接檢查本機與公網端點、OAuth 中繼資料與 MCP 受保護資源：
 
-![MCP 健康检查结果](docs/images/health-check.png)
+![MCP 健康檢查結果](docs/images/health-check.png)
 
-*健康检查会逐项显示连接和认证元数据是否可用。*
+*健康檢查會逐項顯示連線與驗證中繼資料是否可用。*
 
-遇到连接问题时，无需离开桌面端即可查看最近的 MCP 请求日志：
+遇到連線問題時，不必離開桌面端即可查看最近的 MCP 請求日誌：
 
-![MCP 运行日志](docs/images/runtime-logs.png)
+![MCP 執行日誌](docs/images/runtime-logs.png)
 
-*日志可快速确认工具列表、历史初始化和检查点调用是否真正到达服务端。*
+*日誌可快速確認工具清單、歷史初始化與檢查點呼叫是否真的到達伺服端。*
 
-### 5. 连接 AI 客户端
+### 5. 連接 AI 用戶端
 
-支持 MCP 的客户端使用界面中的公网 MCP URL。使用 OAuth 时，客户端会通过服务端元数据进入授权流程；授权口令、Client ID 和 Secret 均可在桌面端集中生成和管理。当前版本使用预配置 OAuth 客户端，创建 ChatGPT 插件时应选择静态/手动 OAuth 凭据，不需要选择 CIMD。
+支援 MCP 的用戶端使用介面中的公網 MCP URL。使用 OAuth 時，用戶端會依伺服端中繼資料進入授權流程；授權口令、Client ID 與 Secret 都可在桌面端集中產生與管理。目前版本使用預先設定的 OAuth 用戶端，建立 ChatGPT 外掛時應選擇靜態／手動 OAuth 憑證，不需要選擇 CIMD。
 
-首次连接建议先调用历史初始化，再检查工作区：
+首次連線建議先呼叫歷史初始化，再檢查工作區：
 
 ```text
 history_session_bootstrap
@@ -113,166 +113,166 @@ git_status
 check_exec_environment
 ```
 
-这样 Agent 不需要依赖聊天上下文猜测当前项目、工作目录和执行能力。
+這樣 Agent 不必依賴聊天上下文去猜目前專案、工作目錄與執行能力。
 
-## ChatGPT 的两种接入方式
+## ChatGPT 的兩種接入方式
 
-| 方式 | 适合场景 | 在客户端中使用什么 |
+| 方式 | 適合情境 | 在用戶端使用什麼 |
 | --- | --- | --- |
-| MCP Connector | ChatGPT 直接使用文件、命令和 Git 工具 | 工作区的公网 `/mcp` 地址 |
-| GPT Actions | 在自定义 GPT 中导入 OpenAPI 工具 | Actions 面板中的 `/openapi.json` 地址 |
+| MCP Connector | ChatGPT 直接使用檔案、指令與 Git 工具 | 工作區的公網 `/mcp` 位址 |
+| GPT Actions | 在自訂 GPT 中匯入 OpenAPI 工具 | Actions 面板中的 `/openapi.json` 位址 |
 
 ### MCP Connector
 
-配置前请先确认：
+設定前請先確認：
 
-1. 工作区的 MCP 服务和公网隧道均处于运行状态。
-2. “健康检查”中的公网 MCP 检查通过；如果使用 OAuth，再确认 OAuth 受保护资源和授权元数据检查通过。
-3. 从桌面端“GPT 配置”卡片复制“公网 MCP 地址”；如果使用 OAuth，同时准备 OAuth Client ID、OAuth Client Secret 和授权口令。
+1. 工作區的 MCP 服務與公網隧道都在執行中。
+2. 「健康檢查」中的公網 MCP 檢查通過；若使用 OAuth，再確認 OAuth 受保護資源與授權中繼資料檢查通過。
+3. 從桌面端「GPT 設定」卡片複製「公網 MCP 位址」；若使用 OAuth，同時準備 OAuth Client ID、OAuth Client Secret 與授權口令。
 
-> ChatGPT 必须使用公网 HTTPS `/mcp` 地址，不能使用 `http://127.0.0.1:28766/mcp` 之类的本地地址。ChatGPT 的菜单名称可能随版本和语言设置略有变化。
+> ChatGPT 必須使用公網 HTTPS `/mcp` 位址，不能使用 `http://127.0.0.1:28766/mcp` 這類本機位址。ChatGPT 的選單名稱可能隨版本與語言設定略有差異。
 
-#### 1. 开启 ChatGPT 开发人员模式
+#### 1. 開啟 ChatGPT 開發人員模式
 
-打开 ChatGPT 设置，进入“账户安全与登录”，开启“开发人员模式”。该开关允许添加未经验证的 MCP 连接器。
+開啟 ChatGPT 設定，進入「帳戶安全與登入」，開啟「開發人員模式」。此開關允許新增未經驗證的 MCP 連接器。
 
-![在 ChatGPT 中开启开发人员模式](docs/images/gpt-config-1.png)
+![在 ChatGPT 中開啟開發人員模式](docs/images/gpt-config-1.png)
 
-*开发人员模式具有较高权限，只应连接你自己部署或明确可信的 MCP 服务。*
+*開發人員模式權限較高，只應連線你自己部署或明確可信的 MCP 服務。*
 
-#### 2. 创建 MCP 插件
+#### 2. 建立 MCP 外掛
 
-在 ChatGPT 左侧进入“插件”，点击右上角的 `+` 新建插件，然后选择 MCP（测试版）并填写：
+在 ChatGPT 左側進入「外掛」，點右上角 `+` 新建外掛，然後選擇 MCP（測試版）並填寫：
 
-| ChatGPT 字段 | 填写内容 |
+| ChatGPT 欄位 | 填寫內容 |
 | --- | --- |
-| 名称 | 自定义一个容易识别的名称，例如 `Coding Tools MCP` |
-| 描述 | 简要说明它连接的项目或用途 |
-| 连接 | 粘贴桌面端“GPT 配置”中的公网 MCP 地址，URL 应以 `/mcp` 结尾 |
-| 身份验证 | 与桌面端保持一致；截图以 OAuth 为例 |
+| 名稱 | 自訂一個容易辨識的名稱，例如 `Coding Tools MCP` |
+| 描述 | 簡要說明它連線的專案或用途 |
+| 連線 | 貼上桌面端「GPT 設定」中的公網 MCP 位址，URL 應以 `/mcp` 結尾 |
+| 身分驗證 | 與桌面端保持一致；截圖以 OAuth 為例 |
 
-![在 ChatGPT 中新建 MCP 插件并填写连接信息](docs/images/gpt-config-2-detail.png)
+![在 ChatGPT 中新建 MCP 外掛並填寫連線資訊](docs/images/gpt-config-2-detail.png)
 
-使用 OAuth 时，展开“高级 OAuth 设置”，选择静态/手动 OAuth 凭据并填写桌面端提供的 Client ID 和 Client Secret，不需要选择 CIMD。保存或连接后，ChatGPT 会打开授权页面；输入桌面端“GPT 配置”卡片中的授权口令完成首次授权。
+使用 OAuth 時，展開「進階 OAuth 設定」，選擇靜態／手動 OAuth 憑證並填寫桌面端提供的 Client ID 與 Client Secret，不需要選擇 CIMD。儲存或連線後，ChatGPT 會開啟授權頁面；輸入桌面端「GPT 設定」卡片中的授權口令完成首次授權。
 
-> Client Secret、授权口令和 Bearer Token 都属于敏感信息，不要粘贴到对话、Issue 或公开截图中。若桌面端使用 Bearer 或不启用认证，请在 ChatGPT 中选择当前界面提供的对应认证方式。
+> Client Secret、授權口令與 Bearer Token 都屬於敏感資訊，不要貼到對話、Issue 或公開截圖中。若桌面端使用 Bearer 或未啟用驗證，請在 ChatGPT 中選擇目前介面提供的對應驗證方式。
 
-#### 3. 验证连接
+#### 3. 驗證連線
 
-创建一个启用了该插件的新对话，并发送：
+建立一個已啟用該外掛的新對話，並傳送：
 
 ```text
-请使用 Coding Tools MCP 调用 server_info、get_default_cwd 和 git_status，
-告诉我当前连接的工作区、默认目录和 Git 状态。
+請使用 Coding Tools MCP 呼叫 server_info、get_default_cwd 和 git_status，
+告訴我目前連線的工作區、預設目錄和 Git 狀態。
 ```
 
-如果能够返回当前项目的信息，说明“桌面端 → 公网隧道 → OAuth → ChatGPT → MCP 工具”链路已经打通。首次正式开发时，再调用 `history_session_bootstrap` 初始化或恢复项目历史。
+若能回傳目前專案的資訊，代表「桌面端 → 公網隧道 → OAuth → ChatGPT → MCP 工具」鏈路已打通。首次正式開發時，再呼叫 `history_session_bootstrap` 初始化或還原專案歷史。
 
-如果 ChatGPT 仍显示旧的工具列表，请断开并重新连接插件，或创建一个新对话后再次验证。
+若 ChatGPT 仍顯示舊的工具清單，請中斷並重新連線外掛，或建立新對話後再驗證一次。
 
-#### 常见问题
+#### 常見問題
 
-| 现象 | 优先检查 |
+| 現象 | 優先檢查 |
 | --- | --- |
-| ChatGPT 无法连接 | 是否使用公网 HTTPS `/mcp` 地址，而不是 `127.0.0.1`；桌面端公网 MCP 健康检查是否通过 |
-| OAuth 授权失败 | Client ID、Client Secret 和授权口令是否来自同一个工作区；OAuth 元数据检查是否通过 |
-| 看不到新增工具 | 断开并重新连接插件，然后创建一个新对话 |
-| 工具调用失败 | 打开桌面端“日志”和“健康检查”，确认请求是否到达 MCP 服务 |
+| ChatGPT 無法連線 | 是否使用公網 HTTPS `/mcp` 位址，而不是 `127.0.0.1`；桌面端公網 MCP 健康檢查是否通過 |
+| OAuth 授權失敗 | Client ID、Client Secret 與授權口令是否來自同一工作區；OAuth 中繼資料檢查是否通過 |
+| 看不到新增工具 | 中斷並重新連線外掛，然後建立一個新對話 |
+| 工具呼叫失敗 | 開啟桌面端「日誌」與「健康檢查」，確認請求是否到達 MCP 服務 |
 
 ### GPT Actions
 
-1. 启动工作区的 Actions 服务。
-2. 复制 Actions 面板中的 OpenAPI URL。
-3. 在 GPT 编辑器的 Actions 页面导入该 URL。
-4. 根据桌面端配置选择 None、API Key 或 OAuth。
+1. 啟動工作區的 Actions 服務。
+2. 複製 Actions 面板中的 OpenAPI URL。
+3. 在 GPT 編輯器的 Actions 頁面匯入該 URL。
+4. 依桌面端設定選擇 None、API Key 或 OAuth。
 
-MCP 和 Actions 可以为同一个工作区同时运行，也可以分别使用不同端口和子域名。
+MCP 與 Actions 可以在同一工作區同時執行，也可以分別使用不同連接埠與子網域。
 
-## 为什么需要它
+## 為什麼需要它
 
-- **面向真实开发**：文件、命令、Git、测试和长时间运行的进程都在同一个 Workspace 中。
-- **跨会话持续开发**：新对话可以读取全部历史摘要和最近一次完整交接，不必反复向 AI 解释项目背景和当前进度。
-- **进度可追溯**：每轮任务完成后可保存结构化检查点，决策、修改、测试结果和下一步都留在项目目录中。
-- **多工作区管理**：一个桌面客户端可以保存多个项目，并管理各自的 MCP、Actions 和公网地址。
-- **连接 ChatGPT 更直接**：内置 Streamable HTTP、OAuth、Bearer Token、OpenAPI、FRP 和 Cloudflare 隧道。
-- **默认工具面保持简单**：稳定的核心工具默认可用，高级 Harness 能力按需开启。
+- **面向真實開發**：檔案、指令、Git、測試與長時間執行的程序都在同一個 Workspace 中。
+- **跨對話持續開發**：新對話可以讀取全部歷史摘要與最近一次完整交接，不必反覆向 AI 解釋專案背景與目前進度。
+- **進度可追溯**：每輪任務完成後可儲存結構化檢查點，決策、修改、測試結果與下一步都留在專案目錄中。
+- **多工作區管理**：一個桌面用戶端可保存多個專案，並管理各自的 MCP、Actions 與公網位址。
+- **連接 ChatGPT 更直接**：內建 Streamable HTTP、OAuth、Bearer Token、OpenAPI、FRP 與 Cloudflare 隧道。
+- **預設工具面保持簡單**：穩定的核心工具預設可用，進階 Harness 能力可按需開啟。
 
-## 让项目记住每次对话
+## 讓專案記住每次對話
 
-普通聊天记录适合回看交流内容，但不适合作为长期开发交接。Coding Tools MCP 将会话进度写入当前项目的 `docs/history-session/`，让上下文跟随项目，而不是困在某一个聊天窗口里。
+一般聊天紀錄適合回看交流內容，但不適合作為長期開發交接。Coding Tools MCP 會將工作階段進度寫入目前專案的 `docs/history-session/`，讓上下文跟著專案走，而不是困在某一個聊天視窗裡。
 
-![ChatGPT 新会话启动提示词](docs/images/history-session-prompt.png)
+![ChatGPT 新工作階段啟動提示詞](docs/images/history-session-prompt.png)
 
-*复制完整提示词到新会话，即可初始化或恢复历史；每轮任务完成后再保存检查点。*
+*複製完整提示詞到新工作階段，即可初始化或還原歷史；每輪任務完成後再儲存檢查點。*
 
-它提供三个互相配合的历史工具：
+它提供三個互相配合的歷史工具：
 
 | 工具 | 作用 |
 | --- | --- |
-| `history_session_bootstrap` | 新对话开始时初始化或恢复项目会话；新文件会固化前序会话的压缩摘要，并返回稳定的 `session_key` 和 `current_path` |
-| `history_session_checkpoint` | 每轮任务完成后按 bootstrap 返回的稳定目标保存结构化进度；目标不一致时拒绝写入，避免串到其他历史文件 |
-| `history_session_validate` | 检查历史编号、文件和会话映射；必要时重建派生索引，不删除已有历史 |
+| `history_session_bootstrap` | 新對話開始時初始化或還原專案工作階段；新檔會固化前序工作階段的壓縮摘要，並回傳穩定的 `session_key` 與 `current_path` |
+| `history_session_checkpoint` | 每輪任務完成後依 bootstrap 回傳的穩定目標儲存結構化進度；目標不一致時拒絕寫入，避免寫到其他歷史檔 |
+| `history_session_validate` | 檢查歷史編號、檔案與工作階段對應；必要時重建衍生索引，不刪除既有歷史 |
 
 典型效果：
 
 ```text
-对话 1：分析项目 → 修改代码 → 运行测试 → 保存检查点
+對話 1：分析專案 → 修改程式碼 → 執行測試 → 儲存檢查點
                                       ↓
-对话 2：读取历史摘要和最新交接 → 从上次进度继续 → 保存新检查点
+對話 2：讀取歷史摘要與最新交接 → 從上次進度繼續 → 儲存新檢查點
 ```
 
-历史文件使用可读的 Markdown 格式，可以随项目备份或纳入 Git，也方便开发者直接审阅和修订。每个新文件顶部都带有有长度上限的“继承的历史摘要”，旧摘要不会递归复制；检查点采用幂等写入，并要求返回 `ok=true` 且会话目标一致后才确认保存成功。
+歷史檔使用可讀的 Markdown 格式，可隨專案備份或納入 Git，也方便開發者直接審閱與修訂。每個新檔頂部都帶有長度上限的「繼承的歷史摘要」，舊摘要不會遞迴複製；檢查點採冪等寫入，並要求回傳 `ok=true` 且工作階段目標一致後才確認儲存成功。
 
-> 历史持久化由 AI 调用 MCP 工具完成，并非桌面端在后台录制聊天内容。若客户端未触发工具调用，服务端无法凭空感知新的对话或任务进度。
+> 歷史持久化由 AI 呼叫 MCP 工具完成，並非桌面端在背景錄製聊天內容。若用戶端未觸發工具呼叫，伺服端無法憑空感知新的對話或任務進度。
 
-## Agent 可以做什么
+## Agent 可以做什麼
 
-默认 `core` profile 提供一组稳定、可组合的开发工具：
+預設 `core` profile 提供一組穩定、可組合的開發工具：
 
-| 类别 | 主要工具 |
+| 類別 | 主要工具 |
 | --- | --- |
-| 文件读取 | `read_file`、`list_dir`、`list_files`、`search_text`、`grep_text`、`view_image` |
-| 文件修改 | `apply_patch` |
-| 命令执行 | `exec_command`、`write_stdin`、`read_output`、`kill_session` |
+| 檔案讀取 | `read_file`、`list_dir`、`list_files`、`search_text`、`grep_text`、`view_image` |
+| 檔案修改 | `apply_patch` |
+| 指令執行 | `exec_command`、`write_stdin`、`read_output`、`kill_session` |
 | Git | `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame` |
-| 环境 | `server_info`、`check_exec_environment`、`get_default_cwd`、`set_default_cwd` |
-| 历史会话 | `history_session_bootstrap`、`history_session_checkpoint`、`history_session_validate` |
+| 環境 | `server_info`、`check_exec_environment`、`get_default_cwd`、`set_default_cwd` |
+| 歷史工作階段 | `history_session_bootstrap`、`history_session_checkpoint`、`history_session_validate` |
 
-典型开发过程：
+典型開發流程：
 
 ```text
-打开 Workspace
-  → 理解项目和 Git 状态
-  → 搜索并读取代码
-  → 事务化应用 Patch
-  → 运行命令和测试
-  → 检查 diff 并提交
+開啟 Workspace
+  → 理解專案與 Git 狀態
+  → 搜尋並讀取程式碼
+  → 事務化套用 Patch
+  → 執行指令與測試
+  → 檢查 diff 並提交
 ```
 
-高级 profile 还保留项目状态、操作记录等 Harness 能力，但普通文件修改和命令执行不要求先创建 Task。
+進階 profile 仍保留專案狀態、操作紀錄等 Harness 能力，但一般檔案修改與指令執行不要求先建立 Task。
 
-## 权限与恢复模型
+## 權限與還原模型
 
-项目采用 Workspace-first 权限模型：
+專案採用 Workspace-first 權限模型：
 
-- Workspace 内普通文件可以读取、创建、修改、删除和执行。
-- Workspace 外允许完整只读：`read_file`、`list_dir`、`list_files`、`search_text`、`view_image`。
-- Workspace 外写入、删除和执行会被阻止。
-- `.git` 和 `.github` 不能被普通文件工具、Patch 或解释器命令破坏。
-- Patch 在单次操作内进行预检和失败恢复；长期恢复统一使用 Git，不创建全量 Workspace Snapshot。
+- Workspace 內一般檔案可以讀取、建立、修改、刪除與執行。
+- Workspace 外允許完整唯讀：`read_file`、`list_dir`、`list_files`、`search_text`、`view_image`。
+- Workspace 外寫入、刪除與執行會被阻擋。
+- `.git` 與 `.github` 不能被一般檔案工具、Patch 或直譯器指令破壞。
+- Patch 在單次操作內進行預檢與失敗還原；長期還原統一使用 Git，不建立全量 Workspace Snapshot。
 
-> Windows 子进程目前仍是 `policy_only` 执行边界，返回中的 `sandbox_enforced: false` 是真实状态。静态命令策略不能等同于完整的操作系统文件系统沙箱。
+> Windows 子程序目前仍是 `policy_only` 執行邊界，回傳中的 `sandbox_enforced: false` 是真實狀態。靜態指令策略不能等同於完整的作業系統檔案系統沙箱。
 
-## 本地开发
+## 本機開發
 
-环境要求：Node.js 20+、Rust stable，以及当前系统的 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)。
+環境需求：Node.js 20+、Rust stable，以及目前系統的 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)。
 
 ```bash
 npm install
 npm run desktop
 ```
 
-常用验证命令：
+常用驗證指令：
 
 ```bash
 npm run check
@@ -281,35 +281,35 @@ cd src-tauri && cargo test
 cd src-tauri && cargo clippy --all-targets -- -D warnings
 ```
 
-Windows 也可以双击 `dev-desktop.cmd`。不要只用 `npm run dev` 验证桌面应用，它只启动 Vite，不会启动 Tauri 外壳。
+Windows 也可以雙擊 `dev-desktop.cmd`。不要只用 `npm run dev` 驗證桌面應用，它只會啟動 Vite，不會啟動 Tauri 外殼。
 
-## 项目结构
+## 專案結構
 
-| 路径 | 作用 |
+| 路徑 | 作用 |
 | --- | --- |
-| `src-tauri/src/tools/` | 文件、Patch、Exec、Git 等共享工具内核 |
-| `src-tauri/src/mcp/` | MCP Streamable HTTP 服务 |
-| `src-tauri/src/actions/` | ChatGPT Actions OpenAPI 网关 |
-| `src-tauri/src/tunnel/` | FRP / Cloudflare 隧道和进程管理 |
-| `src/` | SvelteKit 桌面界面 |
-| `old/` | Python 参考实现和兼容性基线 |
+| `src-tauri/src/tools/` | 檔案、Patch、Exec、Git 等共用工具核心 |
+| `src-tauri/src/mcp/` | MCP Streamable HTTP 服務 |
+| `src-tauri/src/actions/` | ChatGPT Actions OpenAPI 閘道 |
+| `src-tauri/src/tunnel/` | FRP / Cloudflare 隧道與程序管理 |
+| `src/` | SvelteKit 桌面介面 |
+| `old/` | Python 參考實作與相容性基準 |
 
-## 源仓库与归属
+## 來源倉庫與歸屬
 
-本项目为上游 Coding Tools MCP 的衍生作品，并保留其版权与许可声明（见 [NOTICE](NOTICE)）：
+本專案為上游 Coding Tools MCP 的衍生作品，並保留其著作權與授權聲明（見 [NOTICE](NOTICE)）：
 
 - [xyTom/coding-tools-mcp](https://github.com/xyTom/coding-tools-mcp)
 - [mybolide/coding-tools-mcp](https://github.com/mybolide/coding-tools-mcp)
 
-## 致谢
+## 致謝
 
-感谢 [Linux.do](https://linux.do/) 社区对项目推广与反馈的支持。
+感謝 [Linux.do](https://linux.do/) 社群對專案推廣與回饋的支持。
 
 ## License
 
-本项目采用 [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)。
+本專案採用 [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)。
 
-- 完整许可文本：[LICENSE](LICENSE)
-- 归属与 NOTICE 声明：[NOTICE](NOTICE)
+- 完整授權文本：[LICENSE](LICENSE)
+- 歸屬與 NOTICE 聲明：[NOTICE](NOTICE)
 
-使用、修改或再分发本项目（含代码、文档、实质实现细节或衍生作品）时，须保留版权声明、许可声明与 `NOTICE`，并清楚标注来源。
+使用、修改或再散布本專案（含程式碼、文件、實質實作細節或衍生作品）時，須保留著作權聲明、授權聲明與 `NOTICE`，並清楚標註來源。

@@ -1,74 +1,76 @@
-# Coding Tools Built-in WSS Tunnel Server
+# Coding Tools 內建 WSS 隧道伺服器
 
-Narrow reverse HTTP tunnel for Coding Tools MCP. **Caddy (or another reverse proxy) terminates TLS**; this process listens on internal HTTP ports and proxies public routes over server-managed WSS workers.
+[English](README.en.md)
 
-| Port (container) | Role |
+專為 Coding Tools MCP 設計的窄域反向 HTTP 隧道。**由 Caddy（或其他反向代理）終止 TLS**；本行程在內部 HTTP 連接埠接聽，並透過伺服器管理的 WSS worker 代理公開路由。
+
+| 連接埠（容器） | 用途 |
 |---|---|
-| `8088` | Public tunnel: WSS, enrollment POST, MCP / Actions proxy, `/health` |
-| `8089` | Optional Admin WebUI (never mounted on the public router) |
+| `8088` | 公開隧道：WSS、註冊 POST、MCP / Actions 代理、`/health` |
+| `8089` | 選用 Admin WebUI（不會掛在公開路由器上） |
 
-Wire protocol: **`coding-tools-tunnel-v3`** (version `3`). Protocol v2 clients are rejected. Design notes: [`docs/builtin-wss-tunnel.md`](../../docs/builtin-wss-tunnel.md).
+線上協定：**`coding-tools-tunnel-v3`**（版本 `3`）。v2 用戶端會被拒絕。設計說明：[`docs/builtin-wss-tunnel.md`](../../docs/builtin-wss-tunnel.md)。
 
-## Authentication model (current)
+## 驗證模型（現行）
 
-There are **no shared or per-client tunnel tokens**.
+**沒有共用或 per-client 隧道 token。**
 
-| Secret | Who creates it | Where it lives |
+| 密鑰 | 誰產生 | 存在哪裡 |
 |---|---|---|
-| Device Ed25519 private key | Desktop app (random, on first enroll) | Client OS secret store only |
-| Device public key | Desktop app | Server SQLite (`tunnel.db`) |
-| One-time enrollment code | Admin WebUI or `enroll create` CLI | Server stores **SHA-256 digest** only |
-| Admin password | **You** (not auto-generated) | Env or password file at process start |
-| Admin session / CSRF | Server (random per login) | Server memory + `HttpOnly` cookie |
+| 裝置 Ed25519 私鑰 | 桌面端（首次註冊時隨機） | 僅用戶端 OS 密鑰庫 |
+| 裝置公鑰 | 桌面端 | 伺服器 SQLite（`tunnel.db`） |
+| 一次性註冊碼 | Admin WebUI 或 `enroll create` CLI | 伺服器只存 **SHA-256 digest** |
+| Admin 密碼 | **你**（伺服器不會自動產生） | 啟動時環境變數或密碼檔 |
+| Admin session / CSRF | 伺服器（每次登入隨機） | 伺服器記憶體 + `HttpOnly` cookie |
 
-The server never holds device private keys. WSS auth is challenge–response: random nonce, client signs, server verifies the enrolled public key.
+伺服器從不持有裝置私鑰。WSS 驗證為 challenge–response：隨機 nonce、用戶端簽章、伺服器用已註冊公鑰驗證。
 
-## Configuration
+## 設定
 
-All settings are environment variables. Nothing is auto-generated for you at server init except runtime session material after Admin login.
+所有設定皆為環境變數。伺服器初始化時**不會**自動為你產生金鑰（Admin 登入後的 session 材料除外）。
 
-| Variable | Required | Default | Notes |
+| 變數 | 必填 | 預設 | 說明 |
 |---|---|---|---|
-| `CODING_TOOLS_TUNNEL_PUBLIC_ORIGIN` | Strongly recommended | hard-coded fallback origin in binary | Set to your real HTTPS origin; enrollment links use this |
-| `CODING_TOOLS_TUNNEL_BIND` | No | `0.0.0.0:8088` | Public listener |
-| `CODING_TOOLS_TUNNEL_ADMIN_BIND` | No | *(disabled)* | e.g. `0.0.0.0:8089` enables Admin WebUI |
-| `CODING_TOOLS_TUNNEL_ADMIN_USERNAME` | If admin bind set | — | Login username |
-| `CODING_TOOLS_TUNNEL_ADMIN_PASSWORD_FILE` | If admin bind set\* | — | Preferred; file contents trimmed; **≥ 12 bytes** |
-| `CODING_TOOLS_TUNNEL_ADMIN_PASSWORD` | If admin bind set\* | — | Inline fallback when `_FILE` is unset |
-| `CODING_TOOLS_TUNNEL_ADMIN_SESSION_SECONDS` | No | `28800` (8h) | Allowed range: 5 minutes–7 days |
-| `CODING_TOOLS_TUNNEL_DB` | No | `tunnel-data/tunnel.db` | Container image sets `/data/tunnel.db` |
-| `CODING_TOOLS_TUNNEL_LOG_DIR` | No | `<db-parent>/logs` | Container image sets `/data/logs` |
-| `CODING_TOOLS_TUNNEL_MAX_BODY_BYTES` | No | 8 MiB | Buffered public request body limit |
-| `CODING_TOOLS_TUNNEL_RECONNECT_GRACE_MS` | No | built-in default | Worker reconnect grace |
-| `RUST_LOG` | No | `coding_tools_tunnel_server=info` | Tracing filter |
+| `CODING_TOOLS_TUNNEL_PUBLIC_ORIGIN` | 強烈建議 | 二進位內建後備 origin | 設為真實 HTTPS origin；註冊連結會用到 |
+| `CODING_TOOLS_TUNNEL_BIND` | 否 | `0.0.0.0:8088` | 公開監聽 |
+| `CODING_TOOLS_TUNNEL_ADMIN_BIND` | 否 | *（停用）* | 例如 `0.0.0.0:8089` 啟用 Admin WebUI |
+| `CODING_TOOLS_TUNNEL_ADMIN_USERNAME` | 啟用 Admin 時 | — | 登入帳號 |
+| `CODING_TOOLS_TUNNEL_ADMIN_PASSWORD_FILE` | 啟用 Admin 時\* | — | 建議；讀取後 trim；**≥ 12 bytes** |
+| `CODING_TOOLS_TUNNEL_ADMIN_PASSWORD` | 啟用 Admin 時\* | — | 未設 `_FILE` 時的內嵌後備 |
+| `CODING_TOOLS_TUNNEL_ADMIN_SESSION_SECONDS` | 否 | `28800`（8 小時） | 允許範圍：5 分鐘–7 天 |
+| `CODING_TOOLS_TUNNEL_DB` | 否 | `tunnel-data/tunnel.db` | 容器映像預設 `/data/tunnel.db` |
+| `CODING_TOOLS_TUNNEL_LOG_DIR` | 否 | `<db 父目錄>/logs` | 容器映像預設 `/data/logs` |
+| `CODING_TOOLS_TUNNEL_MAX_BODY_BYTES` | 否 | 8 MiB | 公開請求 body 緩衝上限 |
+| `CODING_TOOLS_TUNNEL_RECONNECT_GRACE_MS` | 否 | 內建預設 | worker 重連寬限 |
+| `RUST_LOG` | 否 | `coding_tools_tunnel_server=info` | tracing 過濾 |
 
-\* Exactly one of `ADMIN_PASSWORD_FILE` or `ADMIN_PASSWORD` is required when Admin is enabled. If `ADMIN_PASSWORD_FILE` is set, it is used (file must exist and be readable).
+\* 啟用 Admin 時，`ADMIN_PASSWORD_FILE` 與 `ADMIN_PASSWORD` 須擇一。若有設 `ADMIN_PASSWORD_FILE`，以檔案為準（檔案必須存在且可讀）。
 
-Persist the **whole** `/data` directory (DB + logs), not only `tunnel.db`.
+請掛載整個 `/data` 目錄（DB + 日誌），不要只掛 `tunnel.db`。
 
-Admin credentials are **not** randomly initialized by the server. Create a long password yourself before first start.
+Admin 憑證**不會**由伺服器隨機初始化。首次啟動前請自行建立夠長的密碼。
 
-## Quick start: Docker Compose (recommended example)
+## 快速開始：Docker Compose（建議範例）
 
-The Compose file is an **optional example**. It builds the image, mounts `/data`, enables Admin, and health-checks `GET /health`. TLS is still your job (host Caddy or another proxy).
+Compose 檔是**選用範例**：建映像、掛 `/data`、啟用 Admin，並對 `GET /health` 做 healthcheck。TLS 仍由你負責（主機 Caddy 或其他代理）。
 
-### 1. Create config and password (not auto-generated)
+### 1. 建立設定與密碼（不會自動產生）
 
-From the **repository root**:
+在**倉庫根目錄**：
 
 ```sh
 cp services/tunnel-server/.env.example services/tunnel-server/.env
 cp services/tunnel-server/admin-password.example.txt services/tunnel-server/admin-password.txt
 ```
 
-Edit:
+然後編輯：
 
-1. `services/tunnel-server/.env` → set `TUNNEL_PUBLIC_ORIGIN` to your real HTTPS origin (e.g. `https://tunnel.example.com`).
-2. `services/tunnel-server/admin-password.txt` → replace with a long random password (**at least 12 characters/bytes** after trim).
+1. `services/tunnel-server/.env` → 將 `TUNNEL_PUBLIC_ORIGIN` 設為真實 HTTPS origin（例如 `https://tunnel.example.com`）。
+2. `services/tunnel-server/admin-password.txt` → 改成夠長的隨機密碼（trim 後**至少 12 字元／bytes**）。
 
-Do not commit `.env` or `admin-password.txt`.
+不要提交 `.env` 或 `admin-password.txt`。
 
-### 2. Build and start
+### 2. 建置並啟動
 
 ```sh
 docker compose \
@@ -77,11 +79,11 @@ docker compose \
   up -d --build
 ```
 
-Check:
+檢查：
 
 ```sh
 curl -sS http://127.0.0.1:8088/health
-# expect: ok
+# 預期：ok
 
 docker compose \
   --env-file services/tunnel-server/.env \
@@ -89,20 +91,20 @@ docker compose \
   ps
 ```
 
-Admin WebUI (loopback only by default): open `http://127.0.0.1:8089/` and log in with `TUNNEL_ADMIN_USERNAME` + the password file contents.
+Admin WebUI（預設僅 loopback）：開啟 `http://127.0.0.1:8089/`，以 `TUNNEL_ADMIN_USERNAME` + 密碼檔內容登入。
 
-### 3. Enroll a desktop workspace
+### 3. 註冊桌面工作區
 
-**Option A — Admin WebUI**
+**方式 A — Admin WebUI**
 
-1. Open Admin → create enrollment (Client ID, service `mcp` / `actions` / `both`, TTL).
-2. Copy the printed HTTPS link.
-3. In Coding Tools MCP workspace tunnel settings, paste the link.
-4. The app generates the device keypair locally, enrolls the public key, and stores the private key in the OS secret store.
+1. 開啟 Admin → 建立註冊（Client ID、服務 `mcp` / `actions` / `both`、TTL）。
+2. 複製印出的 HTTPS 連結。
+3. 在 Coding Tools MCP 工作區隧道設定貼上連結。
+4. 應用在本機產生裝置金鑰對、註冊公鑰，並把私鑰存進 OS 密鑰庫。
 
-**Option B — CLI inside the running stack** (same SQLite volume)
+**方式 B — 在執行中的 stack 用 CLI**（同一 SQLite volume）
 
-Compose `ENTRYPOINT` is the server binary, so extra args become CLI subcommands:
+Compose 的 `ENTRYPOINT` 是伺服器 binary，額外參數會變成 CLI 子命令：
 
 ```sh
 docker compose \
@@ -112,7 +114,7 @@ docker compose \
   enroll create --client-id pc-a --service both --ttl-seconds 600
 ```
 
-Against an already-running container (`docker exec` does **not** use `ENTRYPOINT`):
+對已在跑的容器（`docker exec` **不會**使用 `ENTRYPOINT`）：
 
 ```sh
 docker compose \
@@ -123,7 +125,7 @@ docker compose \
   enroll create --client-id pc-a --service both --ttl-seconds 600
 ```
 
-List / revoke devices:
+列出／撤銷裝置：
 
 ```sh
 # list
@@ -136,9 +138,9 @@ docker compose ... exec tunnel-server \
   devices revoke --device-id <device-id>
 ```
 
-After revoke, create a new enrollment link; the desktop app rotates to a new device ID and private key.
+撤銷後請建立**新的**註冊連結；桌面端會輪換為新的 device ID 與私鑰。
 
-### 4. Stop / wipe (careful)
+### 4. 停止／清除（小心）
 
 ```sh
 docker compose \
@@ -146,13 +148,13 @@ docker compose \
   -f services/tunnel-server/compose.example.yml \
   down
 
-# also delete enrolled devices + logs volume:
+# 連註冊裝置與日誌 volume 一併刪除：
 # docker compose ... down -v
 ```
 
-## Docker image
+## Docker 映像
 
-Build context is the **repository root** (needs `crates/tunnel-protocol` + `services/tunnel-server`):
+建置 context 為**倉庫根目錄**（需要 `crates/tunnel-protocol` + `services/tunnel-server`）：
 
 ```sh
 docker build \
@@ -161,15 +163,15 @@ docker build \
   .
 ```
 
-Image defaults:
+映像預設：
 
-- User: `tunnel` (non-root)
-- DB: `/data/tunnel.db`
-- Logs: `/data/logs`
-- `wget` installed for health checks
-- `HEALTHCHECK` hits `http://127.0.0.1:8088/health`
+- 使用者：`tunnel`（非 root）
+- DB：`/data/tunnel.db`
+- 日誌：`/data/logs`
+- 已安裝 `wget` 供健康檢查
+- `HEALTHCHECK` 探測 `http://127.0.0.1:8088/health`
 
-Run without Compose (Admin via env password):
+不用 Compose 直接跑（Admin 用環境變數密碼）：
 
 ```sh
 docker run --rm \
@@ -184,7 +186,7 @@ docker run --rm \
   coding-tools-tunnel-server:local
 ```
 
-Or mount a password file:
+或掛載密碼檔：
 
 ```sh
 docker run --rm \
@@ -197,13 +199,13 @@ docker run --rm \
   coding-tools-tunnel-server:local
 ```
 
-## Local binary (no Docker)
+## 本機 binary（不用 Docker）
 
 ```sh
 cargo run --manifest-path services/tunnel-server/Cargo.toml --release
 ```
 
-With Admin:
+含 Admin：
 
 ```sh
 CODING_TOOLS_TUNNEL_PUBLIC_ORIGIN=https://tunnel.example.com \
@@ -213,7 +215,7 @@ CODING_TOOLS_TUNNEL_ADMIN_PASSWORD='replace-with-a-long-random-password' \
 cargo run --manifest-path services/tunnel-server/Cargo.toml --release
 ```
 
-CLI (process exits after the command; needs the same `CODING_TOOLS_TUNNEL_DB` as the long-running server if you share state):
+CLI（指令結束後程序退出；若要共用狀態，需與長跑伺服器使用相同 `CODING_TOOLS_TUNNEL_DB`）：
 
 ```sh
 coding-tools-tunnel-server enroll create \
@@ -225,9 +227,9 @@ coding-tools-tunnel-server devices list
 coding-tools-tunnel-server devices revoke --device-id <device-id>
 ```
 
-## Public reverse-proxy routes
+## 公開反向代理路由
 
-Route these paths to the public listener (`8088`) **before** any FRP fallback:
+請將下列路徑導向公開監聽（`8088`），且**優先於**任何 FRP 後備：
 
 ```text
 /_tunnel/v1
@@ -237,40 +239,40 @@ Route these paths to the public listener (`8088`) **before** any FRP fallback:
 /.well-known/oauth-protected-resource/builtin/*
 ```
 
-Do **not** put Admin (`8089`) on the public internet. Defaults in the Compose example bind both ports to `127.0.0.1` so host Caddy can proxy. If Caddy runs in Docker instead, attach both services to a **private shared network** and avoid publishing Admin on a public interface.
+**不要**把 Admin（`8089`）暴露到公網。Compose 範例預設兩個連接埠都綁 `127.0.0.1`，方便主機上的 Caddy 代理。若 Caddy 也在 Docker 中，請把兩邊接到**私有共享網路**，避免在公網介面發佈 Admin。
 
-## Admin WebUI behavior
+## Admin WebUI 行為
 
-- Separate listener only; no management routes on `8088`.
-- Unauthenticated browsers get the login page.
-- Login creates a random server-side session with `Secure`, `HttpOnly`, `SameSite=Strict`, host-only cookie (`__Host-coding_tools_admin_session`).
-- Mutating requests require a per-session CSRF token.
-- Password is verified with **Argon2** (unrelated to device WSS auth).
-- Capabilities: create enrollment links, list devices, revoke devices, edit MCP/Actions worker-pool policies, view recent server/client logs (last 2,000 entries kept in SQLite).
+- 僅獨立監聽；`8088` 上沒有管理路由。
+- 未驗證瀏覽器只會看到登入頁。
+- 登入後建立隨機伺服端 session，cookie 為 `Secure`、`HttpOnly`、`SameSite=Strict`、host-only（`__Host-coding_tools_admin_session`）。
+- 變更狀態的請求需要 per-session CSRF token。
+- 密碼以 **Argon2** 驗證（與裝置 WSS 驗證無關）。
+- 功能：建立註冊連結、列出裝置、撤銷裝置、編輯 MCP／Actions worker 池策略、查看近期伺服器／用戶端日誌（SQLite 保留最近 2,000 筆）。
 
-## Data and logs
+## 資料與日誌
 
-| Path (container) | Content |
+| 路徑（容器） | 內容 |
 |---|---|
-| `/data/tunnel.db` | Devices, enrollment digests, worker policies, Admin log buffer |
-| `/data/logs/` | Daily tracing files |
+| `/data/tunnel.db` | 裝置、註冊 digest、worker 策略、Admin 日誌緩衝 |
+| `/data/logs/` | 每日 tracing 檔 |
 
-Rust tracing also goes to stdout (container logs).
+Rust tracing 也會輸出到 stdout（容器日誌）。
 
-## Gitea Actions image build
+## Gitea Actions 映像建置
 
-[`.gitea/workflows/publish-tunnel-server.yml`](../../.gitea/workflows/publish-tunnel-server.yml) builds this Dockerfile on a trusted self-hosted runner that shares the deployment host Docker daemon. Tags left in the local image store:
+[`.gitea/workflows/publish-tunnel-server.yml`](../../.gitea/workflows/publish-tunnel-server.yml) 在信任的 self-hosted runner 上建此 Dockerfile，且 runner 與部署主機共用 Docker daemon。會在本機映像庫留下：
 
 ```text
 coding-tools-tunnel-server:local
 coding-tools-tunnel-server:sha-<40-character-commit>
-coding-tools-tunnel-server:edge    # non-main
+coding-tools-tunnel-server:edge    # 非 main
 coding-tools-tunnel-server:latest  # main
 ```
 
-The workflow does not restart or deploy containers; recreate the service manually when convenient. Runner and deploy host must share the same Docker daemon (typically mount `/var/run/docker.sock`). No registry login is required.
+workflow 不會重啟或部署容器；請在方便時手動重建服務。Runner 與部署主機須共用同一 Docker daemon（通常掛載 `/var/run/docker.sock`）。不需要 registry 登入。
 
-## Tests
+## 測試
 
 ```sh
 cargo test --manifest-path crates/tunnel-protocol/Cargo.toml
@@ -278,20 +280,20 @@ cargo test --manifest-path services/tunnel-server/Cargo.toml
 cargo clippy --manifest-path services/tunnel-server/Cargo.toml --all-targets -- -D warnings
 ```
 
-## Troubleshooting
+## 疑難排解
 
-| Symptom | Check |
+| 症狀 | 檢查 |
 |---|---|
-| Container unhealthy | Image must include `wget` (current Dockerfile does). `curl http://127.0.0.1:8088/health` → `ok` |
-| Admin fails to start | `ADMIN_BIND` set but username/password missing, password &lt; 12 bytes, or password file unreadable |
-| Enrollment link wrong host | Set `CODING_TOOLS_TUNNEL_PUBLIC_ORIGIN` / `TUNNEL_PUBLIC_ORIGIN` to the public HTTPS origin |
-| `enroll create` empty devices on “running” server | CLI used a different DB path/volume; use `compose run`/`exec` against the same stack |
-| Desktop enroll fails after revoke | Create a **new** enrollment link; old code is single-use |
-| Worker auth fails | Protocol must be v3; ensure desktop and server versions match |
+| 容器 unhealthy | 映像須含 `wget`（目前 Dockerfile 有）。`curl http://127.0.0.1:8088/health` → `ok` |
+| Admin 無法啟動 | 有設 `ADMIN_BIND` 但缺帳密、密碼 &lt; 12 bytes，或密碼檔無法讀取 |
+| 註冊連結主機錯誤 | 設定 `CODING_TOOLS_TUNNEL_PUBLIC_ORIGIN` / `TUNNEL_PUBLIC_ORIGIN` 為公開 HTTPS origin |
+| 對「執行中」伺服器 `enroll create` 看不到裝置 | CLI 用了不同 DB 路徑／volume；請對同一 stack 使用 `compose run`／`exec` |
+| 撤銷後桌面註冊失敗 | 建立**新的**註冊連結；舊碼只能用一次 |
+| Worker 驗證失敗 | 協定必須是 v3；確認桌面與伺服器版本一致 |
 
-## What this example does **not** include
+## 本範例**不包含**
 
-- TLS certificates or a Caddy service definition
-- Full multi-service “rproxy” stack
-- Automatic Admin password generation
-- Publishing Admin on `0.0.0.0` for the public internet (do not do this)
+- TLS 憑證或 Caddy 服務定義
+- 完整多服務反向代理堆疊
+- 自動產生 Admin 密碼
+- 把 Admin 發佈在 `0.0.0.0` 供公網使用（請勿如此）

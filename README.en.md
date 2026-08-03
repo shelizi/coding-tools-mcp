@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">中文</a> · <a href="README.en.md">English</a> · Releases
+  <a href="README.md">繁體中文</a> · <a href="README.en.md">English</a> · Releases
 </p>
 
 Coding Tools MCP is a Rust + Tauri 2 desktop application. Select a project directory and start the service; an AI agent can then read files, edit code, run commands and tests, inspect Git, and preserve development progress inside the project through MCP. It behaves like an AI opening an IDE workspace that remembers where the last conversation stopped.
