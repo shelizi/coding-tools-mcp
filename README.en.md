@@ -64,10 +64,55 @@ The macOS build is currently unsigned. If macOS blocks the first launch, allow i
 
 ### 3. Configure a public tunnel
 
-When the AI client is not running on the same machine, expose MCP through HTTPS:
+When the AI client is not on the same machine, expose MCP as a publicly reachable HTTPS URL. Each workspace can use one of three tunnel types (**new workspaces default to built-in WSS**):
 
-- Install or detect `frpc` / `cloudflared` from **Software management**.
-- Save the server, port, and token under **FRP settings**, or select Cloudflare in the workspace.
+| Type | When to use | What you do in the desktop app |
+| --- | --- | --- |
+| **Built-in WSS (`builtin`)** | Self-host `coding-tools-tunnel-server`; terminate TLS with Caddy (or similar) | Paste the one-time enrollment link from the server |
+| **FRP** | You already run FRPS | Save server/token under **FRP settings**; set a subdomain per workspace |
+| **Cloudflare** | Cloudflare Tunnel | Install/detect `cloudflared`; set a token or use Quick Tunnel |
+
+#### 3a. Built-in WSS (self-hosted server)
+
+Architecture (matches the current implementation):
+
+```text
+ChatGPT / public HTTPS clients
+        → Caddy (TLS)
+        → coding-tools-tunnel-server (8088 public / optional 8089 Admin)
+        → desktop embedded WSS client (protocol coding-tools-tunnel-v3)
+        → local MCP or Actions
+```
+
+**Server (summary)**
+
+1. Start with Docker Compose or the binary as described in [`services/tunnel-server/README.md`](services/tunnel-server/README.md) ([繁體中文](services/tunnel-server/README.md) / [English](services/tunnel-server/README.en.md)).
+2. Set `CODING_TOOLS_TUNNEL_PUBLIC_ORIGIN` to your real HTTPS origin (enrollment links use it).
+3. If Admin WebUI is enabled: supply username and password yourself (**the server never auto-generates the password**; at least 12 bytes).
+4. Create a one-time enrollment link via Admin or CLI (for example `enroll create --client-id <id> --service both`).
+
+Reverse-proxy these paths to port `8088` (ahead of any FRP fallback): `/_tunnel/v1`, `/_tunnel/enroll/*`, `/builtin/*`, and the matching `/.well-known/.../builtin/*` routes. Do **not** expose Admin (`8089`) on the public internet.
+
+**Desktop**
+
+1. Set the workspace tunnel type to **Built-in WSS tunnel**.
+2. Paste the one-time enrollment link and save.
+3. The app generates an Ed25519 keypair and device ID locally, stores the **private key** in the OS secret store, and registers only the **public key**. The server-assigned Client ID is authoritative; the public URL updates automatically.
+4. MCP and Actions in the same workspace share one device identity. After revocation, paste a **new** enrollment link to rotate keys.
+
+Public paths look like:
+
+- MCP: `https://<your-domain>/builtin/clients/<client-id>/mcp`
+- Actions: `https://<your-domain>/builtin/actions/<client-id>`
+
+Local placeholders default to `http://127.0.0.1:8088/...` (same default origin as the server). Production should use your HTTPS reverse-proxied domain.
+
+Full deploy steps, env vars, CLI, and troubleshooting: [tunnel-server README (zh-TW)](services/tunnel-server/README.md) / [English](services/tunnel-server/README.en.md). Design notes: [`docs/builtin-wss-tunnel.md`](docs/builtin-wss-tunnel.md).
+
+#### 3b. FRP
+
+- Install or detect `frpc` from **Software management**.
+- Save the server, port, and token under **FRP settings**.
 - Give each workspace a distinct subdomain. The app manages the FRP process and aggregates multiple proxy routes.
 
 ![FRP configuration](docs/images/frp-configuration.png)
@@ -75,6 +120,11 @@ When the AI client is not running on the same machine, expose MCP through HTTPS:
 *FRP server profiles are stored centrally; each workspace only selects a profile and supplies its own subdomain.*
 
 If you do not have an FRPS server yet, follow this [FRPS server installation guide (Chinese, WeChat)](https://mp.weixin.qq.com/s/kmpQhHsvmHlaLfj4rw3A0Q). After deployment, enter the server address, port, and token under **FRP settings** in the desktop client.
+
+#### 3c. Cloudflare
+
+- Install or detect `cloudflared` from **Software management**.
+- Select Cloudflare in the workspace and configure a named-tunnel token or Quick Tunnel.
 
 ### 4. Start MCP
 
@@ -194,7 +244,7 @@ MCP and Actions can run together for the same workspace, with separate ports and
 - **Cross-conversation continuity**: a new conversation can recover the complete history summary and the latest detailed handoff.
 - **Auditable progress**: structured checkpoints preserve decisions, changed files, test results, remaining issues, and next steps inside the project.
 - **Multiple workspaces**: one desktop client stores multiple projects and manages their MCP, Actions, and public endpoints.
-- **Direct ChatGPT connectivity**: Streamable HTTP, OAuth, Bearer tokens, OpenAPI, FRP, and Cloudflare are built in.
+- **Direct ChatGPT connectivity**: Streamable HTTP, OAuth, Bearer tokens, OpenAPI, plus built-in WSS, FRP, and Cloudflare tunnels.
 - **A focused default tool surface**: stable core tools are available by default; advanced Harness capabilities are opt-in.
 
 ## Let the project remember every conversation
@@ -282,7 +332,8 @@ On Windows, you can also run `dev-desktop.cmd`. Do not use `npm run dev` alone t
 | `src-tauri/src/tools/` | Shared file, Patch, Exec, and Git tool kernel |
 | `src-tauri/src/mcp/` | MCP Streamable HTTP server |
 | `src-tauri/src/actions/` | ChatGPT Actions OpenAPI gateway |
-| `src-tauri/src/tunnel/` | FRP / Cloudflare tunnel and process management |
+| `src-tauri/src/tunnel/` | Built-in WSS, FRP, and Cloudflare tunnels and process management |
+| `services/tunnel-server/` | Self-hosted built-in WSS tunnel server (Rust) |
 | `src/` | SvelteKit desktop UI |
 | `old/` | Python reference implementation and compatibility baseline |
 

@@ -294,6 +294,6 @@ cargo clippy --manifest-path services/tunnel-server/Cargo.toml --all-targets -- 
 ## What this example does **not** include
 
 - TLS certificates or a Caddy service definition
-- Full multi-service “rproxy” stack
+- Full multi-service edge reverse-proxy stack
 - Automatic Admin password generation
 - Publishing Admin on `0.0.0.0` for the public internet (do not do this)

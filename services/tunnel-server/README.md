@@ -294,6 +294,6 @@ cargo clippy --manifest-path services/tunnel-server/Cargo.toml --all-targets -- 
 ## 本範例**不包含**
 
 - TLS 憑證或 Caddy 服務定義
-- 完整多服務反向代理堆疊
+- 完整多服務邊緣反向代理堆疊
 - 自動產生 Admin 密碼
 - 把 Admin 發佈在 `0.0.0.0` 供公網使用（請勿如此）

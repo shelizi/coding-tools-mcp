@@ -64,10 +64,55 @@ macOS 安裝包目前尚未簽名。若系統阻擋首次開啟，請到「系�
 
 ### 3. 設定公網隧道
 
-若 AI 用戶端不在本機，需要把本機 MCP 暴露成 HTTPS 位址：
+若 AI 用戶端不在本機，需要把本機 MCP 暴露成可被外網存取的 HTTPS 位址。工作區可選三種隧道（**新建工作區預設為內建 WSS**）：
 
-- 在「軟體管理」中安裝或辨識 `frpc` / `cloudflared`。
-- 在「FRP 設定」中儲存伺服器、連接埠與 Token，或在工作區選擇 Cloudflare。
+| 類型 | 適用情境 | 桌面端要做的事 |
+| --- | --- | --- |
+| **內建 WSS（builtin）** | 自架 `coding-tools-tunnel-server`，由 Caddy 等反代終止 TLS | 貼上伺服器產生的一次性註冊連結 |
+| **FRP** | 已有 FRPS | 在「FRP 設定」存伺服器／Token，工作區填子網域 |
+| **Cloudflare** | 使用 Cloudflare Tunnel | 安裝／辨識 `cloudflared`，設定 token 或 Quick Tunnel |
+
+#### 3a. 內建 WSS（自建伺服器）
+
+架構（與實作一致）：
+
+```text
+ChatGPT / 公開 HTTPS 用戶端
+        → Caddy（TLS）
+        → coding-tools-tunnel-server（8088 公開 / 8089 選用 Admin）
+        → 桌面端內嵌 WSS 用戶端（協定 coding-tools-tunnel-v3）
+        → 本機 MCP 或 Actions
+```
+
+**伺服器端（簡要）**
+
+1. 依 [`services/tunnel-server/README.md`](services/tunnel-server/README.md) 用 Docker Compose 或 binary 啟動。
+2. 設定 `CODING_TOOLS_TUNNEL_PUBLIC_ORIGIN` 為真實 HTTPS origin（註冊連結會用它）。
+3. 若啟用 Admin WebUI：自備帳號與密碼（**伺服器不會自動產生密碼**，至少 12 bytes）。
+4. 用 Admin 或 CLI 建立一次性註冊連結（例如 `enroll create --client-id <id> --service both`）。
+
+公開路由需由反代轉到 `8088`（優先於 FRP 後備）：`/_tunnel/v1`、`/_tunnel/enroll/*`、`/builtin/*` 與對應的 `/.well-known/.../builtin/*`。Admin（`8089`）**不要**暴露到公網。
+
+**桌面端**
+
+1. 工作區隧道類型選「內建 WSS 隧道」（Built-in WSS tunnel）。
+2. 把伺服器印出的一次性註冊連結貼到「一次性註冊連結」欄位並儲存。
+3. 桌面端會在本機產生 Ed25519 金鑰與 device ID，把**私鑰**存進 OS 密鑰庫，只把**公鑰**註冊到伺服器；Client ID 以伺服器綁定的為準，公網 URL 會自動更新。
+4. MCP 與 Actions 在同一工作區共用同一組裝置身分。撤銷後需貼**新的**註冊連結以輪換金鑰。
+
+公開路徑形如：
+
+- MCP：`https://<你的網域>/builtin/clients/<client-id>/mcp`
+- Actions：`https://<你的網域>/builtin/actions/<client-id>`
+
+本機預設 placeholder 為 `http://127.0.0.1:8088/...`（與伺服器預設 origin 一致）；正式環境請用 HTTPS 反代後的網域。
+
+完整部署、環境變數、CLI 與疑難排解見 [隧道伺服器 README（繁中）](services/tunnel-server/README.md)／[English](services/tunnel-server/README.en.md)，設計細節見 [`docs/builtin-wss-tunnel.md`](docs/builtin-wss-tunnel.md)。
+
+#### 3b. FRP
+
+- 在「軟體管理」中安裝或辨識 `frpc`。
+- 在「FRP 設定」中儲存伺服器、連接埠與 Token。
 - 每個工作區填寫獨立子網域。應用程式會統一管理 FRP 程序與多條代理線路。
 
 ![FRP 設定頁面](docs/images/frp-configuration.png)
@@ -75,6 +120,11 @@ macOS 安裝包目前尚未簽名。若系統阻擋首次開啟，請到「系�
 *FRP 伺服器設定集中保存，各工作區只要選設定檔並填自己的子網域。*
 
 若還沒有可用的 FRPS 伺服端，可參考：[FRPS 伺服端安裝教學（微信公眾號）](https://mp.weixin.qq.com/s/kmpQhHsvmHlaLfj4rw3A0Q)。安裝完成後，把伺服端位址、連接埠與 Token 填入用戶端的「FRP 設定」即可。
+
+#### 3c. Cloudflare
+
+- 在「軟體管理」中安裝或辨識 `cloudflared`。
+- 在工作區選擇 Cloudflare，依模式設定 token 或使用 Quick Tunnel。
 
 ### 4. 啟動 MCP
 
@@ -194,7 +244,7 @@ MCP 與 Actions 可以在同一工作區同時執行，也可以分別使用不�
 - **跨對話持續開發**：新對話可以讀取全部歷史摘要與最近一次完整交接，不必反覆向 AI 解釋專案背景與目前進度。
 - **進度可追溯**：每輪任務完成後可儲存結構化檢查點，決策、修改、測試結果與下一步都留在專案目錄中。
 - **多工作區管理**：一個桌面用戶端可保存多個專案，並管理各自的 MCP、Actions 與公網位址。
-- **連接 ChatGPT 更直接**：內建 Streamable HTTP、OAuth、Bearer Token、OpenAPI、FRP 與 Cloudflare 隧道。
+- **連接 ChatGPT 更直接**：內建 Streamable HTTP、OAuth、Bearer Token、OpenAPI，以及內建 WSS／FRP／Cloudflare 隧道。
 - **預設工具面保持簡單**：穩定的核心工具預設可用，進階 Harness 能力可按需開啟。
 
 ## 讓專案記住每次對話
@@ -290,7 +340,8 @@ Windows 也可以雙擊 `dev-desktop.cmd`。不要只用 `npm run dev` 驗證桌
 | `src-tauri/src/tools/` | 檔案、Patch、Exec、Git 等共用工具核心 |
 | `src-tauri/src/mcp/` | MCP Streamable HTTP 服務 |
 | `src-tauri/src/actions/` | ChatGPT Actions OpenAPI 閘道 |
-| `src-tauri/src/tunnel/` | FRP / Cloudflare 隧道與程序管理 |
+| `src-tauri/src/tunnel/` | 內建 WSS／FRP／Cloudflare 隧道與程序管理 |
+| `services/tunnel-server/` | 自建內建 WSS 隧道伺服器（Rust） |
 | `src/` | SvelteKit 桌面介面 |
 | `old/` | Python 參考實作與相容性基準 |
 
