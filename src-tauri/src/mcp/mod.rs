@@ -3,6 +3,7 @@ mod server;
 mod session_activity;
 mod telemetry;
 
+pub(crate) use listener::behavioral_parity_fixture;
 pub use listener::{spawn_listener, ShutdownSender};
 pub use server::{LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS};
 pub(crate) use session_activity::{

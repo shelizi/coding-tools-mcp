@@ -1,0 +1,524 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { execFile as execFileCallback } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { promisify } from 'node:util';
+import { createToolContext } from '../dist/server.js';
+import { callTool } from '../dist/tools.js';
+import { captureBaseline, harnessWorkspaceId } from '../dist/taskTools.js';
+
+const execFile = promisify(execFileCallback);
+const nodeProgram = path.basename(process.execPath);
+
+function config(folders, dataDir) {
+  return {
+    host: '127.0.0.1',
+    port: 0,
+    dataDir,
+    permissionMode: 'trusted',
+    oauth: { clientId: 'chatgpt', password: 'test-password', tokenSecret: 'a sufficiently long test token secret' },
+    folders,
+    limits: { blockingConcurrency: 4, processConcurrency: 4, activeSessionLimit: 16, maxOutputBytes: 1024 * 1024 }
+  };
+}
+
+function meta() { return { 'openai/session': `harness-${Math.random().toString(36).slice(2)}` }; }
+
+async function git(root, ...args) {
+  return execFile('git', args, { cwd: root, encoding: 'utf8' });
+}
+
+async function initRepo(root, files = { 'tracked.txt': 'initial\n' }) {
+  await mkdir(root, { recursive: true });
+  await git(root, 'init');
+  await git(root, 'config', 'user.name', 'Harness Test');
+  await git(root, 'config', 'user.email', 'harness@example.invalid');
+  for (const [relative, content] of Object.entries(files)) {
+    const file = path.join(root, relative);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, content);
+  }
+  await git(root, 'add', '--all');
+  await git(root, 'commit', '-m', 'initial');
+}
+
+async function fixture(files) {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-harness-workspace-'));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-harness-state-'));
+  await initRepo(root, files);
+  const session = meta();
+  const ctx = await createToolContext(config([{ id: 'repo', name: 'Repo', path: root }], dataDir));
+  const selected = await callTool(ctx, 'switch_workspace_folder', { folder_id: 'repo' }, session);
+  assert.equal(selected.ok, true);
+  return { root, dataDir, ctx, meta: session };
+}
+
+function sha256(value) { return createHash('sha256').update(value).digest('hex'); }
+
+function expectedFingerprint(entries) {
+  const hash = createHash('sha256');
+  for (const entry of [...entries].sort((left, right) => Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)))) {
+    hash.update(Buffer.from(entry.path));
+    hash.update(Buffer.from(entry.sha256));
+    const bytes = Buffer.alloc(8);
+    bytes.writeBigUInt64LE(BigInt(entry.bytes));
+    hash.update(bytes);
+  }
+  return hash.digest('hex');
+}
+
+test('start_task captures Git-visible file entries and reports a matching baseline', async () => {
+  const state = await fixture({
+    '.gitignore': ['node_modules/', 'target/', 'dist/', 'build/', '.svelte-kit/', '.mcp-probe-kit/'].join('\n') + '\n',
+    'tracked.txt': 'initial\n',
+    'nested/code.ts': 'export const value = 1;\n'
+  });
+  await writeFile(path.join(state.root, 'binary.bin'), Buffer.from([1, 0, 2]));
+  for (const directory of ['node_modules', 'target', 'dist', 'build', '.svelte-kit', '.mcp-probe-kit']) {
+    await mkdir(path.join(state.root, directory), { recursive: true });
+    await writeFile(path.join(state.root, directory, 'ignored.txt'), 'ignored\n');
+  }
+
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Capture baseline' }, state.meta);
+  assert.equal(started.ok, true);
+  const entries = started.task.baseline.entries;
+  assert.equal(started.task.workspace_id, await harnessWorkspaceId(state.root));
+  assert.deepEqual(entries.map(entry => entry.path), ['.gitignore', 'binary.bin', 'nested/code.ts', 'tracked.txt']);
+  assert.equal(entries.find(entry => entry.path === 'binary.bin').is_binary, true);
+  assert.equal(entries.find(entry => entry.path === 'tracked.txt').sha256, sha256('initial\n'));
+  assert.equal(started.task.baseline.worktree_fingerprint, expectedFingerprint(entries));
+
+  const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(status.baseline_matches, true);
+  assert.equal(status.writable, true);
+  assert.equal(status.capabilities.write.status, 'available');
+  assert.equal(status.branch, started.task.baseline.branch);
+  assert.equal(status.head, started.task.baseline.head);
+});
+
+test('baseline follows Git ignore rules and does not descend into linked worktrees', async () => {
+  const state = await fixture({
+    '.gitignore': 'runtime-data/\ncache/\n',
+    'tracked.txt': 'initial\n'
+  });
+  await mkdir(path.join(state.root, 'runtime-data'), { recursive: true });
+  await writeFile(path.join(state.root, 'runtime-data', 'state.json'), '{"version":1}\n');
+  const linked = path.join(state.root, 'linked-worktree');
+  const linkedBranch = `linked-${Math.random().toString(36).slice(2)}`;
+  await git(state.root, 'worktree', 'add', '-b', linkedBranch, linked);
+
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Ignore runtime-owned files' }, state.meta);
+  assert.equal(started.ok, true);
+  assert.equal(started.task.baseline.entries.some(entry => entry.path.startsWith('runtime-data/')), false);
+  assert.equal(started.task.baseline.entries.some(entry => entry.path.startsWith('linked-worktree/')), false);
+
+  await writeFile(path.join(state.root, 'runtime-data', 'state.json'), '{"version":2}\n');
+  await writeFile(path.join(linked, 'tracked.txt'), 'linked change\n');
+  const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(status.baseline_matches, true);
+  assert.equal(status.writable, true);
+});
+
+test('non-ignored untracked files remain protected by the baseline', async () => {
+  const state = await fixture();
+  await writeFile(path.join(state.root, 'notes.txt'), 'before\n');
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Protect untracked files' }, state.meta);
+  assert.equal(started.task.baseline.entries.some(entry => entry.path === 'notes.txt'), true);
+
+  await writeFile(path.join(state.root, 'notes.txt'), 'after\n');
+  const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(status.baseline_matches, false);
+  assert.equal(status.writable, false);
+});
+
+test('project_state computes clean from the complete file set before max_files truncation', async () => {
+  const state = await fixture({ 'a-clean.txt': 'clean\n', 'z-changed.txt': 'before\n' });
+  await callTool(state.ctx, 'start_task', { objective: 'Bound project state' }, state.meta);
+  await writeFile(path.join(state.root, 'z-changed.txt'), 'after\n');
+
+  const project = await callTool(state.ctx, 'project_state', { max_files: 1 }, state.meta);
+  assert.equal(project.truncated, true);
+  assert.equal(project.total_files, 2);
+  assert.equal(project.files.length, 1);
+  assert.equal(project.files[0].path, 'a-clean.txt');
+  assert.equal(project.files[0].status, 'unchanged');
+  assert.equal(project.clean, false);
+});
+
+test('task_context enforces the public max_bytes budget', async () => {
+  const state = await fixture();
+  const objective = 'bounded-context-'.repeat(2_000);
+  const started = await callTool(state.ctx, 'start_task', { objective }, state.meta);
+  assert.equal(started.ok, true);
+
+  const context = await callTool(state.ctx, 'task_context', { max_bytes: 8_192 }, state.meta);
+  assert.equal(context.ok, true);
+  assert.equal(context.max_bytes, 8_192);
+  assert.equal(context.truncated, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(context)) <= 8_192);
+  assert.ok(context.task.objective.length < objective.length);
+});
+
+test('task_context trims a production-sized baseline without quadratic work', { timeout: 30_000 }, async () => {
+  const state = await fixture();
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Bound a large baseline' }, state.meta);
+  assert.equal(started.ok, true);
+  const entryCount = 50_000;
+  started.task.baseline.entries = Array.from({ length: entryCount }, (_, index) => ({
+    path: `generated/${String(index).padStart(5, '0')}.txt`,
+    exists: true,
+    is_binary: false,
+    sha256: '0'.repeat(64),
+    bytes: 1
+  }));
+  await state.ctx.state.setTask(started.task.workspace_id, started.task);
+
+  const before = Date.now();
+  const context = await callTool(state.ctx, 'task_context', { max_bytes: 8_192 }, state.meta);
+  const elapsedMs = Date.now() - before;
+  assert.equal(context.ok, true);
+  assert.equal(context.truncated, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(context)) <= 8_192);
+  assert.ok(context.task.baseline.entries.length < entryCount);
+  assert.ok(elapsedMs < 5_000, `large task_context took ${elapsedMs}ms`);
+});
+
+test('external changes block real writes while dry runs remain available', async () => {
+  const state = await fixture();
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Protect active task' }, state.meta);
+  assert.equal(started.ok, true);
+  await writeFile(path.join(state.root, 'tracked.txt'), 'external\n');
+  const externalHash = sha256('external\n');
+
+  const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(status.baseline_matches, false);
+  assert.equal(status.writable, false);
+  assert.equal(status.capabilities.write.status, 'denied');
+  assert.deepEqual(status.next_actions.slice(0, 3), ['project_state', 'git_diff', 'refresh_baseline']);
+
+  const dryRun = await callTool(state.ctx, 'edit_file', {
+    path: 'tracked.txt',
+    expected_sha256: externalHash,
+    dry_run: true,
+    edits: [{ type: 'replace', old_text: 'external\n', new_text: 'planned\n' }]
+  }, state.meta);
+  assert.equal(dryRun.ok, true);
+  assert.equal(dryRun.applied, false);
+
+  const blocked = await callTool(state.ctx, 'edit_file', {
+    path: 'tracked.txt',
+    expected_sha256: externalHash,
+    edits: [{ type: 'replace', old_text: 'external\n', new_text: 'blocked\n' }]
+  }, state.meta);
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error.code, 'FILE_CHANGED_EXTERNALLY');
+  assert.equal(blocked.error.category, 'permission');
+  assert.equal(blocked.error.retryable, false);
+  assert.equal(blocked.harness.baseline_matches, false);
+  assert.equal(await readFile(path.join(state.root, 'tracked.txt'), 'utf8'), 'external\n');
+});
+
+test('branch or HEAD changes return BASELINE_STALE before starting a process', async () => {
+  const state = await fixture();
+  await callTool(state.ctx, 'start_task', { objective: 'Keep Git baseline' }, state.meta);
+  await git(state.root, 'checkout', '-b', 'external-branch');
+
+  const blocked = await callTool(state.ctx, 'exec_command', {
+    program: 'git',
+    args: ['status'],
+    yield_time_ms: 30_000
+  }, state.meta);
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error.code, 'BASELINE_STALE');
+  assert.equal(blocked.error.retryable, false);
+  assert.equal(blocked.harness.baseline_matches, false);
+  assert.equal(blocked.session_id, undefined);
+});
+
+test('successful tracked mutations refresh expected state and persist change evidence', async () => {
+  const state = await fixture({ 'tracked.txt': 'initial\n', 'delete.txt': 'remove\n' });
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Record file evidence' }, state.meta);
+  const taskId = started.task.id;
+
+  const edited = await callTool(state.ctx, 'edit_file', {
+    path: 'tracked.txt',
+    expected_sha256: sha256('initial\n'),
+    edits: [{ type: 'replace', old_text: 'initial\n', new_text: 'changed\n' }]
+  }, state.meta);
+  assert.equal(edited.ok, true);
+  assert.match(edited.operation_id, /^[0-9a-f]{32}$/);
+
+  const files = await callTool(state.ctx, 'file_ops', {
+    operations: [
+      { type: 'create', path: 'added.txt', content: 'added\n' },
+      { type: 'delete', path: 'delete.txt' }
+    ]
+  }, state.meta);
+  assert.equal(files.ok, true);
+
+  const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(status.baseline_matches, true);
+  const project = await callTool(state.ctx, 'project_state', { max_files: 20 }, state.meta);
+  assert.equal(project.clean, false);
+  assert.deepEqual(
+    Object.fromEntries(project.files.filter(file => file.status !== 'unchanged').map(file => [file.path, file.status])),
+    { 'added.txt': 'added', 'delete.txt': 'deleted', 'tracked.txt': 'modified' }
+  );
+  assert.equal(project.files.find(file => file.path === 'tracked.txt').sha256, sha256('changed\n'));
+  assert.equal(project.files.find(file => file.path === 'delete.txt').sha256, '');
+
+  const summary = await callTool(state.ctx, 'change_summary', { task_id: taskId }, state.meta);
+  assert.deepEqual(summary.files.map(file => file.path), ['added.txt', 'delete.txt', 'tracked.txt']);
+  assert.deepEqual(summary.verification, []);
+  assert.deepEqual(summary.risks, []);
+  assert.equal(summary.rollback_capability, 'not_available_in_foundation');
+  assert.ok(summary.evidence.some(item => item.kind === 'operation_started' && item.tool_name === 'edit'));
+  assert.ok(summary.evidence.some(item => item.kind === 'operation_finished' && item.tool_name === 'file_ops'));
+
+  const log = await callTool(state.ctx, 'operation_log', { cursor: 0, limit: 100 }, state.meta);
+  const editRows = log.operations.filter(row => row.tool === 'edit');
+  assert.deepEqual(editRows.map(row => row.kind), ['started', 'completed']);
+  assert.equal(editRows[0].id, editRows[1].id);
+  assert.equal(editRows[1].task_id, taskId);
+  assert.deepEqual(editRows[1].affected_files, []);
+  assert.deepEqual(editRows[1].result_summary.affected_files, edited.affected_files);
+});
+
+test('finish_task summary persists an immutable change selected by change_id', async () => {
+  const state = await fixture({ 'tracked.txt': 'initial\n' });
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Persist completion evidence' }, state.meta);
+  const taskId = started.task.id;
+
+  const blank = await callTool(state.ctx, 'finish_task', {
+    task_id: taskId,
+    summary: '   ',
+    allow_unverified: true
+  }, state.meta);
+  assert.equal(blank.ok, false);
+  assert.equal(blank.error.code, 'INVALID_ARGUMENT');
+  const stillActive = await callTool(state.ctx, 'task_context', {}, state.meta);
+  assert.equal(stillActive.task.status, 'active');
+
+  const edited = await callTool(state.ctx, 'edit_file', {
+    path: 'tracked.txt',
+    expected_sha256: sha256('initial\n'),
+    edits: [{ type: 'replace', old_text: 'initial\n', new_text: 'released\n' }]
+  }, state.meta);
+  assert.equal(edited.ok, true);
+
+  const finished = await callTool(state.ctx, 'finish_task', {
+    task_id: taskId,
+    summary: '  Release evidence captured  ',
+    allow_unverified: true
+  }, state.meta);
+  assert.equal(finished.ok, true);
+  assert.equal(finished.summary, 'Release evidence captured');
+  assert.match(finished.change_id, /^[0-9a-f]{32}$/);
+  assert.equal(finished.task.latest_change_id, finished.change_id);
+  assert.equal(finished.task.status, 'completed_unverified');
+  assert.equal(finished.change_summary.change_id, finished.change_id);
+  assert.deepEqual(finished.change_summary.why, {
+    text: 'Release evidence captured',
+    source: 'finish_task_summary'
+  });
+  const captured = finished.change_summary.files.find(file => file.path === 'tracked.txt');
+  assert.equal(captured.status, 'modified');
+  assert.equal(captured.before_sha256, sha256('initial\n'));
+  assert.equal(captured.after_sha256, sha256('released\n'));
+  assert.ok(finished.change_summary.evidence.some(item =>
+    item.kind === 'task_finished'
+      && item.reason?.text === 'Release evidence captured'
+      && item.result_summary?.change_id === finished.change_id));
+
+  await writeFile(path.join(state.root, 'tracked.txt'), 'later external change\n');
+  const selected = await callTool(state.ctx, 'change_summary', { change_id: finished.change_id }, state.meta);
+  assert.equal(selected.change_id, finished.change_id);
+  assert.equal(selected.files.find(file => file.path === 'tracked.txt').after_sha256, sha256('released\n'));
+  const latest = await callTool(state.ctx, 'change_summary', { task_id: taskId }, state.meta);
+  assert.deepEqual(latest.files, selected.files);
+
+  const malformed = await callTool(state.ctx, 'change_summary', { change_id: '../not-a-change' }, state.meta);
+  assert.equal(malformed.ok, false);
+  assert.equal(malformed.error.code, 'INVALID_ARGUMENT');
+
+  const restarted = await createToolContext(config([{ id: 'repo', name: 'Repo', path: state.root }], state.dataDir));
+  await callTool(restarted, 'switch_workspace_folder', { folder_id: 'repo' }, state.meta);
+  const restored = await callTool(restarted, 'change_summary', { change_id: finished.change_id }, state.meta);
+  assert.deepEqual(restored.files, selected.files);
+  assert.deepEqual(restored.why, selected.why);
+
+  const persisted = JSON.parse(await readFile(path.join(state.dataDir, 'state.json'), 'utf8'));
+  assert.equal(persisted.tasks[taskId].latest_change_id, finished.change_id);
+  assert.equal(persisted.changeSets[finished.change_id].reason.text, 'Release evidence captured');
+
+  const next = await callTool(restarted, 'start_task', { objective: 'Next task' }, state.meta);
+  const mismatch = await callTool(restarted, 'change_summary', {
+    task_id: next.task.id,
+    change_id: finished.change_id
+  }, state.meta);
+  assert.equal(mismatch.ok, false);
+  assert.equal(mismatch.error.code, 'CHANGE_TASK_MISMATCH');
+
+  const fallback = await callTool(restarted, 'finish_task', {
+    task_id: next.task.id,
+    allow_unverified: true
+  }, state.meta);
+  assert.equal(fallback.ok, true);
+  assert.equal(fallback.summary, 'Next task');
+  assert.deepEqual(fallback.change_summary.why, {
+    text: 'Next task',
+    source: 'task_objective'
+  });
+});
+
+test('operation logs persist bounded execution diagnostics without raw process payloads', async () => {
+  const state = await fixture();
+  const outputMarker = 'OPERATION_OUTPUT_MUST_NOT_PERSIST';
+  const executed = await callTool(state.ctx, 'exec_command', {
+    program: nodeProgram,
+    args: ['-e', `setTimeout(() => { process.stderr.write('${outputMarker}'); process.exit(7); }, 1_000)`],
+    deduplicate: true,
+    yield_time_ms: 0,
+    timeout_ms: 10_000
+  }, state.meta);
+  assert.ok(executed.command_ok === null || executed.command_ok === false, JSON.stringify(executed));
+  const reattached = await callTool(state.ctx, 'exec_command', {
+    program: nodeProgram,
+    args: ['-e', `setTimeout(() => { process.stderr.write('${outputMarker}'); process.exit(7); }, 1_000)`],
+    deduplicate: true,
+    yield_time_ms: 0,
+    timeout_ms: 10_000
+  }, state.meta);
+  assert.ok(reattached.command_ok === null || reattached.command_ok === false, JSON.stringify(reattached));
+  assert.equal(reattached.session_id, executed.session_id);
+  assert.equal(reattached.deduplicated, true);
+  assert.notEqual(reattached.harness_operation_id, executed.harness_operation_id);
+  const finalized = reattached.command_ok === false
+    ? reattached
+    : executed.command_ok === false
+      ? executed
+      : await callTool(state.ctx, 'wait_command', {
+        session_id: executed.session_id,
+        cursor: executed.latest_cursor,
+        timeout_ms: 30_000,
+        until: 'finalized',
+        output_mode: 'delta'
+      }, state.meta);
+  assert.equal(finalized.ok, false, JSON.stringify(finalized));
+  assert.equal(finalized.command_ok, false, JSON.stringify(finalized));
+  assert.equal(finalized.process_exit_code, 7, JSON.stringify(finalized));
+
+  const log = await callTool(state.ctx, 'operation_log', { cursor: 0, limit: 100 }, state.meta);
+  const operationIds = [executed.harness_operation_id, reattached.harness_operation_id];
+  for (const operationId of operationIds) {
+    const correlated = log.operations.filter(row => row.id === operationId);
+    assert.deepEqual(correlated.map(row => row.kind), ['started', 'failed']);
+  }
+  const terminal = log.operations.find(row => row.id === executed.harness_operation_id && row.kind === 'failed');
+  assert.ok(terminal, JSON.stringify(log));
+  assert.equal(terminal.result_summary.command_ok, false);
+  assert.equal(terminal.result_summary.process_exit_code, 7);
+  assert.equal(terminal.result_summary.termination_reason, 'exited');
+  assert.equal(terminal.result_summary.stderr_bytes, Buffer.byteLength(outputMarker));
+  for (const forbidden of ['command', 'args', 'arguments', 'program', 'stdout', 'stderr', 'environment', 'env']) {
+    assert.equal(Object.hasOwn(terminal.result_summary, forbidden), false, `persisted raw ${forbidden}`);
+  }
+  assert.doesNotMatch(JSON.stringify(terminal.result_summary), new RegExp(outputMarker));
+});
+
+test('legacy folder-id tasks migrate to the Rust workspace identity without losing active state', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-harness-workspace-'));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-harness-state-'));
+  await initRepo(root);
+  const baseline = await captureBaseline(root);
+  const task = {
+    id: 'legacy-task',
+    workspace_id: 'repo',
+    objective: 'Resume legacy state',
+    status: 'active',
+    baseline,
+    expected_fingerprint: baseline.worktree_fingerprint,
+    completed_steps: [],
+    pending_steps: ['continue'],
+    created_at: '1',
+    updated_at: '2'
+  };
+  await writeFile(path.join(dataDir, 'state.json'), `${JSON.stringify({
+    tasks: { [task.id]: task },
+    currentTasks: { repo: task.id },
+    taskEvents: { [task.id]: [] },
+    operations: []
+  }, null, 2)}\n`);
+
+  const session = meta();
+  const ctx = await createToolContext(config([{ id: 'repo', name: 'Repo', path: root }], dataDir));
+  await callTool(ctx, 'switch_workspace_folder', { folder_id: 'repo' }, session);
+  const status = await callTool(ctx, 'harness_status', {}, session);
+  const workspaceId = await harnessWorkspaceId(root);
+  assert.equal(status.task_id, task.id);
+  assert.equal(status.workspace_id, workspaceId);
+  assert.equal(status.baseline_matches, true);
+  const context = await callTool(ctx, 'task_context', {}, session);
+  assert.equal(context.task.workspace_id, workspaceId);
+  const persisted = JSON.parse(await readFile(path.join(dataDir, 'state.json'), 'utf8'));
+  assert.equal(persisted.tasks[task.id].workspace_id, workspaceId);
+  assert.equal(persisted.currentTasks[workspaceId], task.id);
+  assert.equal(persisted.currentTasks.repo, undefined);
+});
+
+test('operation logs are isolated per workspace and survive Agent restart', async () => {
+  const base = await mkdtemp(path.join(tmpdir(), 'ctmcp-harness-multi-'));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-harness-state-'));
+  const rootA = path.join(base, 'a');
+  const rootB = path.join(base, 'b');
+  await initRepo(rootA, { 'a.txt': 'a\n' });
+  await initRepo(rootB, { 'b.txt': 'b\n' });
+  const folders = [
+    { id: 'alpha', name: 'Alpha', path: rootA },
+    { id: 'beta', name: 'Beta', path: rootB }
+  ];
+  const session = meta();
+  const ctx = await createToolContext(config(folders, dataDir));
+  const alphaWorkspaceId = await harnessWorkspaceId(rootA);
+  const betaWorkspaceId = await harnessWorkspaceId(rootB);
+  await callTool(ctx, 'switch_workspace_folder', { folder_id: 'alpha' }, session);
+  await callTool(ctx, 'git_status', {}, session);
+  const alpha = await callTool(ctx, 'operation_log', { cursor: 0, limit: 20 }, session);
+  assert.ok(alpha.operations.length >= 2);
+  assert.ok(alpha.operations.every(row => row.workspace_id === alphaWorkspaceId));
+
+  await callTool(ctx, 'switch_workspace_folder', { folder_id: 'beta' }, session);
+  const betaEmpty = await callTool(ctx, 'operation_log', { cursor: 0, limit: 20 }, session);
+  assert.deepEqual(betaEmpty.operations, []);
+  await callTool(ctx, 'git_status', {}, session);
+  const beta = await callTool(ctx, 'operation_log', { cursor: 0, limit: 20 }, session);
+  assert.ok(beta.operations.every(row => row.workspace_id === betaWorkspaceId));
+
+  const restarted = await createToolContext(config(folders, dataDir));
+  await callTool(restarted, 'switch_workspace_folder', { folder_id: 'alpha' }, session);
+  const restored = await callTool(restarted, 'operation_log', { cursor: 0, limit: 20 }, session);
+  assert.deepEqual(restored.operations, alpha.operations);
+  const workspaceDirs = await readdir(path.join(dataDir, 'harness', 'workspaces'), { withFileTypes: true });
+  assert.deepEqual(
+    workspaceDirs.filter(entry => entry.isDirectory()).map(entry => entry.name).sort(),
+    [alphaWorkspaceId, betaWorkspaceId].sort()
+  );
+});
+
+test('exec_many remains outside the Rust write-baseline gate', async () => {
+  const state = await fixture();
+  await callTool(state.ctx, 'start_task', { objective: 'Match Rust classifier' }, state.meta);
+  await writeFile(path.join(state.root, 'tracked.txt'), 'external\n');
+
+  const result = await callTool(state.ctx, 'exec_many', {
+    mode: 'sequential',
+    commands: [{ id: 'probe', program: nodeProgram, args: ['-e', 'process.stdout.write("ok")'] }]
+  }, state.meta);
+  assert.equal(result.ok, true);
+  assert.equal(result.results[0].stdout, 'ok');
+  const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(status.baseline_matches, false);
+});

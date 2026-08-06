@@ -1,0 +1,868 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { request as httpRequest } from 'node:http';
+import { loadConfigBundle } from '../dist/config.js';
+import { ConfigStore } from '../dist/management.js';
+import { validateManagementHealthPayload } from '../dist/managementObservability.js';
+import { renderDocument } from '../dist/historyMarkdown.js';
+import { harnessWorkspaceId } from '../dist/taskTools.js';
+import { readAgentSecrets } from '../dist/secrets.js';
+import { createAgentRuntime, createAgentServer } from '../dist/server.js';
+import { startAndYield, waitForSession } from '../dist/processes.js';
+import { AGENT_VERSION } from '../dist/version.js';
+
+function document(root, dataDir) {
+  return {
+    host: '127.0.0.1',
+    port: 3789,
+    dataDir,
+    permissionMode: 'trusted',
+    toolProfile: 'core',
+    management: { enabled: true },
+    oauth: {
+      clientId: 'chatgpt',
+      password: 'management-test-password',
+      clientSecret: 'management-test-client-secret',
+      tokenSecret: 'management-test-token-secret-that-is-long-enough'
+    },
+    folders: [{ id: 'repo', name: 'Repo', path: root }],
+    limits: {
+      blockingConcurrency: 4,
+      processConcurrency: 4,
+      activeSessionLimit: 16,
+      maxOutputBytes: 1024 * 1024
+    }
+  };
+}
+
+function editable(config, overrides = {}) {
+  return {
+    host: config.host,
+    port: config.port,
+    publicBaseUrl: config.publicBaseUrl ?? '',
+    dataDir: config.dataDir,
+    permissionMode: config.permissionMode,
+    toolProfile: config.toolProfile,
+    management: { enabled: true },
+    oauth: { clientId: config.oauth.clientId, password: '', clientSecret: '', clearClientSecret: false },
+    policy: config.policy,
+    folders: config.folders,
+    limits: config.limits,
+    tunnel: { enabled: false, publicUrl: '', enrollmentUrl: '', clearEnrollmentUrl: false },
+    ...overrides
+  };
+}
+
+function managementToken(html) {
+  return html.match(/name="ctmcp-admin-token" content="([A-Za-z0-9_-]+)"/)?.[1];
+}
+
+let managementPortSequence = 0;
+
+async function listenOnFetchSafePort(server) {
+  let lastError;
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const port = 40_000 + ((process.pid + managementPortSequence++) % 8_000);
+    try {
+      await new Promise((resolve, reject) => {
+        const onError = error => {
+          server.off('listening', onListening);
+          reject(error);
+        };
+        const onListening = () => {
+          server.off('error', onError);
+          resolve();
+        };
+        server.once('error', onError);
+        server.once('listening', onListening);
+        server.listen(port, '127.0.0.1');
+      });
+      return port;
+    } catch (error) {
+      lastError = error;
+      if (error?.code !== 'EADDRINUSE') throw error;
+    }
+  }
+  throw lastError ?? new Error('unable to allocate a fetch-safe management test port');
+}
+
+async function rawJsonRequest(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(url, options, response => {
+      const chunks = [];
+      response.on('data', chunk => chunks.push(chunk));
+      response.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolve({
+          status: response.statusCode ?? 0,
+          headers: response.headers,
+          json: text ? JSON.parse(text) : null
+        });
+      });
+    });
+    request.on('error', reject);
+    request.end();
+  });
+}
+
+async function startManagementServer(t) {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-root-'));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-data-'));
+  const configPath = path.join(dataDir, 'agent.json');
+  await writeFile(configPath, `${JSON.stringify(document(root, dataDir), null, 2)}\n`);
+  const loaded = await loadConfigBundle(configPath);
+  loaded.config.port = 0;
+  const store = new ConfigStore(loaded);
+  const runtime = await createAgentRuntime(loaded.config, { configStore: store });
+  const port = await listenOnFetchSafePort(runtime.server);
+  t.after(() => new Promise(resolve => runtime.server.close(resolve)));
+  return { root, dataDir, configPath, loaded, store, context: runtime.context, base: `http://127.0.0.1:${port}` };
+}
+
+test('management UI is loopback-only, token protected and never returns configured secrets', async t => {
+  const runtime = await startManagementServer(t);
+  const page = await fetch(`${runtime.base}/ui`);
+  assert.equal(page.status, 200);
+  const csp = page.headers.get('content-security-policy');
+  assert.match(csp, /default-src 'none'/);
+  assert.match(csp, /script-src 'self'/);
+  assert.match(csp, /style-src 'self'/);
+  assert.doesNotMatch(csp, /unsafe-inline/);
+  assert.equal(page.headers.get('x-frame-options'), 'DENY');
+  const html = await page.text();
+  assert.match(html, /Headless Agent/);
+  assert.match(html, /manifest.webmanifest/);
+  assert.match(html, /data-ui-framework="react"/);
+  assert.match(html, /href="\/ui\/app\.css"/);
+  assert.match(html, /src="\/ui\/app\.js"/);
+  assert.doesNotMatch(html, /<style\b/);
+  assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)/);
+  const token = managementToken(html);
+  assert.ok(token);
+
+  const [scriptResponse, styleResponse] = await Promise.all([
+    fetch(`${runtime.base}/ui/app.js`),
+    fetch(`${runtime.base}/ui/app.css`)
+  ]);
+  assert.equal(scriptResponse.status, 200);
+  assert.match(scriptResponse.headers.get('content-type'), /text\/javascript/);
+  assert.equal(scriptResponse.headers.get('cache-control'), 'no-store');
+  const script = await scriptResponse.text();
+  assert.match(script, /命令 Sessions/);
+  assert.match(script, /React 管理介面/);
+  assert.doesNotMatch(script, new RegExp(token));
+  assert.equal(styleResponse.status, 200);
+  assert.match(styleResponse.headers.get('content-type'), /text\/css/);
+  const style = await styleResponse.text();
+  assert.match(style, /\.app-shell/);
+  assert.match(style, /--bs-blue/);
+  assert.doesNotMatch(style, /@import\s+url\s*\(\s*['"]?https?:/i);
+  const rejectedAssetMethod = await fetch(`${runtime.base}/ui/app.js`, { method: 'POST' });
+  assert.equal(rejectedAssetMethod.status, 405);
+  assert.equal(rejectedAssetMethod.headers.get('allow'), 'GET');
+
+  const manifestResponse = await fetch(`${runtime.base}/ui/manifest.webmanifest`);
+  assert.equal(manifestResponse.status, 200);
+  const manifest = await manifestResponse.json();
+  assert.equal(manifest.display, 'standalone');
+  assert.equal(manifest.start_url, '/ui/');
+  const worker = await fetch(`${runtime.base}/ui/sw.js`);
+  assert.equal(worker.status, 200);
+  assert.equal(worker.headers.get('cache-control'), 'no-store');
+  const workerSource = await worker.text();
+  assert.doesNotMatch(workerSource, /caches?\.(?:open|match)|fetch\s*\(/);
+  const denied = await fetch(`${runtime.base}/admin/api/config`);
+  assert.equal(denied.status, 403);
+
+  const rejectedOrigin = await fetch(`${runtime.base}/admin/api/config`, {
+    headers: { 'x-ctmcp-admin-token': token, origin: 'https://attacker.example' }
+  });
+  assert.equal(rejectedOrigin.status, 403);
+
+  const response = await fetch(`${runtime.base}/admin/api/config`, {
+    headers: { 'x-ctmcp-admin-token': token }
+  });
+  assert.equal(response.status, 200);
+  const snapshot = await response.json();
+  const serialized = JSON.stringify(snapshot);
+  assert.doesNotMatch(serialized, /management-test-password/);
+  assert.doesNotMatch(serialized, /management-test-client-secret/);
+  assert.doesNotMatch(serialized, /management-test-token-secret/);
+  assert.equal(snapshot.effective.folders[0].id, 'repo');
+  assert.equal(snapshot.effective.oauth.passwordConfigured, true);
+  assert.equal(snapshot.effective.oauth.clientSecretConfigured, true);
+  assert.equal(snapshot.saved.toolProfile, 'core');
+  assert.equal(snapshot.saved.activeToolProfile, 'trusted-core');
+  assert.equal(snapshot.effective.toolProfile, 'core');
+  assert.equal(snapshot.effective.activeToolProfile, 'trusted-core');
+  assert.equal(snapshot.schemaVersion, 1);
+  assert.equal(snapshot.secretStorePath, runtime.loaded.secretStorePath);
+  assert.equal(snapshot.migrationApplied, true);
+  assert.equal(snapshot.migratedFromSchema, 0);
+
+  const statusResponse = await fetch(`${runtime.base}/admin/api/status`, {
+    headers: { 'x-ctmcp-admin-token': token }
+  });
+  assert.equal(statusResponse.status, 200);
+  const status = await statusResponse.json();
+  assert.equal(status.configuredToolProfile, 'core');
+  assert.equal(status.toolProfile, 'trusted-core');
+  assert.equal(status.tools, 34);
+  assert.match(status.toolsetRevision, /^[0-9a-f]{16}$/);
+});
+
+test('management core is separated from the React UI implementation', async () => {
+  const [managementSource, uiAdapterSource, appSource, formSource] = await Promise.all([
+    readFile(new URL('../src/management.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/managementUi.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../ui/src/App.tsx', import.meta.url), 'utf8'),
+    readFile(new URL('../ui/src/components/ConfigForm.tsx', import.meta.url), 'utf8')
+  ]);
+  assert.doesNotMatch(managementSource, /<!doctype html|<style\b|document\.(?:getElementById|querySelector|createElement)|from ['"]react|from ['"]react-bootstrap|bootstrap\/dist/i);
+  assert.match(managementSource, /handleManagementUiRequest/);
+  assert.match(uiAdapterSource, /data-ui-framework="react"/);
+  assert.match(appSource, /react-bootstrap/);
+  assert.match(appSource, /useAgentQueries/);
+  assert.match(formSource, /Workspace 資料夾/);
+  assert.match(formSource, /工具 Profile/);
+  assert.doesNotMatch(`${appSource}\n${formSource}`, /dangerouslySetInnerHTML|innerHTML/);
+});
+
+test('management dashboard returns bounded telemetry without command, environment or output secrets', async t => {
+  const runtime = await startManagementServer(t);
+  const key = 'dashboard-test';
+  runtime.context.selections.set(key, 'repo');
+  runtime.context.defaultCwds.set(key, '.');
+  const started = await startAndYield(runtime.context, key, {
+    program: path.basename(process.execPath),
+    args: ['-e', 'process.stdout.write("DASHBOARD_OUTPUT_SECRET")', 'DASHBOARD_ARG_SECRET'],
+    env: { DASHBOARD_SECRET: 'DASHBOARD_ENV_SECRET' },
+    timeout_ms: 10_000,
+    yield_time_ms: 10_000,
+    post_checks: [{
+      name: 'DASHBOARD_POST_CHECK_NAME_SECRET',
+      program: path.basename(process.execPath),
+      args: ['-e', 'process.stdout.write("DASHBOARD_POST_CHECK_OUTPUT_SECRET")']
+    }]
+  });
+  const retained = runtime.context.sessions.get(started.session_id);
+  assert.ok(retained);
+  await waitForSession(retained, retained.sequence, 10_000, 'finalized');
+
+  const now = Date.now();
+  for (let index = 0; index < 120; index += 1) {
+    runtime.context.usage.push({
+      tool: index % 2 ? 'read_file' : 'search_text',
+      startedAt: now - index,
+      durationMs: index + 1,
+      ok: index % 4 !== 0,
+      queueWaitMs: index % 3,
+      lockWaitMs: index % 2,
+      responseBytes: 100 + index
+    });
+  }
+  await runtime.context.state.addOperation('repo', {
+    id: 'DASHBOARD_OPERATION_ID_SECRET',
+    workspace_id: 'repo',
+    tool: 'exec_command',
+    kind: 'failed',
+    input_summary: {},
+    result_summary: { ok: false, duration_ms: 12 },
+    reason: 'DASHBOARD_OPERATION_SUMMARY_SECRET',
+    affected_files: [],
+    created_at: String(now)
+  });
+  runtime.context.pendingOperations.set('DASHBOARD_PENDING_ID_SECRET', {
+    resumeId: 'DASHBOARD_PENDING_ID_SECRET',
+    name: 'exec_command',
+    args: { secret: 'DASHBOARD_PENDING_ARG_SECRET' },
+    meta: null,
+    reason: 'DASHBOARD_PENDING_REASON_SECRET',
+    createdAt: now,
+    expiresAt: now + 60_000
+  });
+
+  const html = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(html);
+  assert.ok(token);
+  const script = await fetch(`${runtime.base}/ui/app.js`).then(response => response.text());
+  assert.match(script, /命令 Sessions/);
+  assert.match(script, /WSS Workers/);
+  assert.match(script, /Workspace 資料夾/);
+  assert.doesNotMatch(script, new RegExp(token));
+  assert.equal((await fetch(`${runtime.base}/admin/api/dashboard`)).status, 403);
+  const response = await fetch(`${runtime.base}/admin/api/dashboard`, {
+    headers: { 'x-ctmcp-admin-token': token }
+  });
+  assert.equal(response.status, 200);
+  const dashboard = await response.json();
+  const serialized = JSON.stringify(dashboard);
+  for (const marker of [
+    'DASHBOARD_OUTPUT_SECRET', 'DASHBOARD_ARG_SECRET', 'DASHBOARD_ENV_SECRET',
+    'DASHBOARD_POST_CHECK_NAME_SECRET', 'DASHBOARD_POST_CHECK_OUTPUT_SECRET',
+    'DASHBOARD_OPERATION_ID_SECRET', 'DASHBOARD_OPERATION_SUMMARY_SECRET',
+    'DASHBOARD_PENDING_ID_SECRET', 'DASHBOARD_PENDING_ARG_SECRET', 'DASHBOARD_PENDING_REASON_SECRET'
+  ]) assert.doesNotMatch(serialized, new RegExp(marker));
+  assert.doesNotMatch(serialized, new RegExp(runtime.root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+  assert.equal(dashboard.runtime.version, AGENT_VERSION);
+  assert.equal(dashboard.health.state, 'degraded');
+  assert.equal(dashboard.permissions.pending, 1);
+  assert.equal(dashboard.usage.recent.length, 100);
+  assert.equal(dashboard.usage.windowSize, 120);
+  assert.equal(dashboard.usage.persistent.enabled, true);
+  assert.ok(dashboard.usage.persistent.matchedAsyncSessionEvents >= 1);
+  assert.equal(typeof dashboard.usage.persistent.runtimeBootId, 'string');
+  assert.equal(dashboard.activity.length, 1);
+  assert.equal(dashboard.sessions.items.length, 1);
+  const session = dashboard.sessions.items[0];
+  assert.equal(session.workspaceId, 'repo');
+  assert.equal(session.cwd, '.');
+  assert.ok(session.stdoutBytes > 0);
+  for (const forbidden of ['command', 'operationId', 'fingerprint', 'stdout', 'stderr', 'postChecks']) {
+    assert.equal(Object.hasOwn(session, forbidden), false, `session summary leaked ${forbidden}`);
+  }
+  assert.deepEqual(dashboard.admission.blocking, { limit: 4, active: 0, queued: 0 });
+  assert.deepEqual(dashboard.admission.process, { limit: 4, active: 0, queued: 0 });
+});
+
+test('management health validators reject incomplete local metadata contracts', () => {
+  assert.equal(validateManagementHealthPayload('/health', {
+    ok: true,
+    server: 'coding-tools-mcp-node',
+    version: AGENT_VERSION,
+    toolProfile: 'core'
+  }).ok, true);
+  assert.equal(validateManagementHealthPayload('/health', { ok: true }).ok, false);
+
+  assert.equal(validateManagementHealthPayload('/mcp/info', {
+    name: 'coding-tools-mcp-node',
+    version: AGENT_VERSION,
+    transport: 'streamable-http',
+    supportedProtocolVersions: ['2025-11-25'],
+    tools: ['server_info']
+  }).ok, true);
+  assert.equal(validateManagementHealthPayload('/mcp/info', {
+    name: 'coding-tools-mcp-node',
+    version: AGENT_VERSION,
+    transport: 'streamable-http',
+    supportedProtocolVersions: [],
+    tools: []
+  }).ok, false);
+
+  assert.equal(validateManagementHealthPayload('/.well-known/oauth-authorization-server', {
+    issuer: 'http://127.0.0.1:3789',
+    authorization_endpoint: 'http://127.0.0.1:3789/oauth/authorize',
+    token_endpoint: 'http://127.0.0.1:3789/oauth/token',
+    response_types_supported: ['code'],
+    grant_types_supported: ['authorization_code'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none']
+  }).ok, true);
+  assert.equal(validateManagementHealthPayload('/.well-known/oauth-authorization-server', {
+    issuer: 'http://127.0.0.1:3789'
+  }).ok, false);
+
+  assert.equal(validateManagementHealthPayload('/.well-known/oauth-protected-resource/mcp', {
+    resource: 'http://127.0.0.1:3789/mcp',
+    authorization_servers: ['http://127.0.0.1:3789'],
+    bearer_methods_supported: ['header'],
+    scopes_supported: ['mcp']
+  }).ok, true);
+  assert.equal(validateManagementHealthPayload('/.well-known/oauth-protected-resource/mcp', {
+    resource: 'http://127.0.0.1:3789/mcp'
+  }).ok, false);
+});
+
+test('management observability routes expose sanitized telemetry, operation logs, history, health and diagnostics', async t => {
+  const runtime = await startManagementServer(t);
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(pageHtml);
+  assert.ok(token);
+  const workspaceId = runtime.context.config.workspaceId ?? runtime.context.workspaceProfileId;
+  const headers = { 'x-ctmcp-admin-token': token, origin: runtime.base };
+
+  runtime.context.usageStore.enqueue({
+    schema_version: 7,
+    event: 'tool_call',
+    workspace_id: workspaceId,
+    runtime_boot_id: runtime.context.usageStore.runtimeBootId,
+    server_version: runtime.context.usageStore.serverVersion,
+    tool: 'exec_command',
+    started_ts_ms: Date.now(),
+    duration_ms: 42,
+    outcome: 'success',
+    outcome_class: 'success',
+    is_error: false,
+    response_json_bytes: 123,
+    command_preview: 'TELEMETRY_COMMAND_SECRET',
+    resolved_cwd: 'TELEMETRY_PATH_SECRET',
+    session_id: 'TELEMETRY_SESSION_SECRET',
+    argument_record: { password: 'TELEMETRY_ARGUMENT_SECRET' }
+  });
+
+  const telemetryResponse = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/telemetry?scope=current_runtime&limit=50`, { headers });
+  assert.equal(telemetryResponse.status, 200);
+  const telemetry = await telemetryResponse.json();
+  assert.equal(telemetry.records.length, 1);
+  assert.equal(telemetry.records[0].tool, 'exec_command');
+  const telemetryText = JSON.stringify(telemetry);
+  for (const marker of ['TELEMETRY_COMMAND_SECRET', 'TELEMETRY_PATH_SECRET', 'TELEMETRY_SESSION_SECRET', 'TELEMETRY_ARGUMENT_SECRET']) {
+    assert.doesNotMatch(telemetryText, new RegExp(marker));
+  }
+  const operationWorkspaceId = await harnessWorkspaceId(runtime.root);
+  const operationNow = Date.now();
+  const operationReasonMarker = 'OP_LOG_REASON_MARKER';
+  const operationPasswordMarker = 'OP_LOG_PASSWORD_MARKER';
+  const operationCommandMarker = 'OP_LOG_COMMAND_MARKER';
+  const operationTailMarker = 'OP_LOG_MULTILINE_TAIL';
+  const operationOutsidePath = path.join(path.dirname(runtime.root), 'outside debug', 'secret.txt');
+  const operationRecords = [
+    {
+      id: 'completed-operation-id', workspace_id: operationWorkspaceId, task_id: 'OPERATION_TASK_SECRET',
+      tool: 'edit_file', kind: 'started', input_summary: { arguments_present: true }, result_summary: { ok: true },
+      affected_files: [], created_at: String(operationNow - 4_000)
+    },
+    {
+      id: 'completed-operation-id', workspace_id: operationWorkspaceId, task_id: 'OPERATION_TASK_SECRET',
+      tool: 'edit_file', kind: 'completed', input_summary: { arguments_present: true },
+      result_summary: { ok: true, affected_files: [{ path: path.join(runtime.root, 'private.txt') }] },
+      reason: `${['to', 'ken'].join('')}=${operationReasonMarker} workspace=${runtime.root}`,
+      affected_files: [], created_at: String(operationNow - 3_500)
+    },
+    {
+      id: 'failed-operation-id', workspace_id: operationWorkspaceId,
+      tool: 'exec_command', kind: 'started', input_summary: { arguments_present: true }, result_summary: { ok: true },
+      affected_files: [], created_at: String(operationNow - 3_000)
+    },
+    {
+      id: 'failed-operation-id', workspace_id: operationWorkspaceId,
+      tool: 'exec_command', kind: 'completed', input_summary: { arguments_present: true },
+      result_summary: {
+        ok: true,
+        transport_ok: true,
+        execution_ok: true,
+        command_ok: false,
+        verification_ok: false,
+        termination_reason: 'exited',
+        process_exit_code: 7,
+        process_timed_out: false,
+        request_timed_out: false,
+        retryable: true,
+        error_code: 'COMMAND_FAILED',
+        error_category: 'process',
+        elapsed_ms: 1_000,
+        first_output_ms: 50,
+        stdout_bytes: 10,
+        stderr_bytes: 20,
+        blocking_queue_wait_ms: 5,
+        workspace_admission_wait_ms: 6,
+        warning_count: 2,
+        command: 'OPERATION_COMMAND_SECRET',
+        stdout: 'OPERATION_OUTPUT_SECRET'
+      },
+      reason: `${['pass', 'word'].join('')}=${operationPasswordMarker}; ${['com', 'mand'].join('')}=${operationCommandMarker}; path="${operationOutsidePath}"\n${operationTailMarker}`,
+      affected_files: [], created_at: String(operationNow - 2_000)
+    },
+    {
+      id: 'incomplete-operation-id', workspace_id: operationWorkspaceId,
+      tool: 'git_status', kind: 'started', input_summary: { arguments_present: true }, result_summary: { ok: true },
+      affected_files: [], created_at: String(operationNow - 1_000)
+    },
+    {
+      id: 'incomplete-operation-id', workspace_id: operationWorkspaceId,
+      tool: 'git_status', kind: 'completed', input_summary: { arguments_present: true },
+      result_summary: { ok: true, status: 'running', command_ok: null },
+      affected_files: [], created_at: String(operationNow - 900)
+    }
+  ];
+  for (const record of operationRecords) await runtime.context.state.addOperation(operationWorkspaceId, record);
+
+  const failedLogsResponse = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/logs?folderId=repo&status=failed&limit=1`, { headers });
+  assert.equal(failedLogsResponse.status, 200);
+  const failedLogs = await failedLogsResponse.json();
+  assert.equal(failedLogs.source, 'operation_log');
+  assert.deepEqual(failedLogs.summary, { total: 3, completed: 1, failed: 1, incomplete: 1 });
+  assert.equal(failedLogs.matched, 1);
+  assert.equal(failedLogs.operations[0].id, 'failed-operation-id');
+  assert.equal(failedLogs.operations[0].status, 'failed');
+  assert.equal(failedLogs.operations[0].durationMs, 1_000);
+  assert.equal(failedLogs.operations[0].events.at(-1).kind, 'completed');
+  assert.deepEqual(failedLogs.operations[0].diagnostics, {
+    commandOk: false,
+    transportOk: true,
+    executionOk: true,
+    verificationOk: false,
+    errorCode: 'COMMAND_FAILED',
+    errorCategory: 'process',
+    retryable: true,
+    runtimeStatus: null,
+    terminationReason: 'exited',
+    executionLane: null,
+    outcomeClass: null,
+    exitCode: 7,
+    processTimedOut: false,
+    requestTimedOut: false,
+    recoverable: null,
+    truncated: null,
+    stdoutTruncated: null,
+    stderrTruncated: null,
+    cursorExpired: null,
+    postChecksPending: null,
+    detached: null,
+    deduplicated: null,
+    elapsedMs: 1_000,
+    actualWaitMs: null,
+    firstOutputMs: 50,
+    stdoutBytes: 10,
+    stderrBytes: 20,
+    warningCount: 2,
+    waitMs: {
+      blocking: 5,
+      workspaceAdmission: 6,
+      globalAdmission: null,
+      admissionQueue: null,
+      workspaceLock: null,
+      operationLock: null,
+      resourceLock: null,
+      historyLock: null,
+      sessionRegistry: null
+    }
+  });
+  assert.match(failedLogs.operations[0].reason, /\[REDACTED\]/);
+  assert.match(failedLogs.operations[0].reason, /\[PATH\]/);
+
+  const logsResponse = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/logs?folderId=repo&limit=2`, { headers });
+  assert.equal(logsResponse.status, 200);
+  const logs = await logsResponse.json();
+  assert.equal(logs.operations.length, 2);
+  assert.equal(logs.operations[0].status, 'incomplete');
+  assert.equal(logs.operations[0].events.at(-1).kind, 'completed');
+  assert.equal(logs.operations[0].diagnostics.runtimeStatus, 'running');
+  assert.equal(logs.nextCursor, 2);
+  const olderLogsResponse = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/logs?folderId=repo&cursor=2&limit=2`, { headers });
+  assert.equal(olderLogsResponse.status, 200);
+  const olderLogs = await olderLogsResponse.json();
+  assert.equal(olderLogs.operations[0].id, 'completed-operation-id');
+  assert.equal(olderLogs.operations[0].taskTracked, true);
+  assert.equal(olderLogs.operations[0].affectedFileCount, 1);
+  assert.equal(olderLogs.nextCursor, null);
+  const operationLogText = JSON.stringify({ failedLogs, logs, olderLogs });
+  for (const marker of [
+    operationReasonMarker, operationPasswordMarker, operationCommandMarker, operationTailMarker,
+    operationOutsidePath, 'OPERATION_COMMAND_SECRET', 'OPERATION_OUTPUT_SECRET', 'OPERATION_TASK_SECRET', operationWorkspaceId
+  ]) assert.doesNotMatch(operationLogText, new RegExp(marker));
+  assert.doesNotMatch(operationLogText, new RegExp(runtime.root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+  const invalidLogFilter = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/logs?folderId=repo&status=unknown`, { headers });
+  assert.equal(invalidLogFilter.status, 400);
+  const historyDir = path.join(runtime.root, 'docs', 'history-session');
+  await mkdir(historyDir, { recursive: true });
+  const historyContent = renderDocument(1, 'Management UI archive', 'HISTORY_SESSION_KEY_SECRET', 'unix:1', 'unix:2', 'completed', [{
+    turn_id: 'ui-observability',
+    timestamp: 'unix:2',
+    user_intent: 'Expose archive records',
+    findings: ['History is read-only'],
+    decisions: ['Do not add live activity badges'],
+    files_changed: ['docs/example.md'],
+    tests: ['management route test'],
+    runtime_state: ['healthy'],
+    remaining_issues: [],
+    next_actions: ['ship'],
+    notes: 'archive note'
+  }]);
+  await writeFile(path.join(historyDir, '1.md'), historyContent);
+
+  const historyResponse = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/history?folderId=repo`, { headers });
+  assert.equal(historyResponse.status, 200);
+  const history = await historyResponse.json();
+  assert.equal(history.sessions.length, 1);
+  assert.equal(history.sessions[0].checkpointCount, 1);
+  assert.doesNotMatch(JSON.stringify(history), /HISTORY_SESSION_KEY_SECRET/);
+
+  const detailResponse = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/history/1?folderId=repo`, { headers });
+  assert.equal(detailResponse.status, 200);
+  const detail = await detailResponse.json();
+  assert.equal(detail.records[0].turnId, 'ui-observability');
+  assert.equal(detail.records[0].decisions[0], 'Do not add live activity badges');
+  assert.doesNotMatch(detail.content, /HISTORY_SESSION_KEY_SECRET/);
+  assert.match(detail.content, /\*\*Session key:\*\* \[REDACTED\]/);
+
+  const externalHistory = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-history-outside-'));
+  t.after(() => rm(externalHistory, { recursive: true, force: true }));
+  await writeFile(path.join(externalHistory, '1.md'), historyContent.replace('archive note', 'OUTSIDE_HISTORY_SECRET'));
+  await rm(historyDir, { recursive: true, force: true });
+  await symlink(externalHistory, historyDir, process.platform === 'win32' ? 'junction' : 'dir');
+  const escapedHistoryResponse = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/history?folderId=repo`, { headers });
+  assert.equal(escapedHistoryResponse.status, 403);
+  assert.equal((await escapedHistoryResponse.json()).error.code, 'HISTORY_PATH_OUTSIDE_WORKSPACE');
+
+  const healthResponse = await rawJsonRequest(`${runtime.base}/admin/api/workspaces/${workspaceId}/health`, {
+    method: 'POST',
+    headers: {
+      ...headers,
+      host: 'localhost:9',
+      origin: 'http://localhost:9'
+    }
+  });
+  assert.equal(healthResponse.status, 200);
+  const health = healthResponse.json;
+  assert.equal(health.ok, true);
+  assert.equal(health.items.some(item => item.id === '/health' && item.ok), true);
+  assert.equal(health.items.some(item => item.id === '/mcp/info' && item.ok), true);
+  assert.equal(health.items.some(item => item.id === '/.well-known/oauth-authorization-server' && item.ok), true);
+  assert.equal(health.items.some(item => item.id === '/.well-known/oauth-protected-resource/mcp' && item.ok), true);
+  const mcpChallenge = health.items.find(item => item.id === '/mcp');
+  assert.equal(mcpChallenge?.ok, true);
+  assert.equal(mcpChallenge?.status, 401);
+  assert.match(String(mcpChallenge?.detail), /OAuth protected-resource challenge/);
+  assert.doesNotMatch(JSON.stringify(health), /localhost:9/);
+
+  const diagnosticsResponse = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/diagnostics`, { headers });
+  assert.equal(diagnosticsResponse.status, 200);
+  const diagnosticsText = JSON.stringify(await diagnosticsResponse.json());
+  assert.doesNotMatch(diagnosticsText, new RegExp(runtime.root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  for (const marker of [
+    'management-test-password', 'management-test-client-secret', 'management-test-token-secret',
+    'TELEMETRY_COMMAND_SECRET', 'TELEMETRY_PATH_SECRET', 'TELEMETRY_SESSION_SECRET', 'TELEMETRY_ARGUMENT_SECRET',
+    'HISTORY_SESSION_KEY_SECRET'
+  ]) assert.doesNotMatch(diagnosticsText, new RegExp(marker));
+});
+
+test('management API atomically saves restart configuration while preserving omitted secrets', async t => {
+  const runtime = await startManagementServer(t);
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(pageHtml);
+  assert.ok(token);
+
+  const payload = editable(runtime.loaded.config, {
+    port: 4791,
+    permissionMode: 'guarded',
+    folders: [
+      { id: 'repo', name: 'Primary', path: path.join(runtime.root, 'nested', '..') },
+      { id: 'second', name: 'Second', path: runtime.dataDir }
+    ],
+    policy: {
+      allowedCommands: ['git', 'node', 'npm'],
+      workspaceLocalEntries: false,
+      workspaceScriptExtensions: ['.cmd', '.ps1', '.sh'],
+      maxPatchBytes: 2 * 1024 * 1024
+    },
+    limits: {
+      ...runtime.loaded.config.limits,
+      processConcurrency: 7,
+      globalBlockingConcurrency: 33,
+      globalProcessConcurrency: 17
+    }
+  });
+  const response = await fetch(`${runtime.base}/admin/api/config`, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify(payload)
+  });
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.restartRequired, true);
+  assert.equal(result.saved.port, 4791);
+  assert.equal(result.saved.permissionMode, 'guarded');
+  assert.equal(result.saved.folders.length, 2);
+
+  const saved = JSON.parse(await readFile(runtime.configPath, 'utf8'));
+  assert.equal(saved.schema_version, 1);
+  assert.equal(saved.port, 4791);
+  assert.deepEqual(saved.oauth, { clientId: 'chatgpt' });
+  assert.equal(saved.limits.processConcurrency, 7);
+  assert.equal(saved.limits.globalBlockingConcurrency, 33);
+  assert.equal(saved.limits.globalProcessConcurrency, 17);
+  assert.deepEqual(saved.policy.allowedCommands, ['git', 'node', 'npm']);
+  assert.equal(saved.policy.workspaceLocalEntries, false);
+  assert.deepEqual(saved.policy.workspaceScriptExtensions, ['.cmd', '.ps1', '.sh']);
+  assert.equal(saved.policy.maxPatchBytes, 2 * 1024 * 1024);
+  assert.equal(saved.folders[0].path, await realpath(runtime.root));
+  const publicText = JSON.stringify(saved);
+  assert.doesNotMatch(publicText, /management-test-password|management-test-client-secret|management-test-token-secret/);
+  const encrypted = await readFile(runtime.loaded.secretStorePath, 'utf8');
+  assert.doesNotMatch(encrypted, /management-test-password|management-test-client-secret|management-test-token-secret/);
+  const restarted = await loadConfigBundle(runtime.configPath);
+  assert.equal(restarted.config.oauth.password, 'management-test-password');
+  assert.equal(restarted.config.oauth.clientSecret, 'management-test-client-secret');
+  assert.equal(restarted.config.oauth.tokenSecret, 'management-test-token-secret-that-is-long-enough');
+  assert.equal(restarted.config.port, 4791);
+  assert.equal(restarted.config.folders[0].path, await realpath(runtime.root));
+  assert.equal(runtime.loaded.config.port, 0, 'running configuration must not be hot-mutated');
+});
+
+test('management rejects duplicate canonical workspace roots before restart', async t => {
+  const runtime = await startManagementServer(t);
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(pageHtml);
+  assert.ok(token);
+  const payload = editable(runtime.loaded.config, {
+    folders: [
+      { id: 'primary', name: 'Primary', path: runtime.root },
+      { id: 'alias', name: 'Alias', path: path.join(runtime.root, '.') }
+    ]
+  });
+  const response = await fetch(`${runtime.base}/admin/api/config`, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify(payload)
+  });
+  assert.equal(response.status, 400);
+  const result = await response.json();
+  assert.equal(result.error.code, 'CONFIG_INVALID');
+  assert.match(result.error.message, /same physical workspace root/i);
+});
+
+test('saving the effective configuration unchanged does not require a restart', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-same-root-'));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-same-data-'));
+  const configPath = path.join(dataDir, 'agent.json');
+  await writeFile(configPath, `${JSON.stringify(document(root, dataDir), null, 2)}\n`);
+  const loaded = await loadConfigBundle(configPath);
+  const store = new ConfigStore(loaded);
+  assert.equal(store.snapshot().restartRequired, false);
+  const result = await store.save(editable(loaded.config));
+  assert.equal(result.restartRequired, false);
+  assert.equal(result.warning, null);
+});
+
+test('management keeps saved values separate while writing secrets to the effective environment data directory', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-env-root-'));
+  const savedDataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-env-saved-'));
+  const effectiveDataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-env-effective-'));
+  const configPath = path.join(savedDataDir, 'agent.json');
+  await writeFile(configPath, `${JSON.stringify(document(root, savedDataDir), null, 2)}\n`);
+  const previous = process.env.CTMCP_DATA_DIR;
+  process.env.CTMCP_DATA_DIR = effectiveDataDir;
+  try {
+    const loaded = await loadConfigBundle(configPath);
+    const store = new ConfigStore(loaded);
+    const snapshot = store.snapshot();
+    assert.equal(snapshot.effective.dataDir, effectiveDataDir);
+    assert.equal(snapshot.saved.dataDir, savedDataDir);
+    const result = await store.save(editable(loaded.config, {
+      dataDir: savedDataDir,
+      oauth: {
+        clientId: loaded.config.oauth.clientId,
+        password: 'environment-data-password',
+        clientSecret: '',
+        clearClientSecret: false
+      }
+    }));
+    assert.equal(result.secretStorePath, path.join(effectiveDataDir, 'agent-secrets.enc.json'));
+    const effectiveSecrets = await readAgentSecrets(effectiveDataDir);
+    assert.equal(effectiveSecrets.secrets.oauthPassword, 'environment-data-password');
+    assert.equal(JSON.parse(await readFile(configPath, 'utf8')).dataDir, savedDataDir);
+  } finally {
+    if (previous === undefined) delete process.env.CTMCP_DATA_DIR;
+    else process.env.CTMCP_DATA_DIR = previous;
+  }
+});
+
+test('management save rolls back encrypted secrets when the public config write fails', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-rollback-root-'));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-rollback-data-'));
+  const configPath = path.join(dataDir, 'agent.json');
+  await writeFile(configPath, `${JSON.stringify(document(root, dataDir), null, 2)}\n`);
+  const loaded = await loadConfigBundle(configPath);
+  const store = new ConfigStore(loaded);
+  const beforeStore = await readFile(loaded.secretStorePath, 'utf8');
+  const beforeKey = await readFile(loaded.secretKeyPath, 'utf8');
+
+  await rm(configPath);
+  await mkdir(configPath);
+  await assert.rejects(store.save(editable(loaded.config, {
+    oauth: {
+      clientId: loaded.config.oauth.clientId,
+      password: 'replacement-password',
+      clientSecret: '',
+      clearClientSecret: false
+    }
+  })));
+
+  assert.equal(await readFile(loaded.secretStorePath, 'utf8'), beforeStore);
+  assert.equal(await readFile(loaded.secretKeyPath, 'utf8'), beforeKey);
+  const restored = await readAgentSecrets(dataDir);
+  assert.equal(restored.secrets.oauthPassword, 'management-test-password');
+  assert.equal(restored.secrets.oauthClientSecret, 'management-test-client-secret');
+  assert.equal(restored.secrets.oauthTokenSecret, 'management-test-token-secret-that-is-long-enough');
+});
+
+test('management save copies encrypted secrets when the data directory changes', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-move-root-'));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-move-data-'));
+  const nextDataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-move-next-'));
+  const configPath = path.join(dataDir, 'agent.json');
+  await writeFile(configPath, `${JSON.stringify(document(root, dataDir), null, 2)}\n`);
+  const loaded = await loadConfigBundle(configPath);
+  const store = new ConfigStore(loaded);
+  const result = await store.save(editable(loaded.config, { dataDir: nextDataDir }));
+  assert.equal(result.restartRequired, true);
+  assert.equal(result.secretStorePath, path.join(nextDataDir, 'agent-secrets.enc.json'));
+  await access(result.secretStorePath);
+  await access(path.join(nextDataDir, 'agent-secrets.key'));
+  const saved = JSON.parse(await readFile(configPath, 'utf8'));
+  assert.equal(saved.dataDir, nextDataDir);
+  const restarted = await loadConfigBundle(configPath);
+  assert.equal(restarted.config.oauth.password, 'management-test-password');
+  assert.equal(restarted.config.oauth.clientSecret, 'management-test-client-secret');
+  assert.equal(restarted.config.oauth.tokenSecret, 'management-test-token-secret-that-is-long-enough');
+});
+
+test('management validates saved tool profiles and reports the permission-resolved profile', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-profile-root-'));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-profile-data-'));
+  const configPath = path.join(dataDir, 'agent.json');
+  await writeFile(configPath, `${JSON.stringify(document(root, dataDir), null, 2)}\n`);
+  const loaded = await loadConfigBundle(configPath);
+  const store = new ConfigStore(loaded);
+
+  await assert.rejects(
+    store.save(editable(loaded.config, { toolProfile: 'not-a-profile' })),
+    /toolProfile is invalid/
+  );
+
+  const result = await store.save(editable(loaded.config, {
+    permissionMode: 'guarded',
+    toolProfile: 'core'
+  }));
+  assert.equal(result.restartRequired, true);
+  assert.equal(result.saved.toolProfile, 'core');
+  assert.equal(result.saved.activeToolProfile, 'guarded-core');
+  const persisted = JSON.parse(await readFile(configPath, 'utf8'));
+  assert.equal(persisted.toolProfile, 'core');
+});
+
+test('management UI can be disabled without disabling the headless server', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-no-ui-root-'));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-no-ui-data-'));
+  const configPath = path.join(dataDir, 'agent.json');
+  const input = document(root, dataDir);
+  input.management.enabled = false;
+  await writeFile(configPath, JSON.stringify(input));
+  const loaded = await loadConfigBundle(configPath);
+  loaded.config.port = 0;
+  const server = await createAgentServer(loaded.config, { configStore: new ConfigStore(loaded) });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const base = `http://127.0.0.1:${address.port}`;
+  assert.equal((await fetch(`${base}/ui`)).status, 404);
+  const health = await fetch(`${base}/health`).then(response => response.json());
+  assert.equal(health.ok, true);
+  assert.equal(health.headless, true);
+  assert.equal(health.management.enabled, false);
+});

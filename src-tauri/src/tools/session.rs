@@ -9,7 +9,9 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::{watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
+use crate::harness::{model::OperationRecord, Harness};
 use crate::mcp::{record_async_session_finalized, AsyncSessionTelemetry};
+use crate::tools::dispatch::operation_result_summary;
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 
 const SESSION_BUFFER_BYTES: usize = 1_048_576;
@@ -403,6 +405,12 @@ struct EventBatch {
     has_more: bool,
 }
 
+#[derive(Clone)]
+struct HarnessOperationTracking {
+    harness: Harness,
+    operation: OperationRecord,
+}
+
 pub struct ExecSession {
     pub session_id: String,
     pub(crate) child: AsyncMutex<Child>,
@@ -435,6 +443,8 @@ pub struct ExecSession {
     telemetry_command_kind: String,
     started_ts_ms: u64,
     operation_id: Option<String>,
+    harness_operations: Mutex<Vec<HarnessOperationTracking>>,
+    harness_operation_recorded: Mutex<HashSet<String>>,
     command_fingerprint: Option<String>,
     resource_lock_group: Option<String>,
     resource_lock_target: Option<String>,
@@ -510,6 +520,8 @@ impl ExecSession {
             telemetry_command_kind: "process".to_string(),
             started_ts_ms: unix_timestamp_ms(),
             operation_id: None,
+            harness_operations: Mutex::new(Vec::new()),
+            harness_operation_recorded: Mutex::new(HashSet::new()),
             command_fingerprint: None,
             resource_lock_group: None,
             resource_lock_target: None,
@@ -536,6 +548,25 @@ impl ExecSession {
         self.operation_lock_wait_ms = operation_lock_wait_ms;
         self.resource_lock_wait_ms = resource_lock_wait_ms;
         self
+    }
+
+    pub fn attach_harness_operation(&self, harness: Harness, operation: OperationRecord) {
+        let mut operations = self
+            .harness_operations
+            .lock()
+            .expect("harness operation lock");
+        if let Some(existing) = operations
+            .iter_mut()
+            .find(|tracking| tracking.operation.id == operation.id)
+        {
+            *existing = HarnessOperationTracking { harness, operation };
+        } else {
+            operations.push(HarnessOperationTracking { harness, operation });
+        }
+        drop(operations);
+        if self.is_finalized() {
+            self.record_harness_operation_finalization();
+        }
     }
 
     pub fn operation_id(&self) -> Option<&str> {
@@ -797,7 +828,50 @@ impl ExecSession {
         drop(finalized_at);
         self.active_slot.lock().expect("active slot lock").take();
         self.record_finalization_telemetry();
+        self.record_harness_operation_finalization();
         self.notify_change();
+    }
+
+    fn record_harness_operation_finalization(&self) {
+        let operations = self
+            .harness_operations
+            .lock()
+            .expect("harness operation lock")
+            .clone();
+        for tracking in operations {
+            {
+                let mut recorded = self
+                    .harness_operation_recorded
+                    .lock()
+                    .expect("harness operation recorded lock");
+                if !recorded.insert(tracking.operation.id.clone()) {
+                    continue;
+                }
+            }
+            let summary = operation_result_summary(&tracking.operation.tool, &self.summary());
+            let kind = if summary.get("command_ok").and_then(Value::as_bool) == Some(true) {
+                "completed"
+            } else {
+                "failed"
+            };
+            if tracking
+                .harness
+                .record_operation(
+                    Some(&tracking.operation.id),
+                    tracking.operation.task_id.as_deref(),
+                    &tracking.operation.tool,
+                    kind,
+                    tracking.operation.input_summary.clone(),
+                    summary,
+                )
+                .is_err()
+            {
+                self.harness_operation_recorded
+                    .lock()
+                    .expect("harness operation recorded lock")
+                    .remove(&tracking.operation.id);
+            }
+        }
     }
 
     fn record_finalization_telemetry(&self) {

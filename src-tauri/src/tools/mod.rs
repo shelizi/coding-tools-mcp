@@ -7,6 +7,7 @@ pub mod git;
 pub mod history;
 pub mod hub;
 mod image_tool;
+pub(crate) mod parallel_stats;
 pub mod patch;
 pub mod permission;
 pub mod policy;
@@ -27,3 +28,5 @@ pub use registry::{
     MUTATING_TOOLS,
 };
 pub use workspace::{wrap_mcp_tool_result, wrap_tool_result, Workspace};
+
+pub(crate) use process_start::behavioral_parity_fixture as process_start_behavioral_parity_fixture;

@@ -99,6 +99,22 @@ fn 外部文件变化会被识别且操作会留下事件() {
 }
 
 #[test]
+fn project_state在截断前计算完整脏状态() {
+    let (_temp, workspace, harness_root) = fixture();
+    fs::write(workspace.join("a-clean.txt"), "clean\n").expect("写入干净文件");
+    fs::write(workspace.join("z-changed.txt"), "before\n").expect("写入变更文件");
+    let harness = Harness::new(workspace.clone(), harness_root).expect("创建 Harness");
+    harness.start_task("验证截断脏状态").expect("启动任务");
+    fs::write(workspace.join("z-changed.txt"), "after\n").expect("修改截断外文件");
+
+    let state = harness.project_state(1).expect("读取项目状态");
+    assert!(state.truncated);
+    assert_eq!(state.files.len(), 1);
+    assert!(state.files.iter().all(|file| file.status == "unchanged"));
+    assert!(!state.clean);
+}
+
+#[test]
 fn project_state包含分支任务和脏状态摘要() {
     let (_temp, workspace, harness_root) = fixture();
     let harness = Harness::new(workspace, harness_root).expect("创建 Harness");

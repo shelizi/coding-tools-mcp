@@ -942,7 +942,18 @@ mod tests {
             "mcp-max-idle-workers",
             "mcp-max-workers",
             "mcp-max-requests-per-worker",
+            "mcp-max-pending-requests",
+            "mcp-worker-acquire-timeout-ms",
+            "mcp-max-connecting-workers",
+            "mcp-connecting-capacity-grace-ms",
+            "mcp-scale-down-step",
+            "mcp-burst-warm-workers",
+            "mcp-burst-warm-seconds",
             "actions-max-workers",
+            "actions-max-pending-requests",
+            "actions-worker-acquire-timeout-ms",
+            "actions-scale-down-step",
+            "actions-burst-warm-seconds",
             "/api/worker-policies",
             "primary-tabs",
             "clients-panel",
@@ -951,6 +962,9 @@ mod tests {
             "purge-revoked",
             "/api/devices/revoked/purge",
             "health-status",
+            "queue-balance",
+            "queue-wait",
+            "capacity-errors",
             "worker-count",
             "/api/dashboard",
             "/api/workers",
@@ -1195,6 +1209,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("policy json");
         assert_eq!(value["mcp"]["max_workers"], 16);
         assert_eq!(value["actions"]["min_idle_workers"], 2);
+        assert_eq!(value["mcp"]["max_pending_requests"], 32);
+        assert_eq!(value["mcp"]["worker_acquire_timeout_ms"], 10_000);
+        assert_eq!(value["mcp"]["scale_down_step"], 4);
 
         let update = r#"{
             "start_workers":6,
@@ -1226,6 +1243,9 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("updated policy json");
         assert_eq!(value["max_workers"], 24);
         assert_eq!(value["revision"], 2);
+        assert_eq!(value["max_pending_requests"], 32);
+        assert_eq!(value["worker_acquire_timeout_ms"], 10_000);
+        assert_eq!(value["burst_warm_seconds"], 120);
 
         let no_csrf = app
             .oneshot(

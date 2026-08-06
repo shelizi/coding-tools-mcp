@@ -1,8 +1,8 @@
 #![cfg_attr(target_os = "windows", allow(linker_messages))]
 
 mod actions;
-mod application;
 mod app_state;
+mod application;
 mod auth;
 #[cfg(feature = "desktop")]
 mod commands;
@@ -26,13 +26,10 @@ mod workspace;
 /// need the core can build this library with `--no-default-features` without
 /// pulling Tauri, GTK, or WebView dependencies into their binary.
 pub mod core {
+    pub use crate::app_state::{bootstrap_workspace, teardown_workspace, AppState};
     pub use crate::application::runtime::{
-        actions_runtime_status, mcp_runtime_status, restart_actions_runtime,
-        restart_mcp_runtime, start_actions_runtime, start_mcp_runtime, stop_actions_runtime,
-        stop_mcp_runtime,
-    };
-    pub use crate::app_state::{
-        bootstrap_workspace, teardown_workspace, AppState,
+        actions_runtime_status, mcp_runtime_status, restart_actions_runtime, restart_mcp_runtime,
+        start_actions_runtime, start_mcp_runtime, stop_actions_runtime, stop_mcp_runtime,
     };
     pub use crate::data::{AppData, DataStore};
     pub use crate::error::{AppError, AppResult};
@@ -43,21 +40,39 @@ pub mod core {
     };
 }
 
+#[doc(hidden)]
+pub fn export_behavioral_parity_fixtures() -> serde_json::Value {
+    let limits = tools::ExecutionLimits::default();
+    serde_json::json!({
+        "execution_limits": {
+            "blocking_admission": limits.blocking_admission,
+            "process_admission": limits.process_admission,
+            "global_blocking_admission": limits.global_blocking_admission,
+            "global_process_admission": limits.global_process_admission,
+            "active_sessions": limits.active_sessions
+        },
+        "workspace": tools::hub::behavioral_parity_fixture(),
+        "process_start": tools::process_start_behavioral_parity_fixture(),
+        "mcp_transport": mcp::behavioral_parity_fixture(),
+        "tunnel": tunnel::builtin_behavioral_parity_fixture()
+    })
+}
+
 #[cfg(feature = "desktop")]
 use app_state::AppState;
 #[cfg(feature = "desktop")]
 use commands::{
-    add_workspace_folder, create_workspace, create_wsl_workspace, delete_frp_profile, delete_workspace,
-    get_actions_runtime_status, get_app_settings, get_download_config, get_frp_snippet,
-    get_last_workspace_id, get_proxy, get_runtime_status, get_shared_secret, get_workspace_secret,
-    install_software, list_frp_profiles, list_history_sessions, list_software, list_workspaces,
-    list_wsl_distributions,
-    open_workspace_directory, read_history_session, read_workspace_logs, read_workspace_telemetry,
-    regenerate_shared_secret, regenerate_workspace_secret, remove_workspace_folder,
-    restart_actions_runtime, restart_runtime, restart_tunnel, run_health_checks, save_frp_profile,
-    set_download_config, set_last_workspace, set_proxy, set_shared_secret, set_workspace_secret,
-    start_actions_runtime, start_runtime, start_tunnel, stop_actions_runtime, stop_runtime,
-    stop_tunnel, test_tunnel, uninstall_software, update_workspace,
+    add_workspace_folder, create_workspace, create_wsl_workspace, delete_frp_profile,
+    delete_workspace, get_actions_runtime_status, get_app_settings, get_download_config,
+    get_frp_snippet, get_last_workspace_id, get_proxy, get_runtime_status, get_shared_secret,
+    get_workspace_secret, install_software, list_frp_profiles, list_history_sessions,
+    list_software, list_workspaces, list_wsl_distributions, open_workspace_directory,
+    read_history_session, read_workspace_logs, read_workspace_telemetry, regenerate_shared_secret,
+    regenerate_workspace_secret, remove_workspace_folder, restart_actions_runtime, restart_runtime,
+    restart_tunnel, run_health_checks, save_frp_profile, set_download_config, set_last_workspace,
+    set_proxy, set_shared_secret, set_workspace_secret, start_actions_runtime, start_runtime,
+    start_tunnel, stop_actions_runtime, stop_runtime, stop_tunnel, test_tunnel, uninstall_software,
+    update_workspace,
 };
 #[cfg(feature = "desktop")]
 use tauri::Manager;

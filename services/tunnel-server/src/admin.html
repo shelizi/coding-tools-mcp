@@ -177,6 +177,9 @@
       <div class="metric"><span class="muted">連線 Worker</span><strong id="connected-workers">—</strong></div>
       <div class="metric"><span class="muted">Idle / Busy</span><strong id="worker-balance">—</strong></div>
       <div class="metric"><span class="muted">處理中請求</span><strong id="in-flight">—</strong></div>
+      <div class="metric"><span class="muted">排隊中 / 峰值</span><strong id="queue-balance">—</strong></div>
+      <div class="metric"><span class="muted">平均 / 最長排隊</span><strong id="queue-wait">—</strong></div>
+      <div class="metric"><span class="muted">容量拒絕 / 取得逾時</span><strong id="capacity-errors">—</strong></div>
       <div class="metric"><span class="muted">總請求</span><strong id="total-requests">—</strong></div>
       <div class="metric"><span class="muted">錯誤率</span><strong id="error-rate">—</strong></div>
     </section>
@@ -297,6 +300,13 @@
             <label>最長壽命（秒）<input id="mcp-max-lifetime-seconds" type="number" min="0" max="604800" required></label>
             <label>縮容等待（秒）<input id="mcp-scale-down-delay-seconds" type="number" min="0" max="3600" required></label>
             <label>回收 Jitter（%）<input id="mcp-recycle-jitter-percent" type="number" min="0" max="50" required></label>
+            <label>最大排隊請求<input id="mcp-max-pending-requests" type="number" min="1" max="4096" required></label>
+            <label>取得 Worker 期限（ms）<input id="mcp-worker-acquire-timeout-ms" type="number" min="100" max="60000" required></label>
+            <label>同時連線中 Worker（0=自動）<input id="mcp-max-connecting-workers" type="number" min="0" max="256" required></label>
+            <label>連線容量寬限（ms，0=停用）<input id="mcp-connecting-capacity-grace-ms" type="number" min="0" max="30000" required></label>
+            <label>每次縮容數<input id="mcp-scale-down-step" type="number" min="1" max="256" required></label>
+            <label>Burst 保溫 Worker（0=自動）<input id="mcp-burst-warm-workers" type="number" min="0" max="256" required></label>
+            <label>Burst 保溫秒數<input id="mcp-burst-warm-seconds" type="number" min="0" max="3600" required></label>
           </div>
           <div class="policy-actions"><button type="submit">儲存 MCP 政策</button><span id="mcp-policy-revision" class="muted"></span></div>
         </form>
@@ -311,6 +321,13 @@
             <label>最長壽命（秒）<input id="actions-max-lifetime-seconds" type="number" min="0" max="604800" required></label>
             <label>縮容等待（秒）<input id="actions-scale-down-delay-seconds" type="number" min="0" max="3600" required></label>
             <label>回收 Jitter（%）<input id="actions-recycle-jitter-percent" type="number" min="0" max="50" required></label>
+            <label>最大排隊請求<input id="actions-max-pending-requests" type="number" min="1" max="4096" required></label>
+            <label>取得 Worker 期限（ms）<input id="actions-worker-acquire-timeout-ms" type="number" min="100" max="60000" required></label>
+            <label>同時連線中 Worker（0=自動）<input id="actions-max-connecting-workers" type="number" min="0" max="256" required></label>
+            <label>連線容量寬限（ms，0=停用）<input id="actions-connecting-capacity-grace-ms" type="number" min="0" max="30000" required></label>
+            <label>每次縮容數<input id="actions-scale-down-step" type="number" min="1" max="256" required></label>
+            <label>Burst 保溫 Worker（0=自動）<input id="actions-burst-warm-workers" type="number" min="0" max="256" required></label>
+            <label>Burst 保溫秒數<input id="actions-burst-warm-seconds" type="number" min="0" max="3600" required></label>
           </div>
           <div class="policy-actions"><button type="submit">儲存 Actions 政策</button><span id="actions-policy-revision" class="muted"></span></div>
         </form>
@@ -338,7 +355,9 @@
   const policyFields = [
     "start_workers", "min_idle_workers", "max_idle_workers", "max_workers",
     "max_requests_per_worker", "max_lifetime_seconds", "scale_down_delay_seconds",
-    "recycle_jitter_percent"
+    "recycle_jitter_percent", "max_pending_requests", "worker_acquire_timeout_ms",
+    "max_connecting_workers", "connecting_capacity_grace_ms", "scale_down_step",
+    "burst_warm_workers", "burst_warm_seconds"
   ];
 
   async function api(path, options = {}) {
@@ -593,6 +612,9 @@
       $("connected-workers").textContent = dashboard.connected_workers;
       $("worker-balance").textContent = `${dashboard.idle_workers} / ${dashboard.busy_workers}`;
       $("in-flight").textContent = dashboard.in_flight_requests;
+      $("queue-balance").textContent = `${dashboard.queued_requests} / ${dashboard.peak_queued_requests}`;
+      $("queue-wait").textContent = `${dashboard.average_queue_wait_ms.toFixed(1)} / ${dashboard.max_queue_wait_ms} ms`;
+      $("capacity-errors").textContent = `${dashboard.capacity_rejections} / ${dashboard.worker_acquire_timeouts}`;
       $("total-requests").textContent = dashboard.total_requests.toLocaleString();
       $("error-rate").textContent = `${dashboard.error_rate_percent.toFixed(1)}%`;
       $("uptime").textContent = `運行 ${formatDuration(dashboard.uptime_seconds)}`;

@@ -41,6 +41,7 @@ All settings are environment variables. Nothing is auto-generated for you at ser
 | `CODING_TOOLS_TUNNEL_DB` | No | `tunnel-data/tunnel.db` | Container image sets `/data/tunnel.db` |
 | `CODING_TOOLS_TUNNEL_LOG_DIR` | No | `<db-parent>/logs` | Container image sets `/data/logs` |
 | `CODING_TOOLS_TUNNEL_MAX_BODY_BYTES` | No | 8 MiB | Buffered public request body limit |
+| `CODING_TOOLS_TUNNEL_RESPONSE_HEAD_TIMEOUT_MS` | No | `30000` | Guard for response headers **after a worker accepts the job**. Queue time is separate; this is not a tool runtime limit. The desktop sends headers first and streams the result. |
 | `CODING_TOOLS_TUNNEL_RECONNECT_GRACE_MS` | No | built-in default | Worker reconnect grace |
 | `RUST_LOG` | No | `coding_tools_tunnel_server=info` | Tracing filter |
 
@@ -49,6 +50,34 @@ All settings are environment variables. Nothing is auto-generated for you at ser
 Persist the **whole** `/data` directory (DB + logs), not only `tunnel.db`.
 
 Admin credentials are **not** randomly initialized by the server. Create a long password yourself before first start.
+
+## Worker capacity, queueing, and error semantics
+
+Admin WebUI manages independent MCP / Actions startup, idle, maximum, pending queue, connecting grace, staged shrink, and burst-warm policies. Defaults include `start=4`, `min idle=2`, `max idle=4`, `max workers=16`, 32 pending requests, a 10-second worker-acquire deadline, a scale-down step of 4, and a 120-second burst-warm window.
+
+Public requests now have two separate deadlines:
+
+1. **Worker acquisition**: the pending queue has a real policy limit. A full queue or expired acquisition deadline returns `503 Service Unavailable`, `Retry-After: 1`, and `X-Tunnel-Error` (`worker_capacity_exhausted` or `worker_acquire_timeout`).
+2. **Response head**: timing begins only after a worker accepts the job. Only this stage can return `504 Gateway Timeout`.
+
+The server attaches a short-lived demand hint to `request_head`, allowing the desktop to add several workers at once. Connecting workers count as expected capacity only during grace; afterwards they stop suppressing fresh capacity but are not killed merely because the network is slow. After a burst, scale-down occurs in fixed steps and temporarily retains a warm floor to avoid repeated `4 → 16 → 4` oscillation.
+
+The dashboard exposes current/peak queue depth, average/maximum queue wait, capacity rejections, and worker-acquire timeouts. Successful proxied responses include `X-Tunnel-Queue-Wait-Ms`.
+
+## Public MCP concurrency load test
+
+Use `scripts/tunnel-load-test.py`. The access token is read only from an environment variable and is never written to the report:
+
+```powershell
+$env:CODING_TOOLS_MCP_ACCESS_TOKEN = "<access-token>"
+python scripts/tunnel-load-test.py `
+  --endpoint "https://example.com/clients/<client-id>/mcp" `
+  --workspace-folder-id "<folder-id>" `
+  --concurrency 20 `
+  --duration-seconds 45
+```
+
+The JSON report classifies success, expected 503 capacity protection, 504, RPC/transport errors, and reports latency plus queue-wait p50/p95. Expected 503 responses are allowed by default; use `--fail-on-capacity` in CI when they should fail the run.
 
 ## Quick start: Docker Compose (recommended example)
 

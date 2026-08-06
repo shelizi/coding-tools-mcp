@@ -1,16 +1,21 @@
+use std::convert::Infallible;
+use std::future::Future;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
 use axum::extract::{Form, Query, State};
 use axum::http::{
-    header::{ALLOW, CACHE_CONTROL, ORIGIN, WWW_AUTHENTICATE},
+    header::{ALLOW, CACHE_CONTROL, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE},
     HeaderMap, HeaderValue, StatusCode,
 };
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::stream::unfold;
 use serde_json::{json, Value};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{interval, MissedTickBehavior};
 
 use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
@@ -22,9 +27,10 @@ use crate::mcp::server::{
     handle_request, handle_request_async, is_supported_protocol_version, new_state, SharedState,
     LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
-use crate::mcp::session_activity;
+use crate::mcp::session_activity::{self, SessionActivityGuard};
 use crate::mcp::telemetry::{
-    begin_tool_request, format_request_log_value, record_tool_usage, ToolUsageInput,
+    begin_tool_request, format_request_log_value, record_tool_usage, ToolRequestTiming,
+    ToolUsageInput,
 };
 use crate::secret::SecretStore;
 use crate::tools::policy::PolicySettings;
@@ -36,6 +42,18 @@ use crate::workspace::{
 };
 
 pub type ShutdownSender = oneshot::Sender<()>;
+
+const MCP_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const MCP_STREAM_CHANNEL_CAPACITY: usize = 2;
+
+pub(crate) fn behavioral_parity_fixture() -> Value {
+    json!({
+        "latest_protocol_version": LATEST_PROTOCOL_VERSION,
+        "supported_protocol_versions": SUPPORTED_PROTOCOL_VERSIONS,
+        "stream_heartbeat_interval_ms": MCP_STREAM_HEARTBEAT_INTERVAL.as_millis(),
+        "stream_channel_capacity": MCP_STREAM_CHANNEL_CAPACITY
+    })
+}
 
 #[derive(Clone)]
 struct ListenerState {
@@ -49,6 +67,20 @@ struct ListenerState {
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
     transport_mode: String,
+}
+
+struct RpcExecutionContext {
+    state: ListenerState,
+    method: String,
+    request_id: Value,
+    tool_name: String,
+    argument_value: Value,
+    started_ts_ms: u128,
+    started_at: Instant,
+    session_activity: Option<SessionActivityGuard>,
+    request_timing: Option<ToolRequestTiming>,
+    request_json_bytes: usize,
+    protocol_version: String,
 }
 
 fn unix_timestamp_ms() -> u128 {
@@ -349,7 +381,7 @@ async fn mcp_post(
         && (body.get("result").is_some() || body.get("error").is_some());
     let started_ts_ms = unix_timestamp_ms();
     let started_at = Instant::now();
-    let mut session_activity = session_activity::begin(
+    let session_activity = session_activity::begin(
         &state.workspace_id,
         host_session_key,
         &tool_name,
@@ -410,10 +442,39 @@ async fn mcp_post(
         return StatusCode::ACCEPTED.into_response();
     }
 
-    let mcp = state.mcp.clone();
-    let profile_id = state.workspace_id.clone();
     let fast_path = matches!(method.as_str(), "initialize" | "ping" | "tools/list")
         || method.starts_with("notifications/");
+    let execution = execute_rpc(
+        RpcExecutionContext {
+            state,
+            method,
+            request_id,
+            tool_name,
+            argument_value,
+            started_ts_ms,
+            started_at,
+            session_activity,
+            request_timing,
+            request_json_bytes,
+            protocol_version,
+        },
+        body,
+        fast_path,
+    );
+    if !fast_path && !is_notification {
+        return streaming_json_no_store(execution);
+    }
+    let response = execution.await;
+    if standard_transport && is_notification {
+        StatusCode::ACCEPTED.into_response()
+    } else {
+        json_no_store(response)
+    }
+}
+
+async fn execute_rpc(mut context: RpcExecutionContext, body: Value, fast_path: bool) -> Value {
+    let profile_id = context.state.workspace_id.clone();
+    let mcp = context.state.mcp.clone();
     let result: Result<Value, String> = if fast_path {
         Ok(handle_request(&mcp, &body))
     } else {
@@ -421,16 +482,16 @@ async fn mcp_post(
     };
     match result {
         Ok(response) => {
-            let duration_ms = started_at.elapsed().as_millis();
+            let duration_ms = context.started_at.elapsed().as_millis();
             append_profile_log_buffered(
                 &profile_id,
                 "mcp-requests.log",
                 &format!(
                     "[rpc] completed id={} method={} tool={} duration_ms={}",
-                    request_id, method, tool_name, duration_ms
+                    context.request_id, context.method, context.tool_name, duration_ms
                 ),
             );
-            if !tool_name.is_empty() {
+            if !context.tool_name.is_empty() {
                 let result_is_error = response
                     .get("result")
                     .and_then(|result| result.get("isError"))
@@ -448,28 +509,31 @@ async fn mcp_post(
                 } else {
                     "success"
                 };
-                if let Some(activity) = session_activity.as_mut() {
-                    activity.complete(outcome, started_ts_ms.saturating_add(duration_ms));
+                if let Some(activity) = context.session_activity.as_mut() {
+                    activity.complete(outcome, context.started_ts_ms.saturating_add(duration_ms));
                 }
                 record_tool_usage(ToolUsageInput {
                     profile_id: &profile_id,
-                    transport_mode: &state.transport_mode,
-                    protocol_version: &protocol_version,
-                    request_id: &request_id,
-                    method: &method,
-                    tool_name: &tool_name,
-                    arguments: &argument_value,
-                    request_json_bytes,
+                    transport_mode: &context.state.transport_mode,
+                    protocol_version: &context.protocol_version,
+                    request_id: &context.request_id,
+                    method: &context.method,
+                    tool_name: &context.tool_name,
+                    arguments: &context.argument_value,
+                    request_json_bytes: context.request_json_bytes,
                     rpc_fast_path: fast_path,
-                    request_timing: request_timing.as_ref().expect("tool request timing"),
-                    started_ts_ms,
+                    request_timing: context
+                        .request_timing
+                        .as_ref()
+                        .expect("tool request timing"),
+                    started_ts_ms: context.started_ts_ms,
                     duration_ms,
                     outcome,
                     response: Some(&response),
                     worker_error: None,
                 });
             }
-            if tool_name == "exec_command" || tool_name == "exec_health_check" {
+            if context.tool_name == "exec_command" || context.tool_name == "exec_health_check" {
                 let structured = response
                     .get("result")
                     .and_then(|result| result.get("structuredContent"));
@@ -495,43 +559,50 @@ async fn mcp_post(
                     "mcp-requests.log",
                     &format!(
                         "[exec] id={} tool={} is_error={} status={} termination_reason={} exit_code={}",
-                        request_id, tool_name, is_error, status, termination_reason, exit_code
+                        context.request_id,
+                        context.tool_name,
+                        is_error,
+                        status,
+                        termination_reason,
+                        exit_code
                     ),
                 );
             }
-            if standard_transport && is_notification {
-                StatusCode::ACCEPTED.into_response()
-            } else {
-                json_no_store(response)
-            }
+            response
         }
         Err(error) => {
-            let duration_ms = started_at.elapsed().as_millis();
+            let duration_ms = context.started_at.elapsed().as_millis();
             append_profile_log_buffered(
                 &profile_id,
                 "mcp-requests.log",
                 &format!(
                     "[rpc] worker_failed id={} method={} tool={} error={error}",
-                    request_id, method, tool_name
+                    context.request_id, context.method, context.tool_name
                 ),
             );
-            if !tool_name.is_empty() {
+            if !context.tool_name.is_empty() {
                 let worker_error = error.to_string();
-                if let Some(activity) = session_activity.as_mut() {
-                    activity.complete("worker_failed", started_ts_ms.saturating_add(duration_ms));
+                if let Some(activity) = context.session_activity.as_mut() {
+                    activity.complete(
+                        "worker_failed",
+                        context.started_ts_ms.saturating_add(duration_ms),
+                    );
                 }
                 record_tool_usage(ToolUsageInput {
                     profile_id: &profile_id,
-                    transport_mode: &state.transport_mode,
-                    protocol_version: &protocol_version,
-                    request_id: &request_id,
-                    method: &method,
-                    tool_name: &tool_name,
-                    arguments: &argument_value,
-                    request_json_bytes,
+                    transport_mode: &context.state.transport_mode,
+                    protocol_version: &context.protocol_version,
+                    request_id: &context.request_id,
+                    method: &context.method,
+                    tool_name: &context.tool_name,
+                    arguments: &context.argument_value,
+                    request_json_bytes: context.request_json_bytes,
                     rpc_fast_path: fast_path,
-                    request_timing: request_timing.as_ref().expect("tool request timing"),
-                    started_ts_ms,
+                    request_timing: context
+                        .request_timing
+                        .as_ref()
+                        .expect("tool request timing"),
+                    started_ts_ms: context.started_ts_ms,
                     duration_ms,
                     outcome: "worker_failed",
                     response: None,
@@ -540,7 +611,7 @@ async fn mcp_post(
             }
             let error_body = json!({
                 "jsonrpc": "2.0",
-                "id": request_id,
+                "id": context.request_id,
                 "error": {
                     "code": -32603,
                     "message": "Exec RPC worker failed",
@@ -552,15 +623,7 @@ async fn mcp_post(
                     }
                 }
             });
-            if standard_transport && is_notification {
-                transport_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    -32603,
-                    "RPC worker failed",
-                )
-            } else {
-                json_no_store(error_body)
-            }
+            error_body
         }
     }
 }
@@ -726,6 +789,55 @@ fn transport_error(status: StatusCode, code: i64, message: &str) -> Response {
 
 fn json_no_store(value: Value) -> Response {
     ([(CACHE_CONTROL, "no-store")], Json(value)).into_response()
+}
+
+fn streaming_json_no_store<F>(execution: F) -> Response
+where
+    F: Future<Output = Value> + Send + 'static,
+{
+    let (sender, receiver) =
+        mpsc::channel::<Result<Vec<u8>, Infallible>>(MCP_STREAM_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        let mut heartbeat = interval(MCP_STREAM_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        tokio::pin!(execution);
+        loop {
+            tokio::select! {
+                _ = sender.closed() => return,
+                response = &mut execution => {
+                    let payload = serde_json::to_vec(&response).unwrap_or_else(|_| {
+                        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Failed to serialize RPC response"}}"#.to_vec()
+                    });
+                    let _ = sender.send(Ok(payload)).await;
+                    return;
+                }
+                _ = heartbeat.tick() => {
+                    // Leading JSON whitespace keeps every proxy layer active while
+                    // preserving a standards-compatible application/json body.
+                    let _ = sender.try_send(Ok(b"\n".to_vec()));
+                }
+            }
+        }
+    });
+
+    let stream = unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|chunk| (chunk, receiver))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .header(CACHE_CONTROL, "no-store")
+        .header("x-accel-buffering", "no")
+        .header("x-coding-tools-streaming", "1")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| {
+            transport_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                -32603,
+                "Failed to create streaming RPC response",
+            )
+        })
 }
 
 fn method_not_allowed(allow: &'static str) -> Response {
@@ -1060,7 +1172,7 @@ mod tests {
         let command = "powershell -NoProfile -Command \"Start-Sleep -Seconds 30\"";
         #[cfg(unix)]
         let command = "sh -c \"sleep 30\"";
-        let request = tokio::spawn(async move {
+        let response = tokio::time::timeout(Duration::from_secs(2), async move {
             reqwest::Client::new()
                 .post(format!("http://{address}/mcp"))
                 .header("mcp-protocol-version", "2025-11-25")
@@ -1080,7 +1192,18 @@ mod tests {
                 }))
                 .send()
                 .await
-        });
+        })
+        .await
+        .expect("slow tool did not return response headers promptly")
+        .expect("slow tool response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-coding-tools-streaming")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while context.sessions.active_slots_available()
@@ -1096,8 +1219,7 @@ mod tests {
             active_session_limit - 1
         );
 
-        request.abort();
-        let _ = request.await;
+        drop(response);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             context.sessions.active_slots_available(),

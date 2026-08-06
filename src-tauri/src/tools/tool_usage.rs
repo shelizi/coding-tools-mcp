@@ -6,11 +6,24 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::tools::context::ToolContext;
+use crate::tools::parallel_stats::{parallelism_report, ParallelHistory};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 
 const TOOL_USAGE_LOG_FILE: &str = "mcp-tool-usage.jsonl";
 const MAX_ROTATED_FILES: usize = 5;
 const DEFAULT_BURST_IDLE_MS: u64 = 120_000;
+const PHASE_METRICS: [(&str, &str); 4] = [
+    ("preflight", "phase_preflight_ms"),
+    ("plan", "phase_plan_ms"),
+    ("commit", "phase_commit_ms"),
+    ("total", "phase_total_ms"),
+];
+
+#[derive(Default)]
+struct PhaseStats {
+    total_ms: u128,
+    durations: Vec<u64>,
+}
 
 #[derive(Default)]
 struct ToolStats {
@@ -51,6 +64,7 @@ struct ToolStats {
     unexpected_changes: u64,
     format_diff_bytes: u64,
     format_apply_calls: u64,
+    phase_latency: BTreeMap<String, PhaseStats>,
     durations: Vec<u64>,
 }
 
@@ -70,6 +84,8 @@ struct BurstStats {
     server_duration_ms: u128,
     orchestration_gap_ms: u128,
     tools: BTreeMap<String, u64>,
+    sequential_exec_commands: u64,
+    exec_many_calls: u64,
 }
 
 #[derive(Default)]
@@ -93,6 +109,25 @@ struct PerformanceStats {
     bursts: BTreeMap<String, BurstStats>,
     inferred_burst_id: u64,
     previous_completed_ts_ms: u64,
+}
+
+#[derive(Default)]
+struct RepeatedFailureGroup {
+    tool: String,
+    error_code: String,
+    retry_count: u64,
+    chain_count: u64,
+    wasted_duration_ms: u128,
+    max_attempt_count: u64,
+}
+
+#[derive(Default)]
+struct RepeatedFailureStats {
+    retry_count: u64,
+    chain_count: u64,
+    wasted_duration_ms: u128,
+    max_attempt_count: u64,
+    groups: BTreeMap<String, RepeatedFailureGroup>,
 }
 
 pub fn query_tool_usage(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -193,6 +228,8 @@ pub fn query_tool_usage_for_profile(
     let mut slowest = Vec::<Value>::new();
     let mut largest = Vec::<Value>::new();
     let mut performance = PerformanceStats::default();
+    let mut parallel_history = ParallelHistory::default();
+    let mut repeated_failures = RepeatedFailureStats::default();
 
     for path in paths {
         let (scanned, invalid) = visit_complete_jsonl_records(&path, |record| {
@@ -242,6 +279,7 @@ pub fn query_tool_usage_for_profile(
                 return;
             }
             matched_lines += 1;
+            parallel_history.accumulate_record(&record);
             let current_error_signature = error_signature(&record);
             if current_error_signature.is_some()
                 && current_error_signature == previous_error_signature
@@ -249,6 +287,7 @@ pub fn query_tool_usage_for_profile(
                 repeated_identical_error_count += 1;
             }
             previous_error_signature = current_error_signature;
+            accumulate_repeated_failure(&record, &mut repeated_failures);
             if include_performance {
                 accumulate_performance(&record, &mut performance, burst_idle_ms);
             }
@@ -310,6 +349,7 @@ pub fn query_tool_usage_for_profile(
                 "max_ms": stats.durations.iter().copied().max().unwrap_or(0),
                 "request_bytes": stats.request_bytes,
                 "response_bytes": stats.response_bytes,
+                "phase_latency": phase_latency_stats(&stats),
                 "optimization": {
                     "recovery_actions": stats.recovery_actions,
                     "failed_command_ids": stats.failed_command_ids,
@@ -366,6 +406,7 @@ pub fn query_tool_usage_for_profile(
                 "p50_ms": percentile(&totals.durations, 50),
                 "p95_ms": percentile(&totals.durations, 95),
                 "max_ms": totals.durations.iter().copied().max().unwrap_or(0),
+                "phase_latency": phase_latency_stats(&totals),
                 "request_bytes": totals.request_bytes,
                 "response_bytes": totals.response_bytes,
                 "outcomes": outcome_counts,
@@ -384,7 +425,12 @@ pub fn query_tool_usage_for_profile(
                 "deduplicated_calls": totals.deduplicated_calls,
                 "heartbeat_responses": totals.heartbeat_responses,
                 "detached_responses": totals.detached_responses,
-                "repeated_identical_error_count": repeated_identical_error_count
+                "repeated_identical_error_count": repeated_identical_error_count,
+                "repeated_failures": repeated_failure_report(
+                    &repeated_failures,
+                    repeated_identical_error_count,
+                    top,
+                )
             })
         } else {
             Value::Null
@@ -394,6 +440,7 @@ pub fn query_tool_usage_for_profile(
         } else {
             Value::Null
         },
+        "parallelism": parallelism_report(&parallel_history, top),
         "performance": if include_performance {
             performance_report(&performance, top, include_bursts, burst_idle_ms)
         } else {
@@ -675,6 +722,13 @@ fn add_stats(record: &Value, stats: &mut ToolStats) {
         .unwrap_or(0);
     stats.format_apply_calls +=
         u64::from(record.get("format_applied").and_then(Value::as_bool) == Some(true));
+    for (phase, field) in PHASE_METRICS {
+        if let Some(duration) = record.get(field).and_then(Value::as_u64) {
+            let phase_stats = stats.phase_latency.entry(phase.to_string()).or_default();
+            phase_stats.total_ms += duration as u128;
+            phase_stats.durations.push(duration);
+        }
+    }
     stats.durations.push(duration);
 }
 
@@ -694,8 +748,122 @@ fn formatting_stats(stats: &ToolStats) -> Value {
     })
 }
 
+fn phase_latency_stats(stats: &ToolStats) -> Value {
+    let mut phases = serde_json::Map::new();
+    for (phase, _) in PHASE_METRICS {
+        let values = stats.phase_latency.get(phase);
+        let total_ms = values.map(|value| value.total_ms).unwrap_or(0);
+        let durations = values
+            .map(|value| value.durations.as_slice())
+            .unwrap_or_default();
+        let samples = durations.len() as u64;
+        phases.insert(
+            phase.to_string(),
+            json!({
+                "samples": samples,
+                "total_ms": total_ms,
+                "avg_ms": average(total_ms, samples),
+                "p50_ms": percentile(durations, 50),
+                "p95_ms": percentile(durations, 95),
+                "max_ms": durations.iter().copied().max().unwrap_or(0)
+            }),
+        );
+    }
+    Value::Object(phases)
+}
+
 fn metric(record: &Value, name: &str) -> u128 {
     record.get(name).and_then(Value::as_u64).unwrap_or(0) as u128
+}
+
+fn accumulate_repeated_failure(record: &Value, stats: &mut RepeatedFailureStats) {
+    if record.get("repeated_failure").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let Some(signature) = record.get("failure_signature").and_then(Value::as_str) else {
+        return;
+    };
+    let attempt_count = record
+        .get("repeat_failure_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(2)
+        .max(2);
+    let duration = record
+        .get("duration_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let group = stats
+        .groups
+        .entry(signature.to_string())
+        .or_insert_with(|| RepeatedFailureGroup {
+            tool: record
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            error_code: record
+                .get("error_code")
+                .or_else(|| record.get("rpc_error_code"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+            ..RepeatedFailureGroup::default()
+        });
+    stats.retry_count += 1;
+    stats.chain_count += u64::from(attempt_count == 2);
+    stats.wasted_duration_ms += duration as u128;
+    stats.max_attempt_count = stats.max_attempt_count.max(attempt_count);
+    group.retry_count += 1;
+    group.chain_count += u64::from(attempt_count == 2);
+    group.wasted_duration_ms += duration as u128;
+    group.max_attempt_count = group.max_attempt_count.max(attempt_count);
+}
+
+fn repeated_failure_report(
+    stats: &RepeatedFailureStats,
+    legacy_adjacent_retry_count: u64,
+    top: usize,
+) -> Value {
+    let mut groups = stats
+        .groups
+        .iter()
+        .map(|(signature, group)| {
+            json!({
+                "signature": signature,
+                "tool": group.tool,
+                "error_code": group.error_code,
+                "retry_count": group.retry_count,
+                "chain_count": group.chain_count,
+                "wasted_duration_ms": group.wasted_duration_ms,
+                "max_attempt_count": group.max_attempt_count
+            })
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        metric_u64(right, "retry_count")
+            .cmp(&metric_u64(left, "retry_count"))
+            .then_with(|| {
+                metric_u64(right, "wasted_duration_ms").cmp(&metric_u64(left, "wasted_duration_ms"))
+            })
+            .then_with(|| left["signature"].as_str().cmp(&right["signature"].as_str()))
+    });
+    groups.truncate(top);
+    json!({
+        "retry_count": stats.retry_count,
+        "chain_count": stats.chain_count,
+        "wasted_duration_ms": stats.wasted_duration_ms,
+        "max_attempt_count": stats.max_attempt_count,
+        "legacy_adjacent_retry_count": legacy_adjacent_retry_count,
+        "top": groups,
+        "recovery_hint": if stats.retry_count > 0 {
+            Value::String(
+                "Stop retrying unchanged arguments. Change the target or guard, or follow the tool recovery_actions before retrying."
+                    .to_string(),
+            )
+        } else {
+            Value::Null
+        }
+    })
 }
 
 fn accumulate_performance(record: &Value, performance: &mut PerformanceStats, burst_idle_ms: u64) {
@@ -782,6 +950,11 @@ fn accumulate_performance(record: &Value, performance: &mut PerformanceStats, bu
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     *burst.tools.entry(tool.to_string()).or_default() += 1;
+    if tool == "exec_command" && !concurrent_request {
+        burst.sequential_exec_commands += 1;
+    } else if tool == "exec_many" {
+        burst.exec_many_calls += 1;
+    }
 
     if let Some(kind) = record.get("command_kind").and_then(Value::as_str) {
         let kind_stats = performance
@@ -894,6 +1067,24 @@ fn performance_report(
     });
     command_kinds.truncate(top);
 
+    let opportunity_burst_count = performance
+        .bursts
+        .values()
+        .filter(|burst| burst.sequential_exec_commands >= 2 && burst.exec_many_calls == 0)
+        .count();
+    let parallelizable_exec_command_candidates = performance
+        .bursts
+        .values()
+        .filter(|burst| burst.sequential_exec_commands >= 2 && burst.exec_many_calls == 0)
+        .map(|burst| burst.sequential_exec_commands)
+        .sum::<u64>();
+    let estimated_tool_call_reduction = performance
+        .bursts
+        .values()
+        .filter(|burst| burst.sequential_exec_commands >= 2 && burst.exec_many_calls == 0)
+        .map(|burst| burst.sequential_exec_commands.saturating_sub(1))
+        .sum::<u64>();
+
     let bursts = if include_bursts {
         let mut bursts = performance
             .bursts
@@ -907,7 +1098,15 @@ fn performance_report(
                     "wall_ms": burst.last_completed_ts_ms.saturating_sub(burst.first_started_ts_ms),
                     "server_duration_ms": burst.server_duration_ms,
                     "orchestration_gap_ms": burst.orchestration_gap_ms,
-                    "tools": burst.tools
+                    "tools": burst.tools,
+                    "sequential_exec_commands": burst.sequential_exec_commands,
+                    "exec_many_calls": burst.exec_many_calls,
+                    "parallelization_opportunity": burst.sequential_exec_commands >= 2 && burst.exec_many_calls == 0,
+                    "estimated_tool_call_reduction": if burst.sequential_exec_commands >= 2 && burst.exec_many_calls == 0 {
+                        burst.sequential_exec_commands.saturating_sub(1)
+                    } else {
+                        0
+                    }
                 })
             })
             .collect::<Vec<_>>();
@@ -945,6 +1144,14 @@ fn performance_report(
         "server_share_of_nonidle_attributed_percent": server_share,
         "client_orchestration_share_of_nonidle_attributed_percent": orchestration_share,
         "dominant_observed_nonidle_source": dominant,
+        "parallelization_opportunity_bursts": opportunity_burst_count,
+        "parallelizable_exec_command_candidates": parallelizable_exec_command_candidates,
+        "estimated_tool_call_reduction": estimated_tool_call_reduction,
+        "parallelization_recommendation": if opportunity_burst_count > 0 {
+            "Review sequential exec_command calls in the flagged activity bursts and consolidate independent work with exec_many mode=auto."
+        } else {
+            "No repeated sequential exec_command burst was detected in the selected scope."
+        },
         "command_kinds": command_kinds,
         "activity_bursts": bursts,
         "attribution_note": "client_orchestration_gap is observed between the previous tool response completing and the next tool request arriving. It includes model reasoning, platform scheduling, connector/network latency, and client-side orchestration; it is not pure LLM inference time. Child-process lifetime may overlap both server duration and orchestration gaps and must not be added as an independent wall-time component."
@@ -1172,6 +1379,92 @@ mod tests {
     }
 
     #[test]
+    fn phase_latency_metrics_count_only_instrumented_records() {
+        let mut stats = ToolStats::default();
+        add_stats(
+            &json!({
+                "tool": "edit_file",
+                "duration_ms": 20,
+                "phase_preflight_ms": 4,
+                "phase_plan_ms": 2,
+                "phase_commit_ms": 6,
+                "phase_total_ms": 12
+            }),
+            &mut stats,
+        );
+        add_stats(
+            &json!({
+                "tool": "edit_file",
+                "duration_ms": 30,
+                "phase_preflight_ms": 8,
+                "phase_total_ms": 18
+            }),
+            &mut stats,
+        );
+        add_stats(
+            &json!({
+                "tool": "legacy_edit_file",
+                "duration_ms": 10
+            }),
+            &mut stats,
+        );
+
+        let phases = phase_latency_stats(&stats);
+        assert_eq!(phases["preflight"]["samples"], 2);
+        assert_eq!(phases["preflight"]["total_ms"], 12);
+        assert_eq!(phases["preflight"]["avg_ms"], 6.0);
+        assert_eq!(phases["preflight"]["p50_ms"], 8);
+        assert_eq!(phases["preflight"]["p95_ms"], 8);
+        assert_eq!(phases["plan"]["samples"], 1);
+        assert_eq!(phases["plan"]["total_ms"], 2);
+        assert_eq!(phases["commit"]["samples"], 1);
+        assert_eq!(phases["total"]["samples"], 2);
+        assert_eq!(phases["total"]["max_ms"], 18);
+    }
+
+    #[test]
+    fn repeated_failure_report_counts_explicit_retry_chains() {
+        let mut stats = RepeatedFailureStats::default();
+        let signature = "a".repeat(64);
+        for (attempt_count, duration_ms) in [(2, 7), (3, 11)] {
+            accumulate_repeated_failure(
+                &json!({
+                    "tool": "edit_file",
+                    "error_code": "EDIT_MATCH_COUNT_MISMATCH",
+                    "failure_signature": signature,
+                    "repeated_failure": true,
+                    "repeat_failure_count": attempt_count,
+                    "duration_ms": duration_ms
+                }),
+                &mut stats,
+            );
+        }
+        accumulate_repeated_failure(
+            &json!({
+                "tool": "edit_file",
+                "failure_signature": "b".repeat(64),
+                "repeated_failure": false,
+                "repeat_failure_count": 1,
+                "duration_ms": 100
+            }),
+            &mut stats,
+        );
+
+        let report = repeated_failure_report(&stats, 4, 20);
+        assert_eq!(report["retry_count"], 2);
+        assert_eq!(report["chain_count"], 1);
+        assert_eq!(report["wasted_duration_ms"], 18);
+        assert_eq!(report["max_attempt_count"], 3);
+        assert_eq!(report["legacy_adjacent_retry_count"], 4);
+        assert_eq!(report["top"][0]["signature"], signature);
+        assert_eq!(report["top"][0]["retry_count"], 2);
+        assert!(report["recovery_hint"]
+            .as_str()
+            .unwrap()
+            .contains("Stop retrying"));
+    }
+
+    #[test]
     fn performance_report_separates_server_gaps_and_child_lifetimes() {
         let mut performance = PerformanceStats::default();
         accumulate_performance(
@@ -1225,5 +1518,39 @@ mod tests {
         assert_eq!(report["command_kinds"][0]["command_kind"], "cargo_test");
         assert_eq!(report["command_kinds"][0]["child_sessions"], 1);
         assert_eq!(report["activity_bursts"][0]["calls"], 2);
+        assert_eq!(report["parallelization_opportunity_bursts"], 0);
+    }
+
+    #[test]
+    fn performance_report_flags_repeated_sequential_exec_commands() {
+        let mut performance = PerformanceStats::default();
+        for (started, completed) in [(1_000, 1_100), (1_200, 1_300), (1_400, 1_500)] {
+            accumulate_performance(
+                &json!({
+                    "event": "tool_call",
+                    "runtime_boot_id": "boot",
+                    "activity_burst_id": 7,
+                    "tool": "exec_command",
+                    "started_ts_ms": started,
+                    "completed_ts_ms": completed,
+                    "duration_ms": completed - started,
+                    "concurrent_request": false
+                }),
+                &mut performance,
+                120_000,
+            );
+        }
+        let report = performance_report(&performance, 20, true, 120_000);
+        assert_eq!(report["parallelization_opportunity_bursts"], 1);
+        assert_eq!(report["parallelizable_exec_command_candidates"], 3);
+        assert_eq!(report["estimated_tool_call_reduction"], 2);
+        assert_eq!(
+            report["activity_bursts"][0]["parallelization_opportunity"],
+            true
+        );
+        assert_eq!(
+            report["activity_bursts"][0]["estimated_tool_call_reduction"],
+            2
+        );
     }
 }

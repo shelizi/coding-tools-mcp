@@ -1,4 +1,5 @@
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,9 +9,35 @@ use std::os::windows::process::CommandExt;
 
 use regex::Regex;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::platform::wsl::std_command_for_workspace;
 use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
+
+#[derive(Debug, Clone)]
+struct GitTarget {
+    repo_path: String,
+    root: PathBuf,
+    git_dir: String,
+    common_dir: String,
+    branch: String,
+    head: String,
+    fingerprint: String,
+}
+
+impl GitTarget {
+    fn metadata(&self) -> Value {
+        json!({
+            "repo_path": self.repo_path,
+            "repo_root": self.root.to_string_lossy(),
+            "git_dir": self.git_dir,
+            "git_common_dir": self.common_dir,
+            "branch": self.branch,
+            "head": self.head,
+            "repo_fingerprint": self.fingerprint,
+        })
+    }
+}
 
 pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
@@ -37,6 +64,8 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
             "warnings": [root_check.stderr.trim()]
         })));
     }
+
+    let target = resolve_git_target(ws, &json!({"repo_path": path}))?;
 
     let mut status_args = vec!["status", "--porcelain=v1", "-b"];
     if !include_untracked {
@@ -96,6 +125,8 @@ pub fn git_status(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         "ahead": ahead,
         "behind": behind,
         "clean": entries.is_empty(),
+        "repo": target.metadata(),
+        "repo_fingerprint": target.fingerprint,
         "entries": entries,
         "truncated": entries.len() >= max_entries && total_lines > max_entries + 1,
         "warnings": []
@@ -424,8 +455,8 @@ pub fn git_blame(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
 }
 
 pub fn git_branch(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
-    ensure_git_repo(ws)?;
-    verify_expected_head(ws, args)?;
+    let target = resolve_git_target(ws, args)?;
+    verify_expected_head(&target, args)?;
     let action = args
         .get("action")
         .and_then(Value::as_str)
@@ -434,7 +465,7 @@ pub fn git_branch(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| WorkspaceError::invalid_argument("name is required"))?;
-    validate_branch_name(ws, name)?;
+    validate_branch_name(&target.root, name)?;
     let dry_run = args
         .get("dry_run")
         .and_then(Value::as_bool)
@@ -491,14 +522,15 @@ pub fn git_branch(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
             "action": action,
             "name": name,
             "command": command,
+            "repo": target.metadata(),
             "warnings": []
         })));
     }
-    let completed = run_git_strings(ws.root(), &git_args, Duration::from_secs(15))?;
+    let completed = run_git_strings(&target.root, &git_args, Duration::from_secs(15))?;
     if !completed.success {
         return Err(git_error(&completed.stderr));
     }
-    let status = git_status(ws, &json!({}))?;
+    let status = git_status(ws, &json!({"path": target.repo_path}))?;
     Ok(tool_ok(json!({
         "dry_run": false,
         "applied": true,
@@ -506,6 +538,7 @@ pub fn git_branch(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         "name": name,
         "command": command,
         "stdout": completed.stdout.trim(),
+        "repo": target.metadata(),
         "status": status,
         "affected_files": [],
         "warnings": []
@@ -513,10 +546,11 @@ pub fn git_branch(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
 }
 
 pub fn git_stage(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
-    ensure_git_repo(ws)?;
-    verify_expected_head(ws, args)?;
+    prevalidate_git_paths(ws, args)?;
+    let target = resolve_git_target(ws, args)?;
+    verify_expected_head(&target, args)?;
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-    let paths = git_paths(ws, args)?;
+    let paths = git_paths(ws, &target, args)?;
     if !all && paths.is_empty() {
         return Err(WorkspaceError::invalid_argument(
             "paths is required unless all=true",
@@ -540,19 +574,21 @@ pub fn git_stage(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
             "paths": paths,
             "all": all,
             "command": std::iter::once("git".to_string()).chain(git_args).collect::<Vec<_>>(),
+            "repo": target.metadata(),
             "warnings": []
         })));
     }
-    let completed = run_git_strings(ws.root(), &git_args, Duration::from_secs(20))?;
+    let completed = run_git_strings(&target.root, &git_args, Duration::from_secs(20))?;
     if !completed.success {
         return Err(git_error(&completed.stderr));
     }
-    let status = git_status(ws, &json!({}))?;
+    let status = git_status(ws, &json!({"path": target.repo_path}))?;
     Ok(tool_ok(json!({
         "dry_run": false,
         "applied": true,
         "paths": paths,
         "all": all,
+        "repo": target.metadata(),
         "status": status,
         "affected_files": paths.iter().map(|path| json!({"path": path, "operation": "stage"})).collect::<Vec<_>>(),
         "warnings": []
@@ -560,8 +596,9 @@ pub fn git_stage(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> 
 }
 
 pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
-    ensure_git_repo(ws)?;
-    verify_expected_head(ws, args)?;
+    prevalidate_git_paths(ws, args)?;
+    let target = resolve_git_target(ws, args)?;
+    verify_expected_head(&target, args)?;
     let message = args
         .get("message")
         .and_then(Value::as_str)
@@ -571,7 +608,7 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
             "message must be between 1 and 10000 characters",
         ));
     }
-    let paths = git_paths(ws, args)?;
+    let paths = git_paths(ws, &target, args)?;
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
     let allow_empty = args
         .get("allow_empty")
@@ -581,7 +618,7 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         .get("require_clean_index_before")
         .and_then(Value::as_bool)
         .unwrap_or(!paths.is_empty() || all);
-    let index_clean = git_index_clean(ws)?;
+    let index_clean = git_index_clean(&target.root)?;
     if require_clean_index && !index_clean {
         return Err(WorkspaceError::ToolDetails {
             code: "GIT_INDEX_NOT_CLEAN",
@@ -603,11 +640,12 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
             "paths": paths,
             "all": all,
             "index_clean": index_clean,
+            "repo": target.metadata(),
             "warnings": []
         })));
     }
 
-    let old_head = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
+    let old_head = git_rev_parse(&target.root, "HEAD").unwrap_or_default();
     let staged_by_tool = !paths.is_empty() || all;
     if staged_by_tool {
         let mut add_args = vec!["add".to_string()];
@@ -617,7 +655,7 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
             add_args.push("--".into());
             add_args.extend(paths.clone());
         }
-        let staged = run_git_strings(ws.root(), &add_args, Duration::from_secs(20))?;
+        let staged = run_git_strings(&target.root, &add_args, Duration::from_secs(20))?;
         if !staged.success {
             return Err(git_error(&staged.stderr));
         }
@@ -627,11 +665,11 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     if allow_empty {
         commit_args.push("--allow-empty".into());
     }
-    let committed = run_git_strings(ws.root(), &commit_args, Duration::from_secs(60))?;
+    let committed = run_git_strings(&target.root, &commit_args, Duration::from_secs(60))?;
     if !committed.success {
         if staged_by_tool && index_clean {
             let _ = run_git(
-                ws.root(),
+                &target.root,
                 &["reset", "--quiet", "HEAD", "--"],
                 Duration::from_secs(10),
             );
@@ -648,8 +686,8 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
             }),
         });
     }
-    let new_head = git_rev_parse(ws.root(), "HEAD").unwrap_or_default();
-    let status = git_status(ws, &json!({}))?;
+    let new_head = git_rev_parse(&target.root, "HEAD").unwrap_or_default();
+    let status = git_status(ws, &json!({"path": target.repo_path}))?;
     Ok(tool_ok(json!({
         "dry_run": false,
         "applied": true,
@@ -659,6 +697,7 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         "paths": paths,
         "all": all,
         "stdout": committed.stdout.trim(),
+        "repo": target.metadata(),
         "status": status,
         "affected_files": paths.iter().map(|path| json!({"path": path, "operation": "commit"})).collect::<Vec<_>>(),
         "warnings": []
@@ -666,8 +705,9 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
 }
 
 pub fn git_restore(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
-    ensure_git_repo(ws)?;
-    verify_expected_head(ws, args)?;
+    prevalidate_git_paths(ws, args)?;
+    let target = resolve_git_target(ws, args)?;
+    verify_expected_head(&target, args)?;
     if !args
         .get("confirm")
         .and_then(Value::as_bool)
@@ -681,7 +721,7 @@ pub fn git_restore(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
             details: json!({}),
         });
     }
-    let paths = git_paths(ws, args)?;
+    let paths = git_paths(ws, &target, args)?;
     if paths.is_empty() {
         return Err(WorkspaceError::invalid_argument("paths is required"));
     }
@@ -718,58 +758,119 @@ pub fn git_restore(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
             "paths": paths,
             "staged": staged,
             "worktree": worktree,
+            "repo": target.metadata(),
             "warnings": []
         })));
     }
-    let completed = run_git_strings(ws.root(), &git_args, Duration::from_secs(20))?;
+    let completed = run_git_strings(&target.root, &git_args, Duration::from_secs(20))?;
     if !completed.success {
         return Err(git_error(&completed.stderr));
     }
-    let status = git_status(ws, &json!({}))?;
+    let status = git_status(ws, &json!({"path": target.repo_path}))?;
     Ok(tool_ok(json!({
         "dry_run": false,
         "applied": true,
         "paths": paths,
         "staged": staged,
         "worktree": worktree,
+        "repo": target.metadata(),
         "status": status,
         "affected_files": paths.iter().map(|path| json!({"path": path, "operation": "restore"})).collect::<Vec<_>>(),
         "warnings": []
     })))
 }
 
-fn ensure_git_repo(ws: &Workspace) -> Result<(), WorkspaceError> {
-    if is_git_repo(ws.root()) {
-        Ok(())
-    } else {
-        Err(WorkspaceError::Tool {
+fn resolve_git_target(ws: &Workspace, args: &Value) -> Result<GitTarget, WorkspaceError> {
+    let repo_path = args.get("repo_path").and_then(Value::as_str).unwrap_or(".");
+    let resolved = ws.resolve_existing(repo_path)?;
+    if !resolved.path.is_dir() {
+        return Err(WorkspaceError::not_a_directory(
+            "repo_path must be a directory",
+        ));
+    }
+    let root = git_value(&resolved.path, &["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from)
+        .ok_or_else(|| WorkspaceError::Tool {
             code: "NOT_GIT_REPOSITORY",
-            message: "Workspace is not a Git repository".into(),
+            message: "repo_path is not inside a Git repository".into(),
             category: "validation",
             retryable: false,
-        })
+        })?;
+    let git_dir = git_value(&resolved.path, &["rev-parse", "--absolute-git-dir"])
+        .unwrap_or_else(|| "missing".into());
+    let common_dir = git_value(&resolved.path, &["rev-parse", "--git-common-dir"])
+        .unwrap_or_else(|| git_dir.clone());
+    let branch = git_value(&resolved.path, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_else(|| "HEAD".into());
+    let head = git_rev_parse(&resolved.path, "HEAD").unwrap_or_else(|| "missing".into());
+    let fingerprint = format!(
+        "{:x}",
+        Sha256::digest(
+            [
+                root.to_string_lossy().as_ref(),
+                git_dir.as_str(),
+                common_dir.as_str(),
+                branch.as_str(),
+                head.as_str(),
+            ]
+            .join("\0")
+            .as_bytes(),
+        )
+    );
+    let target = GitTarget {
+        repo_path: repo_path.to_string(),
+        root,
+        git_dir,
+        common_dir,
+        branch,
+        head,
+        fingerprint,
+    };
+    if let Some(expected) = args
+        .get("expected_repo_fingerprint")
+        .and_then(Value::as_str)
+    {
+        if !expected.eq_ignore_ascii_case(&target.fingerprint) {
+            return Err(WorkspaceError::ToolDetails {
+                code: "GIT_REPO_TARGET_MISMATCH",
+                message: "Git repository/worktree target changed since preflight".into(),
+                category: "conflict",
+                retryable: true,
+                details: json!({
+                    "expected_repo_fingerprint": expected,
+                    "actual_repo_fingerprint": target.fingerprint,
+                    "repo": target.metadata(),
+                    "suggestion": "Call git_status with path=repo_path and retry with the returned repo_fingerprint"
+                }),
+            });
+        }
     }
+    Ok(target)
 }
 
-fn verify_expected_head(ws: &Workspace, args: &Value) -> Result<(), WorkspaceError> {
+fn verify_expected_head(target: &GitTarget, args: &Value) -> Result<(), WorkspaceError> {
     if let Some(expected) = args.get("expected_head").and_then(Value::as_str) {
-        let actual = git_rev_parse(ws.root(), "HEAD").unwrap_or_else(|| "missing".into());
+        let actual = &target.head;
         if !expected.eq_ignore_ascii_case(&actual) {
             return Err(WorkspaceError::ToolDetails {
                 code: "GIT_HEAD_MISMATCH",
                 message: "Git HEAD changed since preflight".into(),
                 category: "conflict",
                 retryable: true,
-                details: json!({"expected_head": expected, "actual_head": actual}),
+                details: json!({
+                    "expected_head": expected,
+                    "actual_head": actual,
+                    "repo": target.metadata()
+                }),
             });
         }
     }
     Ok(())
 }
 
-fn validate_branch_name(ws: &Workspace, name: &str) -> Result<(), WorkspaceError> {
+fn validate_branch_name(root: &Path, name: &str) -> Result<(), WorkspaceError> {
     let completed = run_git(
-        ws.root(),
+        root,
         &["check-ref-format", "--branch", name],
         Duration::from_secs(5),
     )?;
@@ -782,7 +883,11 @@ fn validate_branch_name(ws: &Workspace, name: &str) -> Result<(), WorkspaceError
     }
 }
 
-fn git_paths(ws: &Workspace, args: &Value) -> Result<Vec<String>, WorkspaceError> {
+fn git_paths(
+    ws: &Workspace,
+    target: &GitTarget,
+    args: &Value,
+) -> Result<Vec<String>, WorkspaceError> {
     let mut paths = Vec::new();
     if let Some(items) = args.get("paths").and_then(Value::as_array) {
         for item in items {
@@ -790,16 +895,38 @@ fn git_paths(ws: &Workspace, args: &Value) -> Result<Vec<String>, WorkspaceError
                 .as_str()
                 .ok_or_else(|| WorkspaceError::invalid_argument("paths entries must be strings"))?;
             ws.reject_unsafe_text(path)?;
-            ws.reject_protected_write_path(path)?;
+            let workspace_path = if target.repo_path == "." {
+                path.to_string()
+            } else {
+                format!(
+                    "{}/{}",
+                    target.repo_path.trim_end_matches(['/', '\\']),
+                    path
+                )
+            };
+            ws.reject_protected_write_path(&workspace_path)?;
             paths.push(path.to_string());
         }
     }
     Ok(paths)
 }
 
-fn git_index_clean(ws: &Workspace) -> Result<bool, WorkspaceError> {
+fn prevalidate_git_paths(ws: &Workspace, args: &Value) -> Result<(), WorkspaceError> {
+    if let Some(items) = args.get("paths").and_then(Value::as_array) {
+        for item in items {
+            let path = item
+                .as_str()
+                .ok_or_else(|| WorkspaceError::invalid_argument("paths entries must be strings"))?;
+            ws.reject_unsafe_text(path)?;
+            ws.reject_protected_write_path(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn git_index_clean(root: &Path) -> Result<bool, WorkspaceError> {
     let completed = run_git(
-        ws.root(),
+        root,
         &["diff", "--cached", "--quiet", "--exit-code"],
         Duration::from_secs(10),
     )?;
@@ -1025,6 +1152,14 @@ fn git_rev_parse(cwd: &std::path::Path, rev: &str) -> Option<String> {
         .ok()
         .filter(|o| o.success)
         .map(|o| o.stdout.trim().to_string())
+}
+
+fn git_value(cwd: &Path, args: &[&str]) -> Option<String> {
+    run_git(cwd, args, Duration::from_secs(5))
+        .ok()
+        .filter(|output| output.success)
+        .map(|output| output.stdout.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn parse_branch_line(line: &str) -> (String, String, i64, i64) {

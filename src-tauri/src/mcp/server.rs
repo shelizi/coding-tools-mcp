@@ -218,11 +218,34 @@ fn unknown_tool_error(state: &SharedState, name: &str, known: &[&str]) -> Value 
     })
 }
 
+fn legacy_edit_file_arguments(args: Value) -> Value {
+    let Some(source) = args.as_object() else {
+        return args;
+    };
+    let mut file = serde_json::Map::new();
+    for field in ["path", "expected_sha256", "edits", "apply_proposal"] {
+        if let Some(value) = source.get(field) {
+            file.insert(field.to_string(), value.clone());
+        }
+    }
+    let mut converted = serde_json::Map::new();
+    converted.insert("files".into(), Value::Array(vec![Value::Object(file)]));
+    for field in ["dry_run", "reason"] {
+        if let Some(value) = source.get(field) {
+            converted.insert(field.to_string(), value.clone());
+        }
+    }
+    Value::Object(converted)
+}
+
 fn tool_arguments(name: &str, params: &Value) -> Value {
     let mut args = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    if name == "edit_file" {
+        args = legacy_edit_file_arguments(args);
+    }
     if name.starts_with("history_session_") {
         if let Some(session_key) = host_session_key(params) {
             if !args.is_object() {
@@ -483,6 +506,39 @@ mod tests {
         let existing = tool_arguments("read_file", &params);
         assert_eq!(existing["session_key"], "explicit");
         assert!(existing.get("_host_session_key").is_none());
+    }
+
+    #[test]
+    fn legacy_edit_names_are_canonicalized_before_catalog_validation() {
+        let params = json!({
+            "arguments": {
+                "path": "main.rs",
+                "expected_sha256": "a".repeat(64),
+                "edits": [{
+                    "type": "replace",
+                    "old_text": "old",
+                    "new_text": "new"
+                }],
+                "dry_run": true,
+                "reason": "legacy compatibility"
+            }
+        });
+        let arguments = tool_arguments("edit_file", &params);
+        assert_eq!(
+            crate::tools::registry::canonical_tool_name("edit_file"),
+            "edit"
+        );
+        assert_eq!(
+            crate::tools::registry::canonical_tool_name("edit_many"),
+            "edit"
+        );
+        assert_eq!(arguments["files"].as_array().unwrap().len(), 1);
+        assert_eq!(arguments["files"][0]["path"], "main.rs");
+        assert_eq!(arguments["files"][0]["expected_sha256"], "a".repeat(64));
+        assert_eq!(arguments["files"][0]["edits"].as_array().unwrap().len(), 1);
+        assert_eq!(arguments["dry_run"], true);
+        assert_eq!(arguments["reason"], "legacy compatibility");
+        assert!(arguments.get("path").is_none());
     }
 
     #[test]

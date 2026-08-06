@@ -99,8 +99,11 @@ impl WorkerPolicyStore {
                     "INSERT INTO worker_policies
                      (service, start_workers, min_idle_workers, max_idle_workers, max_workers,
                       max_requests_per_worker, max_lifetime_seconds, scale_down_delay_seconds,
-                      recycle_jitter_percent, revision)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                      recycle_jitter_percent, max_pending_requests, worker_acquire_timeout_ms,
+                      max_connecting_workers, connecting_capacity_grace_ms, scale_down_step,
+                      burst_warm_workers, burst_warm_seconds, revision)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                             ?14, ?15, ?16, ?17)
                      ON CONFLICT(service) DO UPDATE SET
                        start_workers = excluded.start_workers,
                        min_idle_workers = excluded.min_idle_workers,
@@ -110,6 +113,13 @@ impl WorkerPolicyStore {
                        max_lifetime_seconds = excluded.max_lifetime_seconds,
                        scale_down_delay_seconds = excluded.scale_down_delay_seconds,
                        recycle_jitter_percent = excluded.recycle_jitter_percent,
+                       max_pending_requests = excluded.max_pending_requests,
+                       worker_acquire_timeout_ms = excluded.worker_acquire_timeout_ms,
+                       max_connecting_workers = excluded.max_connecting_workers,
+                       connecting_capacity_grace_ms = excluded.connecting_capacity_grace_ms,
+                       scale_down_step = excluded.scale_down_step,
+                       burst_warm_workers = excluded.burst_warm_workers,
+                       burst_warm_seconds = excluded.burst_warm_seconds,
                        revision = excluded.revision",
                     params_from_iter(policy_values(service, &policy)),
                 )?;
@@ -141,8 +151,46 @@ fn initialize_schema(connection: &Connection) -> Result<(), WorkerPolicyError> {
             max_lifetime_seconds INTEGER NOT NULL,
             scale_down_delay_seconds INTEGER NOT NULL,
             recycle_jitter_percent INTEGER NOT NULL,
+            max_pending_requests INTEGER NOT NULL DEFAULT 32,
+            worker_acquire_timeout_ms INTEGER NOT NULL DEFAULT 10000,
+            max_connecting_workers INTEGER NOT NULL DEFAULT 0,
+            connecting_capacity_grace_ms INTEGER NOT NULL DEFAULT 1000,
+            scale_down_step INTEGER NOT NULL DEFAULT 4,
+            burst_warm_workers INTEGER NOT NULL DEFAULT 0,
+            burst_warm_seconds INTEGER NOT NULL DEFAULT 120,
             revision INTEGER NOT NULL
          );",
+    )?;
+    ensure_policy_column(
+        connection,
+        "max_pending_requests",
+        "INTEGER NOT NULL DEFAULT 32",
+    )?;
+    ensure_policy_column(
+        connection,
+        "worker_acquire_timeout_ms",
+        "INTEGER NOT NULL DEFAULT 10000",
+    )?;
+    ensure_policy_column(
+        connection,
+        "max_connecting_workers",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_policy_column(
+        connection,
+        "connecting_capacity_grace_ms",
+        "INTEGER NOT NULL DEFAULT 1000",
+    )?;
+    ensure_policy_column(connection, "scale_down_step", "INTEGER NOT NULL DEFAULT 4")?;
+    ensure_policy_column(
+        connection,
+        "burst_warm_workers",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_policy_column(
+        connection,
+        "burst_warm_seconds",
+        "INTEGER NOT NULL DEFAULT 120",
     )?;
     for service in [TunnelService::Mcp, TunnelService::Actions] {
         let policy = WorkerPolicy::default_for(service);
@@ -150,15 +198,36 @@ fn initialize_schema(connection: &Connection) -> Result<(), WorkerPolicyError> {
             "INSERT OR IGNORE INTO worker_policies
              (service, start_workers, min_idle_workers, max_idle_workers, max_workers,
               max_requests_per_worker, max_lifetime_seconds, scale_down_delay_seconds,
-              recycle_jitter_percent, revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              recycle_jitter_percent, max_pending_requests, worker_acquire_timeout_ms,
+              max_connecting_workers, connecting_capacity_grace_ms, scale_down_step,
+              burst_warm_workers, burst_warm_seconds, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17)",
             params_from_iter(policy_values(service, &policy)),
         )?;
     }
     Ok(())
 }
 
-fn policy_values(service: TunnelService, policy: &WorkerPolicy) -> [Value; 10] {
+fn ensure_policy_column(
+    connection: &Connection,
+    name: &str,
+    definition: &str,
+) -> Result<(), WorkerPolicyError> {
+    let mut statement = connection.prepare("PRAGMA table_info(worker_policies)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|column| column == name) {
+        connection.execute(
+            &format!("ALTER TABLE worker_policies ADD COLUMN {name} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn policy_values(service: TunnelService, policy: &WorkerPolicy) -> [Value; 17] {
     [
         Value::Text(service.as_str().to_string()),
         Value::Integer(i64::from(policy.start_workers)),
@@ -169,6 +238,13 @@ fn policy_values(service: TunnelService, policy: &WorkerPolicy) -> [Value; 10] {
         Value::Integer(policy.max_lifetime_seconds as i64),
         Value::Integer(policy.scale_down_delay_seconds as i64),
         Value::Integer(i64::from(policy.recycle_jitter_percent)),
+        Value::Integer(i64::from(policy.max_pending_requests)),
+        Value::Integer(policy.worker_acquire_timeout_ms as i64),
+        Value::Integer(i64::from(policy.max_connecting_workers)),
+        Value::Integer(policy.connecting_capacity_grace_ms as i64),
+        Value::Integer(i64::from(policy.scale_down_step)),
+        Value::Integer(i64::from(policy.burst_warm_workers)),
+        Value::Integer(policy.burst_warm_seconds as i64),
         Value::Integer(policy.revision as i64),
     ]
 }
@@ -181,7 +257,10 @@ fn load_policy(
         .query_row(
             "SELECT start_workers, min_idle_workers, max_idle_workers, max_workers,
                     max_requests_per_worker, max_lifetime_seconds,
-                    scale_down_delay_seconds, recycle_jitter_percent, revision
+                    scale_down_delay_seconds, recycle_jitter_percent,
+                    max_pending_requests, worker_acquire_timeout_ms, max_connecting_workers,
+                    connecting_capacity_grace_ms, scale_down_step, burst_warm_workers,
+                    burst_warm_seconds, revision
              FROM worker_policies WHERE service = ?1",
             params![service.as_str()],
             |row| {
@@ -194,7 +273,14 @@ fn load_policy(
                     max_lifetime_seconds: row.get(5)?,
                     scale_down_delay_seconds: row.get(6)?,
                     recycle_jitter_percent: row.get(7)?,
-                    revision: row.get(8)?,
+                    max_pending_requests: row.get(8)?,
+                    worker_acquire_timeout_ms: row.get(9)?,
+                    max_connecting_workers: row.get(10)?,
+                    connecting_capacity_grace_ms: row.get(11)?,
+                    scale_down_step: row.get(12)?,
+                    burst_warm_workers: row.get(13)?,
+                    burst_warm_seconds: row.get(14)?,
+                    revision: row.get(15)?,
                 })
             },
         )
@@ -238,6 +324,49 @@ mod tests {
         assert_eq!(reopened.current(TunnelService::Mcp), saved);
         assert_eq!(
             reopened.current(TunnelService::Actions),
+            WorkerPolicy::default_for(TunnelService::Actions)
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_policy_table_with_capacity_defaults() {
+        let directory = tempdir().expect("policy tempdir");
+        let path = directory.path().join("legacy.db");
+        let connection = Connection::open(&path).expect("legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE worker_policies (
+                    service TEXT PRIMARY KEY,
+                    start_workers INTEGER NOT NULL,
+                    min_idle_workers INTEGER NOT NULL,
+                    max_idle_workers INTEGER NOT NULL,
+                    max_workers INTEGER NOT NULL,
+                    max_requests_per_worker INTEGER NOT NULL,
+                    max_lifetime_seconds INTEGER NOT NULL,
+                    scale_down_delay_seconds INTEGER NOT NULL,
+                    recycle_jitter_percent INTEGER NOT NULL,
+                    revision INTEGER NOT NULL
+                 );
+                 INSERT INTO worker_policies VALUES
+                    ('mcp', 6, 3, 8, 24, 900, 1800, 30, 15, 7);",
+            )
+            .expect("legacy schema");
+        drop(connection);
+
+        let store = WorkerPolicyStore::open(&path).expect("migrated policy store");
+        let policy = store.current(TunnelService::Mcp);
+        assert_eq!(policy.start_workers, 6);
+        assert_eq!(policy.max_workers, 24);
+        assert_eq!(policy.revision, 7);
+        assert_eq!(policy.max_pending_requests, 32);
+        assert_eq!(policy.worker_acquire_timeout_ms, 10_000);
+        assert_eq!(policy.max_connecting_workers, 0);
+        assert_eq!(policy.connecting_capacity_grace_ms, 1_000);
+        assert_eq!(policy.scale_down_step, 4);
+        assert_eq!(policy.burst_warm_workers, 0);
+        assert_eq!(policy.burst_warm_seconds, 120);
+        assert_eq!(
+            store.current(TunnelService::Actions),
             WorkerPolicy::default_for(TunnelService::Actions)
         );
     }

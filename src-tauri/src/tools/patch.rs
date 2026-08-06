@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use regex::Regex;
 use serde_json::{json, Value};
@@ -243,11 +243,36 @@ pub fn patch_check(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceEr
 }
 
 pub fn edit_file(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let started = Instant::now();
     let ws = &ctx.workspace;
     let path = args
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| WorkspaceError::invalid_argument("path is required"))?;
+    if args.get("edits").is_some() && args.get("apply_proposal").is_some() {
+        return Err(WorkspaceError::ToolDetails {
+            code: "EDIT_CONTRACT_INVALID",
+            message: "edit_file accepts either edits or apply_proposal, not both".into(),
+            category: "validation",
+            retryable: false,
+            details: json!({
+                "path": path,
+                "issue_count": 1,
+                "issues": [{
+                    "field": "edits,apply_proposal",
+                    "reason": "mutually_exclusive_fields"
+                }],
+                "suggestion": "Send precise edits or apply one stored proposal",
+                "recovery_actions": [{
+                    "action": "choose_edit_mode",
+                    "tool": "edit",
+                    "arguments": { "files": [{ "path": path }] },
+                    "required_arguments": ["files[0].edits_or_apply_proposal"],
+                    "reason": "mutually_exclusive_fields"
+                }]
+            }),
+        });
+    }
     let dry_run = args
         .get("dry_run")
         .and_then(Value::as_bool)
@@ -301,6 +326,9 @@ pub fn edit_file(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
             if edits.is_empty() {
                 return Err(WorkspaceError::invalid_argument("edits must not be empty"));
             }
+            if let Err(error) = validate_precise_edit_contract(edits) {
+                return Err(enrich_edit_error(error, &resolved.display, &before_sha256));
+            }
             match apply_precise_edits(&original, edits) {
                 Ok(updated) => (updated, None, "direct"),
                 Err(error) => {
@@ -324,6 +352,50 @@ pub fn edit_file(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
     } else {
         Value::String(Uuid::new_v4().simple().to_string())
     };
+    let preflight_finished = Instant::now();
+    let edit_plan = if dry_run {
+        let mut replay_file = serde_json::Map::new();
+        replay_file.insert("path".into(), json!(resolved.display));
+        replay_file.insert("expected_sha256".into(), json!(before_sha256));
+        if let Some(edits) = args.get("edits") {
+            replay_file.insert("edits".into(), edits.clone());
+        }
+        if let Some(apply_proposal) = args.get("apply_proposal") {
+            replay_file.insert("apply_proposal".into(), apply_proposal.clone());
+        }
+        let mut replay_arguments = serde_json::Map::new();
+        replay_arguments.insert(
+            "files".into(),
+            Value::Array(vec![Value::Object(replay_file)]),
+        );
+        replay_arguments.insert("dry_run".into(), Value::Bool(false));
+        if let Some(reason) = replay_reason(args) {
+            replay_arguments.insert("reason".into(), reason);
+        }
+        let stateful_dependencies = proposal_id.as_ref().map_or_else(
+            || json!([]),
+            |proposal_id| {
+                json!([{
+                    "type": "edit_proposal",
+                    "proposal_id": proposal_id,
+                    "ttl_seconds": EDIT_PROPOSAL_TTL.as_secs()
+                }])
+            },
+        );
+        replayable_edit_plan(
+            "edit",
+            Value::Object(replay_arguments),
+            json!([{
+                "path": resolved.display,
+                "before_sha256": before_sha256,
+                "after_sha256": after_sha256
+            }]),
+            stateful_dependencies,
+        )
+    } else {
+        Value::Null
+    };
+    let plan_finished = Instant::now();
     if !dry_run {
         verify_file_version(ws, &resolved.display, Some(&before_sha256))?;
         let mut staged = HashMap::new();
@@ -337,6 +409,13 @@ pub fn edit_file(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         }
     }
 
+    let completed = Instant::now();
+    let phase_durations_ms = json!({
+        "preflight_ms": preflight_finished.duration_since(started).as_millis(),
+        "plan_ms": plan_finished.duration_since(preflight_finished).as_millis(),
+        "commit_ms": completed.duration_since(plan_finished).as_millis(),
+        "total_ms": completed.duration_since(started).as_millis()
+    });
     Ok(tool_ok(json!({
         "status": if proposal_id.is_some() { "proposal_applied" } else { "edited" },
         "proposal_id": proposal_id,
@@ -350,7 +429,9 @@ pub fn edit_file(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         "operation": "update",
         "before_sha256": before_sha256,
         "after_sha256": after_sha256,
+        "edit_plan": edit_plan,
         "diff": diff,
+        "phase_durations_ms": phase_durations_ms,
         "affected_files": [{ "path": resolved.display, "operation": "update" }],
         "files_created": Vec::<String>::new(),
         "files_modified": [resolved.display],
@@ -638,7 +719,66 @@ fn apply_restricted_proposal_patch(
     Ok(updated)
 }
 
+pub fn edit(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let files = args
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| WorkspaceError::invalid_argument("files is required"))?;
+    if files.is_empty() {
+        return Err(WorkspaceError::invalid_argument("files must not be empty"));
+    }
+    if files.len() > 100 {
+        return Err(WorkspaceError::invalid_argument(
+            "edit supports at most 100 files",
+        ));
+    }
+    if files.len() == 1 {
+        let file = files[0]
+            .as_object()
+            .ok_or_else(|| WorkspaceError::invalid_argument("files[0] must be an object"))?;
+        let mut single = serde_json::Map::new();
+        for field in ["path", "expected_sha256", "edits", "apply_proposal"] {
+            if let Some(value) = file.get(field) {
+                single.insert(field.to_string(), value.clone());
+            }
+        }
+        for field in ["dry_run", "reason"] {
+            if let Some(value) = args.get(field) {
+                single.insert(field.to_string(), value.clone());
+            }
+        }
+        let mut result = edit_file(ctx, &Value::Object(single))?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert("atomic".into(), Value::Bool(true));
+        }
+        return Ok(result);
+    }
+    if files
+        .iter()
+        .any(|file| file.get("apply_proposal").is_some())
+    {
+        return Err(WorkspaceError::ToolDetails {
+            code: "EDIT_CONTRACT_INVALID",
+            message: "apply_proposal is supported only when edit contains one file".into(),
+            category: "validation",
+            retryable: false,
+            details: json!({
+                "file_count": files.len(),
+                "suggestion": "Apply a proposal in a single-file edit call",
+                "recovery_actions": [{
+                    "action": "split_proposal_edit",
+                    "tool": "edit",
+                    "required_arguments": ["files"],
+                    "reason": "proposal_requires_single_file"
+                }]
+            }),
+        });
+    }
+    edit_many(ctx, args)
+}
+
 pub fn edit_many(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let started = Instant::now();
     let files = args
         .get("files")
         .and_then(Value::as_array)
@@ -658,7 +798,7 @@ pub fn edit_many(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
     let mut diffs = String::new();
     let mut seen = HashSet::new();
 
-    for file in files {
+    for (file_index, file) in files.iter().enumerate() {
         let path = file
             .get("path")
             .and_then(Value::as_str)
@@ -698,10 +838,11 @@ pub fn edit_many(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         let before_sha256 = sha256_hex(&original_bytes);
         if let Some(expected) = file.get("expected_sha256").and_then(Value::as_str) {
             if !expected.eq_ignore_ascii_case(&before_sha256) {
-                return Err(version_mismatch(
+                return Err(enrich_edit_many_error(
+                    version_mismatch(&resolved.display, expected, &before_sha256),
                     &resolved.display,
-                    expected,
                     &before_sha256,
+                    file_index,
                 ));
             }
         }
@@ -711,7 +852,17 @@ pub fn edit_many(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
             category: "validation",
             retryable: false,
         })?;
-        let updated = apply_precise_edits(&original, edits)?;
+        if let Err(error) = validate_precise_edit_contract(edits) {
+            return Err(enrich_edit_many_error(
+                error,
+                &resolved.display,
+                &before_sha256,
+                file_index,
+            ));
+        }
+        let updated = apply_precise_edits(&original, edits).map_err(|error| {
+            enrich_edit_many_error(error, &resolved.display, &before_sha256, file_index)
+        })?;
         if updated == original {
             return Err(patch_failed(format!("Edits produced no changes: {path}")));
         }
@@ -733,16 +884,53 @@ pub fn edit_many(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         affected.push(json!({"path": resolved.display, "operation": "update"}));
     }
 
+    let preflight_finished = Instant::now();
+
     if !dry_run {
         for (path, expected) in &versions {
             verify_file_version(ws, path, expected.as_deref())?;
         }
         let _backups = commit_staged(ws, &staged)?;
     }
+    let commit_finished = Instant::now();
     let modified = affected
         .iter()
         .filter_map(|item| item.get("path").and_then(Value::as_str).map(str::to_string))
         .collect::<Vec<_>>();
+    let edit_plan = if dry_run {
+        let replay_files = files
+            .iter()
+            .zip(file_versions.iter())
+            .map(|(file, version)| {
+                json!({
+                    "path": version["path"],
+                    "edits": file["edits"],
+                    "expected_sha256": version["before_sha256"]
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut replay_arguments = serde_json::Map::new();
+        replay_arguments.insert("files".into(), Value::Array(replay_files));
+        replay_arguments.insert("dry_run".into(), Value::Bool(false));
+        if let Some(reason) = replay_reason(args) {
+            replay_arguments.insert("reason".into(), reason);
+        }
+        replayable_edit_plan(
+            "edit",
+            Value::Object(replay_arguments),
+            Value::Array(file_versions.clone()),
+            json!([]),
+        )
+    } else {
+        Value::Null
+    };
+    let completed = Instant::now();
+    let phase_durations_ms = json!({
+        "preflight_ms": preflight_finished.duration_since(started).as_millis(),
+        "commit_ms": commit_finished.duration_since(preflight_finished).as_millis(),
+        "plan_ms": completed.duration_since(commit_finished).as_millis(),
+        "total_ms": completed.duration_since(started).as_millis()
+    });
     Ok(tool_ok(json!({
         "dry_run": dry_run,
         "preflight": true,
@@ -752,6 +940,8 @@ pub fn edit_many(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         "diff": diffs,
         "file_versions": file_versions,
         "affected_files": affected,
+        "edit_plan": edit_plan,
+        "phase_durations_ms": phase_durations_ms,
         "files_created": Vec::<String>::new(),
         "files_modified": modified,
         "files_deleted": Vec::<String>::new(),
@@ -1242,6 +1432,217 @@ struct ResolvedEdit {
     replacement: String,
 }
 
+fn validate_precise_edit_contract(edits: &[Value]) -> Result<(), WorkspaceError> {
+    let mut issues = Vec::new();
+    for (edit_index, edit) in edits.iter().enumerate() {
+        let Some(object) = edit.as_object() else {
+            issues.push(json!({
+                "edit_index": edit_index,
+                "field": Value::Null,
+                "reason": "edit_must_be_object"
+            }));
+            continue;
+        };
+        let Some(edit_type) = object.get("type").and_then(Value::as_str) else {
+            issues.push(json!({
+                "edit_index": edit_index,
+                "field": "type",
+                "reason": "type_required"
+            }));
+            continue;
+        };
+
+        let (allowed, required, non_empty_strings): (&[&str], &[&str], &[&str]) = match edit_type {
+            "replace" => (
+                &[
+                    "type",
+                    "old_text",
+                    "new_text",
+                    "match_mode",
+                    "before_context",
+                    "after_context",
+                    "expected_occurrences",
+                    "start_line",
+                    "end_line",
+                ],
+                &["type", "old_text", "new_text"],
+                &["old_text"],
+            ),
+            "insert_before" | "insert_after" => (
+                &[
+                    "type",
+                    "anchor",
+                    "text",
+                    "match_mode",
+                    "before_context",
+                    "after_context",
+                    "expected_occurrences",
+                    "start_line",
+                    "end_line",
+                ],
+                &["type", "anchor", "text"],
+                &["anchor", "text"],
+            ),
+            "replace_lines" => (
+                &[
+                    "type",
+                    "start_line",
+                    "end_line",
+                    "new_text",
+                    "expected_text",
+                ],
+                &["type", "start_line", "end_line", "new_text"],
+                &[],
+            ),
+            "delete_lines" => (
+                &["type", "start_line", "end_line", "expected_text"],
+                &["type", "start_line", "end_line"],
+                &[],
+            ),
+            other => {
+                issues.push(json!({
+                    "edit_index": edit_index,
+                    "field": "type",
+                    "edit_type": other,
+                    "reason": "unsupported_type",
+                    "allowed_values": ["replace", "insert_before", "insert_after", "replace_lines", "delete_lines"]
+                }));
+                continue;
+            }
+        };
+
+        for key in object.keys() {
+            if !allowed.contains(&key.as_str()) {
+                issues.push(json!({
+                    "edit_index": edit_index,
+                    "edit_type": edit_type,
+                    "field": key,
+                    "reason": "unexpected_field",
+                    "allowed_fields": allowed
+                }));
+            }
+        }
+        for field in required {
+            if !object.contains_key(*field) {
+                issues.push(json!({
+                    "edit_index": edit_index,
+                    "edit_type": edit_type,
+                    "field": field,
+                    "reason": "missing_required_field"
+                }));
+            }
+        }
+
+        for field in [
+            "old_text",
+            "new_text",
+            "anchor",
+            "text",
+            "expected_text",
+            "before_context",
+            "after_context",
+        ] {
+            if let Some(value) = object.get(field) {
+                match value.as_str() {
+                    Some(text) if non_empty_strings.contains(&field) && text.is_empty() => {
+                        issues.push(json!({
+                            "edit_index": edit_index,
+                            "edit_type": edit_type,
+                            "field": field,
+                            "reason": "field_must_be_non_empty"
+                        }));
+                    }
+                    Some(_) => {}
+                    None => issues.push(json!({
+                        "edit_index": edit_index,
+                        "edit_type": edit_type,
+                        "field": field,
+                        "reason": "field_must_be_string"
+                    })),
+                }
+            }
+        }
+
+        if let Some(value) = object.get("match_mode") {
+            if !matches!(value.as_str(), Some("exact" | "whitespace")) {
+                issues.push(json!({
+                    "edit_index": edit_index,
+                    "edit_type": edit_type,
+                    "field": "match_mode",
+                    "reason": "invalid_enum_value",
+                    "allowed_values": ["exact", "whitespace"]
+                }));
+            }
+        }
+        if let Some(value) = object.get("expected_occurrences") {
+            if value.as_u64().is_none_or(|count| count == 0) {
+                issues.push(json!({
+                    "edit_index": edit_index,
+                    "edit_type": edit_type,
+                    "field": "expected_occurrences",
+                    "reason": "field_must_be_positive_integer"
+                }));
+            }
+        }
+
+        let start_line = object.get("start_line");
+        let end_line = object.get("end_line");
+        for (field, value) in [("start_line", start_line), ("end_line", end_line)] {
+            if let Some(value) = value {
+                if value.as_u64().is_none_or(|line| line == 0) {
+                    issues.push(json!({
+                        "edit_index": edit_index,
+                        "edit_type": edit_type,
+                        "field": field,
+                        "reason": "field_must_be_positive_integer"
+                    }));
+                }
+            }
+        }
+        if matches!(edit_type, "replace" | "insert_before" | "insert_after")
+            && start_line.is_some() != end_line.is_some()
+        {
+            issues.push(json!({
+                "edit_index": edit_index,
+                "edit_type": edit_type,
+                "field": "start_line,end_line",
+                "reason": "line_range_pair_required"
+            }));
+        }
+        if let (Some(start), Some(end)) = (
+            start_line.and_then(Value::as_u64),
+            end_line.and_then(Value::as_u64),
+        ) {
+            if end < start {
+                issues.push(json!({
+                    "edit_index": edit_index,
+                    "edit_type": edit_type,
+                    "field": "end_line",
+                    "reason": "line_range_order_invalid",
+                    "start_line": start,
+                    "end_line": end
+                }));
+            }
+        }
+    }
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(WorkspaceError::ToolDetails {
+            code: "EDIT_CONTRACT_INVALID",
+            message: "Precise edit contract validation failed".into(),
+            category: "validation",
+            retryable: false,
+            details: json!({
+                "issue_count": issues.len(),
+                "issues": issues,
+                "suggestion": "Rebuild each edit using only the fields required by its type"
+            }),
+        })
+    }
+}
+
 fn apply_precise_edits(original: &str, edits: &[Value]) -> Result<String, WorkspaceError> {
     let mut resolved = Vec::with_capacity(edits.len());
     for (index, edit) in edits.iter().enumerate() {
@@ -1427,6 +1828,9 @@ fn resolve_text_targets(
                     "start_line": byte_to_line(original, *start),
                     "end_line": byte_to_line(original, end.saturating_sub(1))
                 })).collect::<Vec<_>>(),
+                "candidate_contexts": text_candidate_contexts(original, &candidates, 3),
+                "candidate_context_limit": 8,
+                "candidate_contexts_truncated": candidates.len() > 8,
                 "recovery_reason": if candidates.is_empty() {
                     "target_text_not_found"
                 } else {
@@ -1436,6 +1840,34 @@ fn resolve_text_targets(
         });
     }
     Ok(candidates)
+}
+
+fn text_candidate_contexts(
+    original: &str,
+    candidates: &[(usize, usize)],
+    radius: usize,
+) -> Vec<Value> {
+    let lines = original
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+        .collect::<Vec<_>>();
+    candidates
+        .iter()
+        .take(8)
+        .map(|(start, end)| {
+            let match_start = byte_to_line(original, *start);
+            let match_end = byte_to_line(original, end.saturating_sub(1));
+            let context_start = match_start.saturating_sub(radius).max(1);
+            let context_end = match_end.saturating_add(radius).min(lines.len());
+            json!({
+                "start_line": match_start,
+                "end_line": match_end,
+                "context_start_line": context_start,
+                "context_end_line": context_end,
+                "preview": lines[context_start - 1..context_end]
+            })
+        })
+        .collect()
 }
 
 fn exact_text_candidates(
@@ -1802,6 +2234,63 @@ fn unified_diff(
         .to_string()
 }
 
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            serde_json::to_string(value).expect("serializing canonical JSON scalar")
+        }
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::Object(object) => {
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let fields = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).expect("serializing canonical JSON key"),
+                        canonical_json(&object[key])
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{fields}}}")
+        }
+    }
+}
+
+fn replayable_edit_plan(
+    tool: &str,
+    arguments: Value,
+    files: Value,
+    stateful_dependencies: Value,
+) -> Value {
+    let mut plan = json!({
+        "schema_version": 1,
+        "tool": tool,
+        "arguments": arguments,
+        "expected_result": { "files": files },
+        "stateful_dependencies": stateful_dependencies
+    });
+    let digest = sha256_hex(canonical_json(&plan).as_bytes());
+    plan["plan_sha256"] = json!(digest);
+    plan
+}
+
+fn replay_reason(args: &Value) -> Option<Value> {
+    args.get("reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| json!(reason))
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -1856,6 +2345,37 @@ fn enrich_edit_error(error: WorkspaceError, path: &str, actual_sha256: &str) -> 
     }
 }
 
+fn enrich_edit_many_error(
+    error: WorkspaceError,
+    path: &str,
+    actual_sha256: &str,
+    file_index: usize,
+) -> WorkspaceError {
+    match enrich_edit_error(error, path, actual_sha256) {
+        WorkspaceError::ToolDetails {
+            code,
+            message,
+            category,
+            retryable,
+            mut details,
+        } => {
+            if let Some(object) = details.as_object_mut() {
+                object
+                    .entry("file_index".to_string())
+                    .or_insert_with(|| json!(file_index));
+            }
+            WorkspaceError::ToolDetails {
+                code,
+                message,
+                category,
+                retryable,
+                details,
+            }
+        }
+        other => other,
+    }
+}
+
 fn edit_recovery_actions(path: &str, actual_sha256: &str, reason: &str) -> Vec<Value> {
     vec![
         json!({
@@ -1866,12 +2386,14 @@ fn edit_recovery_actions(path: &str, actual_sha256: &str, reason: &str) -> Vec<V
         }),
         json!({
             "action": "rebuild_guarded_edit",
-            "tool": "edit_file",
+            "tool": "edit",
             "arguments": {
-                "path": path,
-                "expected_sha256": actual_sha256
+                "files": [{
+                    "path": path,
+                    "expected_sha256": actual_sha256
+                }]
             },
-            "required_arguments": ["edits"],
+            "required_arguments": ["files[0].edits"],
             "reason": "rebuild_from_fresh_content"
         }),
     ]
@@ -2042,12 +2564,12 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String, WorkspaceError>
             details: json!({
                 "issue_count": issue_values.len(),
                 "issues": issue_values,
-                "recommended_tool": "edit_file",
-                "suggestion": "Resolve all listed hunk issues before retrying. Prefer edit_file/edit_many for precise replacements.",
+                "recommended_tool": "edit",
+                "suggestion": "Resolve all listed hunk issues before retrying. Prefer edit for precise replacements.",
                 "recovery_actions": [{
                     "action": "switch_to_precise_edits",
-                    "tool": "edit_file",
-                    "required_arguments": ["path", "expected_sha256", "edits"],
+                    "tool": "edit",
+                    "required_arguments": ["files"],
                     "reason": "multiple_patch_hunks_failed_preflight"
                 }]
             }),
@@ -2097,8 +2619,8 @@ fn find_hunk_position(
                 "nearby_contexts": preferred
                     .map(|position| nearby_contexts(lines, &[position], 3))
                     .unwrap_or_default(),
-                "recommended_tool": "edit_file",
-                "suggestion": "Read the exact target range and use edit_file for a single precise replacement, or include more unique patch context.",
+                "recommended_tool": "edit",
+                "suggestion": "Read the exact target range and use edit for a single precise replacement, or include more unique patch context.",
                 "recovery_actions": [{
                     "action": "read_target_range",
                     "tool": "read_file",
@@ -2110,8 +2632,8 @@ fn find_hunk_position(
                     "reason": "patch_context_not_found"
                 }, {
                     "action": "switch_to_precise_edit",
-                    "tool": "edit_file",
-                    "required_arguments": ["path", "expected_sha256", "edits"],
+                    "tool": "edit",
+                    "required_arguments": ["files"],
                     "reason": "patch_context_not_found"
                 }]
             }),
@@ -2130,12 +2652,12 @@ fn find_hunk_position(
                     .map(|position| position + 1)
                     .collect::<Vec<_>>(),
                 "nearby_contexts": nearby_contexts(lines, &candidates, 3),
-                "recommended_tool": "edit_file",
-                "suggestion": "Use edit_file with exact old_text and expected_sha256, or add unique surrounding lines to this hunk.",
+                "recommended_tool": "edit",
+                "suggestion": "Use edit with exact old_text and expected_sha256, or add unique surrounding lines to this hunk.",
                 "recovery_actions": [{
                     "action": "select_candidate_range",
-                    "tool": "edit_file",
-                    "required_arguments": ["path", "expected_sha256", "edits"],
+                    "tool": "edit",
+                    "required_arguments": ["files"],
                     "candidate_lines": candidates
                         .iter()
                         .map(|position| position + 1)
@@ -2458,6 +2980,160 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_edit_plan_replays_once_and_rejects_stale_reuse() {
+        let (_workspace, _harness, context) = context_with_file();
+        let planned = edit(
+            &context,
+            &json!({
+                "files": [{
+                    "path": "main.rs",
+                    "edits": [{
+                        "type": "replace",
+                        "old_text": "old",
+                        "new_text": "new"
+                    }]
+                }],
+                "dry_run": true,
+                "reason": "guarded replay test"
+            }),
+        )
+        .expect("dry-run plan");
+        let plan = planned["edit_plan"].clone();
+        assert_eq!(plan["tool"], "edit");
+        assert_eq!(plan["arguments"]["dry_run"], false);
+        assert_eq!(plan["arguments"]["reason"], "guarded replay test");
+        assert_eq!(
+            plan["arguments"]["files"][0]["expected_sha256"],
+            planned["before_sha256"]
+        );
+        assert_eq!(plan["stateful_dependencies"], json!([]));
+        assert_eq!(plan["plan_sha256"].as_str().unwrap().len(), 64);
+
+        let replayed = edit(&context, &plan["arguments"]).expect("replay plan");
+        assert_eq!(replayed["applied"], true);
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
+            "new\n"
+        );
+
+        let stale = edit(&context, &plan["arguments"]).expect_err("stale replay");
+        assert_eq!(stale.to_error_value()["code"], "FILE_VERSION_MISMATCH");
+    }
+
+    #[test]
+    fn dry_run_edit_many_plan_replays_atomically() {
+        let (_workspace, _harness, context) = context_with_file();
+        std::fs::write(context.workspace.root().join("second.rs"), "second\n")
+            .expect("second fixture");
+        let planned = edit(
+            &context,
+            &json!({
+                "dry_run": true,
+                "files": [
+                    {
+                        "path": "main.rs",
+                        "edits": [{ "type": "replace", "old_text": "old", "new_text": "NEW" }]
+                    },
+                    {
+                        "path": "second.rs",
+                        "edits": [{ "type": "replace", "old_text": "second", "new_text": "SECOND" }]
+                    }
+                ]
+            }),
+        )
+        .expect("edit-many plan");
+        let plan = planned["edit_plan"].clone();
+        assert_eq!(plan["tool"], "edit");
+        assert_eq!(plan["arguments"]["files"].as_array().unwrap().len(), 2);
+        assert_eq!(plan["arguments"]["dry_run"], false);
+        assert_eq!(plan["plan_sha256"].as_str().unwrap().len(), 64);
+
+        let replayed = edit(&context, &plan["arguments"]).expect("replay edit");
+        assert_eq!(replayed["applied"], true);
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
+            "NEW\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("second.rs")).unwrap(),
+            "SECOND\n"
+        );
+    }
+
+    #[test]
+    fn edit_reports_ambiguous_candidates_with_context_without_writing() {
+        let (_workspace, _harness, context) = context_with_file();
+        std::fs::write(
+            context.workspace.root().join("main.rs"),
+            "fn first() {\n    return value;\n}\n\nfn second() {\n    return value;\n}\n",
+        )
+        .expect("fixture");
+
+        let error = edit(
+            &context,
+            &json!({
+                "files": [{
+                    "path": "main.rs",
+                    "edits": [{
+                        "type": "replace",
+                        "old_text": "return value;",
+                        "new_text": "return result;"
+                    }]
+                }]
+            }),
+        )
+        .expect_err("ambiguous target");
+        let value = error.to_error_value();
+        assert_eq!(value["code"], "EDIT_MATCH_COUNT_MISMATCH");
+        assert_eq!(value["details"]["actual_occurrences"], 2);
+        assert_eq!(value["details"]["candidate_lines"], json!([2, 6]));
+        assert_eq!(
+            value["details"]["candidate_contexts"]
+                .as_array()
+                .expect("candidate contexts")
+                .len(),
+            2
+        );
+        assert_eq!(value["details"]["candidate_contexts_truncated"], false);
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
+            "fn first() {\n    return value;\n}\n\nfn second() {\n    return value;\n}\n"
+        );
+    }
+
+    #[test]
+    fn edit_rejects_proposal_mode_for_multiple_files() {
+        let (_workspace, _harness, context) = context_with_file();
+        std::fs::write(context.workspace.root().join("second.rs"), "second\n")
+            .expect("second fixture");
+        let error = edit(
+            &context,
+            &json!({
+                "files": [
+                    {
+                        "path": "main.rs",
+                        "apply_proposal": { "proposal_id": "proposal" }
+                    },
+                    {
+                        "path": "second.rs",
+                        "edits": [{ "type": "replace", "old_text": "second", "new_text": "SECOND" }]
+                    }
+                ]
+            }),
+        )
+        .expect_err("proposal requires one file");
+        assert_eq!(error.to_error_value()["code"], "EDIT_CONTRACT_INVALID");
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
+            "old\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("second.rs")).unwrap(),
+            "second\n"
+        );
+    }
+
+    #[test]
     fn edit_file_exact_mode_tolerates_newline_style_and_preserves_crlf() {
         let (_workspace, _harness, context) = context_with_file();
         std::fs::write(
@@ -2719,6 +3395,71 @@ mod tests {
         )
         .expect_err("stale hash");
         assert_eq!(error.to_error_value()["code"], "FILE_VERSION_MISMATCH");
+    }
+
+    #[test]
+    fn edit_file_aggregates_contract_issues_with_guarded_recovery() {
+        let (_workspace, _harness, context) = context_with_file();
+        let error = edit_file(
+            &context,
+            &json!({
+                "path": "main.rs",
+                "edits": [{
+                    "type": "replace",
+                    "old_text": "old",
+                    "anchor": "unexpected"
+                }]
+            }),
+        )
+        .expect_err("invalid edit contract");
+        let value = error.to_error_value();
+        assert_eq!(value["code"], "EDIT_CONTRACT_INVALID");
+        assert_eq!(value["details"]["issue_count"], 2);
+        assert_eq!(value["details"]["path"], "main.rs");
+        assert!(value["details"]["actual_sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64));
+        assert_eq!(value["details"]["recovery_actions"][1]["tool"], "edit");
+    }
+
+    #[test]
+    fn edit_many_contract_failure_identifies_file_and_preserves_atomicity() {
+        let (_workspace, _harness, context) = context_with_file();
+        std::fs::write(context.workspace.root().join("second.rs"), "second\n")
+            .expect("second fixture");
+        let error = edit_many(
+            &context,
+            &json!({
+                "files": [
+                    {
+                        "path": "main.rs",
+                        "edits": [{
+                            "type": "replace",
+                            "old_text": "old",
+                            "new_text": "new"
+                        }]
+                    },
+                    {
+                        "path": "second.rs",
+                        "edits": [{
+                            "type": "replace",
+                            "old_text": "second",
+                            "anchor": "unexpected"
+                        }]
+                    }
+                ]
+            }),
+        )
+        .expect_err("second file contract failure");
+        let value = error.to_error_value();
+        assert_eq!(value["code"], "EDIT_CONTRACT_INVALID");
+        assert_eq!(value["details"]["file_index"], 1);
+        assert_eq!(value["details"]["path"], "second.rs");
+        assert!(value["details"]["recovery_actions"].is_array());
+        assert_eq!(
+            std::fs::read_to_string(context.workspace.root().join("main.rs")).unwrap(),
+            "old\n"
+        );
     }
 
     #[test]

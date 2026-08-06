@@ -12,8 +12,8 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::model::{
-    BaselineEntry, CapabilityStatus, FileChangeRecord, HarnessEvent, HarnessStatus, OperationRecord,
-    ProjectBaseline, ProjectFileState, ProjectState, TaskSession,
+    BaselineEntry, CapabilityStatus, ChangeSet, FileChangeRecord, HarnessEvent, HarnessStatus,
+    OperationRecord, ProjectBaseline, ProjectFileState, ProjectState, ReasonRecord, TaskSession,
     TaskStatus, WorkspaceHarnessState, SCHEMA_VERSION,
 };
 use super::store::{HarnessError, HarnessResult, HarnessStore};
@@ -101,6 +101,98 @@ impl Harness {
 
     pub fn task(&self, task_id: &str) -> HarnessResult<TaskSession> {
         self.store.load_task(&self.workspace_id, task_id)
+    }
+
+    pub fn change(&self, change_id: &str) -> HarnessResult<ChangeSet> {
+        if !is_change_id(change_id) {
+            return Err(HarnessError::new(
+                "INVALID_ARGUMENT",
+                "change_id 必须是 32 位小写十六进制 ID",
+            ));
+        }
+        self.store.load_change(&self.workspace_id, change_id)
+    }
+
+    pub fn change_files(&self, task_id: &str) -> HarnessResult<Vec<FileChangeRecord>> {
+        let task = self.task(task_id)?;
+        Ok(change_records(
+            &task.baseline,
+            &capture_baseline(&self.workspace_root),
+        ))
+    }
+
+    pub fn finish_task(
+        &self,
+        task_id: &str,
+        summary: Option<&str>,
+        next: TaskStatus,
+    ) -> HarnessResult<(TaskSession, ChangeSet)> {
+        let mut task = self.task(task_id)?;
+        if !task.status.can_transition_to(next) {
+            return Err(HarnessError::new(
+                "INVALID_TASK_TRANSITION",
+                format!("不允许从 {:?} 转换到 {:?}", task.status, next),
+            ));
+        }
+        let reason = match summary {
+            Some(value) if value.trim().is_empty() => {
+                return Err(HarnessError::new("INVALID_ARGUMENT", "summary 不能为空"));
+            }
+            Some(value) => ReasonRecord {
+                text: value.trim().to_string(),
+                source: "finish_task_summary".to_string(),
+            },
+            None => ReasonRecord {
+                text: task.objective.clone(),
+                source: "task_objective".to_string(),
+            },
+        };
+        let now = timestamp();
+        let change_id = Uuid::new_v4().simple().to_string();
+        let finished_event = HarnessEvent {
+            id: Uuid::new_v4().simple().to_string(),
+            task_id: task.id.clone(),
+            operation_id: Uuid::new_v4().simple().to_string(),
+            kind: "task_finished".to_string(),
+            tool_name: None,
+            input_summary: json!({
+                "workspace_id": self.workspace_id,
+                "payload": {"summary": reason.text, "status": next, "change_id": change_id}
+            }),
+            result_summary: json!({"ok": true, "status": next, "change_id": change_id}),
+            reason: Some(reason.clone()),
+            affected_files: Vec::new(),
+            created_at: now.clone(),
+        };
+        let mut command_ids = self
+            .list_events(task_id, 0, 2_000)?
+            .into_iter()
+            .map(|event| event.operation_id)
+            .collect::<Vec<_>>();
+        command_ids.push(finished_event.operation_id.clone());
+        let change = ChangeSet {
+            id: change_id,
+            task_id: task.id.clone(),
+            objective: task.objective.clone(),
+            reason,
+            files: change_records(&task.baseline, &capture_baseline(&self.workspace_root)),
+            command_ids,
+            verification_ids: Vec::new(),
+            risks: Vec::new(),
+            created_at: now.clone(),
+        };
+        task.status = next;
+        task.latest_change_id = Some(change.id.clone());
+        task.updated_at = now;
+        self.store.save_change(&self.workspace_id, &change)?;
+        self.store.save_task(&task)?;
+        self.store
+            .append_event_for_workspace(&self.workspace_id, &finished_event)?;
+        self.save_workspace_state(
+            task.status.is_writable().then_some(task.id.as_str()),
+            &task.updated_at,
+        )?;
+        Ok((task, change))
     }
 
     pub fn transition(&self, task_id: &str, next: TaskStatus) -> HarnessResult<TaskSession> {
@@ -244,7 +336,8 @@ impl Harness {
             affected_files: Vec::new(),
             created_at: timestamp(),
         };
-        self.store.append_operation(&self.workspace_id, &operation)?;
+        self.store
+            .append_operation(&self.workspace_id, &operation)?;
         Ok(operation)
     }
 
@@ -303,6 +396,7 @@ impl Harness {
                 }
             })
             .collect::<Vec<_>>();
+        let clean = files.iter().all(|file| file.status == "unchanged");
         let truncated = files.len() > max_files.max(1);
         let files = files.into_iter().take(max_files.max(1)).collect::<Vec<_>>();
         let active_task_id = task.as_ref().map(|t| t.id.clone());
@@ -316,7 +410,7 @@ impl Harness {
             workspace_id: self.workspace_id.clone(),
             branch: current.branch,
             head: current.head,
-            clean: files.iter().all(|f| f.status == "unchanged"),
+            clean,
             files,
             total_files,
             truncated,
@@ -327,11 +421,22 @@ impl Harness {
     }
 
     pub fn status(&self) -> HarnessResult<HarnessStatus> {
-        let current = capture_baseline(&self.workspace_root);
         let task = self.current_task()?;
+        let current = task
+            .as_ref()
+            .map(|_| capture_baseline(&self.workspace_root));
+        let branch = current
+            .as_ref()
+            .and_then(|baseline| baseline.branch.clone())
+            .or_else(|| git_value(&self.workspace_root, &["rev-parse", "--abbrev-ref", "HEAD"]));
+        let head = current
+            .as_ref()
+            .and_then(|baseline| baseline.head.clone())
+            .or_else(|| git_value(&self.workspace_root, &["rev-parse", "HEAD"]));
         let (task_id, task_state, task_updated_at, writable, baseline_matches, reason) =
             match task.as_ref() {
                 Some(task) => {
+                    let current = current.as_ref().expect("active task baseline");
                     let matches = task.baseline.branch == current.branch
                         && task.baseline.head == current.head
                         && task.expected_fingerprint == current.worktree_fingerprint;
@@ -405,13 +510,13 @@ impl Harness {
         capabilities.insert(
             "git".into(),
             CapabilityStatus {
-                status: if current.branch.is_some() && current.head.is_some() {
+                status: if branch.is_some() && head.is_some() {
                     "available"
                 } else {
                     "degraded"
                 }
                 .into(),
-                reason: if current.branch.is_some() && current.head.is_some() {
+                reason: if branch.is_some() && head.is_some() {
                     "已读取当前分支和 HEAD"
                 } else {
                     "当前工作区不是可读取 Git 状态的仓库"
@@ -451,8 +556,8 @@ impl Harness {
             writable,
             reason,
             recoverable: true,
-            branch: current.branch,
-            head: current.head,
+            branch,
+            head,
             baseline_matches,
             capabilities,
             next_actions,
@@ -483,32 +588,32 @@ impl Harness {
 }
 
 pub fn capture_baseline(root: &Path) -> ProjectBaseline {
-    let mut entries = Vec::new();
-    for item in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        let path = item.path();
-        if path == root || should_skip(path, root) || !item.file_type().is_file() {
-            continue;
-        }
-        let Ok(bytes) = fs::read(path) else { continue };
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        entries.push(BaselineEntry {
-            path: rel,
-            exists: true,
-            is_binary: bytes.contains(&0),
-            sha256: format!("{:x}", hasher.finalize()),
-            bytes: bytes.len() as u64,
+    let mut entries = git_baseline_paths(root)
+        .map(|paths| {
+            paths
+                .into_iter()
+                .filter_map(|relative| baseline_entry(root, &relative))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            WalkDir::new(root)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter_map(|item| {
+                    let path = item.path();
+                    if path == root || should_skip(path, root) || !item.file_type().is_file() {
+                        return None;
+                    }
+                    let relative = path
+                        .strip_prefix(root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    baseline_entry(root, &relative)
+                })
+                .collect::<Vec<_>>()
         });
-    }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let mut fingerprint = Sha256::new();
     for entry in &entries {
@@ -523,6 +628,105 @@ pub fn capture_baseline(root: &Path) -> ProjectBaseline {
         entries,
         captured_at: timestamp(),
     }
+}
+
+fn git_baseline_paths(root: &Path) -> Option<Vec<String>> {
+    let output = git_output(
+        root,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    let mut paths = output
+        .split(|byte| *byte == 0)
+        .filter(|value| !value.is_empty())
+        .map(|value| String::from_utf8_lossy(value).replace('\\', "/"))
+        .filter(|value| !value.ends_with('/'))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    Some(paths)
+}
+
+fn baseline_entry(root: &Path, relative: &str) -> Option<BaselineEntry> {
+    let full = root.join(relative);
+    let metadata = fs::symlink_metadata(&full).ok()?;
+    let (bytes, is_binary) = if metadata.file_type().is_symlink() {
+        (
+            fs::read_link(&full)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/")
+                .into_bytes(),
+            false,
+        )
+    } else if metadata.is_file() {
+        let bytes = fs::read(&full).ok()?;
+        let is_binary = bytes.contains(&0);
+        (bytes, is_binary)
+    } else {
+        return None;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(BaselineEntry {
+        path: relative.replace('\\', "/"),
+        exists: true,
+        is_binary,
+        sha256: format!("{:x}", hasher.finalize()),
+        bytes: bytes.len() as u64,
+    })
+}
+
+fn change_records(baseline: &ProjectBaseline, current: &ProjectBaseline) -> Vec<FileChangeRecord> {
+    let baseline_map = baseline
+        .entries
+        .iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<HashMap<_, _>>();
+    let current_map = current
+        .entries
+        .iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<HashMap<_, _>>();
+    let mut paths = baseline_map
+        .keys()
+        .chain(current_map.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let before = baseline_map.get(&path);
+            let after = current_map.get(&path);
+            let status = match (before, after) {
+                (Some(before), Some(after)) if before.sha256 == after.sha256 => "unchanged",
+                (Some(_), Some(_)) => "modified",
+                (Some(_), None) => "deleted",
+                (None, Some(_)) => "added",
+                (None, None) => "unknown",
+            };
+            (status != "unchanged").then(|| FileChangeRecord {
+                path,
+                status: status.to_string(),
+                before_sha256: before.map(|entry| entry.sha256.clone()),
+                after_sha256: after.map(|entry| entry.sha256.clone()),
+            })
+        })
+        .collect()
+}
+
+fn is_change_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn should_skip(path: &Path, root: &Path) -> bool {
@@ -546,7 +750,16 @@ fn should_skip(path: &Path, root: &Path) -> bool {
 }
 
 fn git_value(root: &Path, args: &[&str]) -> Option<String> {
-    let args = args.iter().map(|arg| (*arg).to_string()).collect::<Vec<_>>();
+    let output = git_output(root, args)?;
+    let value = String::from_utf8_lossy(&output).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
     let mut command = crate::platform::wsl::std_command_for_workspace("git", &args, root);
 
     #[cfg(windows)]
@@ -559,8 +772,7 @@ fn git_value(root: &Path, args: &[&str]) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!value.is_empty()).then_some(value)
+    Some(output.stdout)
 }
 
 fn workspace_id(root: &Path) -> String {
@@ -579,7 +791,27 @@ fn timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::tempdir;
+
+    fn git(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn init_git_workspace(root: &Path) {
+        git(root, &["init"]);
+        git(root, &["config", "user.name", "Harness Test"]);
+        git(root, &["config", "user.email", "harness@example.invalid"]);
+        fs::write(root.join(".gitignore"), "runtime-data/\ncache/\n").expect("gitignore");
+        fs::write(root.join("tracked.txt"), "initial\n").expect("tracked");
+        git(root, &["add", "--all"]);
+        git(root, &["commit", "-m", "initial"]);
+    }
 
     #[test]
     fn status_keeps_read_available_without_task() {
@@ -617,5 +849,47 @@ mod tests {
             .join(harness.workspace_id())
             .join("snapshots")
             .exists());
+    }
+
+    #[test]
+    fn git_baseline_respects_ignores_and_nested_worktree_boundaries() {
+        let workspace = tempdir().expect("workspace");
+        init_git_workspace(workspace.path());
+        fs::create_dir_all(workspace.path().join("runtime-data")).expect("runtime data");
+        fs::write(workspace.path().join("runtime-data/state.json"), "one\n").expect("state");
+        fs::write(workspace.path().join("notes.txt"), "before\n").expect("notes");
+        let linked = workspace.path().join("linked-worktree");
+        let linked_text = linked.to_string_lossy().to_string();
+        git(
+            workspace.path(),
+            &["worktree", "add", "-b", "linked-test", linked_text.as_str()],
+        );
+
+        let baseline = capture_baseline(workspace.path());
+        assert!(baseline
+            .entries
+            .iter()
+            .any(|entry| entry.path == "notes.txt"));
+        assert!(!baseline
+            .entries
+            .iter()
+            .any(|entry| entry.path.starts_with("runtime-data/")));
+        assert!(!baseline
+            .entries
+            .iter()
+            .any(|entry| entry.path.starts_with("linked-worktree/")));
+
+        fs::write(workspace.path().join("runtime-data/state.json"), "two\n").expect("state");
+        fs::write(linked.join("tracked.txt"), "linked change\n").expect("linked change");
+        assert_eq!(
+            capture_baseline(workspace.path()).worktree_fingerprint,
+            baseline.worktree_fingerprint
+        );
+
+        fs::write(workspace.path().join("notes.txt"), "after\n").expect("notes");
+        assert_ne!(
+            capture_baseline(workspace.path()).worktree_fingerprint,
+            baseline.worktree_fingerprint
+        );
     }
 }

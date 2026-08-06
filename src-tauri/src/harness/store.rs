@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use super::model::{HarnessEvent, OperationRecord, TaskSession, WorkspaceHarnessState};
+use super::model::{ChangeSet, HarnessEvent, OperationRecord, TaskSession, WorkspaceHarnessState};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -54,6 +54,10 @@ impl HarnessStore {
         self.workspace_dir(workspace_id).join("events")
     }
 
+    fn changes_dir(&self, workspace_id: &str) -> PathBuf {
+        self.workspace_dir(workspace_id).join("changes")
+    }
+
     fn operations_path(&self, workspace_id: &str) -> PathBuf {
         self.workspace_dir(workspace_id).join("operations.jsonl")
     }
@@ -66,6 +70,25 @@ impl HarnessStore {
 
     pub fn load_task(&self, workspace_id: &str, task_id: &str) -> HarnessResult<TaskSession> {
         read_json(&self.tasks_dir(workspace_id).join(format!("{task_id}.json")))
+    }
+
+    pub fn save_change(&self, workspace_id: &str, change: &ChangeSet) -> HarnessResult<()> {
+        let dir = self.changes_dir(workspace_id);
+        fs::create_dir_all(&dir).map_err(io_error)?;
+        atomic_write_json(&dir.join(format!("{}.json", change.id)), change)
+    }
+
+    pub fn load_change(&self, workspace_id: &str, change_id: &str) -> HarnessResult<ChangeSet> {
+        let path = self
+            .changes_dir(workspace_id)
+            .join(format!("{change_id}.json"));
+        if !path.exists() {
+            return Err(HarnessError::new(
+                "CHANGE_NOT_FOUND",
+                format!("未找到变更集 {change_id}"),
+            ));
+        }
+        read_json(&path)
     }
 
     pub fn list_tasks(&self, workspace_id: &str) -> HarnessResult<Vec<TaskSession>> {

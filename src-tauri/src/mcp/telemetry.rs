@@ -17,7 +17,7 @@ const MAX_LOG_STRING_CHARS: usize = 4 * 1024;
 const MAX_ARGUMENT_RECORD_BYTES: usize = 4 * 1024;
 const MAX_ARGUMENT_PREVIEW_BYTES: usize = 512;
 const TOOL_USAGE_LOG_FILE: &str = "mcp-tool-usage.jsonl";
-const TOOL_USAGE_LOG_SCHEMA_VERSION: u64 = 6;
+const TOOL_USAGE_LOG_SCHEMA_VERSION: u64 = 7;
 const TOOL_USAGE_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const TOOL_USAGE_LOG_RETAINED_FILES: usize = 5;
 const TOOL_USAGE_LOG_QUEUE_CAPACITY: usize = 1_024;
@@ -37,6 +37,9 @@ struct ActivityState {
     burst_id: u64,
     burst_sequence: u64,
     active_requests: u64,
+    last_failure_signature: Option<String>,
+    last_failure_burst_id: u64,
+    repeat_failure_count: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -160,9 +163,103 @@ pub(crate) fn format_request_log_value(value: &Value) -> String {
     .unwrap_or_else(|_| "null".to_string())
 }
 
+fn failure_signature(record: &Map<String, Value>) -> Option<String> {
+    let is_error = record.get("is_error").and_then(Value::as_bool) == Some(true)
+        || record
+            .get("outcome")
+            .and_then(Value::as_str)
+            .is_some_and(|outcome| outcome != "success");
+    if !is_error {
+        return None;
+    }
+    let mut identity = vec![
+        json!("tool-failure-v1"),
+        record.get("tool").cloned().unwrap_or(Value::Null),
+        record
+            .get("arguments_sha256")
+            .cloned()
+            .unwrap_or(Value::Null),
+        record
+            .get("error_code")
+            .or_else(|| record.get("rpc_error_code"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        record.get("error_category").cloned().unwrap_or(Value::Null),
+    ];
+    for field in [
+        "path",
+        "file_index",
+        "edit_index",
+        "start_line",
+        "end_line",
+        "expected_sha256",
+        "actual_sha256",
+        "expected_occurrences",
+        "actual_occurrences",
+        "recovery_reason",
+    ] {
+        identity.push(
+            record
+                .get(&format!("error_{field}"))
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+    let serialized = serde_json::to_vec(&identity).unwrap_or_default();
+    Some(format!("{:x}", Sha256::digest(serialized)))
+}
+
+fn reset_failure_chain(state: &mut ActivityState) {
+    state.last_failure_signature = None;
+    state.last_failure_burst_id = 0;
+    state.repeat_failure_count = 0;
+}
+
+fn annotate_repeated_failure(profile_id: &str, record: &mut Value) {
+    let Some(object) = record.as_object_mut() else {
+        return;
+    };
+    let signature = failure_signature(object);
+    let burst_id = object
+        .get("activity_burst_id")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let concurrent = object.get("concurrent_request").and_then(Value::as_bool) == Some(true);
+    let states = ACTIVITY_STATES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut states = states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = states.entry(profile_id.to_string()).or_default();
+    let Some(signature) = signature else {
+        reset_failure_chain(state);
+        return;
+    };
+    let repeated = !concurrent
+        && state.last_failure_signature.as_deref() == Some(signature.as_str())
+        && state.last_failure_burst_id == burst_id;
+    let count = if repeated {
+        state.repeat_failure_count.saturating_add(1)
+    } else {
+        1
+    };
+    object.insert("failure_signature".into(), json!(signature.clone()));
+    object.insert("repeat_failure_count".into(), json!(count));
+    object.insert("repeated_failure".into(), json!(count > 1));
+    object.insert("retry_without_change".into(), json!(count > 1));
+    if concurrent {
+        reset_failure_chain(state);
+    } else {
+        state.last_failure_signature = Some(signature);
+        state.last_failure_burst_id = burst_id;
+        state.repeat_failure_count = count;
+    }
+}
+
 pub(crate) fn record_tool_usage(input: ToolUsageInput<'_>) {
     let completed_ts_ms = input.started_ts_ms.saturating_add(input.duration_ms);
-    append_tool_usage_log(input.profile_id, build_tool_usage_record(&input));
+    let mut record = build_tool_usage_record(&input);
+    annotate_repeated_failure(input.profile_id, &mut record);
+    append_tool_usage_log(input.profile_id, record);
     complete_tool_request(input.profile_id, completed_ts_ms);
 }
 
@@ -247,6 +344,7 @@ fn tool_family(tool_name: &str) -> &'static str {
             | "read_many"
             | "list_files"
             | "apply_patch"
+            | "edit"
             | "edit_file"
             | "edit_many"
             | "file_ops"
@@ -705,6 +803,17 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
                     "failed_command_count",
                     "skipped_command_count",
                     "batch_summary",
+                    "mode",
+                    "requested_mode",
+                    "auto_selected",
+                    "parallel_decision_source",
+                    "parallel_confidence",
+                    "parallel_history_samples",
+                    "parallel_blocked_pair_count",
+                    "recommended_max_parallel",
+                    "inferred_lock_group_count",
+                    "parallel_observation_count",
+                    "parallelism_observation_truncated",
                     "wait_timeout_ms",
                     "effective_wait_ms",
                     "heartbeat_ms",
@@ -722,6 +831,48 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
                     "wait_until",
                 ] {
                     insert_structured_metric(&mut record, structured, field, field);
+                }
+                if input.tool_name == "exec_many" {
+                    if let Some(observations) = structured
+                        .get("parallelism_observations")
+                        .and_then(Value::as_array)
+                    {
+                        record.insert(
+                            "parallelism_observations".into(),
+                            Value::Array(
+                                observations
+                                    .iter()
+                                    .take(128)
+                                    .map(|observation| {
+                                        sanitize_log_value(
+                                            observation,
+                                            Some("parallelism_observations"),
+                                        )
+                                    })
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    if let Some(reasons) = structured
+                        .get("parallel_decision_reasons")
+                        .and_then(Value::as_array)
+                    {
+                        record.insert(
+                            "parallel_decision_reasons".into(),
+                            Value::Array(
+                                reasons
+                                    .iter()
+                                    .take(16)
+                                    .map(|reason| {
+                                        sanitize_log_value(
+                                            reason,
+                                            Some("parallel_decision_reasons"),
+                                        )
+                                    })
+                                    .collect(),
+                            ),
+                        );
+                    }
                 }
                 if input.tool_name == "format_files" {
                     for (source, destination) in [
@@ -756,6 +907,16 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
                         "format_unexpected_change_count",
                     );
                 }
+                if let Some(phases) = structured.get("phase_durations_ms") {
+                    for (source, destination) in [
+                        ("preflight_ms", "phase_preflight_ms"),
+                        ("plan_ms", "phase_plan_ms"),
+                        ("commit_ms", "phase_commit_ms"),
+                        ("total_ms", "phase_total_ms"),
+                    ] {
+                        insert_structured_metric(&mut record, phases, source, destination);
+                    }
+                }
                 if let Some(error) = structured.get("error") {
                     insert_structured_metric(&mut record, error, "code", "error_code");
                     insert_structured_metric(&mut record, error, "category", "error_category");
@@ -769,6 +930,11 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
                             "recommended_format",
                             "patch_bytes",
                             "replacement_bytes",
+                            "path",
+                            "file_index",
+                            "edit_index",
+                            "start_line",
+                            "end_line",
                             "actual_sha256",
                             "expected_sha256",
                             "actual_occurrences",
@@ -858,6 +1024,10 @@ fn classify_outcome(record: &Map<String, Value>, outcome: &str) -> &'static str 
         .or_else(|| record.get("rpc_error_code"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let category = record
+        .get("error_category")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if record.get("request_timed_out").and_then(Value::as_bool) == Some(true)
         || record.get("process_timed_out").and_then(Value::as_bool) == Some(true)
     {
@@ -878,10 +1048,41 @@ fn classify_outcome(record: &Map<String, Value>, outcome: &str) -> &'static str 
         "success"
     } else if code == "UNKNOWN_TOOL" {
         "catalog_mismatch"
-    } else if code.contains("POLICY") || code.contains("PERMISSION") {
+    } else if matches!(category, "policy" | "permission" | "security")
+        || code.contains("POLICY")
+        || code.contains("PERMISSION")
+        || code.starts_with("DANGEROUS_OPERATION_")
+        || code.starts_with("PROTECTED_")
+    {
         "policy_rejection"
-    } else if code.contains("VERSION_MISMATCH") {
-        "version_conflict"
+    } else if code == "GIT_REPO_TARGET_MISMATCH"
+        || category == "workspace_routing"
+        || code.contains("ROUTING")
+    {
+        "routing_error"
+    } else if matches!(
+        code,
+        "EDIT_MATCH_COUNT_MISMATCH"
+            | "PATCH_CONTEXT_AMBIGUOUS"
+            | "PATCH_CONTEXT_NOT_FOUND"
+            | "PATCH_HUNK_COUNT_MISMATCH"
+            | "NOT_FOUND"
+            | "NOT_GIT_REPOSITORY"
+            | "EDIT_PROPOSAL_NOT_FOUND"
+    ) || category == "not_found"
+    {
+        "target_resolution_error"
+    } else if matches!(
+        code,
+        "FILE_VERSION_MISMATCH"
+            | "EDIT_EXPECTED_TEXT_MISMATCH"
+            | "GIT_HEAD_MISMATCH"
+            | "GIT_INDEX_NOT_CLEAN"
+            | "BASELINE_STALE"
+            | "EXPECTED_HEAD_MISMATCH"
+    ) || category == "conflict"
+    {
+        "state_conflict"
     } else if code.contains("TIMEOUT") {
         "timeout"
     } else if code.contains("CANCEL") {
@@ -894,10 +1095,12 @@ fn classify_outcome(record: &Map<String, Value>, outcome: &str) -> &'static str 
         .is_some_and(|code| code != 0)
     {
         "process_failure"
-    } else if record.get("error_category").and_then(Value::as_str) == Some("validation") {
+    } else if category == "validation"
+        || matches!(code, "INVALID_ARGUMENT" | "EDIT_CONTRACT_INVALID")
+    {
         "caller_argument_error"
     } else {
-        "tool_internal_error"
+        "internal_error"
     }
 }
 
@@ -970,9 +1173,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        begin_tool_request, build_async_session_record, build_tool_usage_record,
-        classify_command_text, classify_outcome, complete_tool_request, format_log_value,
-        format_request_log_value, AsyncSessionTelemetry, ToolRequestTiming, ToolUsageInput,
+        annotate_repeated_failure, begin_tool_request, build_async_session_record,
+        build_tool_usage_record, classify_command_text, classify_outcome, complete_tool_request,
+        format_log_value, format_request_log_value, AsyncSessionTelemetry, ToolRequestTiming,
+        ToolUsageInput,
     };
 
     #[test]
@@ -1013,6 +1217,65 @@ mod tests {
     }
 
     #[test]
+    fn repeated_failure_detection_resets_at_safe_boundaries() {
+        let profile = format!("repeat-failure-test-{}", uuid::Uuid::new_v4());
+        let failure = |arguments_sha256: &str, burst_id: u64, concurrent: bool| {
+            json!({
+                "outcome": "tool_error",
+                "is_error": true,
+                "tool": "edit_file",
+                "arguments_sha256": arguments_sha256,
+                "error_code": "EDIT_MATCH_COUNT_MISMATCH",
+                "error_category": "validation",
+                "error_path": "main.txt",
+                "error_edit_index": 0,
+                "error_actual_occurrences": 0,
+                "error_expected_occurrences": 1,
+                "activity_burst_id": burst_id,
+                "concurrent_request": concurrent
+            })
+        };
+
+        let mut first = failure(&"a".repeat(64), 7, false);
+        annotate_repeated_failure(&profile, &mut first);
+        let mut second = failure(&"a".repeat(64), 7, false);
+        annotate_repeated_failure(&profile, &mut second);
+        assert_eq!(first["failure_signature"].as_str().unwrap().len(), 64);
+        assert_eq!(first["repeat_failure_count"], 1);
+        assert_eq!(first["repeated_failure"], false);
+        assert_eq!(second["failure_signature"], first["failure_signature"]);
+        assert_eq!(second["repeat_failure_count"], 2);
+        assert_eq!(second["repeated_failure"], true);
+        assert_eq!(second["retry_without_change"], true);
+
+        let mut changed = failure(&"b".repeat(64), 7, false);
+        annotate_repeated_failure(&profile, &mut changed);
+        assert_eq!(changed["repeat_failure_count"], 1);
+        let mut new_burst = failure(&"b".repeat(64), 8, false);
+        annotate_repeated_failure(&profile, &mut new_burst);
+        assert_eq!(new_burst["repeat_failure_count"], 1);
+        let mut concurrent = failure(&"b".repeat(64), 8, true);
+        annotate_repeated_failure(&profile, &mut concurrent);
+        assert_eq!(concurrent["repeat_failure_count"], 1);
+        assert_eq!(concurrent["repeated_failure"], false);
+        let mut after_concurrent = failure(&"b".repeat(64), 8, false);
+        annotate_repeated_failure(&profile, &mut after_concurrent);
+        assert_eq!(after_concurrent["repeat_failure_count"], 1);
+
+        let mut success = json!({
+            "outcome": "success",
+            "is_error": false,
+            "activity_burst_id": 8,
+            "concurrent_request": false
+        });
+        annotate_repeated_failure(&profile, &mut success);
+        assert!(success.get("failure_signature").is_none());
+        let mut after_success = failure(&"b".repeat(64), 8, false);
+        annotate_repeated_failure(&profile, &mut after_success);
+        assert_eq!(after_success["repeat_failure_count"], 1);
+    }
+
+    #[test]
     fn async_session_record_captures_real_child_process_lifetime() {
         let record = build_async_session_record(
             &AsyncSessionTelemetry {
@@ -1030,7 +1293,7 @@ mod tests {
             6_250,
         );
 
-        assert_eq!(record["schema_version"], 6);
+        assert_eq!(record["schema_version"], 7);
         assert_eq!(record["event"], "async_session_finalized");
         assert_eq!(record["session_id"], "session-1");
         assert_eq!(record["command_kind"], "cargo_test");
@@ -1098,6 +1361,38 @@ mod tests {
     }
 
     #[test]
+    fn tool_outcome_taxonomy_separates_recoverable_failures_from_internal_errors() {
+        let cases = [
+            (
+                "EDIT_MATCH_COUNT_MISMATCH",
+                "validation",
+                "target_resolution_error",
+            ),
+            (
+                "PATCH_CONTEXT_AMBIGUOUS",
+                "validation",
+                "target_resolution_error",
+            ),
+            ("FILE_VERSION_MISMATCH", "conflict", "state_conflict"),
+            ("GIT_REPO_TARGET_MISMATCH", "conflict", "routing_error"),
+            (
+                "EDIT_CONTRACT_INVALID",
+                "validation",
+                "caller_argument_error",
+            ),
+            ("PROTECTED_PATH", "security", "policy_rejection"),
+            ("E_FAIL", "runtime", "internal_error"),
+        ];
+
+        for (code, category, expected) in cases {
+            let mut record = serde_json::Map::new();
+            record.insert("error_code".into(), json!(code));
+            record.insert("error_category".into(), json!(category));
+            assert_eq!(classify_outcome(&record, "tool_error"), expected, "{code}");
+        }
+    }
+
+    #[test]
     fn usage_record_contains_payload_and_result_metrics() {
         let arguments = json!({
             "cmd": "cargo test --token hidden-value",
@@ -1113,6 +1408,12 @@ mod tests {
                     "ok": true,
                     "status": "exited",
                     "duration_ms": 12,
+                    "phase_durations_ms": {
+                        "preflight_ms": 4,
+                        "plan_ms": 2,
+                        "commit_ms": 5,
+                        "total_ms": 11
+                    },
                     "operation_lock_wait_ms": 7,
                     "resource_lock_wait_ms": 13,
                     "resource_lock_group": "cargo-target:fixture",
@@ -1154,7 +1455,7 @@ mod tests {
             worker_error: None,
         });
 
-        assert_eq!(record["schema_version"], 6);
+        assert_eq!(record["schema_version"], 7);
         assert!(record["runtime_boot_id"].as_str().is_some());
         assert_eq!(record["rpc_fast_path"], false);
         assert_eq!(record["tool_family"], "process");
@@ -1162,6 +1463,10 @@ mod tests {
         assert_eq!(record["deprecated_tool"], false);
         assert!(record["call_sequence"].as_u64().is_some());
         assert_eq!(record["duration_ms"], 25);
+        assert_eq!(record["phase_preflight_ms"], 4);
+        assert_eq!(record["phase_plan_ms"], 2);
+        assert_eq!(record["phase_commit_ms"], 5);
+        assert_eq!(record["phase_total_ms"], 11);
         assert_eq!(record["operation_lock_wait_ms"], 7);
         assert_eq!(record["resource_lock_wait_ms"], 13);
         assert_eq!(record["resource_lock_group"], "cargo-target:fixture");
@@ -1182,7 +1487,7 @@ mod tests {
         assert_eq!(record["notice_count"], 1);
         assert_eq!(record["deprecation_count"], 0);
         assert_eq!(record["returned_count"], 3);
-        assert_eq!(record["schema_version"], 6);
+        assert_eq!(record["schema_version"], 7);
         assert_eq!(record["arguments"]["stdin"], "[REDACTED]");
         assert!(record["command_preview"]
             .as_str()
@@ -1190,6 +1495,73 @@ mod tests {
             .contains("--token [REDACTED]"));
         assert!(!record.to_string().contains("hidden-value"));
         assert!(!record.to_string().contains("do-not-log"));
+    }
+
+    #[test]
+    fn exec_many_usage_record_keeps_bounded_parallel_statistics() {
+        let request_timing = ToolRequestTiming {
+            previous_response_completed_ts_ms: None,
+            orchestration_gap_ms: None,
+            activity_burst_id: 8,
+            activity_burst_sequence: 1,
+            concurrent_request: false,
+        };
+        let arguments = json!({"mode": "auto", "commands": [{"program": "cargo"}]});
+        let response = json!({
+            "result": {
+                "content": [{"type": "text", "text": "batch complete"}],
+                "structuredContent": {
+                    "ok": true,
+                    "mode": "parallel",
+                    "requested_mode": "auto",
+                    "auto_selected": true,
+                    "parallel_decision_source": "historical_statistics",
+                    "parallel_confidence": 0.812,
+                    "parallel_history_samples": 12,
+                    "parallel_blocked_pair_count": 0,
+                    "recommended_max_parallel": 4,
+                    "parallel_observation_count": 1,
+                    "parallelism_observation_truncated": false,
+                    "parallel_decision_reasons": ["statistically supported"],
+                    "parallelism_observations": [{
+                        "pair": "cargo:test@abc|node:test@def",
+                        "left": "cargo:test@abc",
+                        "right": "node:test@def",
+                        "outcome": "success",
+                        "overlap_ms": 500,
+                        "lock_wait_ms": 0,
+                        "same_lock_group": false
+                    }]
+                },
+                "isError": false
+            }
+        });
+        let record = build_tool_usage_record(&ToolUsageInput {
+            profile_id: "workspace",
+            transport_mode: "streamable-http",
+            protocol_version: "2025-11-25",
+            request_id: &json!(8),
+            method: "tools/call",
+            tool_name: "exec_many",
+            arguments: &arguments,
+            request_json_bytes: 100,
+            rpc_fast_path: false,
+            request_timing: &request_timing,
+            started_ts_ms: 2_000,
+            duration_ms: 600,
+            outcome: "success",
+            response: Some(&response),
+            worker_error: None,
+        });
+        assert_eq!(record["schema_version"], 7);
+        assert_eq!(record["mode"], "parallel");
+        assert_eq!(record["parallel_decision_source"], "historical_statistics");
+        assert_eq!(record["parallel_history_samples"], 12);
+        assert_eq!(record["parallelism_observations"][0]["outcome"], "success");
+        assert_eq!(
+            record["parallel_decision_reasons"][0],
+            "statistically supported"
+        );
     }
 
     #[test]
@@ -1243,7 +1615,7 @@ mod tests {
             response: Some(&response),
             worker_error: None,
         });
-        assert_eq!(check["schema_version"], 6);
+        assert_eq!(check["schema_version"], 7);
         assert_eq!(check["tool_family"], "quality");
         assert_eq!(check["mutating_tool"], false);
         assert_eq!(check["format_mode"], "check");

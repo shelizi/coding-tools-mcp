@@ -608,3 +608,38 @@ fn concurrent_bootstrap_allocates_distinct_numbers() {
     assert!(workspace.path().join("docs/history-session/1.md").is_file());
     assert!(workspace.path().join("docs/history-session/2.md").is_file());
 }
+
+#[test]
+fn bootstrap_waits_for_the_shared_lock_directory_protocol() {
+    let (workspace, _harness, ctx) = test_context();
+    let history_dir = workspace.path().join("docs/history-session");
+    let lock_dir = history_dir.join(".history.lock.d");
+    fs::create_dir_all(&lock_dir).expect("create shared lock directory");
+    fs::write(
+        lock_dir.join("owner.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "token": "node-compatible-owner",
+            "pid": 42,
+            "created_at_ms": 0
+        }))
+        .expect("serialize owner"),
+    )
+    .expect("write owner");
+
+    let release_path = lock_dir.clone();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        fs::remove_dir_all(release_path).expect("release shared lock directory");
+    });
+
+    let result = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "shared-lock-protocol"}),
+    );
+    release.join().expect("release thread");
+    let payload = assert_ok(&result);
+    assert!(payload["history_lock_wait_ms"].as_u64().unwrap_or_default() >= 50);
+    assert_eq!(payload["current_number"], 1);
+}

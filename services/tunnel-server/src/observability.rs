@@ -27,6 +27,13 @@ struct Inner {
     successful_requests: AtomicU64,
     failed_requests: AtomicU64,
     in_flight_requests: AtomicUsize,
+    queued_requests: AtomicUsize,
+    peak_queued_requests: AtomicUsize,
+    capacity_rejections: AtomicU64,
+    worker_acquire_timeouts: AtomicU64,
+    assigned_requests: AtomicU64,
+    queue_wait_total_ms: AtomicU64,
+    max_queue_wait_ms: AtomicU64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -77,6 +84,12 @@ pub struct DashboardSnapshot {
     pub successful_requests: u64,
     pub failed_requests: u64,
     pub in_flight_requests: usize,
+    pub queued_requests: usize,
+    pub peak_queued_requests: usize,
+    pub capacity_rejections: u64,
+    pub worker_acquire_timeouts: u64,
+    pub average_queue_wait_ms: f64,
+    pub max_queue_wait_ms: u64,
     pub error_rate_percent: f64,
     pub retained_logs: usize,
     pub retained_activities: usize,
@@ -180,6 +193,13 @@ impl Observability {
                 successful_requests: AtomicU64::new(0),
                 failed_requests: AtomicU64::new(0),
                 in_flight_requests: AtomicUsize::new(0),
+                queued_requests: AtomicUsize::new(0),
+                peak_queued_requests: AtomicUsize::new(0),
+                capacity_rejections: AtomicU64::new(0),
+                worker_acquire_timeouts: AtomicU64::new(0),
+                assigned_requests: AtomicU64::new(0),
+                queue_wait_total_ms: AtomicU64::new(0),
+                max_queue_wait_ms: AtomicU64::new(0),
             }),
         }
     }
@@ -201,6 +221,8 @@ impl Observability {
             .count();
         let total_requests = self.inner.total_requests.load(Ordering::Relaxed);
         let failed_requests = self.inner.failed_requests.load(Ordering::Relaxed);
+        let assigned_requests = self.inner.assigned_requests.load(Ordering::Relaxed);
+        let queue_wait_total_ms = self.inner.queue_wait_total_ms.load(Ordering::Relaxed);
         DashboardSnapshot {
             status: if connected_workers > 0 || total_requests == 0 {
                 "healthy"
@@ -217,6 +239,16 @@ impl Observability {
             successful_requests: self.inner.successful_requests.load(Ordering::Relaxed),
             failed_requests,
             in_flight_requests: self.inner.in_flight_requests.load(Ordering::Relaxed),
+            queued_requests: self.inner.queued_requests.load(Ordering::Relaxed),
+            peak_queued_requests: self.inner.peak_queued_requests.load(Ordering::Relaxed),
+            capacity_rejections: self.inner.capacity_rejections.load(Ordering::Relaxed),
+            worker_acquire_timeouts: self.inner.worker_acquire_timeouts.load(Ordering::Relaxed),
+            average_queue_wait_ms: if assigned_requests == 0 {
+                0.0
+            } else {
+                queue_wait_total_ms as f64 / assigned_requests as f64
+            },
+            max_queue_wait_ms: self.inner.max_queue_wait_ms.load(Ordering::Relaxed),
             error_rate_percent: if total_requests == 0 {
                 0.0
             } else {
@@ -496,6 +528,47 @@ impl Observability {
         }
     }
 
+    pub fn queue_enter(&self) {
+        let current = self
+            .inner
+            .queued_requests
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.inner
+            .peak_queued_requests
+            .fetch_max(current, Ordering::Relaxed);
+    }
+
+    pub fn queue_exit(&self) {
+        let _ = self.inner.queued_requests.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+    }
+
+    pub fn record_capacity_rejection(&self) {
+        self.inner
+            .capacity_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_worker_acquire_timeout(&self) {
+        self.inner
+            .worker_acquire_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_worker_assignment(&self, queue_wait_ms: u64) {
+        self.inner.assigned_requests.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .queue_wait_total_ms
+            .fetch_add(queue_wait_ms, Ordering::Relaxed);
+        self.inner
+            .max_queue_wait_ms
+            .fetch_max(queue_wait_ms, Ordering::Relaxed);
+    }
+
     pub fn begin_request(
         &self,
         request_id: &str,
@@ -734,6 +807,20 @@ mod tests {
         assert_eq!(dashboard.total_requests, 1);
         assert_eq!(dashboard.failed_requests, 1);
         assert_eq!(dashboard.in_flight_requests, 0);
+        telemetry.queue_enter();
+        telemetry.queue_enter();
+        telemetry.queue_exit();
+        telemetry.record_capacity_rejection();
+        telemetry.record_worker_acquire_timeout();
+        telemetry.record_worker_assignment(25);
+        telemetry.record_worker_assignment(75);
+        let dashboard = telemetry.dashboard();
+        assert_eq!(dashboard.queued_requests, 1);
+        assert_eq!(dashboard.peak_queued_requests, 2);
+        assert_eq!(dashboard.capacity_rejections, 1);
+        assert_eq!(dashboard.worker_acquire_timeouts, 1);
+        assert_eq!(dashboard.average_queue_wait_ms, 50.0);
+        assert_eq!(dashboard.max_queue_wait_ms, 75);
     }
 
     #[test]

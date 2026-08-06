@@ -32,3 +32,11 @@ src-tauri/icons/logo-design.png
 docs/history-session/
 
 dist-portable/
+/dist-node-portable/
+/dist-skills/
+
+# Local linked Git worktrees
+/.worktrees/
+
+# Node package archives
+/packages/node-agent/*.tgz

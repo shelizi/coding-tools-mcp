@@ -65,3 +65,11 @@ This project is indexed by GitNexus as **coding-tools-mcp** (2497 symbols, 5234 
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+## Client / Node.js parity
+
+- `Client` includes the Tauri/Rust/Svelte desktop implementation and shared MCP tool, schema, security, runtime, and transport contracts.
+- When changing Client behavior that also exists under `packages/node-agent`, update the Node.js implementation in the same change, or explicitly document why the change is not applicable.
+- If a Rust shared behavior cannot be synchronized immediately, add or update its item in `docs/todo/node-agent-parity/manifest.json` and the matching TODO file; do not leave an undocumented parity gap.
+- When the Desktop Client version changes, run `npm run version:sync`. It must also update `packages/node-agent/package.json` under `codingTools.clientVersion` and `packages/node-agent/src/clientVersion.generated.ts`.
+- Before committing Client or shared-contract changes, run `npm run version:check`, `npm run node-agent:parity:check`, and `npm run node-agent:verify-repo`.

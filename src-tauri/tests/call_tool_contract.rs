@@ -435,7 +435,9 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
     );
     assert!(names.contains("search_text"));
     assert!(names.contains("read_many"));
-    assert!(names.contains("edit_file"));
+    assert!(names.contains("edit"));
+    assert!(!names.contains("edit_file"));
+    assert!(!names.contains("edit_many"));
     assert!(names.contains("wait_command"));
     assert!(names.contains("send_input"));
     assert!(names.contains("exec_many"));
@@ -445,7 +447,7 @@ fn core_profile_keeps_the_default_capabilities_and_adds_history_tools() {
     assert!(!names.contains("write_stdin"));
     for tool in [
         "project_map",
-        "edit_many",
+        "edit",
         "file_ops",
         "git_branch",
         "git_stage",

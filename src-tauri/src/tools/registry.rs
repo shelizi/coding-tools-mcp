@@ -45,7 +45,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "query_tool_usage",
         "Query tool usage",
-        "Safely query complete MCP tool-usage JSONL records and aggregate errors, server latency, client orchestration gaps, async child-process lifetimes, activity bursts, traffic, and warnings without reading a partial writer tail.",
+        "Safely query complete MCP tool-usage JSONL records and aggregate errors, latency, orchestration gaps, async child lifetimes, activity bursts, traffic, warnings, and sanitized command-pair parallelism statistics. Returns conflict/serialization evidence, Wilson confidence, and LLM-facing batching recommendations without reading a partial writer tail.",
         true,
         false,
         false,
@@ -158,7 +158,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "set_default_cwd",
         "Set default cwd",
         "Set the default cwd for relative tool paths inside the workspace.",
-        true,
+        false,
         false,
         false,
     ),
@@ -211,17 +211,9 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
-        "edit_file",
-        "Edit file precisely",
-        "Apply guarded text or line edits to one file and return a diff. CRLF/LF differences are handled automatically while preserving the file's newline style.",
-        false,
-        true,
-        false,
-    ),
-    (
-        "edit_many",
-        "Edit many files",
-        "Apply guarded text edits to multiple files as one atomic transaction. CRLF/LF differences are handled automatically while preserving each file's newline style.",
+        "edit",
+        "Edit files",
+        "Apply guarded text or line edits to one or more files as one atomic transaction. Text, context, and line targeting are selected through edit parameters while preserving each file's newline style.",
         false,
         true,
         false,
@@ -261,7 +253,7 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "exec_many",
         "Execute command graph",
-        "Run up to 256 structured exec_command requests sequentially, in parallel, or as a dependency DAG. Named lock groups serialize shared resources across batches.",
+        "Run up to 256 structured exec_command requests. Auto mode combines non-bypassable safety rules, inferred or named Cargo/Git/Node resource locks, and sanitized historical command-pair statistics. Unknown pairs stay sequential until repeated explicit parallel runs establish a safe Wilson confidence bound; conflicts or lock serialization automatically reduce concurrency. Prefer this over repeated exec_command calls when two or more commands can overlap.",
         false,
         true,
         true,
@@ -419,8 +411,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "list_files",
     "search_text",
     "apply_patch",
-    "edit_file",
-    "edit_many",
+    "edit",
     "file_ops",
     "format_files",
     "exec_command",
@@ -457,8 +448,7 @@ pub const GUARDED_CORE_TOOLS: &[&str] = &[
     "list_files",
     "search_text",
     "apply_patch",
-    "edit_file",
-    "edit_many",
+    "edit",
     "file_ops",
     "format_files",
     "exec_command",
@@ -521,8 +511,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "list_files",
     "search_text",
     "apply_patch",
-    "edit_file",
-    "edit_many",
+    "edit",
     "file_ops",
     "format_files",
     "patch_check",
@@ -562,8 +551,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "history_session_checkpoint",
     "history_session_validate",
     "apply_patch",
-    "edit_file",
-    "edit_many",
+    "edit",
     "file_ops",
     "format_files",
     "git_branch",
@@ -592,8 +580,7 @@ pub const SERIALIZED_WORKSPACE_TOOLS: &[&str] = &[
     "history_session_checkpoint",
     "history_session_validate",
     "apply_patch",
-    "edit_file",
-    "edit_many",
+    "edit",
     "file_ops",
     "format_files",
     "git_branch",
@@ -608,34 +595,7 @@ pub const SERIALIZED_WORKSPACE_TOOLS: &[&str] = &[
     "finish_task",
 ];
 
-pub const READ_ONLY_TOOLS: &[&str] = &[
-    "list_workspace_folders",
-    "harness_status",
-    "operation_log",
-    "server_info",
-    "query_tool_usage",
-    "exec_health_check",
-    "read_file",
-    "read_many",
-    "project_map",
-    "list_files",
-    "search_text",
-    "wait_command",
-    "resolve_operation",
-    "list_sessions",
-    "read_output",
-    "git_status",
-    "git_diff",
-    "git_log",
-    "git_show",
-    "git_blame",
-    "view_image",
-    "patch_check",
-    "project_state",
-    "task_context",
-    "list_task_events",
-    "change_summary",
-];
+pub const READ_ONLY_TOOLS: &[&str] = coding_tools_tunnel_protocol::MCP_READ_ONLY_TOOL_NAMES;
 
 pub fn is_allowed_tool(name: &str) -> bool {
     ALLOWED_TOOLS.contains(&name)
@@ -646,7 +606,10 @@ pub fn is_mcp_only_tool(name: &str) -> bool {
 }
 
 pub fn canonical_tool_name(name: &str) -> &str {
-    name
+    match name {
+        "edit_file" | "edit_many" => "edit",
+        _ => name,
+    }
 }
 
 pub fn normalize_tool_profile(profile: &str) -> &'static str {
@@ -691,11 +654,18 @@ pub fn list_tools_for_profile(tool_profile: &str) -> Vec<Value> {
         .into_iter()
         .filter_map(|name| {
             P0_TOOLS.iter().find(|(n, ..)| *n == name).map(|entry| {
-                let (name, title, description, read_only, destructive, open_world) = *entry;
+                let (name, title, description, declared_read_only, destructive, open_world) =
+                    *entry;
+                let contract_read_only =
+                    coding_tools_tunnel_protocol::is_retry_safe_tool_name(name);
+                debug_assert_eq!(
+                    declared_read_only, contract_read_only,
+                    "tool read-only contract drifted for {name}"
+                );
                 let (read_only, destructive, open_world) = if compat {
                     (true, false, false)
                 } else {
-                    (read_only, destructive, open_world)
+                    (contract_read_only, destructive, open_world)
                 };
                 json!({
                     "name": name,
@@ -719,6 +689,98 @@ pub fn toolset_revision(tool_profile: &str) -> String {
     let encoded = serde_json::to_vec(&list_tools_for_profile(tool_profile)).unwrap_or_default();
     let digest = format!("{:x}", Sha256::digest(encoded));
     digest[..16].to_string()
+}
+
+fn precise_edit_schema() -> Value {
+    let text_target_properties = json!({
+        "match_mode": {
+            "type": "string",
+            "enum": ["exact", "whitespace"],
+            "default": "exact",
+            "description": "exact requires identical content except CRLF/LF line endings; whitespace additionally tolerates whitespace differences. Inserted and replacement text is normalized to the target file's newline style."
+        },
+        "before_context": { "type": "string" },
+        "after_context": { "type": "string" },
+        "expected_occurrences": { "type": "integer", "minimum": 1, "default": 1 },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 }
+    });
+    let text_target = text_target_properties
+        .as_object()
+        .expect("precise edit text target properties");
+
+    let mut replace_properties = text_target.clone();
+    replace_properties.insert(
+        "type".into(),
+        json!({ "type": "string", "enum": ["replace"] }),
+    );
+    replace_properties.insert(
+        "old_text".into(),
+        json!({ "type": "string", "minLength": 1 }),
+    );
+    replace_properties.insert("new_text".into(), json!({ "type": "string" }));
+
+    let mut insert_before_properties = text_target.clone();
+    insert_before_properties.insert(
+        "type".into(),
+        json!({ "type": "string", "enum": ["insert_before"] }),
+    );
+    insert_before_properties.insert("anchor".into(), json!({ "type": "string", "minLength": 1 }));
+    insert_before_properties.insert("text".into(), json!({ "type": "string", "minLength": 1 }));
+
+    let mut insert_after_properties = text_target.clone();
+    insert_after_properties.insert(
+        "type".into(),
+        json!({ "type": "string", "enum": ["insert_after"] }),
+    );
+    insert_after_properties.insert("anchor".into(), json!({ "type": "string", "minLength": 1 }));
+    insert_after_properties.insert("text".into(), json!({ "type": "string", "minLength": 1 }));
+
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": replace_properties,
+                "required": ["type", "old_text", "new_text"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": insert_before_properties,
+                "required": ["type", "anchor", "text"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": insert_after_properties,
+                "required": ["type", "anchor", "text"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": { "type": "string", "enum": ["replace_lines"] },
+                    "start_line": { "type": "integer", "minimum": 1 },
+                    "end_line": { "type": "integer", "minimum": 1 },
+                    "new_text": { "type": "string" },
+                    "expected_text": { "type": "string" }
+                },
+                "required": ["type", "start_line", "end_line", "new_text"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "type": { "type": "string", "enum": ["delete_lines"] },
+                    "start_line": { "type": "integer", "minimum": 1 },
+                    "end_line": { "type": "integer", "minimum": 1 },
+                    "expected_text": { "type": "string" }
+                },
+                "required": ["type", "start_line", "end_line"],
+                "additionalProperties": false
+            }
+        ]
+    })
 }
 
 pub fn input_schema(name: &str) -> Value {
@@ -1028,60 +1090,7 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["patch"],
             "additionalProperties": false
         }),
-        "edit_file" => json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string", "minLength": 1 },
-                "expected_sha256": { "type": "string", "minLength": 64, "maxLength": 64 },
-                "edits": {
-                    "type": "array",
-                    "minItems": 1,
-                    "maxItems": 100,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "type": { "type": "string", "enum": ["replace", "insert_before", "insert_after", "replace_lines", "delete_lines"] },
-                            "old_text": { "type": "string" },
-                            "new_text": { "type": "string" },
-                            "anchor": { "type": "string" },
-                            "text": { "type": "string" },
-                            "expected_text": { "type": "string" },
-                            "match_mode": { "type": "string", "enum": ["exact", "whitespace"], "default": "exact", "description": "exact requires identical content except CRLF/LF line endings; whitespace additionally tolerates whitespace differences. Inserted and replacement text is normalized to the target file's newline style." },
-                            "before_context": { "type": "string" },
-                            "after_context": { "type": "string" },
-                            "expected_occurrences": { "type": "integer", "minimum": 1, "default": 1 },
-                            "start_line": { "type": "integer", "minimum": 1 },
-                            "end_line": { "type": "integer", "minimum": 1 }
-                        },
-                        "required": ["type"],
-                        "additionalProperties": false
-                    }
-                },
-                "apply_proposal": {
-                    "type": "object",
-                    "properties": {
-                        "proposal_id": { "type": "string", "minLength": 1 },
-                        "patch": {
-                            "type": "string",
-                            "maxLength": 65536,
-                            "description": "Optional economical unified diff limited to one file and one hunk, applied only to the proposal replacement text."
-                        },
-                        "replacement": {
-                            "type": "string",
-                            "maxLength": 131072,
-                            "description": "Optional complete final replacement for the proposal candidate region. Mutually exclusive with patch."
-                        }
-                    },
-                    "required": ["proposal_id"],
-                    "additionalProperties": false
-                },
-                "dry_run": { "type": "boolean", "default": false },
-                "reason": { "type": "string", "default": "" }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        }),
-        "edit_many" => json!({
+        "edit" => json!({
             "type": "object",
             "properties": {
                 "files": {
@@ -1097,28 +1106,32 @@ pub fn input_schema(name: &str) -> Value {
                                 "type": "array",
                                 "minItems": 1,
                                 "maxItems": 100,
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "type": { "type": "string", "enum": ["replace", "insert_before", "insert_after", "replace_lines", "delete_lines"] },
-                                        "old_text": { "type": "string" },
-                                        "new_text": { "type": "string" },
-                                        "anchor": { "type": "string" },
-                                        "text": { "type": "string" },
-                                        "expected_text": { "type": "string" },
-                                        "match_mode": { "type": "string", "enum": ["exact", "whitespace"], "default": "exact", "description": "exact requires identical content except CRLF/LF line endings; whitespace additionally tolerates whitespace differences. Inserted and replacement text is normalized to the target file's newline style." },
-                                        "before_context": { "type": "string" },
-                                        "after_context": { "type": "string" },
-                                        "expected_occurrences": { "type": "integer", "minimum": 1, "default": 1 },
-                                        "start_line": { "type": "integer", "minimum": 1 },
-                                        "end_line": { "type": "integer", "minimum": 1 }
+                                "items": precise_edit_schema()
+                            },
+                            "apply_proposal": {
+                                "type": "object",
+                                "properties": {
+                                    "proposal_id": { "type": "string", "minLength": 1 },
+                                    "patch": {
+                                        "type": "string",
+                                        "maxLength": 65536,
+                                        "description": "Optional economical unified diff limited to one file and one hunk, applied only to the proposal replacement text."
                                     },
-                                    "required": ["type"],
-                                    "additionalProperties": false
-                                }
+                                    "replacement": {
+                                        "type": "string",
+                                        "maxLength": 131072,
+                                        "description": "Optional complete final replacement for the proposal candidate region. Mutually exclusive with patch."
+                                    }
+                                },
+                                "required": ["proposal_id"],
+                                "additionalProperties": false
                             }
                         },
-                        "required": ["path", "edits"],
+                        "required": ["path"],
+                        "oneOf": [
+                            { "required": ["edits"] },
+                            { "required": ["apply_proposal"] }
+                        ],
                         "additionalProperties": false
                     }
                 },
@@ -1267,8 +1280,8 @@ pub fn input_schema(name: &str) -> Value {
                         "additionalProperties": false
                     }
                 },
-                "mode": { "type": "string", "enum": ["sequential", "parallel", "dag"], "default": "sequential", "description": "Execution scheduler; sequential preserves legacy behavior" },
-                "max_parallel": { "type": "integer", "minimum": 1, "maximum": 256, "description": "Maximum concurrently running batch commands" },
+                "mode": { "type": "string", "enum": ["auto", "sequential", "parallel", "dag"], "default": "auto", "description": "Execution scheduler. Auto uses dependencies, hard safety rules, resource locks, and historical pair statistics. Unknown command pairs remain sequential until explicit parallel observations provide enough safe evidence; explicit parallel is never silently overridden." },
+                "max_parallel": { "type": "integer", "minimum": 1, "maximum": 256, "description": "Maximum concurrently running batch commands. Auto mode bounds the requested value by 8, workspace process admission, and historical resource-serialization recommendations." },
                 "stop_on_error": { "type": "boolean", "default": true }
             },
             "required": ["commands"],
@@ -1482,6 +1495,8 @@ pub fn input_schema(name: &str) -> Value {
                 "start_point": { "type": "string" },
                 "switch": { "type": "boolean", "default": true },
                 "force": { "type": "boolean", "default": false },
+                "repo_path": { "type": "string", "default": ".", "description": "Workspace-relative Git repository or linked worktree root" },
+                "expected_repo_fingerprint": { "type": "string", "minLength": 64, "maxLength": 64 },
                 "expected_head": { "type": "string" },
                 "dry_run": { "type": "boolean", "default": false },
                 "confirm": { "type": "boolean", "default": false },
@@ -1495,6 +1510,8 @@ pub fn input_schema(name: &str) -> Value {
             "properties": {
                 "paths": { "type": "array", "items": { "type": "string" } },
                 "all": { "type": "boolean", "default": false },
+                "repo_path": { "type": "string", "default": ".", "description": "Workspace-relative Git repository or linked worktree root" },
+                "expected_repo_fingerprint": { "type": "string", "minLength": 64, "maxLength": 64 },
                 "expected_head": { "type": "string" },
                 "dry_run": { "type": "boolean", "default": false },
                 "reason": { "type": "string", "default": "" }
@@ -1508,6 +1525,8 @@ pub fn input_schema(name: &str) -> Value {
                 "paths": { "type": "array", "items": { "type": "string" } },
                 "all": { "type": "boolean", "default": false },
                 "allow_empty": { "type": "boolean", "default": false },
+                "repo_path": { "type": "string", "default": ".", "description": "Workspace-relative Git repository or linked worktree root" },
+                "expected_repo_fingerprint": { "type": "string", "minLength": 64, "maxLength": 64 },
                 "require_clean_index_before": { "type": "boolean" },
                 "expected_head": { "type": "string" },
                 "dry_run": { "type": "boolean", "default": false },
@@ -1523,6 +1542,8 @@ pub fn input_schema(name: &str) -> Value {
                 "staged": { "type": "boolean", "default": false },
                 "worktree": { "type": "boolean" },
                 "source": { "type": "string" },
+                "repo_path": { "type": "string", "default": ".", "description": "Workspace-relative Git repository or linked worktree root" },
+                "expected_repo_fingerprint": { "type": "string", "minLength": 64, "maxLength": 64 },
                 "expected_head": { "type": "string" },
                 "dry_run": { "type": "boolean", "default": false },
                 "confirm": { "type": "boolean", "default": false },
@@ -1602,10 +1623,29 @@ pub fn input_schema(name: &str) -> Value {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{input_schema, list_tools_for_profile};
+    use serde_json::json;
+
+    use super::{input_schema, list_tools_for_profile, P0_TOOLS};
 
     #[test]
-    fn trusted_core_catalog_exposes_33_non_overlapping_tools() {
+    fn read_only_annotations_match_the_tunnel_retry_contract() {
+        for (name, _, _, declared_read_only, _, _) in P0_TOOLS {
+            assert_eq!(
+                *declared_read_only,
+                coding_tools_tunnel_protocol::is_retry_safe_tool_name(name),
+                "read-only retry contract drifted for {name}"
+            );
+        }
+        assert!(!coding_tools_tunnel_protocol::is_retry_safe_tool_name(
+            "set_default_cwd"
+        ));
+        assert!(!coding_tools_tunnel_protocol::is_retry_safe_tool_name(
+            "apply_patch"
+        ));
+    }
+
+    #[test]
+    fn trusted_core_catalog_exposes_non_overlapping_tools() {
         let tools = list_tools_for_profile("core");
         let names: Vec<_> = tools
             .iter()
@@ -1613,14 +1653,16 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 35);
+        assert_eq!(tools.len(), 34);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
         assert!(names.contains(&"list_workspace_folders"));
         assert!(names.contains(&"switch_workspace_folder"));
         assert!(names.contains(&"read_many"));
-        assert!(names.contains(&"edit_file"));
+        assert!(names.contains(&"edit"));
+        assert!(!names.contains(&"edit_file"));
+        assert!(!names.contains(&"edit_many"));
         assert!(names.contains(&"format_files"));
         assert!(names.contains(&"wait_command"));
         assert!(names.contains(&"resolve_operation"));
@@ -1651,8 +1693,8 @@ mod tests {
     fn guarded_core_adds_only_permission_requests() {
         let trusted = list_tools_for_profile("trusted-core");
         let guarded = list_tools_for_profile("guarded-core");
-        assert_eq!(trusted.len(), 35);
-        assert_eq!(guarded.len(), 36);
+        assert_eq!(trusted.len(), 34);
+        assert_eq!(guarded.len(), 35);
         assert!(guarded
             .iter()
             .any(|tool| tool["name"] == "request_permissions"));
@@ -1695,5 +1737,26 @@ mod tests {
             600_000
         );
         assert!(format_schema["properties"]["expected_sha256"]["additionalProperties"].is_object());
+    }
+
+    #[test]
+    fn precise_edit_schema_is_discriminated_by_operation_type() {
+        let edit = input_schema("edit");
+        let variants = edit["properties"]["files"]["items"]["properties"]["edits"]["items"]
+            ["oneOf"]
+            .as_array()
+            .expect("edit precise edit variants");
+
+        assert_eq!(variants.len(), 5);
+        assert_eq!(
+            variants[0]["required"],
+            json!(["type", "old_text", "new_text"])
+        );
+        assert_eq!(
+            variants[3]["required"],
+            json!(["type", "start_line", "end_line", "new_text"])
+        );
+        assert!(variants[4]["properties"].get("new_text").is_none());
+        assert_eq!(variants[4]["additionalProperties"], false);
     }
 }

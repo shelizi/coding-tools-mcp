@@ -41,6 +41,7 @@
 | `CODING_TOOLS_TUNNEL_DB` | 否 | `tunnel-data/tunnel.db` | 容器映像預設 `/data/tunnel.db` |
 | `CODING_TOOLS_TUNNEL_LOG_DIR` | 否 | `<db 父目錄>/logs` | 容器映像預設 `/data/logs` |
 | `CODING_TOOLS_TUNNEL_MAX_BODY_BYTES` | 否 | 8 MiB | 公開請求 body 緩衝上限 |
+| `CODING_TOOLS_TUNNEL_RESPONSE_HEAD_TIMEOUT_MS` | 否 | `30000` | Worker **接單後**等待回應標頭的保護期限；不包含排隊時間，也不是工具執行上限。桌面端會先送標頭並串流結果。 |
 | `CODING_TOOLS_TUNNEL_RECONNECT_GRACE_MS` | 否 | 內建預設 | worker 重連寬限 |
 | `RUST_LOG` | 否 | `coding_tools_tunnel_server=info` | tracing 過濾 |
 
@@ -49,6 +50,34 @@
 請掛載整個 `/data` 目錄（DB + 日誌），不要只掛 `tunnel.db`。
 
 Admin 憑證**不會**由伺服器隨機初始化。首次啟動前請自行建立夠長的密碼。
+
+## Worker 容量、排隊與錯誤語意
+
+Admin WebUI 可分別調整 MCP / Actions 的啟動、閒置、上限、排隊、連線寬限、分段縮容與 burst 保溫政策。預設值包含：`start=4`、`min idle=2`、`max idle=4`、`max workers=16`、最多 32 個 pending、取得 Worker 期限 10 秒、每次最多縮 4 個、burst 保溫 120 秒。
+
+公開請求分成兩個期限：
+
+1. **取得 Worker**：pending queue 有真正的政策上限；queue 滿或期限到會回 `503 Service Unavailable`、`Retry-After: 1` 與 `X-Tunnel-Error`（`worker_capacity_exhausted` 或 `worker_acquire_timeout`）。
+2. **等待 response head**：只有 Worker 已接單後才開始計時；期限到才回 `504 Gateway Timeout`。
+
+Server 會在 `request_head` 附上短期 demand hint，桌面端可一次補多個 Worker；連線中的 Worker 只在 grace 期間算作預期容量，超過後不再阻止補充新容量，但不會只因網路較慢就被終止。負載結束後先以固定 step 縮容，近期 burst 則暫時保留 warm floor，避免 `4 → 16 → 4` 反覆震盪。
+
+Dashboard 顯示目前／峰值排隊量、平均／最長 queue wait、容量拒絕與 Worker 取得逾時。成功代理的回應會附上 `X-Tunnel-Queue-Wait-Ms`。
+
+## 公開 MCP 併發壓測
+
+倉庫提供 `scripts/tunnel-load-test.py`。Access token 僅從環境變數讀取，不會寫入報告：
+
+```powershell
+$env:CODING_TOOLS_MCP_ACCESS_TOKEN = "<access-token>"
+python scripts/tunnel-load-test.py `
+  --endpoint "https://example.com/clients/<client-id>/mcp" `
+  --workspace-folder-id "<folder-id>" `
+  --concurrency 20 `
+  --duration-seconds 45
+```
+
+輸出 JSON 會分類成功、503 容量保護、504、RPC／傳輸錯誤，並提供 latency 與 queue-wait p50 / p95。預設允許預期的 503；CI 要把容量保護視為失敗時加上 `--fail-on-capacity`。
 
 ## 快速開始：Docker Compose（建議範例）
 

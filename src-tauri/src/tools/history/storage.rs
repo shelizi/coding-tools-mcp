@@ -3,9 +3,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
 use crate::tools::workspace::{relative_display, Workspace, WorkspaceError, WorkspaceResult};
@@ -15,8 +14,15 @@ use super::model::{HistoryDocument, HistoryIndex, IndexEntry, ScanReport};
 
 pub const DEFAULT_HISTORY_DIR: &str = "docs/history-session";
 
+const HISTORY_LOCK_DIR: &str = ".history.lock.d";
+const HISTORY_LOCK_OWNER_FILE: &str = "owner.json";
+const HISTORY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const HISTORY_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const HISTORY_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+
 pub struct HistoryLock {
-    file: File,
+    path: PathBuf,
+    token: String,
     wait_ms: u128,
 }
 
@@ -28,7 +34,20 @@ impl HistoryLock {
 
 impl Drop for HistoryLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let owner_path = self.path.join(HISTORY_LOCK_OWNER_FILE);
+        let owned = fs::read_to_string(owner_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+            .and_then(|value| {
+                value
+                    .get("token")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|token| token == self.token);
+        if owned {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -99,29 +118,42 @@ pub fn ensure_directory(path: &Path) -> WorkspaceResult<()> {
 }
 
 pub fn lock_directory(path: &Path) -> WorkspaceResult<HistoryLock> {
-    const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-    const RETRY_INTERVAL: Duration = Duration::from_millis(10);
-
     ensure_directory(path)?;
-    let lock_path = path.join(".history.lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)
-        .map_err(|error| io_error("HISTORY_LOCK_FAILED", error, true))?;
+    let lock_path = path.join(HISTORY_LOCK_DIR);
+    let token = uuid::Uuid::new_v4().to_string();
     let started = Instant::now();
     loop {
-        match FileExt::try_lock_exclusive(&file) {
+        match fs::create_dir(&lock_path) {
             Ok(()) => {
+                let created_at_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let owner = serde_json::json!({
+                    "version": 1,
+                    "token": token,
+                    "pid": std::process::id(),
+                    "created_at_ms": created_at_ms
+                });
+                if let Err(error) = fs::write(
+                    lock_path.join(HISTORY_LOCK_OWNER_FILE),
+                    serde_json::to_vec(&owner).unwrap_or_default(),
+                ) {
+                    let _ = fs::remove_dir_all(&lock_path);
+                    return Err(io_error("HISTORY_LOCK_FAILED", error, true));
+                }
                 return Ok(HistoryLock {
-                    file,
+                    path: lock_path,
+                    token,
                     wait_ms: started.elapsed().as_millis(),
-                })
+                });
             }
-            Err(error) if is_lock_contended(&error) => {
-                if started.elapsed() >= LOCK_TIMEOUT {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if lock_directory_is_stale(&lock_path) {
+                    let _ = fs::remove_dir_all(&lock_path);
+                    continue;
+                }
+                if started.elapsed() >= HISTORY_LOCK_TIMEOUT {
                     return Err(WorkspaceError::ToolDetails {
                         code: "HISTORY_LOCK_TIMEOUT",
                         message: "Timed out waiting for the history archive lock.".into(),
@@ -129,32 +161,23 @@ pub fn lock_directory(path: &Path) -> WorkspaceResult<HistoryLock> {
                         retryable: true,
                         details: serde_json::json!({
                             "history_lock_wait_ms": started.elapsed().as_millis(),
-                            "timeout_ms": LOCK_TIMEOUT.as_millis(),
+                            "timeout_ms": HISTORY_LOCK_TIMEOUT.as_millis(),
                             "suggestion": "Retry after the current history write completes"
                         }),
                     });
                 }
-                thread::sleep(RETRY_INTERVAL);
+                thread::sleep(HISTORY_LOCK_RETRY_INTERVAL);
             }
             Err(error) => return Err(io_error("HISTORY_LOCK_FAILED", error, true)),
         }
     }
 }
 
-fn is_lock_contended(error: &io::Error) -> bool {
-    if error.kind() == io::ErrorKind::WouldBlock {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        // ERROR_SHARING_VIOLATION (32) and ERROR_LOCK_VIOLATION (33) are
-        // reported as Uncategorized by std on some Windows toolchains.
-        matches!(error.raw_os_error(), Some(32 | 33))
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+fn lock_directory_is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .and_then(|modified| modified.elapsed().map_err(io::Error::other))
+        .is_ok_and(|elapsed| elapsed >= HISTORY_LOCK_STALE_AFTER)
 }
 
 pub fn read_document(

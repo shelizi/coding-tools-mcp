@@ -33,6 +33,9 @@ fn log_file_names(profile: &WorkspaceProfile, service: &str) -> AppResult<Vec<&'
     match service {
         "mcp" => {
             let mut names = vec!["stderr.log", "stdout.log"];
+            if profile.tunnel.tunnel_type == "builtin" {
+                names.insert(0, "builtin-tunnel.log");
+            }
             if profile.tunnel.tunnel_type == "cloudflare" {
                 names.insert(0, "cloudflared.log");
             }
@@ -43,6 +46,9 @@ fn log_file_names(profile: &WorkspaceProfile, service: &str) -> AppResult<Vec<&'
         }
         "actions" => {
             let mut names = vec!["actions-stderr.log", "actions-stdout.log"];
+            if profile.actions.tunnel_type == "builtin" {
+                names.insert(0, "actions-builtin-tunnel.log");
+            }
             if profile.actions.tunnel_type == "cloudflare" {
                 names.insert(0, "actions-cloudflared.log");
             }
@@ -100,4 +106,25 @@ pub async fn read_workspace_logs(
     }
 
     Ok(chunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_tunnel_logs_are_visible_to_the_workspace_log_api() {
+        let mut profile = WorkspaceProfile::new("C:/workspace/demo".into(), Some("demo".into()));
+        profile.tunnel.tunnel_type = "builtin".into();
+        profile.actions.tunnel_type = "builtin".into();
+
+        assert_eq!(
+            log_file_names(&profile, "mcp").expect("mcp log names")[0],
+            "builtin-tunnel.log"
+        );
+        assert_eq!(
+            log_file_names(&profile, "actions").expect("actions log names")[0],
+            "actions-builtin-tunnel.log"
+        );
+    }
 }

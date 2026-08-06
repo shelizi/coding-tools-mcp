@@ -76,11 +76,7 @@ fn validate_edit_file(arguments: &Value, policy: &PolicySettings) -> Result<(), 
     match (edits, apply_proposal) {
         (Some(edits), None) if !edits.is_empty() => {}
         (None, Some(_)) => {}
-        (Some(_), Some(_)) => {
-            return Err(PolicyError(
-                "edit_file accepts either edits or apply_proposal, not both".into(),
-            ));
-        }
+        (Some(edits), Some(_)) if !edits.is_empty() => {}
         _ => {
             return Err(PolicyError(
                 "edit_file requires non-empty edits or apply_proposal".into(),
@@ -94,6 +90,40 @@ fn validate_edit_file(arguments: &Value, policy: &PolicySettings) -> Result<(), 
         return Err(PolicyError("Edit payload is too large".into()));
     }
     Ok(())
+}
+
+fn validate_edit(arguments: &Value, policy: &PolicySettings) -> Result<(), PolicyError> {
+    let files = arguments
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| PolicyError("edit requires files".into()))?;
+    if files.is_empty() || files.len() > 100 {
+        return Err(PolicyError("edit requires between 1 and 100 files".into()));
+    }
+    for (index, file) in files.iter().enumerate() {
+        let object = file
+            .as_object()
+            .ok_or_else(|| PolicyError(format!("edit files[{index}] must be an object")))?;
+        let path = object
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PolicyError(format!("edit files[{index}].path is required")))?;
+        if path.trim().is_empty() {
+            return Err(PolicyError(format!(
+                "edit files[{index}].path must not be empty"
+            )));
+        }
+        if object
+            .get("edits")
+            .and_then(Value::as_array)
+            .is_some_and(|edits| edits.len() > 100)
+        {
+            return Err(PolicyError(format!(
+                "edit files[{index}].edits supports at most 100 operations"
+            )));
+        }
+    }
+    validate_bounded_mutation(arguments, policy, "edit")
 }
 
 fn validate_bounded_mutation(
@@ -334,6 +364,7 @@ pub fn validate_tool_arguments_for_workspace(
     match tool_name {
         "exec_command" => validate_command_for_workspace(arguments, policy, workspace),
         "apply_patch" | "patch_check" => validate_patch(arguments, policy),
+        "edit" => validate_edit(arguments, policy),
         "edit_file" => validate_edit_file(arguments, policy),
         "edit_many" | "file_ops" => validate_bounded_mutation(arguments, policy, tool_name),
         "format_files" => validate_format_files(arguments, policy),
@@ -799,6 +830,21 @@ mod tests {
     fn actions_exposes_folder_listing_but_rejects_global_switch() {
         assert!(validate_actions_exposure("list_workspace_folders").is_ok());
         assert!(validate_actions_exposure("switch_workspace_folder").is_err());
+    }
+
+    #[test]
+    fn edit_policy_defers_mixed_modes_to_the_typed_tool_contract() {
+        let policy = PolicySettings::default();
+        assert!(validate_edit_file(
+            &json!({
+                "path": "main.rs",
+                "edits": [{ "type": "replace", "old_text": "old", "new_text": "new" }],
+                "apply_proposal": { "proposal_id": "00000000000000000000000000000000" }
+            }),
+            &policy,
+        )
+        .is_ok());
+        assert!(validate_edit_file(&json!({ "path": "main.rs" }), &policy).is_err());
     }
 
     #[test]

@@ -9,8 +9,8 @@ use base64::Engine;
 use coding_tools_tunnel_protocol::{
     auth_signing_payload, is_hop_by_hop_header, valid_client_id, ClientHello, ControlMessage,
     DeviceAuthProof, EnrollmentRequest, EnrollmentResponse, HeaderPair, TunnelService,
-    WorkerPolicy, CLIENT_ID_HEADER, ENROLL_PATH_PREFIX, MAX_REQUEST_BODY_BYTES, PROTOCOL_VERSION,
-    SERVICE_HEADER, WS_PATH, WS_SUBPROTOCOL,
+    WorkerDemand, WorkerPolicy, CLIENT_ID_HEADER, ENROLL_PATH_PREFIX, MAX_REQUEST_BODY_BYTES,
+    PROTOCOL_VERSION, SERVICE_HEADER, WS_PATH, WS_SUBPROTOCOL,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::stream::{SplitSink, SplitStream};
@@ -42,8 +42,16 @@ const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+const DEMAND_HINT_TTL: Duration = Duration::from_secs(3);
 const DEVICE_IDENTITY_KEY: &str = "builtin_tunnel_device_identity";
 const ENROLLMENT_URL_KEY: &str = "builtin_tunnel_enrollment_url";
+
+pub(crate) fn behavioral_parity_fixture() -> serde_json::Value {
+    serde_json::json!({
+        "local_connect_timeout_ms": LOCAL_CONNECT_TIMEOUT.as_millis(),
+        "demand_hint_ttl_ms": DEMAND_HINT_TTL.as_millis()
+    })
+}
 
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ClientSink = SplitSink<ClientWebSocket, Message>;
@@ -523,10 +531,15 @@ async fn run_worker_pool(
     let (policy_tx, mut policy_rx) = watch::channel::<Option<WorkerPolicy>>(None);
     let mut next_worker_index = 0_usize;
     let mut idle_excess_since = None;
+    let mut last_policy_revision = None;
+    let mut last_scale_up_block = None;
+    let mut demand_target = 0_usize;
+    let mut demand_seen_at = None;
+    let mut last_pressure_at = None;
     let mut reconcile_tick = interval(Duration::from_secs(1));
     reconcile_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    spawn_managed_worker(
+    let bootstrap_worker = spawn_managed_worker(
         &mut workers,
         &mut managed,
         &mut next_worker_index,
@@ -537,15 +550,51 @@ async fn run_worker_pool(
         &event_tx,
         &policy_tx,
     );
+    append_log(
+        &config.log_path,
+        &format!(
+            "event=worker_spawn reason=bootstrap worker_indices={bootstrap_worker} before_total=0 after_total=1"
+        ),
+    );
 
     while !*shutdown.borrow() {
         tokio::select! {
             _ = shutdown.changed() => break,
             event = event_rx.recv() => {
-                if let Some(WorkerEvent::State { worker_index, state }) = event {
-                    if let Some(worker) = managed.get_mut(&worker_index) {
-                        worker.state = state;
+                match event {
+                    Some(WorkerEvent::State { worker_index, state }) => {
+                        if let Some(worker) = managed.get_mut(&worker_index) {
+                            let was_busy = worker.state == PoolWorkerState::Busy;
+                            let was_connecting = worker.state == PoolWorkerState::Connecting;
+                            if state == PoolWorkerState::Connecting && !was_connecting {
+                                worker.connecting_since = Instant::now();
+                            }
+                            worker.state = state;
+                            if state == PoolWorkerState::Busy
+                                || (was_busy && state == PoolWorkerState::Idle)
+                            {
+                                last_pressure_at = Some(Instant::now());
+                            }
+                        }
                     }
+                    Some(WorkerEvent::Demand(demand)) => {
+                        demand_target = usize::from(demand.desired_workers);
+                        demand_seen_at = Some(Instant::now());
+                        if demand.queued_requests > 0 {
+                            last_pressure_at = Some(Instant::now());
+                        }
+                        append_log(
+                            &config.log_path,
+                            &format!(
+                                "event=worker_demand queued_requests={} oldest_queue_wait_ms={} desired_workers={} current_total={}",
+                                demand.queued_requests,
+                                demand.oldest_queue_wait_ms,
+                                demand.desired_workers,
+                                managed.len(),
+                            ),
+                        );
+                    }
+                    None => {}
                 }
             }
             changed = policy_rx.changed() => {
@@ -574,36 +623,150 @@ async fn run_worker_pool(
         let Some(policy) = policy_rx.borrow().clone() else {
             continue;
         };
+        if last_policy_revision != Some(policy.revision) {
+            append_log(
+                &config.log_path,
+                &format!(
+                    "event=worker_policy_applied service={} revision={} start_workers={} min_idle_workers={} max_idle_workers={} max_workers={} max_pending_requests={} worker_acquire_timeout_ms={} max_connecting_workers={} connecting_capacity_grace_ms={} scale_down_step={} burst_warm_workers={} burst_warm_seconds={} scale_down_delay_seconds={} max_requests_per_worker={} max_lifetime_seconds={}",
+                    config.service.as_str(),
+                    policy.revision,
+                    policy.start_workers,
+                    policy.min_idle_workers,
+                    policy.max_idle_workers,
+                    policy.max_workers,
+                    policy.max_pending_requests,
+                    policy.worker_acquire_timeout_ms,
+                    policy.max_connecting_workers,
+                    policy.connecting_capacity_grace_ms,
+                    policy.scale_down_step,
+                    policy.burst_warm_workers,
+                    policy.burst_warm_seconds,
+                    policy.scale_down_delay_seconds,
+                    policy.max_requests_per_worker,
+                    policy.max_lifetime_seconds,
+                ),
+            );
+            last_policy_revision = Some(policy.revision);
+            last_scale_up_block = None;
+        }
         metrics.set_policy(&policy);
+        let now = Instant::now();
+        let connecting_grace = Duration::from_millis(policy.connecting_capacity_grace_ms);
         let counts = pool_counts(&managed);
         metrics.set_pool_counts(counts.idle, counts.busy);
-        if counts.idle > usize::from(policy.max_idle_workers) {
-            idle_excess_since.get_or_insert_with(Instant::now);
+        let demand_active = demand_seen_at
+            .is_some_and(|seen| now.saturating_duration_since(seen) <= DEMAND_HINT_TTL);
+        let desired_workers = if demand_active {
+            demand_target.min(usize::from(policy.max_workers))
+        } else {
+            0
+        };
+        let effective_connecting = effective_connecting_workers(&managed, connecting_grace);
+        let max_connecting = configured_max_connecting(&policy);
+        let warm_floor = configured_burst_warm_floor(&policy);
+        let warm_active = policy.burst_warm_seconds > 0
+            && last_pressure_at.is_some_and(|seen| {
+                now.saturating_duration_since(seen) < Duration::from_secs(policy.burst_warm_seconds)
+            });
+        let scale_down_floor = if warm_active {
+            warm_floor
+        } else {
+            usize::from(policy.max_idle_workers)
+        };
+        if counts.total > scale_down_floor && counts.idle > 0 {
+            idle_excess_since.get_or_insert(now);
         } else {
             idle_excess_since = None;
         }
         let idle_excess_elapsed = idle_excess_since.is_some_and(|started| {
-            Instant::now().saturating_duration_since(started)
+            now.saturating_duration_since(started)
                 >= Duration::from_secs(policy.scale_down_delay_seconds)
         });
-        let adjustment = pool_adjustment(&policy, counts, idle_excess_elapsed);
+        let adjustment = pool_adjustment(
+            &policy,
+            counts,
+            effective_connecting,
+            max_connecting,
+            desired_workers,
+            idle_excess_elapsed,
+            scale_down_floor,
+        );
+
+        let blocked = scale_up_block(
+            &policy,
+            counts,
+            effective_connecting,
+            max_connecting,
+            desired_workers,
+            adjustment,
+        );
+        if blocked != last_scale_up_block {
+            if let Some(reason) = blocked {
+                append_log(
+                    &config.log_path,
+                    &format!(
+                        "event=scale_up_blocked reason={} total={} connecting={} effective_connecting={} idle={} busy={} desired_workers={} min_idle_workers={} max_connecting_workers={} max_workers={} policy_revision={}",
+                        reason.as_str(),
+                        counts.total,
+                        counts.connecting,
+                        effective_connecting,
+                        counts.idle,
+                        counts.busy,
+                        desired_workers,
+                        policy.min_idle_workers,
+                        max_connecting,
+                        policy.max_workers,
+                        policy.revision,
+                    ),
+                );
+            }
+            last_scale_up_block = blocked;
+        }
 
         let mut remaining_retirements = adjustment.retire;
-        for worker in managed.values_mut() {
+        let mut retired_worker_indices = Vec::with_capacity(adjustment.retire);
+        for (worker_index, worker) in managed.iter_mut() {
             if remaining_retirements == 0 {
                 break;
             }
             if worker.state == PoolWorkerState::Idle {
                 worker.state = PoolWorkerState::Retiring;
                 let _ = worker.retire.send(true);
+                retired_worker_indices.push(*worker_index);
                 remaining_retirements -= 1;
             }
         }
         if adjustment.retire > 0 {
-            idle_excess_since = None;
+            retired_worker_indices.sort_unstable();
+            let after_total = counts.total.saturating_sub(retired_worker_indices.len());
+            append_log(
+                &config.log_path,
+                &format!(
+                    "event=scale_down reason={} requested={} retired={} worker_indices={} before_total={} after_total={} connecting={} idle={} busy={} scale_down_floor={} warm_active={} scale_down_step={} max_idle_workers={} max_workers={} policy_revision={}",
+                    scale_down_reason(&policy, counts, idle_excess_elapsed, warm_active),
+                    adjustment.retire,
+                    retired_worker_indices.len(),
+                    join_worker_indices(&retired_worker_indices),
+                    counts.total,
+                    after_total,
+                    counts.connecting,
+                    counts.idle,
+                    counts.busy,
+                    scale_down_floor,
+                    warm_active,
+                    policy.scale_down_step,
+                    policy.max_idle_workers,
+                    policy.max_workers,
+                    policy.revision,
+                ),
+            );
+            if after_total <= scale_down_floor {
+                idle_excess_since = None;
+            }
         }
+        let mut spawned_worker_indices = Vec::with_capacity(adjustment.spawn);
         for _ in 0..adjustment.spawn {
-            spawn_managed_worker(
+            spawned_worker_indices.push(spawn_managed_worker(
                 &mut workers,
                 &mut managed,
                 &mut next_worker_index,
@@ -613,6 +776,30 @@ async fn run_worker_pool(
                 &metrics,
                 &event_tx,
                 &policy_tx,
+            ));
+        }
+        if adjustment.spawn > 0 {
+            append_log(
+                &config.log_path,
+                &format!(
+                    "event=scale_up reason={} requested={} spawned={} worker_indices={} before_total={} after_total={} connecting={} effective_connecting={} idle={} busy={} desired_workers={} start_workers={} min_idle_workers={} max_connecting_workers={} max_workers={} policy_revision={}",
+                    scale_up_reason(&policy, counts, effective_connecting, desired_workers),
+                    adjustment.spawn,
+                    spawned_worker_indices.len(),
+                    join_worker_indices(&spawned_worker_indices),
+                    counts.total,
+                    counts.total.saturating_add(spawned_worker_indices.len()),
+                    counts.connecting,
+                    effective_connecting,
+                    counts.idle,
+                    counts.busy,
+                    desired_workers,
+                    policy.start_workers,
+                    policy.min_idle_workers,
+                    max_connecting,
+                    policy.max_workers,
+                    policy.revision,
+                ),
             );
         }
     }
@@ -623,7 +810,6 @@ async fn run_worker_pool(
     workers.abort_all();
     while workers.join_next().await.is_some() {}
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PoolWorkerState {
     Connecting,
@@ -634,6 +820,7 @@ enum PoolWorkerState {
 
 struct ManagedWorker {
     state: PoolWorkerState,
+    connecting_since: Instant,
     retire: watch::Sender<bool>,
 }
 
@@ -642,6 +829,7 @@ enum WorkerEvent {
         worker_index: usize,
         state: PoolWorkerState,
     },
+    Demand(WorkerDemand),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -662,7 +850,7 @@ fn spawn_managed_worker(
     metrics: &Arc<BuiltinTunnelMetrics>,
     event_tx: &mpsc::Sender<WorkerEvent>,
     policy_tx: &watch::Sender<Option<WorkerPolicy>>,
-) {
+) -> usize {
     let worker_index = *next_worker_index;
     *next_worker_index = next_worker_index.saturating_add(1);
     let (retire, retire_rx) = watch::channel(false);
@@ -670,6 +858,7 @@ fn spawn_managed_worker(
         worker_index,
         ManagedWorker {
             state: PoolWorkerState::Connecting,
+            connecting_since: Instant::now(),
             retire,
         },
     );
@@ -683,6 +872,7 @@ fn spawn_managed_worker(
         event_tx.clone(),
         policy_tx.clone(),
     ));
+    worker_index
 }
 
 fn pool_counts(workers: &HashMap<usize, ManagedWorker>) -> PoolCounts {
@@ -704,6 +894,23 @@ fn pool_counts(workers: &HashMap<usize, ManagedWorker>) -> PoolCounts {
         idle,
         busy,
     }
+}
+
+fn effective_connecting_workers(workers: &HashMap<usize, ManagedWorker>, grace: Duration) -> usize {
+    if grace.is_zero() {
+        return workers
+            .values()
+            .filter(|worker| worker.state == PoolWorkerState::Connecting)
+            .count();
+    }
+    let now = Instant::now();
+    workers
+        .values()
+        .filter(|worker| {
+            worker.state == PoolWorkerState::Connecting
+                && now.saturating_duration_since(worker.connecting_since) <= grace
+        })
+        .count()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -994,31 +1201,147 @@ struct PoolAdjustment {
     retire: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScaleUpBlock {
+    ConnectingLimitReached,
+    MaxWorkersReached,
+}
+
+impl ScaleUpBlock {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectingLimitReached => "connecting_limit_reached",
+            Self::MaxWorkersReached => "max_workers_reached",
+        }
+    }
+}
+
+fn configured_max_connecting(policy: &WorkerPolicy) -> usize {
+    let maximum = usize::from(policy.max_workers).max(1);
+    if policy.max_connecting_workers == 0 {
+        maximum.min(4)
+    } else {
+        usize::from(policy.max_connecting_workers)
+            .min(maximum)
+            .max(1)
+    }
+}
+
+fn configured_burst_warm_floor(policy: &WorkerPolicy) -> usize {
+    let maximum = usize::from(policy.max_workers);
+    if policy.burst_warm_workers == 0 {
+        usize::from(policy.start_workers)
+            .max(usize::from(policy.max_idle_workers).saturating_mul(2))
+            .min(maximum)
+    } else {
+        usize::from(policy.burst_warm_workers).min(maximum)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pool_adjustment(
     policy: &WorkerPolicy,
     counts: PoolCounts,
+    effective_connecting: usize,
+    max_connecting: usize,
+    desired_workers: usize,
     idle_excess_elapsed: bool,
+    scale_down_floor: usize,
 ) -> PoolAdjustment {
     debug_assert_eq!(counts.total, counts.connecting + counts.idle + counts.busy);
     let maximum = usize::from(policy.max_workers);
     let startup_needed = usize::from(policy.start_workers).saturating_sub(counts.total);
-    let spare_needed =
-        usize::from(policy.min_idle_workers).saturating_sub(counts.idle + counts.connecting);
-    let spawn = startup_needed
-        .max(spare_needed)
-        .min(maximum.saturating_sub(counts.total));
-    let above_maximum = counts.total.saturating_sub(maximum);
-    let above_max_idle = if idle_excess_elapsed {
+    let spare_needed = usize::from(policy.min_idle_workers)
+        .saturating_sub(counts.idle.saturating_add(effective_connecting));
+    let demand_needed = desired_workers.saturating_sub(counts.total);
+    let requested_spawn = startup_needed.max(spare_needed).max(demand_needed);
+    let connecting_budget = max_connecting.saturating_sub(effective_connecting);
+    let spawn = requested_spawn
+        .min(maximum.saturating_sub(counts.total))
+        .min(connecting_budget);
+
+    let above_maximum = counts.total.saturating_sub(maximum).min(counts.idle);
+    let staged_idle_excess = if idle_excess_elapsed && above_maximum == 0 {
         counts
-            .idle
-            .saturating_sub(usize::from(policy.max_idle_workers))
+            .total
+            .saturating_sub(scale_down_floor)
+            .min(counts.idle)
+            .min(usize::from(policy.scale_down_step))
     } else {
         0
     };
     PoolAdjustment {
         spawn,
-        retire: above_maximum.max(above_max_idle).min(counts.idle),
+        retire: above_maximum.max(staged_idle_excess),
     }
+}
+
+fn scale_up_reason(
+    policy: &WorkerPolicy,
+    counts: PoolCounts,
+    effective_connecting: usize,
+    desired_workers: usize,
+) -> &'static str {
+    if desired_workers > counts.total {
+        return "server_demand";
+    }
+    let startup_deficit = counts.total < usize::from(policy.start_workers);
+    let idle_deficit = counts.idle + effective_connecting < usize::from(policy.min_idle_workers);
+    match (startup_deficit, idle_deficit) {
+        (true, true) => "startup_and_idle_reserve",
+        (true, false) => "startup",
+        (false, true) => "idle_reserve",
+        (false, false) => "none",
+    }
+}
+
+fn scale_down_reason(
+    policy: &WorkerPolicy,
+    counts: PoolCounts,
+    idle_excess_elapsed: bool,
+    warm_active: bool,
+) -> &'static str {
+    if counts.total > usize::from(policy.max_workers) {
+        "max_workers_reduced"
+    } else if idle_excess_elapsed && warm_active {
+        "burst_warm_staged"
+    } else if idle_excess_elapsed {
+        "idle_excess_elapsed"
+    } else {
+        "none"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scale_up_block(
+    policy: &WorkerPolicy,
+    counts: PoolCounts,
+    effective_connecting: usize,
+    max_connecting: usize,
+    desired_workers: usize,
+    adjustment: PoolAdjustment,
+) -> Option<ScaleUpBlock> {
+    let startup_deficit = counts.total < usize::from(policy.start_workers);
+    let idle_deficit = counts.idle + effective_connecting < usize::from(policy.min_idle_workers);
+    let demand_deficit = desired_workers > counts.total;
+    if adjustment.spawn > 0 || !(startup_deficit || idle_deficit || demand_deficit) {
+        return None;
+    }
+    if counts.total >= usize::from(policy.max_workers) {
+        return Some(ScaleUpBlock::MaxWorkersReached);
+    }
+    if effective_connecting >= max_connecting {
+        return Some(ScaleUpBlock::ConnectingLimitReached);
+    }
+    None
+}
+
+fn join_worker_indices(indices: &[usize]) -> String {
+    indices
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn jittered_limit(base: u64, seed: u64, percent: u8) -> u64 {
@@ -1116,10 +1439,14 @@ async fn receive_request(
         method,
         path_and_query,
         headers,
+        demand,
     } = head
     else {
         return Err("expected request_head".into());
     };
+    if let Some(demand) = demand {
+        let _ = event_tx.send(WorkerEvent::Demand(demand)).await;
+    }
     let _ = event_tx
         .send(WorkerEvent::State {
             worker_index,
@@ -1779,8 +2106,11 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_pool_plan_matches_fpm_idle_and_max_rules() {
+    fn dynamic_pool_plan_uses_demand_connecting_limits_and_staged_shrink() {
         let policy = coding_tools_tunnel_protocol::WorkerPolicy::default_for(TunnelService::Mcp);
+        let max_connecting = configured_max_connecting(&policy);
+        assert_eq!(max_connecting, 4);
+        assert_eq!(configured_burst_warm_floor(&policy), 8);
 
         assert_eq!(
             pool_adjustment(
@@ -1791,7 +2121,11 @@ mod tests {
                     idle: 0,
                     busy: 0,
                 },
+                1,
+                max_connecting,
+                0,
                 false,
+                4,
             ),
             PoolAdjustment {
                 spawn: 3,
@@ -1807,29 +2141,121 @@ mod tests {
                     idle: 1,
                     busy: 3,
                 },
+                0,
+                max_connecting,
+                16,
                 false,
+                8,
             ),
             PoolAdjustment {
-                spawn: 1,
+                spawn: 4,
                 retire: 0,
             }
         );
+        let connecting_limited = PoolCounts {
+            total: 8,
+            connecting: 4,
+            idle: 0,
+            busy: 4,
+        };
+        let connecting_adjustment =
+            pool_adjustment(&policy, connecting_limited, 4, max_connecting, 16, false, 8);
+        assert_eq!(connecting_adjustment.spawn, 0);
         assert_eq!(
-            pool_adjustment(
+            scale_up_block(
                 &policy,
-                PoolCounts {
-                    total: 6,
-                    connecting: 0,
-                    idle: 5,
-                    busy: 1,
-                },
-                true,
+                connecting_limited,
+                4,
+                max_connecting,
+                16,
+                connecting_adjustment,
             ),
-            PoolAdjustment {
-                spawn: 0,
-                retire: 1,
-            }
+            Some(ScaleUpBlock::ConnectingLimitReached)
         );
+
+        for (total, floor, expected_retire) in [(16, 8, 4), (12, 8, 4), (8, 8, 0), (8, 4, 4)] {
+            assert_eq!(
+                pool_adjustment(
+                    &policy,
+                    PoolCounts {
+                        total,
+                        connecting: 0,
+                        idle: total,
+                        busy: 0,
+                    },
+                    0,
+                    max_connecting,
+                    0,
+                    true,
+                    floor,
+                )
+                .retire,
+                expected_retire,
+            );
+        }
+
+        let maximum = PoolCounts {
+            total: usize::from(policy.max_workers),
+            connecting: 0,
+            idle: 0,
+            busy: usize::from(policy.max_workers),
+        };
+        assert_eq!(
+            scale_up_block(
+                &policy,
+                maximum,
+                0,
+                max_connecting,
+                usize::from(policy.max_workers).saturating_add(1),
+                PoolAdjustment {
+                    spawn: 0,
+                    retire: 0,
+                },
+            ),
+            Some(ScaleUpBlock::MaxWorkersReached)
+        );
+    }
+
+    #[test]
+    fn stale_connecting_workers_stop_counting_as_idle_reserve() {
+        let (_retire_tx, retire_rx) = watch::channel(false);
+        let (second_tx, _second_rx) = watch::channel(false);
+        let now = Instant::now();
+        let workers = HashMap::from([
+            (
+                1,
+                ManagedWorker {
+                    state: PoolWorkerState::Connecting,
+                    connecting_since: now,
+                    retire: _retire_tx,
+                },
+            ),
+            (
+                2,
+                ManagedWorker {
+                    state: PoolWorkerState::Connecting,
+                    connecting_since: now - Duration::from_secs(2),
+                    retire: second_tx,
+                },
+            ),
+        ]);
+        drop(retire_rx);
+        assert_eq!(
+            effective_connecting_workers(&workers, Duration::from_secs(1)),
+            1
+        );
+        let policy = WorkerPolicy::default_for(TunnelService::Mcp);
+        let counts = pool_counts(&workers);
+        let adjustment = pool_adjustment(
+            &policy,
+            counts,
+            1,
+            configured_max_connecting(&policy),
+            4,
+            false,
+            usize::from(policy.max_idle_workers),
+        );
+        assert_eq!(adjustment.spawn, 2);
     }
 
     #[test]
@@ -1967,6 +2393,7 @@ mod tests {
         let metrics = Arc::new(BuiltinTunnelMetrics::new(1));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (status_tx, _status_rx) = mpsc::channel(8);
+        let pool_log_path = config.log_path.clone();
         let pool = tokio::spawn(run_worker_pool(
             config,
             shutdown_rx,
@@ -2011,6 +2438,12 @@ mod tests {
             .await
             .expect("server shutdown")
             .expect("server task");
+        let pool_log = std::fs::read_to_string(pool_log_path).expect("pool audit log");
+        assert!(pool_log.contains("event=worker_policy_applied"));
+        assert!(pool_log.contains("event=scale_up"));
+        assert!(pool_log.contains("reason=startup"));
+        assert!(pool_log.contains("event=scale_down"));
+        assert!(pool_log.contains("reason=max_workers_reduced"));
     }
 
     #[tokio::test]
@@ -2098,6 +2531,7 @@ mod tests {
                                 method: "GET".into(),
                                 path_and_query: "/builtin/clients/pc-a/mcp".into(),
                                 headers: Vec::new(),
+                                demand: None,
                             })
                             .expect("request head")
                             .into(),

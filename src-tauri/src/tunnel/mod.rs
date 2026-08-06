@@ -28,6 +28,8 @@ pub use supervisor::{
     log_dir_for_profile, TunnelServiceKind, TunnelStatus, TunnelSupervisor,
 };
 
+pub(crate) use builtin::behavioral_parity_fixture as builtin_behavioral_parity_fixture;
+
 pub fn frp_snippet(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> String {
     let settings = AppSettings::load_or_default();
     frp::frp_snippet(profile, kind, &settings)

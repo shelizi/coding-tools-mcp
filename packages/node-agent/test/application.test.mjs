@@ -1,0 +1,288 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { ApplicationConfigStore, loadApplication } from '../dist/application.js';
+import { loadConfigBundle } from '../dist/config.js';
+import { createAgentRuntime } from '../dist/server.js';
+
+function configDocument(root, dataDir, port, overrides = {}) {
+  return {
+    schema_version: 1,
+    host: '127.0.0.1',
+    port,
+    dataDir,
+    permissionMode: 'trusted',
+    toolProfile: 'core',
+    management: { enabled: true },
+    oauth: {},
+    folders: [{ id: 'repo', name: 'Repo', path: root }],
+    limits: {
+      blockingConcurrency: 2,
+      processConcurrency: 2,
+      activeSessionLimit: 8,
+      maxOutputBytes: 1024 * 1024
+    },
+    ...overrides
+  };
+}
+
+async function fixture(prefix) {
+  const base = await mkdtemp(path.join(tmpdir(), `${prefix}-`));
+  const root = path.join(base, 'root');
+  const dataDir = path.join(base, 'data');
+  const configPath = path.join(dataDir, 'agent.json');
+  await import('node:fs/promises').then(({ mkdir }) => Promise.all([
+    mkdir(root, { recursive: true }),
+    mkdir(dataDir, { recursive: true })
+  ]));
+  return { base, root, dataDir, configPath };
+}
+
+let managementPortSequence = 0;
+
+async function listen(server) {
+  let lastError;
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const port = 44_000 + ((process.pid + managementPortSequence++) % 4_000);
+    try {
+      await new Promise((resolve, reject) => {
+        const onError = error => {
+          server.off('listening', onListening);
+          reject(error);
+        };
+        const onListening = () => {
+          server.off('error', onError);
+          resolve();
+        };
+        server.once('error', onError);
+        server.once('listening', onListening);
+        server.listen(port, '127.0.0.1');
+      });
+      return port;
+    } catch (error) {
+      lastError = error;
+      if (error?.code !== 'EADDRINUSE') throw error;
+    }
+  }
+  throw lastError ?? new Error('unable to allocate management test port');
+}
+
+function managementToken(html) {
+  return html.match(/name="ctmcp-admin-token" content="([A-Za-z0-9_-]+)"/)?.[1];
+}
+
+function updatePayload(workspace, overrides = {}) {
+  const saved = workspace.saved;
+  return {
+    name: workspace.name,
+    host: saved.host,
+    port: saved.port,
+    publicBaseUrl: saved.publicBaseUrl,
+    dataDir: saved.dataDir,
+    permissionMode: saved.permissionMode,
+    toolProfile: saved.toolProfile,
+    management: saved.management,
+    oauth: {
+      clientId: saved.oauth.clientId,
+      password: '',
+      clientSecret: '',
+      clearClientSecret: false
+    },
+    folders: saved.folders,
+    limits: saved.limits,
+    tunnel: {
+      enabled: saved.tunnel.enabled,
+      publicUrl: saved.tunnel.publicUrl,
+      enrollmentUrl: '',
+      clearEnrollmentUrl: false
+    },
+    ...overrides
+  };
+}
+
+test('application initialization persists a Rust-style random OAuth client ID and authorization password', async () => {
+  const { root, dataDir, configPath } = await fixture('ctmcp-application-init');
+  await writeFile(configPath, `${JSON.stringify(configDocument(root, dataDir, 43121), null, 2)}\n`);
+
+  const first = await loadApplication(configPath);
+  assert.equal(first.registryCreated, true);
+  assert.equal(first.workspaces.length, 1);
+  assert.match(first.workspaces[0].id, /^[0-9a-f]{32}$/);
+  assert.equal(first.workspaces[0].name, 'Repo');
+  assert.match(first.workspaces[0].loaded.config.oauth.clientId, /^chatgpt-client-[0-9a-f-]{12}$/);
+  assert.match(first.workspaces[0].loaded.config.oauth.password, /^[A-Za-z0-9_-]{32}$/);
+  assert.notEqual(first.workspaces[0].loaded.config.oauth.password, 'change-me');
+
+  const saved = JSON.parse(await readFile(configPath, 'utf8'));
+  assert.equal(saved.oauth.clientId, first.workspaces[0].loaded.config.oauth.clientId);
+  assert.equal(saved.oauth.password, undefined);
+  const registry = JSON.parse(await readFile(first.registryPath, 'utf8'));
+  assert.equal(registry.workspaces[0].id, first.workspaces[0].id);
+
+  const second = await loadApplication(configPath);
+  assert.equal(second.registryCreated, false);
+  assert.equal(second.workspaces[0].id, first.workspaces[0].id);
+  assert.equal(second.workspaces[0].loaded.config.oauth.clientId, first.workspaces[0].loaded.config.oauth.clientId);
+  assert.equal(second.workspaces[0].loaded.config.oauth.password, first.workspaces[0].loaded.config.oauth.password);
+});
+
+test('workspace registry keeps settings, secrets, ports and multiple folders independent', async () => {
+  const primary = await fixture('ctmcp-application-primary');
+  const secondary = await fixture('ctmcp-application-secondary');
+  const secondFolder = path.join(secondary.base, 'docs');
+  await import('node:fs/promises').then(({ mkdir }) => mkdir(secondFolder, { recursive: true }));
+
+  await writeFile(primary.configPath, `${JSON.stringify(configDocument(primary.root, primary.dataDir, 43131), null, 2)}\n`);
+  await writeFile(secondary.configPath, `${JSON.stringify(configDocument(secondary.root, secondary.dataDir, 43132, {
+    permissionMode: 'guarded',
+    folders: [
+      { id: 'source', name: 'Source', path: secondary.root },
+      { id: 'docs', name: 'Docs', path: secondFolder }
+    ]
+  }), null, 2)}\n`);
+
+  const registryPath = path.join(primary.dataDir, 'workspace-profiles.json');
+  await writeFile(registryPath, `${JSON.stringify({
+    schema_version: 1,
+    workspaces: [
+      { id: 'primary', name: 'Primary Workspace', configPath: primary.configPath },
+      { id: 'secondary', name: 'Secondary Workspace', configPath: secondary.configPath }
+    ]
+  }, null, 2)}\n`);
+
+  const application = await loadApplication(primary.configPath);
+  assert.deepEqual(application.workspaces.map(workspace => workspace.id), ['primary', 'secondary']);
+  assert.deepEqual(application.workspaces.map(workspace => workspace.loaded.config.port), [43131, 43132]);
+  assert.equal(application.workspaces[0].loaded.config.folders.length, 1);
+  assert.equal(application.workspaces[1].loaded.config.folders.length, 2);
+  assert.equal(application.workspaces[1].loaded.config.permissionMode, 'guarded');
+
+  const store = new ApplicationConfigStore(application);
+  const before = store.snapshot();
+  const primaryPassword = store.secret('primary', 'oauthPassword');
+  const secondaryPassword = store.secret('secondary', 'oauthPassword');
+  assert.notEqual(primaryPassword, secondaryPassword);
+
+  const rotated = await store.regenerateSecret('secondary', 'oauthPassword');
+  assert.notEqual(rotated.value, secondaryPassword);
+  assert.equal(store.secret('primary', 'oauthPassword'), primaryPassword);
+  assert.equal(store.secret('secondary', 'oauthPassword'), rotated.value);
+
+  const secondarySnapshot = before.workspaces.find(workspace => workspace.id === 'secondary');
+  const renamedFolders = [
+    ...secondarySnapshot.saved.folders,
+    { id: 'assets', name: 'Assets', path: primary.root }
+  ];
+  await store.saveWorkspace('secondary', updatePayload(secondarySnapshot, {
+    name: 'Secondary Renamed',
+    folders: renamedFolders
+  }));
+
+  const after = store.snapshot();
+  const primaryAfter = after.workspaces.find(workspace => workspace.id === 'primary');
+  const secondaryAfter = after.workspaces.find(workspace => workspace.id === 'secondary');
+  assert.equal(primaryAfter.name, 'Primary Workspace');
+  assert.equal(primaryAfter.saved.folders.length, 1);
+  assert.equal(secondaryAfter.name, 'Secondary Renamed');
+  assert.equal(secondaryAfter.saved.folders.length, 3);
+
+  const savedRegistry = JSON.parse(await readFile(registryPath, 'utf8'));
+  assert.equal(savedRegistry.workspaces[1].name, 'Secondary Renamed');
+  const reloadedSecondary = await loadConfigBundle(secondary.configPath);
+  assert.equal(reloadedSecondary.config.folders.length, 3);
+  assert.equal(reloadedSecondary.config.oauth.password, rotated.value);
+});
+
+test('workspace management API scopes settings, dashboards and authorization passwords by profile', async t => {
+  const primary = await fixture('ctmcp-application-api-primary');
+  const secondary = await fixture('ctmcp-application-api-secondary');
+  await writeFile(primary.configPath, `${JSON.stringify(configDocument(primary.root, primary.dataDir, 43151), null, 2)}\n`);
+  await writeFile(secondary.configPath, `${JSON.stringify(configDocument(secondary.root, secondary.dataDir, 43152, {
+    permissionMode: 'guarded',
+    folders: [{ id: 'secondary-root', name: 'Secondary Root', path: secondary.root }]
+  }), null, 2)}\n`);
+  await writeFile(path.join(primary.dataDir, 'workspace-profiles.json'), `${JSON.stringify({
+    schema_version: 1,
+    workspaces: [
+      { id: 'primary', name: 'Primary Workspace', configPath: primary.configPath },
+      { id: 'secondary', name: 'Secondary Workspace', configPath: secondary.configPath }
+    ]
+  }, null, 2)}\n`);
+
+  const application = await loadApplication(primary.configPath);
+  const store = new ApplicationConfigStore(application);
+  const runtimes = new Map();
+  const primaryProfile = application.workspaces[0];
+  const secondaryProfile = application.workspaces[1];
+  primaryProfile.loaded.config.port = 0;
+  secondaryProfile.loaded.config.port = 0;
+  secondaryProfile.loaded.config.management.enabled = false;
+
+  const primaryRuntime = await createAgentRuntime(primaryProfile.loaded.config, {
+    configStore: store.workspace('primary').store,
+    workspaceStore: store,
+    runtimeRegistry: runtimes
+  });
+  await createAgentRuntime(secondaryProfile.loaded.config, { runtimeRegistry: runtimes });
+  const port = await listen(primaryRuntime.server);
+  t.after(() => new Promise(resolve => primaryRuntime.server.close(resolve)));
+  const base = `http://127.0.0.1:${port}`;
+  const token = managementToken(await fetch(`${base}/ui`).then(response => response.text()));
+  assert.ok(token);
+  const headers = { 'x-ctmcp-admin-token': token };
+
+  const snapshot = await fetch(`${base}/admin/api/config`, { headers }).then(response => response.json());
+  assert.equal(snapshot.primaryWorkspaceId, 'primary');
+  assert.deepEqual(snapshot.workspaces.map(workspace => workspace.id), ['primary', 'secondary']);
+
+  const status = await fetch(`${base}/admin/api/status`, { headers }).then(response => response.json());
+  assert.deepEqual(status.workspaces.map(workspace => workspace.id), ['primary', 'secondary']);
+
+  const secondaryDashboard = await fetch(`${base}/admin/api/dashboard?workspaceId=secondary`, { headers });
+  assert.equal(secondaryDashboard.status, 200);
+  const secondaryDashboardPayload = await secondaryDashboard.json();
+  assert.equal(secondaryDashboardPayload.permissions.byWorkspace[0].workspaceFolderId, 'secondary-root');
+
+  const passwordResponse = await fetch(`${base}/admin/api/workspaces/secondary/secrets/oauth-password`, { headers });
+  assert.equal(passwordResponse.status, 200);
+  const originalPassword = (await passwordResponse.json()).value;
+  assert.equal(originalPassword, store.secret('secondary', 'oauthPassword'));
+
+  const regenerated = await fetch(`${base}/admin/api/workspaces/secondary/secrets/oauth-password/regenerate`, {
+    method: 'POST',
+    headers: { ...headers, origin: base }
+  }).then(response => response.json());
+  assert.notEqual(regenerated.value, originalPassword);
+  assert.equal(store.secret('secondary', 'oauthPassword'), regenerated.value);
+
+  const secondarySnapshot = snapshot.workspaces.find(workspace => workspace.id === 'secondary');
+  const saveResponse = await fetch(`${base}/admin/api/workspaces/secondary/config`, {
+    method: 'PUT',
+    headers: { ...headers, 'content-type': 'application/json', origin: base },
+    body: JSON.stringify(updatePayload(secondarySnapshot, { name: 'Secondary API Renamed' }))
+  });
+  assert.equal(saveResponse.status, 200);
+  assert.equal((await saveResponse.json()).name, 'Secondary API Renamed');
+
+  const refreshed = await fetch(`${base}/admin/api/config`, { headers }).then(response => response.json());
+  assert.equal(refreshed.workspaces.find(workspace => workspace.id === 'secondary').name, 'Secondary API Renamed');
+  assert.equal(refreshed.workspaces.find(workspace => workspace.id === 'primary').name, 'Primary Workspace');
+});
+
+test('workspace registry rejects duplicate runtime ports before servers start', async () => {
+  const primary = await fixture('ctmcp-application-conflict-primary');
+  const secondary = await fixture('ctmcp-application-conflict-secondary');
+  await writeFile(primary.configPath, `${JSON.stringify(configDocument(primary.root, primary.dataDir, 43141), null, 2)}\n`);
+  await writeFile(secondary.configPath, `${JSON.stringify(configDocument(secondary.root, secondary.dataDir, 43141), null, 2)}\n`);
+  await writeFile(path.join(primary.dataDir, 'workspace-profiles.json'), `${JSON.stringify({
+    schema_version: 1,
+    workspaces: [
+      { id: 'one', name: 'One', configPath: primary.configPath },
+      { id: 'two', name: 'Two', configPath: secondary.configPath }
+    ]
+  }, null, 2)}\n`);
+
+  await assert.rejects(loadApplication(primary.configPath), /Workspace ports conflict/);
+});

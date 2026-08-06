@@ -10,6 +10,10 @@ use crate::workspace::{compare_wsl_paths, AuthConfig, WorkspaceFolder, Workspace
 
 const MAX_CONVERSATION_CONTEXTS: usize = 128;
 
+pub(crate) fn behavioral_parity_fixture() -> Value {
+    json!({ "max_conversation_contexts": MAX_CONVERSATION_CONTEXTS })
+}
+
 #[derive(Clone)]
 pub struct HubConfig {
     pub auth: AuthConfig,

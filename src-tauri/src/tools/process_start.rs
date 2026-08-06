@@ -10,26 +10,31 @@ use tokio::process::{Child, Command};
 #[cfg(windows)]
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
-#[cfg(windows)]
 const STARTUP_SLOTS: usize = 4;
-#[cfg(windows)]
 const START_INTERVAL: Duration = Duration::from_millis(75);
-#[cfg(windows)]
 pub(crate) const STARTUP_PROBE_WINDOW: Duration = Duration::from_millis(125);
-#[cfg(windows)]
 const FAILURE_WINDOW: Duration = Duration::from_secs(10);
-#[cfg(windows)]
 const CIRCUIT_BREAKER_THRESHOLD: usize = 3;
-#[cfg(windows)]
 const CIRCUIT_BREAKER_DELAY: Duration = Duration::from_secs(3);
-#[cfg(windows)]
 const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(250),
     Duration::from_millis(750),
     Duration::from_millis(1_500),
 ];
-#[cfg(windows)]
 pub(crate) const STATUS_DLL_INIT_FAILED: i32 = 0xC000_0142_u32 as i32;
+
+pub(crate) fn behavioral_parity_fixture() -> Value {
+    json!({
+        "startup_slots": STARTUP_SLOTS,
+        "start_interval_ms": START_INTERVAL.as_millis(),
+        "startup_probe_ms": STARTUP_PROBE_WINDOW.as_millis(),
+        "failure_window_ms": FAILURE_WINDOW.as_millis(),
+        "circuit_breaker_threshold": CIRCUIT_BREAKER_THRESHOLD,
+        "circuit_breaker_delay_ms": CIRCUIT_BREAKER_DELAY.as_millis(),
+        "retry_delays_ms": RETRY_DELAYS.map(|delay| delay.as_millis()),
+        "status_dll_init_failed": STATUS_DLL_INIT_FAILED
+    })
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StartupDiagnostics {

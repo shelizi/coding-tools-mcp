@@ -22,17 +22,17 @@ use axum::Json;
 use axum::Router;
 use bytes::Bytes;
 use coding_tools_tunnel_protocol::{
-    expected_routes, is_hop_by_hop_header, route_matches, valid_client_id, ClientHello,
-    ControlMessage, EnrollmentRequest, HeaderPair, TunnelService, CLIENT_ID_HEADER,
-    ENROLL_PATH_PREFIX, MAX_REQUEST_BODY_BYTES, PROTOCOL_VERSION, SERVICE_HEADER, WS_PATH,
-    WS_SUBPROTOCOL,
+    expected_routes, is_hop_by_hop_header, is_retry_safe_mcp_request, is_retry_safe_tool_name,
+    route_matches, valid_client_id, ClientHello, ControlMessage, EnrollmentRequest, HeaderPair,
+    TunnelService, WorkerDemand, WorkerPolicy, CLIENT_ID_HEADER, ENROLL_PATH_PREFIX,
+    MAX_REQUEST_BODY_BYTES, PROTOCOL_VERSION, SERVICE_HEADER, WS_PATH, WS_SUBPROTOCOL,
 };
 use database::DatabaseWriter;
 use device_auth::{unix_ms, AllowedServices, DeviceAuthError, DeviceRegistry};
 use observability::Observability;
 use tokio::sync::watch;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{interval, sleep, timeout, timeout_at, Instant, MissedTickBehavior};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
 use tracing_subscriber::{prelude::*, EnvFilter};
@@ -73,6 +73,7 @@ struct ClientPool {
     request_tx: mpsc::Sender<ProxyJob>,
     available_tx: mpsc::Sender<AvailableWorker>,
     active_workers: Arc<AtomicUsize>,
+    pending_requests: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -106,9 +107,72 @@ struct ProxyJob {
     headers: Vec<HeaderPair>,
     body: Bytes,
     attempt: u8,
+    enqueued_at: Instant,
+    policy: WorkerPolicy,
+    active_workers: Arc<AtomicUsize>,
+    demand: Option<WorkerDemand>,
+    assigned: Option<oneshot::Sender<AssignmentInfo>>,
+    pending_slot: Option<PendingRequestSlot>,
     response_head: oneshot::Sender<Result<ResponseHeadData, String>>,
     response_body: mpsc::Sender<Result<Bytes, io::Error>>,
     cancelled: watch::Receiver<bool>,
+}
+
+impl ProxyJob {
+    fn abandoned(&self) -> bool {
+        self.response_head.is_closed()
+            || self
+                .assigned
+                .as_ref()
+                .is_none_or(oneshot::Sender::is_closed)
+            || *self.cancelled.borrow()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AssignmentInfo {
+    queue_wait_ms: u64,
+}
+
+struct PendingRequestSlot {
+    pending_requests: Arc<AtomicUsize>,
+    observability: Observability,
+    released: bool,
+}
+
+impl PendingRequestSlot {
+    fn try_new(
+        pending_requests: Arc<AtomicUsize>,
+        maximum: usize,
+        observability: Observability,
+    ) -> Option<Self> {
+        pending_requests
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < maximum).then_some(current + 1)
+            })
+            .ok()?;
+        observability.queue_enter();
+        Some(Self {
+            pending_requests,
+            observability,
+            released: false,
+        })
+    }
+
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.pending_requests.fetch_sub(1, Ordering::AcqRel);
+        self.observability.queue_exit();
+    }
+}
+
+impl Drop for PendingRequestSlot {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 struct ResponseHeadData {
@@ -154,6 +218,7 @@ impl Registry {
             request_tx,
             available_tx,
             active_workers: Arc::new(AtomicUsize::new(0)),
+            pending_requests: Arc::new(AtomicUsize::new(0)),
         };
         tokio::spawn(dispatch_requests(request_rx, available_rx));
 
@@ -190,17 +255,58 @@ async fn dispatch_requests(
 ) {
     let mut jobs: VecDeque<ProxyJob> = VecDeque::new();
     let mut workers: VecDeque<AvailableWorker> = VecDeque::new();
+    let mut cleanup_tick = interval(Duration::from_millis(100));
+    cleanup_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
+        jobs.retain(|job| !job.abandoned());
         while !workers.is_empty() && !jobs.is_empty() {
             let worker = workers.pop_front().expect("worker queue checked");
-            let job = jobs.pop_front().expect("job queue checked");
-            if job.response_head.is_closed() {
+            let mut job = jobs.pop_front().expect("job queue checked");
+            if job.abandoned() {
                 workers.push_front(worker);
                 continue;
             }
-            if let Err(job) = worker.assign.send(job) {
-                jobs.push_front(job);
+
+            let queued_requests = job.pending_slot.as_ref().map_or(1, |slot| {
+                slot.pending_requests.load(Ordering::Acquire).max(1)
+            });
+            let connected_workers = job.active_workers.load(Ordering::Acquire);
+            let idle_workers = workers.len().saturating_add(1).min(connected_workers);
+            let busy_workers = connected_workers.saturating_sub(idle_workers);
+            let desired_workers = connected_workers
+                .max(
+                    busy_workers
+                        .saturating_add(queued_requests)
+                        .saturating_add(usize::from(job.policy.min_idle_workers)),
+                )
+                .min(usize::from(job.policy.max_workers));
+            let queue_wait_ms = job
+                .enqueued_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            job.demand = Some(WorkerDemand {
+                queued_requests: queued_requests.min(usize::from(u16::MAX)) as u16,
+                oldest_queue_wait_ms: queue_wait_ms,
+                desired_workers: desired_workers.min(usize::from(u16::MAX)) as u16,
+            });
+            let assigned = job.assigned.take();
+            let mut pending_slot = job.pending_slot.take();
+            match worker.assign.send(job) {
+                Ok(()) => {
+                    if let Some(slot) = pending_slot.as_mut() {
+                        slot.release();
+                    }
+                    if let Some(assigned) = assigned {
+                        let _ = assigned.send(AssignmentInfo { queue_wait_ms });
+                    }
+                }
+                Err(mut job) => {
+                    job.assigned = assigned;
+                    job.pending_slot = pending_slot;
+                    jobs.push_front(job);
+                }
             }
         }
 
@@ -213,6 +319,7 @@ async fn dispatch_requests(
                 Some(worker) => workers.push_back(worker),
                 None => break,
             },
+            _ = cleanup_tick.tick() => {}
         }
     }
 
@@ -296,7 +403,11 @@ async fn main() {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(MAX_REQUEST_BODY_BYTES),
-        response_head_timeout: RESPONSE_HEAD_TIMEOUT,
+        response_head_timeout: std::env::var("CODING_TOOLS_TUNNEL_RESPONSE_HEAD_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(RESPONSE_HEAD_TIMEOUT),
         reconnect_grace_timeout: std::env::var("CODING_TOOLS_TUNNEL_RECONNECT_GRACE_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -733,6 +844,7 @@ async fn proxy_job_over_socket(
         path_and_query,
         headers,
         body,
+        demand,
         response_head,
         response_body,
         mut cancelled,
@@ -747,6 +859,7 @@ async fn proxy_job_over_socket(
             method,
             path_and_query,
             headers,
+            demand,
         },
     )
     .await
@@ -888,7 +1001,8 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
     };
     let pool = route.pool;
     let client_id = route.key.client_id;
-    let service = route.key.service.as_str().to_string();
+    let service_kind = route.key.service;
+    let service = service_kind.as_str().to_string();
 
     let (parts, body) = request.into_parts();
     let request_id = Uuid::new_v4().to_string();
@@ -952,7 +1066,9 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
         Err(_) => return status_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
     let request_headers = encode_headers(&parts.headers);
-    let max_attempts = if supports_automatic_retry(&request_method) {
+    let retry_class =
+        automatic_retry_class(&request_method, service_kind, &request_path, body.as_ref());
+    let max_attempts = if retry_class.is_some() {
         MAX_SAFE_REQUEST_ATTEMPTS
     } else {
         1
@@ -966,29 +1082,22 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
     );
     let mut attempt = 1_u8;
 
-    let (head, body_rx) = loop {
-        let (head_tx, head_rx) = oneshot::channel();
-        let (body_tx, body_rx) = mpsc::channel(RESPONSE_BODY_CAPACITY);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let job = ProxyJob {
-            request_id: request_id.clone(),
-            method: request_method.clone(),
-            path_and_query: request_path.clone(),
-            headers: request_headers.clone(),
-            body: body.clone(),
-            attempt,
-            response_head: head_tx,
-            response_body: body_tx,
-            cancelled: cancel_rx,
-        };
-
-        if pool.request_tx.send(job).await.is_err() {
+    let (head, body_rx, queue_wait_ms) = loop {
+        let policy = state.policies.current(service_kind);
+        let Some(pending_slot) = PendingRequestSlot::try_new(
+            pool.pending_requests.clone(),
+            usize::from(policy.max_pending_requests),
+            state.observability.clone(),
+        ) else {
+            state.observability.record_capacity_rejection();
             state.observability.log(
-                "error",
-                "gateway",
+                "warn",
+                "capacity",
                 format!(
-                    "dispatch_failed on attempt {attempt}/{max_attempts} after {} ms: request queue closed",
-                    request_started.elapsed().as_millis()
+                    "worker_capacity_exhausted pending={} limit={} active_workers={}",
+                    pool.pending_requests.load(Ordering::Acquire),
+                    policy.max_pending_requests,
+                    pool.active_workers.load(Ordering::Acquire)
                 ),
                 Some(&client_id),
                 Some(&service),
@@ -996,21 +1105,141 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                 Some(&request_id),
             );
             request_guard.finish(StatusCode::SERVICE_UNAVAILABLE.as_u16());
-            return status_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "tunnel route is unavailable",
+            return capacity_response(
+                "worker_capacity_exhausted",
+                "tunnel worker capacity is exhausted",
             );
+        };
+
+        let acquire_deadline =
+            Instant::now() + Duration::from_millis(policy.worker_acquire_timeout_ms);
+        let (head_tx, head_rx) = oneshot::channel();
+        let (body_tx, body_rx) = mpsc::channel(RESPONSE_BODY_CAPACITY);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (assigned_tx, assigned_rx) = oneshot::channel();
+        let job = ProxyJob {
+            request_id: request_id.clone(),
+            method: request_method.clone(),
+            path_and_query: request_path.clone(),
+            headers: request_headers.clone(),
+            body: body.clone(),
+            attempt,
+            enqueued_at: Instant::now(),
+            policy: policy.clone(),
+            active_workers: pool.active_workers.clone(),
+            demand: None,
+            assigned: Some(assigned_tx),
+            pending_slot: Some(pending_slot),
+            response_head: head_tx,
+            response_body: body_tx,
+            cancelled: cancel_rx,
+        };
+
+        match timeout_at(acquire_deadline, pool.request_tx.send(job)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                state.observability.log(
+                    "error",
+                    "gateway",
+                    format!(
+                        "dispatch_failed on attempt {attempt}/{max_attempts} after {} ms: request queue closed",
+                        request_started.elapsed().as_millis()
+                    ),
+                    Some(&client_id),
+                    Some(&service),
+                    None,
+                    Some(&request_id),
+                );
+                request_guard.finish(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                return status_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "tunnel route is unavailable",
+                );
+            }
+            Err(_) => {
+                let _ = cancel_tx.send(true);
+                state.observability.record_worker_acquire_timeout();
+                state.observability.log(
+                    "warn",
+                    "capacity",
+                    format!(
+                        "worker_acquire_timeout while entering dispatcher after {} ms; timeout_ms={}; pending={}; active_workers={}",
+                        request_started.elapsed().as_millis(),
+                        policy.worker_acquire_timeout_ms,
+                        pool.pending_requests.load(Ordering::Acquire),
+                        pool.active_workers.load(Ordering::Acquire)
+                    ),
+                    Some(&client_id),
+                    Some(&service),
+                    None,
+                    Some(&request_id),
+                );
+                request_guard.finish(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                return capacity_response(
+                    "worker_acquire_timeout",
+                    "the tunnel dispatcher did not accept the request before the queue deadline",
+                );
+            }
         }
 
+        let assignment = match timeout_at(acquire_deadline, assigned_rx).await {
+            Ok(Ok(assignment)) => assignment,
+            Ok(Err(_)) => {
+                let _ = cancel_tx.send(true);
+                state.observability.log(
+                    "error",
+                    "gateway",
+                    "worker assignment channel closed before dispatch",
+                    Some(&client_id),
+                    Some(&service),
+                    None,
+                    Some(&request_id),
+                );
+                request_guard.finish(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                return status_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "tunnel route is unavailable",
+                );
+            }
+            Err(_) => {
+                let _ = cancel_tx.send(true);
+                state.observability.record_worker_acquire_timeout();
+                state.observability.log(
+                    "warn",
+                    "capacity",
+                    format!(
+                        "worker_acquire_timeout after {} ms; timeout_ms={}; pending={}; active_workers={}",
+                        request_started.elapsed().as_millis(),
+                        policy.worker_acquire_timeout_ms,
+                        pool.pending_requests.load(Ordering::Acquire),
+                        pool.active_workers.load(Ordering::Acquire)
+                    ),
+                    Some(&client_id),
+                    Some(&service),
+                    None,
+                    Some(&request_id),
+                );
+                request_guard.finish(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                return capacity_response(
+                    "worker_acquire_timeout",
+                    "no tunnel worker became available before the queue deadline",
+                );
+            }
+        };
+        state
+            .observability
+            .record_worker_assignment(assignment.queue_wait_ms);
+
         match timeout(state.response_head_timeout, head_rx).await {
-            Ok(Ok(Ok(head))) => break (head, body_rx),
+            Ok(Ok(Ok(head))) => break (head, body_rx, assignment.queue_wait_ms),
             Ok(Ok(Err(message))) => {
                 let _ = cancel_tx.send(true);
                 state.observability.log(
                     "error",
                     "gateway",
                     format!(
-                        "response_head_error on attempt {attempt}/{max_attempts} after {} ms: {message}",
+                        "response_head_error on attempt {attempt}/{max_attempts} after assignment; queue_wait_ms={}; elapsed_ms={}: {message}",
+                        assignment.queue_wait_ms,
                         request_started.elapsed().as_millis()
                     ),
                     Some(&client_id),
@@ -1024,7 +1253,8 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                         "warn",
                         "gateway",
                         format!(
-                            "retrying_request attempt={attempt}/{max_attempts}; reason=response_head_error; active_workers={}",
+                            "retrying_request attempt={attempt}/{max_attempts}; reason=response_head_error; retry_class={}; active_workers={}",
+                            retry_class.unwrap_or("disabled"),
                             pool.active_workers.load(Ordering::Acquire)
                         ),
                         Some(&client_id),
@@ -1043,7 +1273,8 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                     "error",
                     "gateway",
                     format!(
-                        "response_head_channel_closed on attempt {attempt}/{max_attempts} after {} ms",
+                        "response_head_channel_closed on attempt {attempt}/{max_attempts} after assignment; queue_wait_ms={}; elapsed_ms={}",
+                        assignment.queue_wait_ms,
                         request_started.elapsed().as_millis()
                     ),
                     Some(&client_id),
@@ -1057,7 +1288,8 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                         "warn",
                         "gateway",
                         format!(
-                            "retrying_request attempt={attempt}/{max_attempts}; reason=response_head_channel_closed; active_workers={}",
+                            "retrying_request attempt={attempt}/{max_attempts}; reason=response_head_channel_closed; retry_class={}; active_workers={}",
+                            retry_class.unwrap_or("disabled"),
                             pool.active_workers.load(Ordering::Acquire)
                         ),
                         Some(&client_id),
@@ -1076,8 +1308,8 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                     "error",
                     "gateway",
                     format!(
-                        "response_head_timeout on attempt {attempt}/{max_attempts} after {} ms; timeout_ms={}; active_workers={}",
-                        request_started.elapsed().as_millis(),
+                        "response_head_timeout on attempt {attempt}/{max_attempts} after worker assignment; queue_wait_ms={}; response_timeout_ms={}; active_workers={}",
+                        assignment.queue_wait_ms,
                         state.response_head_timeout.as_millis(),
                         pool.active_workers.load(Ordering::Acquire)
                     ),
@@ -1089,7 +1321,7 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                 request_guard.finish(StatusCode::GATEWAY_TIMEOUT.as_u16());
                 return status_response(
                     StatusCode::GATEWAY_TIMEOUT,
-                    "no tunnel worker became available",
+                    "assigned tunnel worker did not provide response headers before the deadline",
                 );
             }
         }
@@ -1115,7 +1347,9 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
         }
     };
     request_guard.finish(status.as_u16());
-    let mut builder = Response::builder().status(status);
+    let mut builder = Response::builder()
+        .status(status)
+        .header("x-tunnel-queue-wait-ms", queue_wait_ms.to_string());
     for header in head.headers {
         if is_hop_by_hop_header(&header.name) {
             continue;
@@ -1150,8 +1384,33 @@ async fn wait_for_active_worker(pool: &ClientPool, grace: Duration) -> bool {
     }
 }
 
-fn supports_automatic_retry(method: &str) -> bool {
-    matches!(method, "GET" | "HEAD" | "OPTIONS")
+fn automatic_retry_class(
+    method: &str,
+    service: TunnelService,
+    path_and_query: &str,
+    body: &[u8],
+) -> Option<&'static str> {
+    if matches!(method, "GET" | "HEAD" | "OPTIONS") {
+        return Some("safe_http_method");
+    }
+    if method != "POST" {
+        return None;
+    }
+    match service {
+        TunnelService::Mcp if is_retry_safe_mcp_request(body) => Some("mcp_read_only"),
+        TunnelService::Actions => action_tool_name(path_and_query)
+            .filter(|name| is_retry_safe_tool_name(name))
+            .map(|_| "actions_read_only"),
+        _ => None,
+    }
+}
+
+fn action_tool_name(path_and_query: &str) -> Option<&str> {
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    let marker = "/actions/";
+    let start = path.rfind(marker)? + marker.len();
+    let name = &path[start..];
+    (!name.is_empty() && !name.contains('/')).then_some(name)
 }
 
 fn encode_headers(headers: &HeaderMap) -> Vec<HeaderPair> {
@@ -1220,6 +1479,16 @@ fn fail_response_head(
 
 fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok().map(str::trim)
+}
+
+fn capacity_response(reason: &str, message: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header("retry-after", "1")
+        .header("x-tunnel-error", reason)
+        .body(Body::from(message.to_string()))
+        .expect("static capacity response")
 }
 
 fn status_response(status: StatusCode, message: &str) -> Response<Body> {
@@ -1583,6 +1852,7 @@ mod tests {
             method,
             path_and_query,
             headers,
+            ..
         } = serde_json::from_str::<ControlMessage>(request_head.as_ref())
             .expect("request head json")
         else {
@@ -1919,13 +2189,156 @@ mod tests {
     }
 
     #[test]
-    fn automatic_retry_is_limited_to_safe_methods() {
-        assert!(supports_automatic_retry("GET"));
-        assert!(supports_automatic_retry("HEAD"));
-        assert!(supports_automatic_retry("OPTIONS"));
-        assert!(!supports_automatic_retry("POST"));
-        assert!(!supports_automatic_retry("PUT"));
-        assert!(!supports_automatic_retry("DELETE"));
+    fn automatic_retry_is_limited_to_read_only_operations() {
+        assert_eq!(
+            automatic_retry_class("GET", TunnelService::Mcp, "/mcp", b""),
+            Some("safe_http_method")
+        );
+
+        let read = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"path": "README.md"}}
+        }))
+        .unwrap();
+        let write = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "apply_patch", "arguments": {"patch": "test"}}
+        }))
+        .unwrap();
+
+        assert_eq!(
+            automatic_retry_class("POST", TunnelService::Mcp, "/mcp", &read),
+            Some("mcp_read_only")
+        );
+        assert_eq!(
+            automatic_retry_class("POST", TunnelService::Mcp, "/mcp", &write),
+            None
+        );
+        assert_eq!(
+            automatic_retry_class(
+                "POST",
+                TunnelService::Actions,
+                "/builtin/actions/pc-a/actions/read_file",
+                b"{}"
+            ),
+            Some("actions_read_only")
+        );
+        assert_eq!(
+            automatic_retry_class(
+                "POST",
+                TunnelService::Actions,
+                "/builtin/actions/pc-a/actions/apply_patch",
+                b"{}"
+            ),
+            None
+        );
+        assert_eq!(
+            automatic_retry_class("PUT", TunnelService::Mcp, "/mcp", &read),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_route_uses_bounded_queue_and_returns_explicit_503_errors() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database_path = directory.path().join("devices.db");
+        let devices = DeviceRegistry::open(&database_path).expect("device registry");
+        let policies =
+            WorkerPolicyStore::from_writer(devices.database_writer()).expect("policy store");
+        let mut policy = policies.current(TunnelService::Mcp);
+        policy.start_workers = 1;
+        policy.min_idle_workers = 1;
+        policy.max_idle_workers = 1;
+        policy.max_workers = 4;
+        policy.max_pending_requests = 1;
+        policy.worker_acquire_timeout_ms = 150;
+        policies
+            .update(TunnelService::Mcp, policy)
+            .expect("save capacity policy");
+        let (address, server) =
+            start_test_server_with_policies(devices.clone(), Registry::default(), policies).await;
+        let (signing_key, device_id) = enroll_test_device(address, &devices).await;
+        let mut worker = authenticate_worker(address, &signing_key, &device_id).await;
+        finish_worker_auth(&mut worker).await;
+
+        let first_request = tokio::spawn(async move {
+            reqwest::get(format!("http://{address}/builtin/clients/pc-a/mcp?busy=1"))
+                .await
+                .expect("busy public request")
+        });
+        let first_head = worker.next().await.expect("busy head").expect("busy head");
+        let WsMessage::Text(first_head) = first_head else {
+            panic!("expected busy request head");
+        };
+        let ControlMessage::RequestHead {
+            demand: Some(demand),
+            ..
+        } = serde_json::from_str::<ControlMessage>(first_head.as_ref())
+            .expect("busy request head json")
+        else {
+            panic!("expected demand hint on request head");
+        };
+        assert_eq!(demand.queued_requests, 1);
+        assert_eq!(demand.desired_workers, 2);
+        let _first_end = worker.next().await.expect("busy end").expect("busy end");
+
+        let waiting_request = tokio::spawn(async move {
+            reqwest::get(format!(
+                "http://{address}/builtin/clients/pc-a/mcp?waiting=1"
+            ))
+            .await
+            .expect("waiting public request")
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let rejected = reqwest::get(format!(
+            "http://{address}/builtin/clients/pc-a/mcp?rejected=1"
+        ))
+        .await
+        .expect("capacity rejection");
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            rejected
+                .headers()
+                .get("x-tunnel-error")
+                .and_then(|value| value.to_str().ok()),
+            Some("worker_capacity_exhausted")
+        );
+        assert_eq!(
+            rejected
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+
+        let waiting = tokio::time::timeout(Duration::from_secs(1), waiting_request)
+            .await
+            .expect("worker acquire timeout deadline")
+            .expect("waiting task");
+        assert_eq!(waiting.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            waiting
+                .headers()
+                .get("x-tunnel-error")
+                .and_then(|value| value.to_str().ok()),
+            Some("worker_acquire_timeout")
+        );
+        assert_eq!(
+            waiting
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+
+        first_request.abort();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

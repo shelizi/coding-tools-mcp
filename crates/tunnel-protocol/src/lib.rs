@@ -10,6 +10,68 @@ pub const BUILTIN_MCP_PREFIX: &str = "/builtin/clients";
 pub const BUILTIN_ACTIONS_PREFIX: &str = "/builtin/actions";
 pub const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 
+/// MCP tools whose contracts are read-only and therefore safe to replay after a
+/// transport failure that occurs before any response headers are received.
+///
+/// Keep this as the single source of truth for both MCP annotations and tunnel
+/// retry decisions. Tools that change workspace, Git, process, routing, task,
+/// permission, or history state must never be added here.
+pub const MCP_READ_ONLY_TOOL_NAMES: &[&str] = &[
+    "list_workspace_folders",
+    "harness_status",
+    "operation_log",
+    "server_info",
+    "query_tool_usage",
+    "exec_health_check",
+    "read_file",
+    "read_many",
+    "project_map",
+    "list_files",
+    "search_text",
+    "wait_command",
+    "resolve_operation",
+    "list_sessions",
+    "read_output",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_blame",
+    "view_image",
+    "patch_check",
+    "project_state",
+    "task_context",
+    "list_task_events",
+    "change_summary",
+];
+
+pub fn is_retry_safe_tool_name(name: &str) -> bool {
+    MCP_READ_ONLY_TOOL_NAMES.contains(&name.trim())
+}
+
+/// Returns true only for JSON-RPC requests that are safe to replay.
+/// Notifications and malformed messages are intentionally not retried.
+pub fn is_retry_safe_mcp_request(body: &[u8]) -> bool {
+    let Ok(message) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(object) = message.as_object() else {
+        return false;
+    };
+    if object.get("id").is_none() || object.get("id").is_some_and(serde_json::Value::is_null) {
+        return false;
+    }
+    match object.get("method").and_then(serde_json::Value::as_str) {
+        Some("initialize" | "ping" | "tools/list") => true,
+        Some("tools/call") => object
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_retry_safe_tool_name),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TunnelService {
@@ -27,7 +89,41 @@ pub struct WorkerPolicy {
     pub max_lifetime_seconds: u64,
     pub scale_down_delay_seconds: u64,
     pub recycle_jitter_percent: u8,
+    #[serde(default = "default_max_pending_requests")]
+    pub max_pending_requests: u16,
+    #[serde(default = "default_worker_acquire_timeout_ms")]
+    pub worker_acquire_timeout_ms: u64,
+    #[serde(default)]
+    pub max_connecting_workers: u16,
+    #[serde(default = "default_connecting_capacity_grace_ms")]
+    pub connecting_capacity_grace_ms: u64,
+    #[serde(default = "default_scale_down_step")]
+    pub scale_down_step: u16,
+    #[serde(default)]
+    pub burst_warm_workers: u16,
+    #[serde(default = "default_burst_warm_seconds")]
+    pub burst_warm_seconds: u64,
     pub revision: u64,
+}
+
+const fn default_max_pending_requests() -> u16 {
+    32
+}
+
+const fn default_worker_acquire_timeout_ms() -> u64 {
+    10_000
+}
+
+const fn default_connecting_capacity_grace_ms() -> u64 {
+    1_000
+}
+
+const fn default_scale_down_step() -> u16 {
+    4
+}
+
+const fn default_burst_warm_seconds() -> u64 {
+    120
 }
 
 impl WorkerPolicy {
@@ -41,6 +137,13 @@ impl WorkerPolicy {
             max_lifetime_seconds: 3_600,
             scale_down_delay_seconds: 60,
             recycle_jitter_percent: 10,
+            max_pending_requests: default_max_pending_requests(),
+            worker_acquire_timeout_ms: default_worker_acquire_timeout_ms(),
+            max_connecting_workers: 0,
+            connecting_capacity_grace_ms: default_connecting_capacity_grace_ms(),
+            scale_down_step: default_scale_down_step(),
+            burst_warm_workers: 0,
+            burst_warm_seconds: default_burst_warm_seconds(),
             revision: 1,
         }
     }
@@ -70,6 +173,38 @@ impl WorkerPolicy {
         }
         if self.recycle_jitter_percent > 50 {
             return Err("recycle jitter must be between 0 and 50 percent".into());
+        }
+        if self.max_pending_requests == 0 || self.max_pending_requests > 4_096 {
+            return Err("max pending requests must be between 1 and 4096".into());
+        }
+        if !(100..=60_000).contains(&self.worker_acquire_timeout_ms) {
+            return Err("worker acquire timeout must be between 100 and 60000 milliseconds".into());
+        }
+        if self.max_connecting_workers > self.max_workers {
+            return Err(
+                "max connecting workers must be 0 (automatic) or no greater than max workers"
+                    .into(),
+            );
+        }
+        if self.connecting_capacity_grace_ms > 30_000 {
+            return Err(
+                "connecting capacity grace must be between 0 and 30000 milliseconds".into(),
+            );
+        }
+        if self.scale_down_step == 0 || self.scale_down_step > 256 {
+            return Err("scale-down step must be between 1 and 256".into());
+        }
+        if self.burst_warm_workers != 0
+            && (self.burst_warm_workers < self.max_idle_workers
+                || self.burst_warm_workers > self.max_workers)
+        {
+            return Err(
+                "burst warm workers must be 0 (automatic) or between max idle and max workers"
+                    .into(),
+            );
+        }
+        if self.burst_warm_seconds > 3_600 {
+            return Err("burst warm duration must be between 0 and 3600 seconds".into());
         }
         if self.revision == 0 {
             return Err("worker policy revision must be positive".into());
@@ -132,6 +267,13 @@ pub struct EnrollmentResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerDemand {
+    pub queued_requests: u16,
+    pub oldest_queue_wait_ms: u64,
+    pub desired_workers: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlMessage {
     Challenge {
@@ -152,6 +294,8 @@ pub enum ControlMessage {
         method: String,
         path_and_query: String,
         headers: Vec<HeaderPair>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        demand: Option<WorkerDemand>,
     },
     RequestEnd {
         request_id: String,
@@ -328,6 +472,13 @@ mod tests {
         assert_eq!(policy.max_lifetime_seconds, 3_600);
         assert_eq!(policy.scale_down_delay_seconds, 60);
         assert_eq!(policy.recycle_jitter_percent, 10);
+        assert_eq!(policy.max_pending_requests, 32);
+        assert_eq!(policy.worker_acquire_timeout_ms, 10_000);
+        assert_eq!(policy.max_connecting_workers, 0);
+        assert_eq!(policy.connecting_capacity_grace_ms, 1_000);
+        assert_eq!(policy.scale_down_step, 4);
+        assert_eq!(policy.burst_warm_workers, 0);
+        assert_eq!(policy.burst_warm_seconds, 120);
         assert_eq!(policy.revision, 1);
 
         let message = ControlMessage::HelloAck {
@@ -348,6 +499,27 @@ mod tests {
     }
 
     #[test]
+    fn older_worker_policy_json_receives_capacity_defaults() {
+        let policy: WorkerPolicy = serde_json::from_value(serde_json::json!({
+            "start_workers": 1,
+            "min_idle_workers": 1,
+            "max_idle_workers": 1,
+            "max_workers": 1,
+            "max_requests_per_worker": 500,
+            "max_lifetime_seconds": 3600,
+            "scale_down_delay_seconds": 60,
+            "recycle_jitter_percent": 10,
+            "revision": 1
+        }))
+        .expect("legacy policy");
+        assert_eq!(policy.max_pending_requests, 32);
+        assert_eq!(policy.worker_acquire_timeout_ms, 10_000);
+        assert_eq!(policy.max_connecting_workers, 0);
+        assert_eq!(policy.burst_warm_workers, 0);
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
     fn worker_policy_rejects_invalid_fpm_relationships_and_bounds() {
         let valid = WorkerPolicy::default_for(TunnelService::Actions);
         assert!(valid.validate().is_ok());
@@ -363,5 +535,52 @@ mod tests {
         invalid = valid;
         invalid.recycle_jitter_percent = 51;
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn retry_contract_accepts_only_read_only_mcp_requests() {
+        let read = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"path": "README.md"}}
+        });
+        let write = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "apply_patch", "arguments": {"patch": "test"}}
+        });
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"path": "README.md"}}
+        });
+
+        assert!(is_retry_safe_mcp_request(
+            &serde_json::to_vec(&read).unwrap()
+        ));
+        assert!(!is_retry_safe_mcp_request(
+            &serde_json::to_vec(&write).unwrap()
+        ));
+        assert!(!is_retry_safe_mcp_request(
+            &serde_json::to_vec(&notification).unwrap()
+        ));
+        assert!(!is_retry_safe_mcp_request(b"not-json"));
+    }
+
+    #[test]
+    fn retry_contract_accepts_safe_protocol_requests() {
+        for method in ["initialize", "ping", "tools/list"] {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": method,
+                "method": method,
+                "params": {}
+            });
+            assert!(is_retry_safe_mcp_request(
+                &serde_json::to_vec(&request).unwrap()
+            ));
+        }
     }
 }
