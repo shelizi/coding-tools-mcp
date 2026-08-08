@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { normalizeConfig } from '../dist/config.js';
 import { MAX_CONVERSATION_CONTEXTS } from '../dist/conversation.js';
+import { ABSOLUTE_COMMAND_TIMEOUT_MAX_MS, DEFAULT_COMMAND_TIMEOUT_MAX_MS } from '../dist/executionLimits.js';
 import {
   WINDOWS_CIRCUIT_BREAKER_DELAY_MS,
   WINDOWS_CIRCUIT_BREAKER_THRESHOLD,
@@ -47,9 +48,12 @@ test('Rust behavioral parity fixtures match Node runtime constants', () => {
     globalBlockingConcurrency: execution.global_blocking_admission,
     globalProcessConcurrency: execution.global_process_admission,
     activeSessionLimit: execution.active_sessions,
-    maxOutputBytes: 1024 * 1024
+    maxOutputBytes: 1024 * 1024,
+    commandTimeoutMaxMs: execution.command_timeout_default_ms
   });
   assert.equal(MAX_CONVERSATION_CONTEXTS, workspace.max_conversation_contexts);
+  assert.equal(DEFAULT_COMMAND_TIMEOUT_MAX_MS, execution.command_timeout_default_ms);
+  assert.equal(ABSOLUTE_COMMAND_TIMEOUT_MAX_MS, execution.command_timeout_absolute_max_ms);
   assert.deepEqual({
     startup_slots: WINDOWS_STARTUP_SLOTS,
     start_interval_ms: WINDOWS_START_INTERVAL_MS,

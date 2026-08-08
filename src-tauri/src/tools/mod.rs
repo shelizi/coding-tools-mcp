@@ -19,7 +19,10 @@ pub mod session;
 pub mod tool_usage;
 pub mod workspace;
 
-pub use context::{ExecutionLimits, SharedToolContext, ToolContext};
+pub use context::{
+    ExecutionLimits, RuntimeToolConfig, SharedRuntimeToolConfig, SharedToolContext, ToolContext,
+    ABSOLUTE_COMMAND_TIMEOUT_MAX_MS, DEFAULT_COMMAND_TIMEOUT_MAX_MS,
+};
 /// 唯一工具执行入口；MCP 与 Actions 必须调用这些共享入口，不得分叉实现。
 pub use dispatch::{call_tool, call_tool_async};
 pub use policy::{validate_actions_exposure, PolicySettings};

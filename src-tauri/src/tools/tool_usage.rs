@@ -12,11 +12,17 @@ use crate::tools::workspace::{tool_ok, WorkspaceError};
 const TOOL_USAGE_LOG_FILE: &str = "mcp-tool-usage.jsonl";
 const MAX_ROTATED_FILES: usize = 5;
 const DEFAULT_BURST_IDLE_MS: u64 = 120_000;
-const PHASE_METRICS: [(&str, &str); 4] = [
+const PHASE_METRICS: [(&str, &str); 10] = [
     ("preflight", "phase_preflight_ms"),
     ("plan", "phase_plan_ms"),
     ("commit", "phase_commit_ms"),
     ("total", "phase_total_ms"),
+    ("baseline_capture", "phase_baseline_capture_ms"),
+    ("error_enrichment", "phase_error_enrichment_ms"),
+    ("harness_begin", "phase_harness_begin_ms"),
+    ("dispatch", "phase_dispatch_ms"),
+    ("harness_finish", "phase_harness_finish_ms"),
+    ("serialization", "phase_serialization_ms"),
 ];
 
 #[derive(Default)]
@@ -174,11 +180,11 @@ pub fn query_tool_usage_for_profile(
     let include_slowest = args
         .get("include_slowest")
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(false);
     let include_largest = args
         .get("include_largest")
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(false);
     let include_performance = args
         .get("include_performance")
         .and_then(Value::as_bool)
@@ -186,7 +192,7 @@ pub fn query_tool_usage_for_profile(
     let include_bursts = args
         .get("include_bursts")
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(false);
     let include_async_sessions = args
         .get("include_async_sessions")
         .and_then(Value::as_bool)
@@ -369,6 +375,80 @@ pub fn query_tool_usage_for_profile(
             .then_with(|| a["tool"].as_str().cmp(&b["tool"].as_str()))
     });
     tool_stats.truncate(top);
+    let response_profile =
+        if include_records || include_slowest || include_largest || include_bursts {
+            "detailed"
+        } else {
+            "summary"
+        };
+    let detail_sections = json!({
+        "records": include_records,
+        "slowest": include_slowest,
+        "largest": include_largest,
+        "activity_bursts": include_bursts
+    });
+    let aggregate_value = if aggregate {
+        json!({
+            "calls": totals.calls,
+            "errors": totals.errors,
+            "warnings": totals.warnings,
+            "duration_ms": totals.duration_ms,
+            "queue_wait_ms": totals.queue_wait_ms,
+            "workspace_admission_wait_ms": totals.workspace_admission_wait_ms,
+            "global_admission_wait_ms": totals.global_admission_wait_ms,
+            "blocking_queue_wait_ms": totals.blocking_queue_wait_ms,
+            "workspace_lock_wait_ms": totals.workspace_lock_wait_ms,
+            "history_lock_wait_ms": totals.history_lock_wait_ms,
+            "session_registry_wait_ms": totals.session_registry_wait_ms,
+            "actual_wait_ms": totals.actual_wait_ms,
+            "snapshot_ms": totals.snapshot_ms,
+            "resource_lock_wait_ms": totals.resource_lock_wait_ms,
+            "operation_lock_wait_ms": totals.operation_lock_wait_ms,
+            "batch_queue_wait_ms": totals.batch_queue_wait_ms,
+            "queue_nonzero": totals.queue_nonzero,
+            "avg_ms": average(totals.duration_ms, totals.calls),
+            "p50_ms": percentile(&totals.durations, 50),
+            "p95_ms": percentile(&totals.durations, 95),
+            "max_ms": totals.durations.iter().copied().max().unwrap_or(0),
+            "phase_latency": phase_latency_stats(&totals),
+            "request_bytes": totals.request_bytes,
+            "response_bytes": totals.response_bytes,
+            "outcomes": outcome_counts,
+            "errors_by_code": error_counts,
+            "tools": tool_stats
+        })
+    } else {
+        Value::Null
+    };
+    let optimization_value = if aggregate {
+        json!({
+            "recovery_actions": totals.recovery_actions,
+            "failed_command_ids": totals.failed_command_ids,
+            "skipped_command_ids": totals.skipped_command_ids,
+            "empty_wait_timeouts": totals.empty_wait_timeouts,
+            "deduplicated_calls": totals.deduplicated_calls,
+            "heartbeat_responses": totals.heartbeat_responses,
+            "detached_responses": totals.detached_responses,
+            "repeated_identical_error_count": repeated_identical_error_count,
+            "repeated_failures": repeated_failure_report(
+                &repeated_failures,
+                repeated_identical_error_count,
+                top,
+            )
+        })
+    } else {
+        Value::Null
+    };
+    let formatting_value = if aggregate {
+        formatting_stats(&totals)
+    } else {
+        Value::Null
+    };
+    let performance_value = if include_performance {
+        performance_report(&performance, top, include_bursts, burst_idle_ms)
+    } else {
+        Value::Null
+    };
 
     Ok(tool_ok(json!({
         "workspace_id": profile_id,
@@ -380,72 +460,16 @@ pub fn query_tool_usage_for_profile(
         "matched_lines": matched_lines,
         "matched_async_session_events": matched_async_session_events,
         "invalid_complete_lines": invalid_lines,
+        "response_profile": response_profile,
+        "detail_sections": detail_sections,
         "records": recent,
         "slowest": if include_slowest { Value::Array(slowest) } else { Value::Null },
         "largest": if include_largest { Value::Array(largest) } else { Value::Null },
-        "aggregate": if aggregate {
-            json!({
-                "calls": totals.calls,
-                "errors": totals.errors,
-                "warnings": totals.warnings,
-                "duration_ms": totals.duration_ms,
-                "queue_wait_ms": totals.queue_wait_ms,
-                "workspace_admission_wait_ms": totals.workspace_admission_wait_ms,
-                "global_admission_wait_ms": totals.global_admission_wait_ms,
-                "blocking_queue_wait_ms": totals.blocking_queue_wait_ms,
-                "workspace_lock_wait_ms": totals.workspace_lock_wait_ms,
-                "history_lock_wait_ms": totals.history_lock_wait_ms,
-                "session_registry_wait_ms": totals.session_registry_wait_ms,
-                "actual_wait_ms": totals.actual_wait_ms,
-                "snapshot_ms": totals.snapshot_ms,
-                "resource_lock_wait_ms": totals.resource_lock_wait_ms,
-                "operation_lock_wait_ms": totals.operation_lock_wait_ms,
-                "batch_queue_wait_ms": totals.batch_queue_wait_ms,
-                "queue_nonzero": totals.queue_nonzero,
-                "avg_ms": average(totals.duration_ms, totals.calls),
-                "p50_ms": percentile(&totals.durations, 50),
-                "p95_ms": percentile(&totals.durations, 95),
-                "max_ms": totals.durations.iter().copied().max().unwrap_or(0),
-                "phase_latency": phase_latency_stats(&totals),
-                "request_bytes": totals.request_bytes,
-                "response_bytes": totals.response_bytes,
-                "outcomes": outcome_counts,
-                "errors_by_code": error_counts,
-                "tools": tool_stats
-            })
-        } else {
-            Value::Null
-        },
-        "optimization": if aggregate {
-            json!({
-                "recovery_actions": totals.recovery_actions,
-                "failed_command_ids": totals.failed_command_ids,
-                "skipped_command_ids": totals.skipped_command_ids,
-                "empty_wait_timeouts": totals.empty_wait_timeouts,
-                "deduplicated_calls": totals.deduplicated_calls,
-                "heartbeat_responses": totals.heartbeat_responses,
-                "detached_responses": totals.detached_responses,
-                "repeated_identical_error_count": repeated_identical_error_count,
-                "repeated_failures": repeated_failure_report(
-                    &repeated_failures,
-                    repeated_identical_error_count,
-                    top,
-                )
-            })
-        } else {
-            Value::Null
-        },
-        "formatting": if aggregate {
-            formatting_stats(&totals)
-        } else {
-            Value::Null
-        },
+        "aggregate": aggregate_value,
+        "optimization": optimization_value,
+        "formatting": formatting_value,
         "parallelism": parallelism_report(&parallel_history, top),
-        "performance": if include_performance {
-            performance_report(&performance, top, include_bursts, burst_idle_ms)
-        } else {
-            Value::Null
-        },
+        "performance": performance_value,
         "warnings": Vec::<String>::new()
     })))
 }

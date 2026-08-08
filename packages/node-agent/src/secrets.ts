@@ -30,14 +30,17 @@ export interface SecretStoreState {
 export interface AgentSecretFileSnapshot {
   storePath: string;
   keyPath: string;
+  keyBackupPath: string;
   storeContent?: Buffer;
   keyContent?: Buffer;
+  keyBackupContent?: Buffer;
 }
 
-export function secretStorePaths(dataDir: string): { storePath: string; keyPath: string } {
+export function secretStorePaths(dataDir: string): { storePath: string; keyPath: string; keyBackupPath: string } {
   return {
     storePath: path.join(dataDir, 'agent-secrets.enc.json'),
-    keyPath: path.join(dataDir, 'agent-secrets.key')
+    keyPath: path.join(dataDir, 'agent-secrets.key'),
+    keyBackupPath: path.join(dataDir, 'agent-secrets.key.backup')
   };
 }
 
@@ -80,19 +83,39 @@ async function readKey(keyPath: string): Promise<Buffer | undefined> {
   }
 }
 
+async function writeKeyBackupIfMissing(keyBackupPath: string, key: Buffer): Promise<void> {
+  await mkdir(path.dirname(keyBackupPath), { recursive: true, mode: 0o700 });
+  try {
+    await writeFile(keyBackupPath, `${key.toString('base64url')}\n`, { flag: 'wx', mode: 0o600 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  await chmod(keyBackupPath, 0o600).catch(() => undefined);
+}
+
 async function loadOrCreateKey(dataDir: string): Promise<{ key: Buffer; keyPath: string }> {
-  const { keyPath } = secretStorePaths(dataDir);
+  const { keyPath, keyBackupPath } = secretStorePaths(dataDir);
   const existing = await readKey(keyPath);
-  if (existing) return { key: existing, keyPath };
+  if (existing) {
+    await writeKeyBackupIfMissing(keyBackupPath, existing);
+    return { key: existing, keyPath };
+  }
+  const backup = await readKey(keyBackupPath);
+  if (backup) {
+    await writeAtomic(keyPath, `${backup.toString('base64url')}\n`);
+    return { key: backup, keyPath };
+  }
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const generated = randomBytes(KEY_BYTES);
   try {
     await writeFile(keyPath, `${generated.toString('base64url')}\n`, { flag: 'wx', mode: 0o600 });
+    await writeKeyBackupIfMissing(keyBackupPath, generated);
     return { key: generated, keyPath };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     const raced = await readKey(keyPath);
     if (!raced) throw new Error(`Agent secret key disappeared after concurrent creation: ${keyPath}`);
+    await writeKeyBackupIfMissing(keyBackupPath, raced);
     return { key: raced, keyPath };
   }
 }
@@ -167,18 +190,30 @@ async function readOptionalFile(filePath: string): Promise<Buffer | undefined> {
 
 export async function snapshotAgentSecretFiles(dataDir: string): Promise<AgentSecretFileSnapshot> {
   const paths = secretStorePaths(dataDir);
-  const [storeContent, keyContent] = await Promise.all([
+  const [storeContent, keyContent, keyBackupContent] = await Promise.all([
     readOptionalFile(paths.storePath),
-    readOptionalFile(paths.keyPath)
+    readOptionalFile(paths.keyPath),
+    readOptionalFile(paths.keyBackupPath)
   ]);
-  return { ...paths, storeContent, keyContent };
+  return { ...paths, storeContent, keyContent, keyBackupContent };
 }
 
 export async function restoreAgentSecretFiles(snapshot: AgentSecretFileSnapshot): Promise<void> {
-  if (snapshot.keyContent) await writeAtomic(snapshot.keyPath, snapshot.keyContent.toString('utf8'));
-  else await rm(snapshot.keyPath, { force: true });
+  if (snapshot.storeContent && !snapshot.keyContent) {
+    throw new Error(`Refusing to restore an encrypted agent secret store without its key: ${snapshot.storePath}`);
+  }
+  if (!snapshot.storeContent) {
+    await rm(snapshot.storePath, { force: true });
+  }
+  if (snapshot.keyContent) {
+    const backupContent = snapshot.keyBackupContent ?? snapshot.keyContent;
+    await writeAtomic(snapshot.keyBackupPath, backupContent.toString('utf8'));
+    await writeAtomic(snapshot.keyPath, snapshot.keyContent.toString('utf8'));
+  } else {
+    await rm(snapshot.keyPath, { force: true });
+    await rm(snapshot.keyBackupPath, { force: true });
+  }
   if (snapshot.storeContent) await writeAtomic(snapshot.storePath, snapshot.storeContent.toString('utf8'));
-  else await rm(snapshot.storePath, { force: true });
 }
 
 async function createStoreExclusive(storePath: string, secrets: AgentSecrets, key: Buffer): Promise<boolean> {
@@ -194,7 +229,15 @@ async function createStoreExclusive(storePath: string, secrets: AgentSecrets, ke
 
 export async function readAgentSecrets(dataDir: string): Promise<SecretStoreState> {
   const paths = secretStorePaths(dataDir);
-  const key = await readKey(paths.keyPath);
+  let key = await readKey(paths.keyPath);
+  if (!key) {
+    const backup = await readKey(paths.keyBackupPath);
+    if (backup) {
+      await readStore(paths.storePath, backup);
+      await writeAtomic(paths.keyPath, `${backup.toString('base64url')}\n`);
+      key = backup;
+    }
+  }
   if (!key) {
     try {
       await readFile(paths.storePath, 'utf8');
@@ -204,8 +247,10 @@ export async function readAgentSecrets(dataDir: string): Promise<SecretStoreStat
     }
     return { secrets: {}, ...paths, created: false, changed: false };
   }
+  const secrets = await readStore(paths.storePath, key) ?? {};
+  await writeKeyBackupIfMissing(paths.keyBackupPath, key);
   return {
-    secrets: await readStore(paths.storePath, key) ?? {},
+    secrets,
     ...paths,
     created: false,
     changed: false

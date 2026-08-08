@@ -22,7 +22,7 @@ test('every Rust catalog tool has an explicit Node regression reference', async 
   const testSource = (await Promise.all(testFiles.map(name => readFile(path.join(directory, name), 'utf8')))).join('\n');
   const missing = toolNames.filter(name => !new RegExp(`\\b${escapePattern(name)}\\b`).test(testSource));
 
-  assert.equal(toolNames.length, 49);
+  assert.equal(toolNames.length, 50);
   assert.deepEqual(missing, []);
 });
 
@@ -113,7 +113,8 @@ test('Rust and Node edits share replay-plan and phase-latency contracts', async 
     assert.match(rustPatch, new RegExp(marker));
     assert.match(nodeFiles, new RegExp(marker));
   }
-  assert.match(nodeTelemetry, /record\[`phase_\$\{phase\}`\]/);
+  assert.match(nodeTelemetry, /const source = `\$\{phase\}_ms`/);
+  assert.match(nodeTelemetry, /record\[`phase_\$\{source\}`\]/);
   for (const field of ['phase_preflight_ms', 'phase_plan_ms', 'phase_commit_ms', 'phase_total_ms']) {
     assert.match(rustTelemetry, new RegExp(field));
     assert.match(nodeObservability, new RegExp(field));

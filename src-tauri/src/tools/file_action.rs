@@ -484,7 +484,16 @@ fn collect_requested_files(
             continue;
         }
         let mut builder = WalkBuilder::new(&resolved.path);
-        builder.follow_links(false).hidden(false).require_git(false);
+        builder
+            .follow_links(false)
+            .hidden(false)
+            .require_git(false)
+            .filter_entry(|entry| {
+                entry.file_name().to_str().map_or(true, |name| {
+                    !name.eq_ignore_ascii_case(".git")
+                        && !crate::tools::workspace::DEFAULT_EXCLUDED_NAMES.contains(&name)
+                })
+            });
         for entry in builder.build().filter_map(Result::ok) {
             if collected.len() >= request.max_files {
                 break;
@@ -493,7 +502,7 @@ fn collect_requested_files(
                 continue;
             }
             let path = entry.path();
-            if !ws.is_safe_read_path(path) || ws.is_ignored_path(path, false, false) {
+            if !ws.is_safe_read_path(path) || ws.is_ignored_path(path, false, false, false) {
                 continue;
             }
             let display = relative_path(ws.root(), path);
@@ -1191,7 +1200,7 @@ impl ActionRunner for SystemRunner {
 
         let wsl_workspace = crate::workspace::parse_wsl_path(&request.mirror_root).is_some();
         let executable_text = executable.to_string_lossy().into_owned();
-        let mut process = crate::platform::wsl::std_command_for_workspace(
+        let mut process = crate::platform::wsl::std_command_for_workspace_clean_env(
             &executable_text,
             &command.args,
             &request.mirror_root,
@@ -1201,7 +1210,6 @@ impl ActionRunner for SystemRunner {
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
         if !wsl_workspace {
-            process.env_clear();
             copy_safe_formatter_environment(&mut process);
         }
         let mut child = process

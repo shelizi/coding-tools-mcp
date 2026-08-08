@@ -55,14 +55,15 @@ try {
     }
 
     $packageName = "Coding.Tools.MCP_${version}_x64_portable"
+    $expandedName = 'Coding.Tools.MCP_x64_portable'
     $distRoot = Join-Path $workspace 'dist-portable'
-    $packageDir = Join-Path $distRoot $packageName
-    $portableExe = Join-Path $packageDir 'Coding Tools MCP.exe'
+    $expandedDir = Join-Path $distRoot $expandedName
     $zipPath = Join-Path $distRoot "$packageName.zip"
     $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) "coding-tools-mcp-portable-$([guid]::NewGuid().ToString('N'))"
     $stagingPackageDir = Join-Path $stagingRoot $packageName
     $stagingExe = Join-Path $stagingPackageDir 'Coding Tools MCP.exe'
     $stagingZip = Join-Path $stagingRoot "$packageName.zip"
+    $expandedStagingDir = Join-Path $distRoot ".$expandedName.next-$([guid]::NewGuid().ToString('N'))"
 
     try {
         New-Item -ItemType Directory -Path $stagingPackageDir -Force | Out-Null
@@ -73,13 +74,19 @@ try {
             -CompressionLevel Optimal
         Move-Item -LiteralPath $stagingZip -Destination $zipPath -Force
 
-        New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+        Copy-Item -LiteralPath $stagingPackageDir -Destination $expandedStagingDir -Recurse
         try {
-            Copy-Item -LiteralPath $releaseExe -Destination $portableExe -Force
+            if (Test-Path -LiteralPath $expandedDir) {
+                Remove-Item -LiteralPath $expandedDir -Recurse -Force
+            }
+            Move-Item -LiteralPath $expandedStagingDir -Destination $expandedDir
         } catch [System.IO.IOException] {
-            Write-Warning "Portable folder was not updated because its executable is running. The ZIP is current: $zipPath"
+            Write-Warning "Expanded portable folder was not replaced, usually because it is running. The ZIP is current: $zipPath"
         }
     } finally {
+        if (Test-Path -LiteralPath $expandedStagingDir) {
+            Remove-Item -LiteralPath $expandedStagingDir -Recurse -Force
+        }
         $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
         $resolvedStaging = [System.IO.Path]::GetFullPath($stagingRoot)
         if ($resolvedStaging.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
@@ -99,6 +106,7 @@ try {
     Write-Host "Portable ZIP: $($zipInfo.FullName)"
     Write-Host "ZIP bytes: $($zipInfo.Length)"
     Write-Host "ZIP SHA-256: $zipHash"
+    Write-Host "Expanded portable: $expandedDir"
 } finally {
     Pop-Location
 }

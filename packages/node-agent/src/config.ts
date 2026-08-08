@@ -5,11 +5,13 @@ import path from 'node:path';
 import { ensureAgentSecrets } from './secrets.js';
 import { defaultPolicy, mergeAllowedCommands, normalizeScriptExtensions } from './policy.js';
 import { configuredToolProfile, resolveToolProfile } from './catalog.js';
+import { compatibilityToolProfile, normalizeSecurityPolicy } from './securityPolicy.js';
 import type {
   AgentConfig, AgentConfigDocument, AgentSecrets, PermissionMode, WorkspaceFolder, WorkspaceFolderDocument
 } from './types.js';
 import { normalizeWorkspacePath, workspaceBasename } from './wsl.js';
 import { canonicalizeWorkspaceFolders, validateUniqueWorkspaceFolders } from './workspace.js';
+import { ABSOLUTE_COMMAND_TIMEOUT_MAX_MS, DEFAULT_COMMAND_TIMEOUT_MAX_MS } from './executionLimits.js';
 
 export const CURRENT_CONFIG_SCHEMA_VERSION = 1 as const;
 
@@ -121,6 +123,11 @@ export function normalizeConfig(
   const environmentFolders = environment.CTMCP_WORKSPACES;
   const effectivePermissionMode = permissionMode(environment.CTMCP_PERMISSION_MODE ?? input.permissionMode);
   const toolProfile = configuredToolProfile(environment.CTMCP_TOOL_PROFILE ?? input.toolProfile);
+  const securityPolicy = normalizeSecurityPolicy(input.securityPolicy, effectivePermissionMode, toolProfile);
+  const securityPolicyCustomized = input.securityPolicy !== undefined;
+  const activeToolProfile = input.securityPolicy
+    ? resolveToolProfile(compatibilityToolProfile(securityPolicy), 'trusted')
+    : resolveToolProfile(toolProfile, effectivePermissionMode);
   return {
     host: environment.CTMCP_HOST ?? input.host ?? '127.0.0.1',
     port: positiveInt(environment.CTMCP_PORT ?? input.port, 3789, 65_535),
@@ -128,7 +135,9 @@ export function normalizeConfig(
     dataDir,
     permissionMode: effectivePermissionMode,
     toolProfile,
-    activeToolProfile: resolveToolProfile(toolProfile, effectivePermissionMode),
+    activeToolProfile,
+    securityPolicy,
+    securityPolicyCustomized,
     policy: {
       allowedCommands: mergeAllowedCommands(environment.CTMCP_ALLOWED_COMMANDS ?? input.policy?.allowedCommands),
       workspaceLocalEntries: enabled(environment.CTMCP_WORKSPACE_LOCAL_ENTRIES ?? input.policy?.workspaceLocalEntries, true),
@@ -155,7 +164,12 @@ export function normalizeConfig(
       globalBlockingConcurrency: positiveInt(environment.CTMCP_GLOBAL_BLOCKING_CONCURRENCY ?? input.limits?.globalBlockingConcurrency, 1_024, 65_535),
       globalProcessConcurrency: positiveInt(environment.CTMCP_GLOBAL_PROCESS_CONCURRENCY ?? input.limits?.globalProcessConcurrency, 512, 65_535),
       activeSessionLimit: positiveInt(environment.CTMCP_ACTIVE_SESSION_LIMIT ?? input.limits?.activeSessionLimit, 512, 65_535),
-      maxOutputBytes: positiveInt(environment.CTMCP_MAX_OUTPUT_BYTES ?? input.limits?.maxOutputBytes, 1024 * 1024, 16 * 1024 * 1024)
+      maxOutputBytes: positiveInt(environment.CTMCP_MAX_OUTPUT_BYTES ?? input.limits?.maxOutputBytes, 1024 * 1024, 16 * 1024 * 1024),
+      commandTimeoutMaxMs: positiveInt(
+        environment.CTMCP_COMMAND_TIMEOUT_MAX_MS ?? input.limits?.commandTimeoutMaxMs,
+        DEFAULT_COMMAND_TIMEOUT_MAX_MS,
+        ABSOLUTE_COMMAND_TIMEOUT_MAX_MS
+      )
     },
     tunnel: publicUrl ? {
       enabled: enabled(environment.CTMCP_BUILTIN_ENABLED ?? input.tunnel?.enabled, true),

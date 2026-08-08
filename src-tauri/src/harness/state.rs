@@ -433,6 +433,8 @@ impl Harness {
             .as_ref()
             .and_then(|baseline| baseline.head.clone())
             .or_else(|| git_value(&self.workspace_root, &["rev-parse", "HEAD"]));
+        let current_head = head.clone();
+        let task_baseline_head = task.as_ref().and_then(|task| task.baseline.head.clone());
         let (task_id, task_state, task_updated_at, writable, baseline_matches, reason) =
             match task.as_ref() {
                 Some(task) => {
@@ -558,6 +560,8 @@ impl Harness {
             recoverable: true,
             branch,
             head,
+            current_head,
+            task_baseline_head,
             baseline_matches,
             capabilities,
             next_actions,
@@ -760,7 +764,9 @@ fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
         .iter()
         .map(|arg| (*arg).to_string())
         .collect::<Vec<_>>();
-    let mut command = crate::platform::wsl::std_command_for_workspace("git", &args, root);
+    let git_env = [("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
+    let mut command =
+        crate::platform::wsl::std_command_for_workspace_with_env("git", &args, root, &git_env, &[]);
 
     #[cfg(windows)]
     {

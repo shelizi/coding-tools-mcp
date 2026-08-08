@@ -360,7 +360,8 @@ impl Workspace {
         &self,
         path: &Path,
         include_hidden: bool,
-        include_ignored: bool,
+        _include_ignored: bool,
+        include_generated: bool,
     ) -> bool {
         let Ok(scan_path) = path.strip_prefix(&self.root) else {
             return true;
@@ -372,6 +373,11 @@ impl Workspace {
                 _ => None,
             })
             .collect();
+        for part in &parts {
+            if part.eq_ignore_ascii_case(".git") {
+                return true;
+            }
+        }
         if !include_hidden {
             for part in &parts {
                 if part.starts_with('.') && part != "." {
@@ -379,7 +385,7 @@ impl Workspace {
                 }
             }
         }
-        if !include_ignored {
+        if !include_generated {
             for part in &parts {
                 if DEFAULT_EXCLUDED_NAMES.contains(&part.as_str()) {
                     return true;

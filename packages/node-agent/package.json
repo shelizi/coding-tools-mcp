@@ -1,10 +1,10 @@
 {
   "name": "@coding-tools/node-agent",
-  "version": "0.29.5",
+  "version": "0.29.8",
   "private": true,
   "type": "module",
   "codingTools": {
-    "clientVersion": "0.1.37"
+    "clientVersion": "0.1.40"
   },
   "files": [
     "dist",
@@ -20,7 +20,9 @@
     "dev:ui": "node scripts/build-ui.mjs --watch",
     "build": "npm run build:server && npm run build:ui",
     "start": "node dist/cli.js",
-    "test": "npm run build && node --test test/*.test.mjs",
+    "test": "npm run build:server && node --import ./test/setup.mjs --test test/*.test.mjs",
+    "test:full": "npm run build && node --import ./test/setup.mjs --test test/*.test.mjs",
+    "test:ui": "npm run build:ui",
     "test:wss:production": "npm run build:server && node scripts/test-production-wss.mjs",
     "sync:rust-contract": "node scripts/sync-rust-catalog.mjs",
     "check:rust-contract": "node scripts/sync-rust-catalog.mjs --check",
@@ -28,7 +30,7 @@
     "check:parity-todos": "node ../../scripts/check-node-agent-parity.mjs",
     "check:ui-parity": "node ../../scripts/check-node-agent-ui-parity.mjs",
     "check:native": "node scripts/check-native.mjs",
-    "verify": "npm test && npm run check:native",
+    "verify": "npm run test:full && npm run check:native",
     "verify:repo": "npm run verify && npm run check:rust-contract && npm run check:client-version && npm run check:parity-todos && npm run check:ui-parity",
     "portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1",
     "portable:bundled": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1 -Edition bundled-node",

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { stat } from 'node:fs/promises';
 import type { FolderRuntime, JsonObject, PendingOperation, ToolContext } from './types.js';
 import { readOnlyTools, toolNamesForProfile, toolsetRevisionForProfile } from './catalog.js';
@@ -10,8 +10,8 @@ import {
 import { fileOpsTool } from './fileOpsTools.js';
 import { formatFilesTool } from './formatterTools.js';
 import {
-  gitBlameTool, gitBranchTool, gitCommitTool, gitDiffTool, gitLogTool,
-  gitRestoreTool, gitShowTool, gitStageTool, gitStatusTool
+  gitBlameTool, gitBranchTool, gitCommitTool, gitDiffTool, gitLogTool, gitPushTool,
+  gitRestoreTool, gitRuntimeRevisionInfo, gitShowTool, gitStageTool, gitStatusTool
 } from './gitTools.js';
 import { bootstrapHistory, checkpointHistory, validateHistory } from './history.js';
 import {
@@ -30,6 +30,7 @@ import {
   selectedFolderSafe
 } from './workspace.js';
 import { AGENT_VERSION, CLIENT_COMPAT_VERSION } from './version.js';
+import { ABSOLUTE_COMMAND_TIMEOUT_MAX_MS } from './executionLimits.js';
 import { OutputRedactionContext } from './redaction.js';
 import { validateToolPolicy } from './policy.js';
 import { parseWslUncPath, validateWslWorkspacePath } from './wsl.js';
@@ -47,8 +48,63 @@ const HARNESS_TOOLS = new Set([
 const GUARDED_TOOLS = new Set([
   'apply_patch', 'edit', 'edit_file', 'edit_many', 'file_ops', 'format_files',
   'exec_command', 'exec_many', 'kill_session',
-  'git_branch', 'git_stage', 'git_commit', 'git_restore'
+  'git_branch', 'git_stage', 'git_commit', 'git_push', 'git_restore'
 ]);
+const inflightToolCalls = new WeakMap<ToolContext, Map<string, Promise<JsonObject>>>();
+
+function stableRequestValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableRequestValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([field, nested]) => [field, stableRequestValue(nested)]));
+  }
+  return value;
+}
+
+function canCoalesceInflight(name: string, args: JsonObject): boolean {
+  if (name === 'request_permissions' || name === 'switch_workspace_folder') return false;
+  if (readOnlyTools.has(name)) return true;
+  return name === 'exec_command' && String(args.operation_id ?? '').trim().length > 0;
+}
+
+function inflightCallKey(
+  conversationKey: string,
+  name: string,
+  args: JsonObject,
+  binding: ReturnType<typeof executionBindingFor>
+): string {
+  const material = stableRequestValue({
+    conversation_key: conversationKey,
+    tool: name,
+    arguments: args,
+    folder_id: binding.folderId ?? null,
+    default_cwd: binding.defaultCwd ?? null
+  });
+  return createHash('sha256').update(JSON.stringify(material)).digest('hex');
+}
+
+function contextInflightCalls(ctx: ToolContext): Map<string, Promise<JsonObject>> {
+  let calls = inflightToolCalls.get(ctx);
+  if (!calls) {
+    calls = new Map();
+    inflightToolCalls.set(ctx, calls);
+  }
+  return calls;
+}
+
+function elapsedPhaseMs(startedAt: number): number {
+  return Math.max(0, Math.round(performance.now() - startedAt));
+}
+
+function addPhaseDuration(result: JsonObject, phase: string, durationMs: number): void {
+  const phases = result.phase_durations_ms && typeof result.phase_durations_ms === 'object' && !Array.isArray(result.phase_durations_ms)
+    ? { ...result.phase_durations_ms as JsonObject }
+    : {};
+  const previous = Number(phases[phase] ?? 0);
+  phases[phase] = Math.max(0, Math.round(Number.isFinite(previous) ? previous : 0)) + Math.max(0, Math.round(durationMs));
+  result.phase_durations_ms = phases;
+}
 
 function ok(value: JsonObject = {}): JsonObject { return { ok: true, ...value }; }
 const fail = toolFail;
@@ -64,6 +120,7 @@ function lockGroups(name: string): string[] {
 }
 
 function permissionKind(name: string): string {
+  if (name === 'git_push') return 'network';
   if (name.startsWith('git_') || name === 'apply_patch' || name === 'edit' || name.startsWith('edit_') || name === 'file_ops') return 'workspace_mutation';
   if (name.startsWith('exec_') || name === 'kill_session') return 'process_execution';
   return 'privileged_operation';
@@ -89,6 +146,7 @@ function preparePendingInsert(runtime: FolderRuntime): void {
 
 function permissionDecision(ctx: ToolContext, key: string, name: string, args: JsonObject, meta: unknown): JsonObject | undefined {
   if (name === 'request_permissions' || name === 'list_workspace_folders' || name === 'switch_workspace_folder') return undefined;
+  if (ctx.config.securityPolicyCustomized) return undefined;
   if (ctx.config.permissionMode === 'read-only' && !readOnlyTools.has(name)) {
     return fail('PERMISSION_MODE_READ_ONLY', `${name} is unavailable in read-only mode`, 'policy', false, { permission_mode: 'read-only' });
   }
@@ -166,6 +224,11 @@ async function dispatch(
 ): Promise<JsonObject> {
   const identity = ctx.conversations.identity(meta);
   const key = identity.key;
+  const historyArgs = identity.isolated
+    ? { ...args, _host_session_key: key }
+    : identity.source === 'stable_fallback'
+      ? { ...args, _fallback_session_key: key }
+      : args;
 
   switch (name) {
     case 'harness_status': return harnessStatus(ctx, key);
@@ -174,6 +237,12 @@ async function dispatch(
       const folder = identity.source === 'missing_mcp_conversation' ? undefined : selectedFolderSafe(ctx, key);
       const profileTools = toolNamesForProfile(ctx.config.activeToolProfile);
       const profileRevision = toolsetRevisionForProfile(ctx.config.activeToolProfile);
+      const processStartedAtMs = Math.round(Date.now() - process.uptime() * 1000);
+      const revision = folder ? await gitRuntimeRevisionInfo(ctx, key) : { workspace_git_head: null, workspace_head_committed_at_ms: null };
+      const workspaceHeadCommittedAtMs = typeof revision.workspace_head_committed_at_ms === 'number'
+        ? revision.workspace_head_committed_at_ms
+        : null;
+      const runtimePredatesWorkspaceHead = workspaceHeadCommittedAtMs === null ? null : processStartedAtMs < workspaceHeadCommittedAtMs;
       return ok({
         server: 'coding-tools-mcp-node', title: 'Coding Tools MCP Node Agent', version: AGENT_VERSION,
         client_compat_version: CLIENT_COMPAT_VERSION,
@@ -181,6 +250,15 @@ async function dispatch(
         endpoint_path: '/mcp', auth_enabled: true, auth_type: 'oauth', tool_count: profileTools.length,
         tools: profileTools, toolset_revision: profileRevision, workspace: folder?.path ?? null,
         configured_tool_profile: ctx.config.toolProfile, tool_profile: ctx.config.activeToolProfile,
+        runtime_revision: {
+          process_started_at_ms: processStartedAtMs,
+          workspace_git_head: revision.workspace_git_head,
+          workspace_head_committed_at_ms: workspaceHeadCommittedAtMs,
+          runtime_predates_workspace_head: runtimePredatesWorkspaceHead,
+          warning: runtimePredatesWorkspaceHead
+            ? 'The Node Agent process started before the current workspace HEAD was committed; restart/rebuild before trusting live schemas or behavior.'
+            : null
+        },
         profile_id: ctx.workspaceProfileId,
         selected_folder_id: folder?.id ?? null,
         selection_scope: folder ? identity.isolated ? 'conversation' : 'runtime' : 'unselected',
@@ -190,7 +268,11 @@ async function dispatch(
         permission_mode: ctx.config.permissionMode,
         policy: ctx.config.policy,
         node_version: process.version, platform: process.platform, arch: process.arch,
-        limits: ctx.config.limits, tunnel: ctx.tunnelStatus ?? { enabled: false, state: 'disabled', workers: 0, connectedWorkers: 0, completedRequests: 0 },
+        limits: {
+          ...ctx.config.limits,
+          commandTimeoutAbsoluteMaxMs: ABSOLUTE_COMMAND_TIMEOUT_MAX_MS
+        },
+        tunnel: ctx.tunnelStatus ?? { enabled: false, state: 'disabled', workers: 0, connectedWorkers: 0, completedRequests: 0 },
         native_binary_free: true, unsupported_tunnels: ['frp', 'cloudflare']
       });
     }
@@ -234,8 +316,8 @@ async function dispatch(
       });
     }
     case 'query_tool_usage': return ctx.usageStore.query(args);
-    case 'history_session_bootstrap': return bootstrapHistory(ctx, key, args);
-    case 'history_session_checkpoint': return checkpointHistory(ctx, key, args);
+    case 'history_session_bootstrap': return bootstrapHistory(ctx, key, historyArgs);
+    case 'history_session_checkpoint': return checkpointHistory(ctx, key, historyArgs);
     case 'history_session_validate': return validateHistory(ctx, key, args);
     case 'project_state': return projectState(ctx, key, args);
     case 'start_task': return startTask(ctx, key, args);
@@ -344,7 +426,11 @@ async function dispatch(
       const waitUntil = String(args.until ?? 'output_or_exit');
       const waited = await waitForSession(session, cursor, waitTimeoutMs, waitUntil, heartbeatMs);
       const snapshotStarted = Date.now();
-      const requestTimedOut = !waited.changed && !waited.heartbeat;
+      const requestTimedOut = !waited.changed;
+      const processCompleted = session.finalizedAt !== undefined;
+      const terminal = processCompleted;
+      const progressSinceLastWait = session.sequence > cursor || Boolean(session.endedAt) || processCompleted;
+      const nextWaitMs = terminal ? null : waitTimeoutMs || 30_000;
       const result = processResult(session, { ...args, request_timed_out: requestTimedOut });
       Object.assign(result, {
         session_registry_wait_ms: sessionRegistryWaitMs,
@@ -352,6 +438,12 @@ async function dispatch(
         snapshot_ms: Date.now() - snapshotStarted,
         heartbeat: waited.heartbeat,
         request_timed_out: requestTimedOut,
+        wait_timed_out: requestTimedOut,
+        wait_completed: waited.changed || requestTimedOut,
+        process_completed: processCompleted,
+        terminal,
+        progress_since_last_wait: progressSinceLastWait,
+        next_wait_ms: nextWaitMs,
         wait_timeout_ms: waitTimeoutMs,
         effective_wait_ms: waited.effectiveWaitMs,
         heartbeat_ms: heartbeatMs,
@@ -364,14 +456,13 @@ async function dispatch(
             session_id: session.id,
             cursor: result.latest_cursor,
             timeout_ms: waitTimeoutMs || 30_000,
-            heartbeat_ms: heartbeatMs || 10_000,
             until: waitUntil,
             output_mode: 'delta'
           }
         }];
       }
-      if (waited.heartbeat) result.suggestion = 'Heartbeat emitted; continue waiting with next_actions.';
-      else if (!session.finalizedAt) result.suggestion = '使用 next_actions 继续等待新输出或进程结束';
+      if (requestTimedOut && !processCompleted) result.suggestion = 'Wait window ended without process completion; process is still running. Continue with next_actions.';
+      else if (!processCompleted) result.suggestion = 'Process made progress but is not complete; continue with next_actions.';
       else if (result.termination_reason === 'exited') result.suggestion = '进程已结束；检查 process_exit_code 与 post_checks';
       return result;
     }
@@ -460,6 +551,7 @@ async function dispatch(
         tail_lines: 100
       });
       Object.assign(result, {
+        ok: true,
         killed: terminated,
         status: terminated ? 'killed' : 'terminating',
         evicted: terminated
@@ -492,6 +584,7 @@ async function dispatch(
     case 'git_branch': return gitBranchTool(ctx, key, args);
     case 'git_stage': return gitStageTool(ctx, key, args);
     case 'git_commit': return gitCommitTool(ctx, key, args);
+    case 'git_push': return gitPushTool(ctx, key, args);
     case 'git_restore': return gitRestoreTool(ctx, key, args);
     case 'request_permissions': {
       const id = String(args.resume_id ?? '').trim();
@@ -670,10 +763,66 @@ export async function callTool(
 ): Promise<JsonObject> {
   const key = ctx.conversations.identity(meta).key;
   const canonical = canonicalToolCall(name, args);
-  return runWithExecutionBinding(
-    executionBindingFor(ctx, key, canonical.name, canonical.args, bindingOverride),
+  const binding = executionBindingFor(ctx, key, canonical.name, canonical.args, bindingOverride);
+  if (skipPermission || !canCoalesceInflight(canonical.name, canonical.args)) {
+    return runWithExecutionBinding(
+      binding,
+      () => callToolInScope(ctx, canonical.name, canonical.args, meta, skipPermission, processLifecycle)
+    );
+  }
+
+  const callKey = inflightCallKey(key, canonical.name, canonical.args, binding);
+  const inflight = contextInflightCalls(ctx);
+  const existing = inflight.get(callKey);
+  if (existing) {
+    const startedAt = Date.now();
+    const requestTiming = ctx.usageStore.beginRequest(startedAt);
+    const shared = structuredClone(await existing);
+    delete shared.phase_durations_ms;
+    const durationMs = Date.now() - startedAt;
+    Object.assign(shared, {
+      coalesced_inflight: true,
+      coalesced_wait_ms: durationMs,
+      duration_ms: durationMs,
+      admission_queue_wait_ms: 0,
+      global_admission_wait_ms: 0,
+      workspace_admission_wait_ms: 0,
+      workspace_lock_wait_ms: 0
+    });
+    addPhaseDuration(shared, 'serialization_ms', 0);
+    const serializationStartedAt = performance.now();
+    const serializedShared = JSON.stringify(shared);
+    const serializationMs = elapsedPhaseMs(serializationStartedAt);
+    const sharedPhases = shared.phase_durations_ms as JsonObject;
+    sharedPhases.serialization_ms = serializationMs;
+    const responseBytes = Buffer.byteLength(serializedShared);
+    const folderId = binding.folderId ?? selectedFolderId(ctx, key);
+    ctx.usageStore.recordToolCall({
+      tool: canonical.name,
+      arguments: canonical.args,
+      result: shared,
+      startedTsMs: startedAt,
+      durationMs,
+      requestTiming,
+      requestJsonBytes: Buffer.byteLength(JSON.stringify(canonical.args)),
+      workspaceId: folderId
+    });
+    ctx.usage.push({ tool: canonical.name, startedAt, durationMs, ok: shared.ok === true, queueWaitMs: 0, lockWaitMs: 0, responseBytes });
+    if (ctx.usage.length > 5_000) ctx.usage.splice(0, 1_000);
+    return shared;
+  }
+
+  const promise = runWithExecutionBinding(
+    binding,
     () => callToolInScope(ctx, canonical.name, canonical.args, meta, skipPermission, processLifecycle)
   );
+  inflight.set(callKey, promise);
+  try {
+    return await promise;
+  } finally {
+    if (inflight.get(callKey) === promise) inflight.delete(callKey);
+    if (inflight.size === 0) inflightToolCalls.delete(ctx);
+  }
 }
 
 async function callToolInScope(
@@ -684,7 +833,7 @@ async function callToolInScope(
   skipPermission = false,
   processLifecycle?: ProcessRequestLifecycle
 ): Promise<JsonObject> {
-  const redaction = new OutputRedactionContext(name, args);
+  const redaction = new OutputRedactionContext(name, args, ctx.config.securityPolicy);
   const startedAt = Date.now();
   const requestTiming = skipPermission ? undefined : ctx.usageStore.beginRequest(startedAt);
   const key = ctx.conversations.identity(meta).key;
@@ -702,6 +851,13 @@ async function callToolInScope(
   let globalAdmissionWaitMs = 0;
   let workspaceAdmissionWaitMs = 0;
   let lockWaitMs = 0;
+  let preflightMs = 0;
+  let harnessBeginMs = 0;
+  let dispatchMs = 0;
+  let harnessFinishMs = 0;
+  let preflightObserved = false;
+  let harnessBeginObserved = false;
+  let dispatchObserved = false;
   let result: JsonObject;
   const availableTools = toolNamesForProfile(ctx.config.activeToolProfile);
   const exposedTools = new Set(availableTools);
@@ -741,23 +897,62 @@ async function callToolInScope(
           releaseLocks = await lockAdmission.locks.acquire(groups);
           lockWaitMs = Date.now() - lockStarted;
         }
-        if (!HARNESS_TOOLS.has(name)) tracking = await beginHarnessTracking(ctx, key, name, args);
-        try {
-          result = await dispatch(ctx, name, args, meta, processLifecycle);
-        } catch (error) {
-          result = mapError(error);
+        let preflightResult: JsonObject | undefined;
+        if (name === 'edit') {
+          const preflightStartedAt = performance.now();
+          try {
+            const checked = await editTool(ctx, key, { ...args, dry_run: true });
+            if (args.dry_run === true || checked.ok !== true || checked.status === 'proposal_required') preflightResult = checked;
+          } catch (error) {
+            preflightResult = mapError(error);
+          } finally {
+            preflightMs += elapsedPhaseMs(preflightStartedAt);
+            preflightObserved = true;
+          }
         }
-        if (tracking) {
-          result = await finishHarnessTracking(ctx, key, name, args, tracking, result, exposedTools);
-          trackingFinished = true;
-        } else if (HARNESS_TOOLS.has(name) && result.ok === false) {
-          result = await attachHarnessStatus(ctx, key, result, false, exposedTools);
+        if (preflightResult) {
+          result = preflightResult;
+        } else {
+          if (!HARNESS_TOOLS.has(name)) {
+            const harnessBeginStartedAt = performance.now();
+            try {
+              tracking = await beginHarnessTracking(ctx, key, name, args);
+            } finally {
+              harnessBeginMs += elapsedPhaseMs(harnessBeginStartedAt);
+              harnessBeginObserved = true;
+            }
+          }
+          const dispatchStartedAt = performance.now();
+          try {
+            result = await dispatch(ctx, name, args, meta, processLifecycle);
+          } catch (error) {
+            result = mapError(error);
+          } finally {
+            dispatchMs += elapsedPhaseMs(dispatchStartedAt);
+            dispatchObserved = true;
+          }
+          if (tracking) {
+            const harnessFinishStartedAt = performance.now();
+            try {
+              result = await finishHarnessTracking(ctx, key, name, args, tracking, result, exposedTools);
+              trackingFinished = true;
+            } finally {
+              harnessFinishMs += elapsedPhaseMs(harnessFinishStartedAt);
+            }
+          } else if (HARNESS_TOOLS.has(name) && result.ok === false) {
+            result = await attachHarnessStatus(ctx, key, result, false, exposedTools);
+          }
         }
       }
     } catch (error) {
       result = mapError(error);
       if (tracking && !trackingFinished) {
-        result = await finishHarnessTracking(ctx, key, name, args, tracking, result, exposedTools).catch(() => result);
+        const harnessFinishStartedAt = performance.now();
+        try {
+          result = await finishHarnessTracking(ctx, key, name, args, tracking, result, exposedTools).catch(() => result);
+        } finally {
+          harnessFinishMs += elapsedPhaseMs(harnessFinishStartedAt);
+        }
       } else if (error instanceof HarnessError) {
         result = await attachHarnessStatus(ctx, key, result, false, exposedTools);
       }
@@ -779,9 +974,19 @@ async function callToolInScope(
     workspace_lock_wait_ms: lockWaitMs,
     duration_ms: durationMs
   });
+  if (preflightObserved) addPhaseDuration(result, 'preflight_ms', preflightMs);
+  if (harnessBeginObserved) addPhaseDuration(result, 'harness_begin_ms', harnessBeginMs);
+  if (dispatchObserved) addPhaseDuration(result, 'dispatch_ms', dispatchMs);
+  if (harnessFinishMs > 0) addPhaseDuration(result, 'harness_finish_ms', harnessFinishMs);
   result = normalizeToolResult(result);
   result = redaction.redact(result);
-  const responseBytes = Buffer.byteLength(JSON.stringify(result));
+  addPhaseDuration(result, 'serialization_ms', 0);
+  const serializationStartedAt = performance.now();
+  const serializedResult = JSON.stringify(result);
+  const serializationMs = elapsedPhaseMs(serializationStartedAt);
+  const resultPhases = result.phase_durations_ms as JsonObject;
+  resultPhases.serialization_ms = serializationMs;
+  const responseBytes = Buffer.byteLength(serializedResult);
   const folderId = binding?.folderId ?? selectedFolderId(ctx, key);
   if (requestTiming) {
     ctx.usageStore.recordToolCall({

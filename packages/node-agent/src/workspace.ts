@@ -394,6 +394,7 @@ export interface WalkOptions {
   maxResults?: number;
   includeHidden?: boolean;
   includeIgnored?: boolean;
+  includeGenerated?: boolean;
   includeDirectories?: boolean;
 }
 
@@ -410,7 +411,7 @@ function hiddenPath(relative: string): boolean {
 
 function fixedExcluded(name: string, options: WalkOptions): boolean {
   if (name.toLowerCase() === '.git') return true;
-  return options.includeIgnored !== true && DEFAULT_EXCLUDED_NAMES.has(name);
+  return options.includeGenerated !== true && DEFAULT_EXCLUDED_NAMES.has(name);
 }
 
 async function rulesForStart(root: string, start: string, options: WalkOptions): Promise<{ rules: IgnoreRule[]; blocked: boolean }> {

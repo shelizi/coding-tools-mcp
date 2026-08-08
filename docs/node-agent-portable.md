@@ -47,9 +47,11 @@ The default outputs are:
 ```text
 dist-node-portable/Coding.Tools.Node.Agent_<agent-version>_portable-<portable-version>_bundled-node_win-x64.zip
 dist-node-portable/Coding.Tools.Node.Agent_<agent-version>_portable-<portable-version>_system-node_win-x64.zip
+dist-node-portable/Coding.Tools.Node.Agent_portable_bundled-node_win-x64/
+dist-node-portable/Coding.Tools.Node.Agent_portable_system-node_win-x64/
 ```
 
-Each ZIP contains one top-level directory with the same edition-specific name.
+ZIP filenames and their top-level directories remain versioned release artifacts. The two expanded directories are stable latest-build locations: every successful build replaces the matching directory instead of accumulating versioned expanded copies.
 
 ## Archive contents
 
@@ -81,7 +83,7 @@ The `system-node` launcher finds `node.exe` on `PATH` and rejects a runtime that
 
 ## Data directory
 
-Both launchers use `%LOCALAPPDATA%\CodingToolsMCPNode` by default. This matches the Node Agent's Windows per-user default and lets a newly extracted portable version or a switch between editions reuse the existing configuration, encrypted secret store and key, tunnel identity, Harness state, history, and logs.
+Both launchers use `%LOCALAPPDATA%\CodingToolsMCPNode` by default. This matches the Node Agent's Windows per-user default and lets a newly extracted portable version or a switch between editions reuse the existing configuration, encrypted secret store, primary/recovery key pair, tunnel identity, Harness state, history, and logs. The Agent recreates a missing `agent-secrets.key` from `agent-secrets.key.backup` only after the backup successfully decrypts the existing store.
 
 An existing process, user, or machine `CTMCP_DATA_DIR` environment variable takes precedence. Set it to another absolute directory when isolation is required; point it at the extracted package's `data` directory for package-local behavior.
 

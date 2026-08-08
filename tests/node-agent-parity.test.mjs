@@ -85,11 +85,11 @@ test('stale baseline versions and non-ancestor anchors fail precisely', async t 
     runtimeBaseline: {
       repositoryHead: '673be6430f274f954b4b51bc8b5b2034239f743a',
       desktopClientVersion: '0.1.37',
-      nodeAgentVersion: '0.29.5',
+      nodeAgentVersion: '0.29.6',
       clientCompatibilityVersion: '0.1.37'
     }
   });
-  assert.ok(staleVersion.errors.some(error => error.includes('baseline node_agent_version 0.0.0 does not match 0.29.5')));
+  assert.ok(staleVersion.errors.some(error => error.includes('baseline node_agent_version 0.0.0 does not match 0.29.6')));
 
   const staleHead = await validateMutation(t, manifest => {
     manifest.baseline.repository_head = '1111111111111111111111111111111111111111';

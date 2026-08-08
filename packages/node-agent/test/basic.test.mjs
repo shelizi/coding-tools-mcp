@@ -2,15 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile as execFileCallback } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { access, chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { toolNames, tools } from '../dist/catalog.js';
+import { RESTART_SUPERVISED_FLAG, restartSupervisedFromArgv } from '../dist/cliOptions.js';
 import { captureGitRestoreSnapshot, restoreGitSnapshot } from '../dist/gitTools.js';
 import { createToolContext } from '../dist/server.js';
 import { callTool } from '../dist/tools.js';
+import { MAX_RETAINED_COMMAND_GRAPHS, pruneRetainedCommandGraphs } from '../dist/processes.js';
 import { AGENT_VERSION, CLIENT_COMPAT_VERSION } from '../dist/version.js';
 
 const execFile = promisify(execFileCallback);
@@ -66,8 +68,8 @@ async function git(root, ...args) {
   return result.stdout.trim();
 }
 
-async function gitContext() {
-  const state = await context();
+async function gitContext(permissionMode = 'trusted') {
+  const state = await context(permissionMode);
   await git(state.root, 'init');
   await git(state.root, 'config', 'user.name', 'Node Agent Test');
   await git(state.root, 'config', 'user.email', 'node-agent@example.invalid');
@@ -83,8 +85,38 @@ test('catalog exactly matches the Rust P0 tool names', async () => {
   const registry = await readFile(registryPath, 'utf8');
   const block = registry.split('pub const P0_TOOLS')[1].split('];')[0];
   const rustNames = [...block.matchAll(/^\s*"([a-z_]+)",\s*$/gm)].map(match => match[1]);
-  assert.equal(tools.length, 49);
+  assert.equal(tools.length, 50);
   assert.deepEqual(toolNames, rustNames);
+});
+
+test('command execution schemas expose the timeout ceilings and deprecate application heartbeats', () => {
+  const exec = tools.find(tool => tool.name === 'exec_command');
+  const execMany = tools.find(tool => tool.name === 'exec_many');
+  const wait = tools.find(tool => tool.name === 'wait_command');
+  assert.ok(exec);
+  assert.ok(execMany);
+  assert.ok(wait);
+  assert.equal(exec.inputSchema.properties.timeout_ms.maximum, 60 * 60_000);
+  assert.equal(exec.inputSchema.properties.post_checks.items.properties.timeout_ms.maximum, 60 * 60_000);
+  assert.equal(execMany.inputSchema.properties.commands.items.properties.timeout_ms.maximum, 60 * 60_000);
+  assert.match(wait.inputSchema.properties.heartbeat_ms.description, /deprecated.*ignored.*transport/i);
+});
+
+test('portable restart supervision requires the explicit launcher flag', async () => {
+  assert.equal(restartSupervisedFromArgv(['node', 'cli.js']), false);
+  assert.equal(restartSupervisedFromArgv(['node', 'cli.js', RESTART_SUPERVISED_FLAG]), true);
+
+  const portableScriptPath = fileURLToPath(new URL('../scripts/build-portable.ps1', import.meta.url));
+  const portableScript = await readFile(portableScriptPath, 'utf8');
+  assert.doesNotMatch(portableScript, /CTMCP_RESTART_SUPERVISED/);
+  assert.match(portableScript, /"%NODE_EXE%" "%AGENT_ENTRY%" --restart-supervised %\*/);
+  assert.match(portableScript, /catch \[System\.UnauthorizedAccessException\]/);
+  assert.match(portableScript, /The ZIP is current/);
+
+  const repoLauncherPath = fileURLToPath(new URL('../../../start-node-agent.bat', import.meta.url));
+  const repoLauncher = await readFile(repoLauncherPath, 'utf8');
+  assert.doesNotMatch(repoLauncher, /CTMCP_RESTART_SUPERVISED/);
+  assert.match(repoLauncher, /dist\\cli\.js" --restart-supervised %\*/);
 });
 
 test('server_info reports the package Agent version', async () => {
@@ -96,6 +128,12 @@ test('server_info reports the package Agent version', async () => {
   assert.equal(AGENT_VERSION, packageMetadata.version);
   assert.equal(info.version, packageMetadata.version);
   assert.equal(info.client_compat_version, CLIENT_COMPAT_VERSION);
+  assert.equal(typeof info.runtime_revision.process_started_at_ms, 'number');
+  assert.ok(Object.hasOwn(info.runtime_revision, 'workspace_git_head'));
+  assert.ok(Object.hasOwn(info.runtime_revision, 'runtime_predates_workspace_head'));
+  assert.equal(info.limits.commandTimeoutAbsoluteMaxMs, 60 * 60_000);
+  assert.ok(Number(info.phase_durations_ms.dispatch_ms) >= 0);
+  assert.ok(Number(info.phase_durations_ms.serialization_ms) >= 0);
 });
 
 test('workspace selection gates access and read_file returns a bounded slice', async () => {
@@ -607,6 +645,50 @@ test('git_commit restores a clean index after a commit hook failure', async () =
   assert.equal(await readFile(path.join(root, 'tracked.txt'), 'utf8'), 'hook failure\n');
 });
 
+test('git_push uses guarded network approval and pushes to a local bare remote without local baseline work', async t => {
+  const { root, ctx, meta } = await gitContext('guarded');
+  const remote = await mkdtemp(path.join(tmpdir(), 'ctmcp-push-remote-'));
+  t.after(() => rm(remote, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
+  await git(remote, 'init', '--bare');
+  await git(root, 'remote', 'add', 'origin', remote);
+  const head = await git(root, 'rev-parse', 'HEAD');
+  const status = await callTool(ctx, 'git_status', {}, meta);
+
+  const pending = await callTool(ctx, 'git_push', {
+    remote: 'origin',
+    branch: status.branch,
+    expected_head: head,
+    expected_repo_fingerprint: status.repo_fingerprint,
+    reason: 'local guarded push regression'
+  }, meta);
+  assert.equal(pending.ok, false);
+  assert.equal(pending.error.code, 'PERMISSION_REQUIRED');
+  assert.equal(pending.error.details.permission_request.permission, 'network');
+  assert.equal(pending.error.details.permission_request.tool_name, 'git_push');
+
+  const resumed = await callTool(ctx, 'request_permissions', {
+    resume_id: pending.error.details.permission_request.resume_id,
+    approve: true,
+    confirm: true,
+    scope: 'once'
+  }, meta);
+  assert.equal(resumed.ok, true, JSON.stringify(resumed));
+  assert.equal(resumed.resumed, true);
+  assert.equal(resumed.applied, true);
+  assert.equal(await git(remote, 'rev-parse', `refs/heads/${status.branch}`), head);
+
+  const operations = await callTool(ctx, 'operation_log', {
+    order: 'desc',
+    tool: 'git_push',
+    limit: 10
+  }, meta);
+  assert.equal(operations.ok, true);
+  assert.equal(operations.order, 'desc');
+  assert.equal(operations.operations.length, 2);
+  assert.equal(operations.operations[0].kind, 'completed');
+  assert.equal(operations.operations[1].kind, 'started');
+});
+
 test('git_restore keeps staged and worktree restoration modes separate', async () => {
   const { root, ctx, meta } = await gitContext();
   const head = await git(root, 'rev-parse', 'HEAD');
@@ -759,11 +841,520 @@ test('exec_many runs a dependency DAG and retains output sessions', async () => 
     ]
   }, meta);
   assert.equal(graph.ok, true);
+  assert.equal(graph.graph_completed, true);
+  assert.equal(graph.detached, false);
   assert.equal(graph.failed_command_count, 0);
   assert.equal(graph.results[0].stdout, 'first');
   assert.equal(graph.results[1].stdout, 'second');
   const sessions = await callTool(ctx, 'list_sessions', {}, meta);
   assert.equal(sessions.count, 2);
+});
+
+test('exec_many reports failed and skipped command ids with bounded recovery guidance', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const graph = await callTool(ctx, 'exec_many', {
+    mode: 'dag',
+    commands: [
+      { id: 'fail', program: nodeProgram, args: ['-e', 'process.exit(7)'] },
+      { id: 'blocked', depends_on: ['fail'], program: nodeProgram, args: ['-e', 'process.stdout.write("never")'] }
+    ]
+  }, meta);
+  assert.equal(graph.ok, false);
+  assert.deepEqual(graph.failed_command_ids, ['fail']);
+  assert.deepEqual(graph.skipped_command_ids, ['blocked']);
+  assert.equal(graph.first_failure.id, 'fail');
+  assert.equal(graph.first_failure.exit_code, 7);
+  assert.equal(graph.recovery_actions[0].action, 'retry_failed_commands');
+  assert.deepEqual(graph.recovery_actions[0].command_ids, ['fail']);
+  assert.equal(graph.recovery_actions[1].action, 'retry_affected_subgraph');
+  assert.deepEqual(graph.recovery_actions[1].command_ids, ['blocked']);
+  assert.deepEqual(graph.recovery_actions[1].failed_command_ids, ['fail']);
+});
+
+test('exec_many only graph-deduplicates explicitly idempotent children', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const idempotent = {
+    mode: 'sequential',
+    commands: [{
+      id: 'safe',
+      operation_id: 'safe-graph-child',
+      program: nodeProgram,
+      args: ['-e', 'process.stdout.write("safe")']
+    }]
+  };
+  const first = await callTool(ctx, 'exec_many', idempotent, meta);
+  const second = await callTool(ctx, 'exec_many', idempotent, meta);
+  assert.equal(first.graph_execution_ok, true);
+  assert.equal(second.graph_operation_id, first.graph_operation_id);
+  assert.equal(second.reattached, true);
+  assert.equal(second.graph_deduplicated, true);
+  assert.equal(second.retained_graph_count, first.retained_graph_count);
+
+  const ordinary = {
+    mode: 'sequential',
+    commands: [{ id: 'ordinary', program: nodeProgram, args: ['-e', 'process.stdout.write("ordinary")'] }]
+  };
+  const ordinaryFirst = await callTool(ctx, 'exec_many', ordinary, meta);
+  const ordinarySecond = await callTool(ctx, 'exec_many', ordinary, meta);
+  assert.notEqual(ordinarySecond.graph_operation_id, ordinaryFirst.graph_operation_id);
+  assert.equal(ordinarySecond.graph_deduplicated, undefined);
+  assert.equal(ordinaryFirst.results[0].stdout, 'ordinary');
+  assert.equal(ordinarySecond.results[0].stdout, 'ordinary');
+});
+
+test('exec_many cancellation preserves a pre-existing deduplicated child session', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const child = {
+    operation_id: 'shared-preexisting-child',
+    program: nodeProgram,
+    args: ['-e', 'setTimeout(() => process.stdout.write("shared-finished"), 1_500)'],
+    timeout_ms: 5_000,
+    yield_time_ms: 0,
+    output_mode: 'none'
+  };
+  const original = await callTool(ctx, 'exec_command', child, meta);
+  assert.equal(original.process_still_running, true);
+
+  const graph = await callTool(ctx, 'exec_many', {
+    operation_id: 'shared-session-graph',
+    yield_time_ms: 5,
+    mode: 'sequential',
+    commands: [{ id: 'shared', ...child }]
+  }, meta);
+  assert.equal(graph.graph_completed, false);
+
+  const cancelled = await callTool(ctx, 'exec_many', {
+    operation_id: 'shared-session-graph',
+    action: 'cancel',
+    yield_time_ms: 2_000
+  }, meta);
+  assert.equal(cancelled.graph_status, 'cancelled');
+  assert.equal(cancelled.cancelled_session_count, 0);
+  assert.equal(cancelled.recovery_actions.length, 0);
+  assert.equal(cancelled.results[0].shared_session_preserved, true);
+  assert.equal(cancelled.results[0].session_id, original.session_id);
+
+  const stillShared = await callTool(ctx, 'resolve_operation', {
+    operation_id: 'shared-preexisting-child',
+    output_mode: 'none'
+  }, meta);
+  assert.equal(stillShared.session_id, original.session_id);
+  assert.equal(stillShared.termination_reason, 'running');
+  assert.equal(stillShared.process_still_running, true);
+
+  const finalized = await callTool(ctx, 'wait_command', {
+    session_id: original.session_id,
+    cursor: stillShared.latest_cursor,
+    timeout_ms: 2_000,
+    until: 'finalized',
+    output_mode: 'all'
+  }, meta);
+  assert.equal(finalized.command_ok, true);
+  assert.equal(finalized.termination_reason, 'exited');
+  assert.equal(finalized.stdout, 'shared-finished');
+});
+
+test('exec_many keeps command setup failures inside the graph result', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const graph = await callTool(ctx, 'exec_many', {
+    mode: 'sequential',
+    commands: [{
+      id: 'missing-workdir',
+      program: nodeProgram,
+      args: ['-e', 'process.stdout.write("never")'],
+      workdir: 'missing-exec-many-workdir'
+    }]
+  }, meta);
+  assert.equal(graph.ok, false);
+  assert.deepEqual(graph.failed_command_ids, ['missing-workdir']);
+  assert.equal(graph.results[0].command_ok, false);
+  assert.equal(typeof graph.results[0].error.code, 'string');
+  assert.equal(graph.first_failure.id, 'missing-workdir');
+  assert.equal(graph.first_failure.error_code, graph.results[0].error.code);
+});
+
+test('exec_many detaches long graphs and reattaches without starting duplicate children', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const operationId = 'retained-long-graph';
+  const started = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    yield_time_ms: 10,
+    mode: 'sequential',
+    commands: [{
+      id: 'slow',
+      program: nodeProgram,
+      args: ['-e', 'setTimeout(() => process.stdout.write("slow-done"), 180)'],
+      timeout_ms: 5_000
+    }]
+  }, meta);
+  assert.equal(started.ok, true);
+  assert.equal(started.graph_operation_id, operationId);
+  assert.equal(started.graph_completed, false);
+  assert.equal(started.graph_status, 'running');
+  assert.equal(started.detached, true);
+  assert.equal(started.reattached, false);
+  assert.equal(started.next_actions[0].tool, 'exec_many');
+  assert.deepEqual(started.next_actions[0].arguments, { operation_id: operationId, yield_time_ms: 30000, result_mode: 'summary' });
+
+  const finalized = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    yield_time_ms: 2_000
+  }, meta);
+  assert.equal(finalized.ok, true);
+  assert.equal(finalized.graph_completed, true);
+  assert.equal(finalized.terminal, true);
+  assert.equal(finalized.detached, false);
+  assert.equal(finalized.reattached, true);
+  assert.equal(finalized.commands_executed, 1);
+  assert.equal(finalized.results[0].stdout, 'slow-done');
+
+  const sessionsAfterFinal = await callTool(ctx, 'list_sessions', {}, meta);
+  assert.equal(sessionsAfterFinal.count, 1);
+  const attachedAgain = await callTool(ctx, 'exec_many', { operation_id: operationId, yield_time_ms: 0 }, meta);
+  const sessionsAfterReattach = await callTool(ctx, 'list_sessions', {}, meta);
+  assert.equal(attachedAgain.graph_completed, true);
+  assert.equal(attachedAgain.results[0].stdout, 'slow-done');
+  assert.equal(sessionsAfterReattach.count, sessionsAfterFinal.count);
+
+  await ctx.usageStore.flush();
+  const usage = await ctx.usageStore.query({
+    scope: 'current_runtime', tools: ['exec_many'], exclude_tools: [], include_records: true
+  });
+  const detachedRecord = usage.records.find(record => record.graph_operation_id === operationId && record.detached === true);
+  assert.equal(detachedRecord.graph_status, 'running');
+  assert.equal(detachedRecord.graph_completed, false);
+  assert.ok(Number(detachedRecord.running_command_id_count ?? 0) + Number(detachedRecord.pending_command_id_count ?? 0) >= 1);
+  const completedRecord = usage.records.find(record => record.graph_operation_id === operationId && record.graph_completed === true);
+  assert.equal(completedRecord.reattached, true);
+  assert.equal(completedRecord.completed_command_id_count, 1);
+});
+
+test('detached exec_many preserves failed and skipped recovery after reattachment', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const started = await callTool(ctx, 'exec_many', {
+    operation_id: 'retained-failure-graph',
+    yield_time_ms: 5,
+    mode: 'dag',
+    commands: [
+      { id: 'fail', program: nodeProgram, args: ['-e', 'setTimeout(() => process.exit(7), 120)'], timeout_ms: 5_000 },
+      { id: 'blocked', depends_on: ['fail'], program: nodeProgram, args: ['-e', 'process.stdout.write("never")'] }
+    ]
+  }, meta);
+  assert.equal(started.graph_completed, false);
+  assert.equal(started.detached, true);
+
+  const finalized = await callTool(ctx, 'exec_many', {
+    operation_id: 'retained-failure-graph',
+    yield_time_ms: 2_000
+  }, meta);
+  assert.equal(finalized.graph_completed, true);
+  assert.equal(finalized.ok, false);
+  assert.deepEqual(finalized.failed_command_ids, ['fail']);
+  assert.deepEqual(finalized.skipped_command_ids, ['blocked']);
+  assert.equal(finalized.first_failure.id, 'fail');
+  assert.equal(finalized.first_failure.exit_code, 7);
+  assert.equal(finalized.recovery_actions[0].action, 'retry_failed_commands');
+  assert.deepEqual(finalized.recovery_actions[0].command_ids, ['fail']);
+  assert.equal(finalized.commands_executed, 1);
+});
+
+test('exec_many status reports failed graph execution without turning the control request into a tool failure', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const operationId = 'retained-failed-status';
+  const failedRun = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    commands: [{ id: 'fail', program: nodeProgram, args: ['-e', 'process.exit(9)'] }]
+  }, meta);
+  assert.equal(failedRun.ok, false);
+  assert.equal(failedRun.graph_execution_ok, false);
+
+  const status = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    action: 'status'
+  }, meta);
+  assert.equal(status.ok, true);
+  assert.equal(status.control_ok, true);
+  assert.equal(status.graph_execution_ok, false);
+  assert.deepEqual(status.failed_command_ids, ['fail']);
+
+  await ctx.usageStore.flush();
+  const usage = await ctx.usageStore.query({
+    scope: 'current_runtime', tools: ['exec_many'], exclude_tools: [], include_records: true
+  });
+  const runRecord = usage.records.find(record => record.graph_operation_id === operationId && record.graph_action === 'run');
+  const statusRecord = usage.records.find(record => record.graph_operation_id === operationId && record.graph_action === 'status');
+  assert.notEqual(runRecord.outcome, 'success');
+  assert.equal(statusRecord.outcome, 'success');
+  assert.equal(statusRecord.graph_execution_ok, false);
+  assert.equal(statusRecord.control_ok, true);
+});
+
+test('exec_many retained graph operation ids reject conflicts and unknown reattachments', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const operationId = 'retained-conflict-graph';
+  const command = {
+    id: 'slow',
+    program: nodeProgram,
+    args: ['-e', 'setTimeout(() => process.stdout.write("original"), 120)'],
+    timeout_ms: 5_000
+  };
+  const started = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    yield_time_ms: 0,
+    commands: [command]
+  }, meta);
+  assert.equal(started.graph_operation_id, operationId);
+
+  const conflict = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    yield_time_ms: 0,
+    commands: [{ ...command, args: ['-e', 'process.stdout.write("different")'] }]
+  }, meta);
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.error.code, 'OPERATION_ID_CONFLICT');
+
+  const missing = await callTool(ctx, 'exec_many', {
+    operation_id: 'missing-retained-graph',
+    yield_time_ms: 0
+  }, meta);
+  assert.equal(missing.ok, false);
+  assert.equal(missing.error.code, 'COMMAND_GRAPH_OPERATION_NOT_FOUND');
+
+  const finalized = await callTool(ctx, 'exec_many', { operation_id: operationId, yield_time_ms: 2_000 }, meta);
+  assert.equal(finalized.ok, true);
+  assert.equal(finalized.results[0].stdout, 'original');
+});
+
+test('exec_many retained graph control actions report status, terminate children, and forget completed graphs', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const operationId = 'retained-control-graph';
+  const started = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    yield_time_ms: 5,
+    mode: 'sequential',
+    commands: [
+      {
+        id: 'long',
+        program: nodeProgram,
+        args: ['-e', 'setTimeout(() => process.stdout.write("should-not-complete"), 5_000)'],
+        timeout_ms: 10_000
+      },
+      {
+        id: 'pending',
+        program: nodeProgram,
+        args: ['-e', 'process.stdout.write("never-started")'],
+        timeout_ms: 5_000
+      }
+    ]
+  }, meta);
+  assert.equal(started.graph_completed, false);
+
+  let status = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    action: 'status'
+  }, meta);
+  for (let attempt = 0; attempt < 20 && !status.results.some(result => result.session_id); attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+    status = await callTool(ctx, 'exec_many', { operation_id: operationId, action: 'status' }, meta);
+  }
+  assert.equal(status.graph_action, 'status');
+  assert.equal(status.graph_status, 'running');
+  assert.equal(status.graph_wait_ms, 0);
+  assert.equal(status.graph_yield_ms, 0);
+  assert.equal(status.cancel_requested, false);
+  assert.ok(status.results.some(result => result.session_id), 'test must observe a retained child before cancellation');
+
+  const cancelled = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    action: 'cancel',
+    reason: 'test cancellation',
+    yield_time_ms: 2_000
+  }, meta);
+  assert.equal(cancelled.graph_action, 'cancel');
+  assert.equal(cancelled.ok, true);
+  assert.equal(cancelled.control_ok, true);
+  assert.equal(cancelled.graph_execution_ok, false);
+  assert.equal(cancelled.cancel_accepted, true);
+  assert.equal(cancelled.cancel_requested, true);
+  assert.equal(cancelled.cancel_reason, 'test cancellation');
+  assert.equal(cancelled.graph_completed, true);
+  assert.equal(cancelled.graph_status, 'cancelled');
+  assert.equal(cancelled.terminal, true);
+  assert.ok(cancelled.cancelled_session_count >= 1);
+  assert.ok(cancelled.skipped_command_ids.includes('pending'));
+  const longResult = cancelled.results.find(result => result.id === 'long');
+  assert.equal(longResult.command_ok, false);
+  assert.equal(longResult.termination_reason, 'graph_cancelled');
+
+  const sessions = await callTool(ctx, 'list_sessions', {}, meta);
+  const graphSessions = sessions.sessions.filter(session => session.termination_reason === 'graph_cancelled');
+  assert.ok(graphSessions.length >= 1);
+  assert.ok(graphSessions.every(session => session.process_still_running === false));
+
+  const cancelledAgain = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    action: 'cancel',
+    yield_time_ms: 0
+  }, meta);
+  assert.equal(cancelledAgain.cancel_accepted, false);
+  assert.equal(cancelledAgain.graph_status, 'cancelled');
+
+  const forgotten = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    action: 'forget'
+  }, meta);
+  assert.equal(forgotten.ok, true);
+  assert.equal(forgotten.forgotten, true);
+  assert.equal(forgotten.graph_status, 'forgotten');
+
+  const afterForget = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    action: 'status'
+  }, meta);
+  assert.equal(afterForget.ok, false);
+  assert.equal(afterForget.error.code, 'COMMAND_GRAPH_OPERATION_NOT_FOUND');
+});
+
+test('exec_many retained graph control actions require an operation id and reject commands', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const missingId = await callTool(ctx, 'exec_many', { action: 'status' }, meta);
+  assert.equal(missingId.ok, false);
+  assert.equal(missingId.error.code, 'INVALID_ARGUMENT');
+
+  const withCommands = await callTool(ctx, 'exec_many', {
+    action: 'cancel',
+    operation_id: 'no-such-graph',
+    commands: [{ id: 'unexpected', program: nodeProgram, args: ['-e', 'process.exit(0)'] }]
+  }, meta);
+  assert.equal(withCommands.ok, false);
+  assert.equal(withCommands.error.code, 'INVALID_ARGUMENT');
+});
+
+test('retained exec_many capacity eviction removes oldest completed graphs but never active graphs', () => {
+  const now = Date.now();
+  const graphs = new Map();
+  for (let index = 0; index < MAX_RETAINED_COMMAND_GRAPHS - 1; index += 1) {
+    const id = `active-${index}`;
+    graphs.set(id, { id, createdAt: now - index });
+  }
+  graphs.set('completed-old', { id: 'completed-old', createdAt: now - 1_000, completedAt: now - 500 });
+  graphs.set('completed-new', { id: 'completed-new', createdAt: now - 500, completedAt: now - 100 });
+
+  const evicted = pruneRetainedCommandGraphs(graphs, 1);
+  assert.equal(evicted, 2);
+  assert.equal(graphs.size, MAX_RETAINED_COMMAND_GRAPHS - 1);
+  assert.equal(graphs.has('completed-old'), false);
+  assert.equal(graphs.has('completed-new'), false);
+  assert.equal([...graphs.keys()].filter(id => id.startsWith('active-')).length, MAX_RETAINED_COMMAND_GRAPHS - 1);
+});
+
+test('exec_many status defaults to compact results and full detail remains opt-in', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const operationId = 'retained-compact-status';
+  const completed = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    commands: [{
+      id: 'large-output',
+      program: nodeProgram,
+      args: ['-e', 'process.stdout.write("x".repeat(32768))'],
+      max_output_bytes: 65_536,
+      timeout_ms: 5_000
+    }]
+  }, meta);
+  assert.equal(completed.graph_completed, true);
+  assert.equal(completed.result_mode, 'full');
+  assert.equal(completed.results[0].stdout.length, 32768);
+
+  const summary = await callTool(ctx, 'exec_many', { operation_id: operationId, action: 'status' }, meta);
+  assert.equal(summary.result_mode, 'summary');
+  assert.equal(summary.ok, true);
+  assert.equal(summary.control_ok, true);
+  assert.equal(summary.graph_execution_ok, true);
+  assert.equal(summary.results_included, true);
+  assert.equal(summary.result_output_included, false);
+  assert.equal(summary.results[0].stdout, undefined);
+  assert.equal(summary.results[0].stdout_bytes, 32768);
+  assert.ok(summary.retention_expires_ts_ms > summary.graph_completed_ts_ms);
+  assert.ok(summary.retention_remaining_ms > 0);
+
+  const full = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    action: 'status',
+    result_mode: 'full'
+  }, meta);
+  assert.equal(full.result_mode, 'full');
+  assert.equal(full.result_output_included, true);
+  assert.equal(full.results[0].stdout.length, 32768);
+  assert.ok(JSON.stringify(summary).length < JSON.stringify(full).length / 4);
+
+  const none = await callTool(ctx, 'exec_many', {
+    operation_id: operationId,
+    action: 'status',
+    result_mode: 'none'
+  }, meta);
+  assert.equal(none.results_included, false);
+  assert.equal(none.results.length, 0);
+  assert.equal(none.results_omitted_count, 1);
+});
+
+test('identical in-flight idempotent exec calls coalesce without duplicating harness operations', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const command = {
+    operation_id: 'coalesce-inflight-operation',
+    program: nodeProgram,
+    args: ['-e', 'setTimeout(() => process.stdout.write("coalesced"), 200)'],
+    yield_time_ms: 100,
+    timeout_ms: 5_000,
+    output_mode: 'none'
+  };
+  const [first, second] = await Promise.all([
+    callTool(ctx, 'exec_command', command, meta),
+    callTool(ctx, 'exec_command', command, meta)
+  ]);
+  assert.equal(first.session_id, second.session_id);
+  const responses = [first, second];
+  assert.equal(responses.filter(result => result.coalesced_inflight === true).length, 1);
+  const follower = responses.find(result => result.coalesced_inflight === true);
+  assert.ok(follower.coalesced_wait_ms >= 0);
+  assert.equal(follower.admission_queue_wait_ms, 0);
+  assert.equal(follower.workspace_lock_wait_ms, 0);
+
+  const operations = await callTool(ctx, 'operation_log', { cursor: 0, limit: 100 }, meta);
+  const execStarts = operations.operations.filter(row => row.tool === 'exec_command' && row.kind === 'started');
+  assert.equal(execStarts.length, 1);
+
+  await ctx.usageStore.flush();
+  const usage = await ctx.usageStore.query({
+    scope: 'current_runtime', tools: ['exec_command'], exclude_tools: [], include_records: true
+  });
+  assert.equal(usage.records.length, 2);
+  assert.equal(usage.records.filter(record => record.coalesced_inflight === true).length, 1);
+});
+
+test('ordinary task mutations are never coalesced', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const [first, second] = await Promise.all([
+    callTool(ctx, 'start_task', { objective: 'Concurrent task mutation' }, meta),
+    callTool(ctx, 'start_task', { objective: 'Concurrent task mutation' }, meta)
+  ]);
+  assert.equal([first, second].filter(result => result.ok === true).length, 1);
+  const failed = [first, second].find(result => result.ok === false);
+  assert.equal(failed.error.code, 'TASK_ALREADY_ACTIVE');
+  assert.equal(first.coalesced_inflight, undefined);
+  assert.equal(second.coalesced_inflight, undefined);
 });
 
 test('retained commands support operation reattachment, post-checks, environment removal and absolute output offsets', async () => {
@@ -851,6 +1442,49 @@ test('retained commands support operation reattachment, post-checks, environment
   assert.equal(output.offset, 8);
   assert.equal(output.content, '89abcdef');
   assert.equal(output.total_bytes, 16);
+});
+
+test('wait_command separates wait timeout from process completion', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+  const started = await callTool(ctx, 'exec_command', {
+    program: nodeProgram,
+    args: ['-e', 'setTimeout(() => process.exit(0), 500)'],
+    yield_time_ms: 0,
+    timeout_ms: 5_000,
+    output_mode: 'none'
+  }, meta);
+  const waited = await callTool(ctx, 'wait_command', {
+    session_id: started.session_id,
+    cursor: started.latest_cursor,
+    until: 'finalized',
+    timeout_ms: 20,
+    heartbeat_ms: 0,
+    output_mode: 'none'
+  }, meta);
+  assert.equal(waited.ok, true);
+  assert.equal(waited.request_timed_out, true);
+  assert.equal(waited.wait_timed_out, true);
+  assert.equal(waited.wait_completed, true);
+  assert.equal(waited.process_completed, false);
+  assert.equal(waited.terminal, false);
+  assert.equal(waited.progress_since_last_wait, false);
+  assert.equal(waited.next_wait_ms, 20);
+  assert.equal(waited.process_timed_out, false);
+  assert.equal(waited.process_still_running, true);
+  assert.match(waited.suggestion, /still running/i);
+
+  const finalized = await callTool(ctx, 'wait_command', {
+    session_id: started.session_id,
+    cursor: waited.latest_cursor,
+    until: 'finalized',
+    timeout_ms: 5_000,
+    output_mode: 'none'
+  }, meta);
+  assert.equal(finalized.process_completed, true);
+  assert.equal(finalized.terminal, true);
+  assert.equal(finalized.next_wait_ms, null);
+  assert.equal(finalized.request_timed_out, false);
 });
 
 test('production WSS E2E runner refuses to run without explicit credentials', async () => {

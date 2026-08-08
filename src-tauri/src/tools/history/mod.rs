@@ -582,6 +582,14 @@ fn resolve_session_key(args: &Value) -> WorkspaceResult<(String, &'static str)> 
     {
         return Ok((value.to_string(), "platform_conversation_id"));
     }
+    if let Some(value) = args
+        .get("_fallback_session_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok((value.to_string(), "stable_runtime_fallback"));
+    }
     Err(history_error(
         "SESSION_ID_UNAVAILABLE",
         "A stable ChatGPT session identifier is required.",

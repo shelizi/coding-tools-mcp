@@ -18,7 +18,9 @@ use crate::auth::{
     TokenForm,
 };
 use crate::tools::hub::{HubConfig, HubRouter};
-use crate::tools::{self, policy::PolicySettings, wrap_tool_result, ExecutionLimits};
+use crate::tools::{
+    self, policy::PolicySettings, wrap_tool_result, ExecutionLimits, SharedRuntimeToolConfig,
+};
 use crate::tunnel::append_profile_log_buffered;
 use crate::workspace::{
     parse_bind_address, socket_addr_for_bind, url_host_for_bind, WorkspaceFolder,
@@ -152,9 +154,11 @@ async fn serve(
                 auth_type: auth_type.clone(),
                 ..crate::workspace::AuthConfig::default()
             },
-            policy: policy.clone(),
-            tool_profile: "full".into(),
-            permission_mode: policy.permission_mode.clone(),
+            runtime_config: SharedRuntimeToolConfig::new(
+                policy.clone(),
+                "full".into(),
+                policy.permission_mode.clone(),
+            ),
             limits: execution_limits,
             execution_resource_namespace: "actions".into(),
         },

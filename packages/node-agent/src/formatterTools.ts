@@ -688,11 +688,11 @@ export async function formatFilesTool(ctx: ToolContext, key: string, args: JsonO
     const mode = String(args.mode ?? 'plan');
     if (!['plan', 'check', 'apply'].includes(mode)) throw new FormatterError('INVALID_ARGUMENT', `Unsupported format mode: ${mode}`, 'validation', false);
     const plan = await planFormatFiles(root, args);
-    if (mode === 'apply' && plan.scope === 'project' && args.confirm !== true) {
+    if (ctx.config.securityPolicy.requireWriteConfirmation && mode === 'apply' && plan.scope === 'project' && args.confirm !== true) {
       throw new FormatterError('CONFIRMATION_REQUIRED', 'format_files scope=project mode=apply requires confirm=true', 'permission', false);
     }
     const customGroups = plan.groups.filter(group => group.custom);
-    if (mode !== 'plan' && customGroups.length && args.confirm !== true) {
+    if (ctx.config.securityPolicy.requireWriteConfirmation && mode !== 'plan' && customGroups.length && args.confirm !== true) {
       throw new FormatterError('CUSTOM_FORMATTER_REQUIRES_CONFIRMATION', 'Custom formatter execution requires confirm=true', 'permission', false, {
         custom_adapters: customGroups.map(group => group.adapter_id),
         suggestion: 'Review mode=plan output, then retry with confirm=true'

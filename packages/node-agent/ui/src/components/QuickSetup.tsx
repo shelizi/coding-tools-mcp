@@ -126,8 +126,7 @@ export function QuickSetup({
         port: saved.port,
         publicBaseUrl: publicUrl.replace(/\/mcp$/, ''),
         dataDir: saved.dataDir,
-        permissionMode: saved.permissionMode,
-        toolProfile: saved.toolProfile,
+        securityPolicy: saved.securityPolicy,
         management: { enabled: saved.management.enabled },
         oauth: {
           clientId: saved.oauth.clientId,

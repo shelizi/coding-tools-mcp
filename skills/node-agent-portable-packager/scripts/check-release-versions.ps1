@@ -27,11 +27,45 @@ Assert-SemVer -Version $agentVersion -Label 'Node Agent version'
 Assert-SemVer -Version $portableVersion -Label 'Portable version'
 Assert-SemVer -Version $skillVersion -Label 'Skill version'
 
+$gitExecutable = (Get-Command git.exe -ErrorAction Stop).Source
+$gitCommit = [string](& $gitExecutable -C $repository rev-parse HEAD)
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitCommit)) {
+    throw 'Unable to resolve the repository HEAD commit.'
+}
+$gitCommit = $gitCommit.Trim()
+
+$statusLines = @(& $gitExecutable -C $repository status --porcelain --untracked-files=normal)
+if ($LASTEXITCODE -ne 0) {
+    throw 'Unable to inspect the repository worktree status.'
+}
+if ($statusLines.Count -gt 0) {
+    throw "Node portable release checks require a clean worktree before packaging.`n$($statusLines -join "`n")"
+}
+
+$releaseTag = "node-agent-v${agentVersion}-portable-v${portableVersion}"
+$tagType = [string](& $gitExecutable -C $repository cat-file -t "refs/tags/$releaseTag" 2>$null)
+if ($LASTEXITCODE -ne 0 -or $tagType.Trim() -ne 'tag') {
+    throw "Expected annotated Node portable release tag was not found: $releaseTag"
+}
+$tagCommit = [string](& $gitExecutable -C $repository rev-parse "$releaseTag^{commit}" 2>$null)
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($tagCommit)) {
+    throw "Unable to resolve release tag commit: $releaseTag"
+}
+$tagCommit = $tagCommit.Trim()
+if (-not $tagCommit.Equals($gitCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Release tag $releaseTag resolves to $tagCommit but HEAD is $gitCommit."
+}
+
 $baseName = "Coding.Tools.Node.Agent_${agentVersion}_portable-${portableVersion}"
 [ordered]@{
     nodeAgentVersion = $agentVersion
     portableVersion = $portableVersion
     skillVersion = $skillVersion
+    releaseTag = $releaseTag
+    gitCommit = $gitCommit
+    tagType = $tagType.Trim()
+    tagMatchesHead = $true
+    worktreeClean = $true
     independent = $true
     editions = @('bundled-node', 'system-node')
     artifactNames = @(

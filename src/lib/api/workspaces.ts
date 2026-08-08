@@ -16,14 +16,6 @@ export async function listWslDistributions(): Promise<string[]> {
   return invoke<string[]>("list_wsl_distributions");
 }
 
-export async function createWslWorkspace(
-  distro: string,
-  linuxPath: string,
-  name?: string,
-): Promise<WorkspaceProfile> {
-  return invoke<WorkspaceProfile>("create_wsl_workspace", { distro, linuxPath, name });
-}
-
 export async function updateWorkspace(profile: WorkspaceProfile): Promise<void> {
   return invoke("update_workspace", { profile });
 }
@@ -34,6 +26,15 @@ export async function addWorkspaceFolder(
   name?: string,
 ): Promise<WorkspaceProfile> {
   return invoke<WorkspaceProfile>("add_workspace_folder", { id, path, name });
+}
+
+export async function addWslWorkspaceFolder(
+  id: string,
+  distro: string,
+  linuxPath: string,
+  name?: string,
+): Promise<WorkspaceProfile> {
+  return invoke<WorkspaceProfile>("add_wsl_workspace_folder", { id, distro, linuxPath, name });
 }
 
 export async function removeWorkspaceFolder(

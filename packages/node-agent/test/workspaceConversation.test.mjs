@@ -49,6 +49,7 @@ async function fixture(t) {
   ];
   const ctx = await createToolContext(config(folders, dataDir));
   t.after(async () => {
+    await ctx.conversations.flush();
     await ctx.usageStore.flush();
     await rm(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
@@ -89,6 +90,7 @@ test('workspace listing and switching expose conversation-isolated Rust metadata
   assert.notEqual(isolatedRuntime.conversations.fallbackKey, state.ctx.conversations.fallbackKey);
   const isolatedListing = await callTool(isolatedRuntime, 'list_workspace_folders', {}, undefined);
   assert.equal(isolatedListing.selected_folder_id, null);
+  await isolatedRuntime.conversations.flush();
   await isolatedRuntime.usageStore.flush();
 
   const metaA = { 'openai/session': 'conversation-a' };
@@ -130,6 +132,36 @@ test('switching back to a folder restores that conversation folder cwd', async t
   assert.equal(listing.default_cwd, 'src');
   assert.equal(listing.folders.find(folder => folder.id === 'first').default_cwd, 'src');
   assert.equal(listing.folders.find(folder => folder.id === 'second').default_cwd, 'packages');
+});
+
+test('workspace selection, per-folder cwd, and fallback identity survive Agent restart', async t => {
+  const state = await fixture(t);
+  const meta = { 'openai/session': 'restart-conversation' };
+
+  await callTool(state.ctx, 'switch_workspace_folder', { folder_id: 'first' }, meta);
+  await callTool(state.ctx, 'set_default_cwd', { path: 'src' }, meta);
+  await callTool(state.ctx, 'switch_workspace_folder', { folder_id: 'second' }, meta);
+  await callTool(state.ctx, 'set_default_cwd', { path: 'packages' }, meta);
+  await callTool(state.ctx, 'switch_workspace_folder', { folder_id: 'first' }, meta);
+  await callTool(state.ctx, 'switch_workspace_folder', { folder_id: 'second' }, undefined);
+  await state.ctx.conversations.flush();
+
+  const restarted = await createToolContext(config(state.folders, state.dataDir));
+  t.after(async () => {
+    await restarted.conversations.flush();
+    await restarted.usageStore.flush();
+  });
+  assert.equal(restarted.conversations.fallbackKey, state.ctx.conversations.fallbackKey);
+
+  const restored = await callTool(restarted, 'list_workspace_folders', {}, meta);
+  assert.equal(restored.selected_folder_id, 'first');
+  assert.equal(restored.default_cwd, 'src');
+  assert.equal(restored.folders.find(folder => folder.id === 'second').default_cwd, 'packages');
+  const restoredSecond = await callTool(restarted, 'switch_workspace_folder', { folder_id: 'second' }, meta);
+  assert.equal(restoredSecond.default_cwd, 'packages');
+
+  const fallback = await callTool(restarted, 'list_workspace_folders', {}, undefined);
+  assert.equal(fallback.selected_folder_id, 'second');
 });
 
 test('conversation contexts use deterministic 128-entry LRU while preserving bindings and cwd', () => {
@@ -208,6 +240,8 @@ test('canonical duplicate roots are rejected and profile identity survives resta
   const firstContext = await createToolContext(config(state.folders, path.join(state.base, 'restart-a')));
   const secondContext = await createToolContext(config(state.folders, path.join(state.base, 'restart-b')));
   assert.equal(firstContext.workspaceProfileId, secondContext.workspaceProfileId);
+  await firstContext.conversations.flush();
+  await secondContext.conversations.flush();
   await firstContext.usageStore.flush();
   await secondContext.usageStore.flush();
   assert.match(firstContext.workspaceProfileId, /^node-[0-9a-f]{16}$/);

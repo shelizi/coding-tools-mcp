@@ -1,6 +1,6 @@
 ---
 name: node-agent-portable-packager
-description: Build, verify, version, and package the Coding Tools MCP Node Agent as two Windows x64 portable ZIP editions: bundled-node with embedded Node.js and system-node without Node.js. Use when creating or reviewing Node Agent portable releases, changing launchers or archive layout, validating either artifact, or deciding which independent Node Agent, Portable, or Skill version to increment.
+description: Build, verify, version, tag, and package the Coding Tools MCP Node Agent as two Windows x64 portable ZIP editions: bundled-node with embedded Node.js and system-node without Node.js. Use when creating or reviewing Node Agent portable releases, enforcing release tag-to-commit provenance, changing launchers or archive layout, validating either artifact, or deciding which independent Node Agent, Portable, or Skill version to increment.
 ---
 
 # Node Agent Portable Packager
@@ -14,6 +14,7 @@ Keep these sources independent:
 - Read the Node Agent application version from `packages/node-agent/package.json#version`.
 - Read the Portable wrapper version from `packages/node-agent/portable-version.json#version`.
 - Read this Skill version from `VERSION` beside this file.
+- Derive the release tag as `node-agent-v<agent>-portable-v<portable>`; this tag is release provenance, not a fourth independent version.
 
 Never synchronize or bulk-bump them. Increment only the component whose behavior changed. Read [references/packaging-rules.md](references/packaging-rules.md) before changing version, edition, or archive policy.
 
@@ -27,18 +28,22 @@ Both editions contain the same compiled application and production dependencies 
 ## Workflow
 
 1. Inspect Git status and preserve unrelated changes and generated artifacts.
-2. Run `scripts/check-release-versions.ps1 -RepositoryRoot <repo>` from this Skill to validate the three version sources and both artifact names.
-3. Review the changes being released and choose independent version increments.
-4. Run `npm run node-agent:portable` from the repository root to build both editions from one verified build. Use the focused `:bundled` or `:system` commands only when explicitly requested.
-5. Inspect both ZIP names and manifests; require Agent version, Portable version, and edition in each artifact identity.
-6. Confirm common application contents are present in both editions. Confirm only `bundled-node` contains `runtime/node.exe` and the Node license.
-7. Extract both ZIPs to paths containing spaces. Start each with `start-node-agent.bat --no-browser` on isolated ports and data directories, then verify `/health`, `/ui`, and static UI assets.
-8. Stop both smoke-test processes cleanly, validate every checksum entry, and compute both archive SHA-256 values.
-9. Deliver both Portable ZIPs separately from the Skill ZIP.
+2. Review the changes being released and choose independent version increments.
+3. Run the normal Node Agent verification before creating the release identity.
+4. Commit all release source and version changes. Require a clean worktree after the commit.
+5. Create an annotated `node-agent-v<agent>-portable-v<portable>` tag on that exact commit.
+6. Run `scripts/check-release-versions.ps1 -RepositoryRoot <repo>` from this Skill. Require the expected annotated tag to resolve to `HEAD`, a clean worktree, valid versions, and expected artifact names.
+7. Run `npm run node-agent:portable` from the repository root to build both editions from the tagged commit. Use the focused `:bundled` or `:system` commands only when explicitly requested.
+8. Inspect both ZIP names and manifests; require Agent version, Portable version, edition, release tag, and full Git commit in each artifact identity.
+9. Confirm common application contents are present in both editions. Confirm only `bundled-node` contains `runtime/node.exe` and the Node license.
+10. Extract both ZIPs to paths containing spaces. Start each with `start-node-agent.bat --no-browser` on isolated ports and data directories, then verify `/health`, `/ui`, and static UI assets.
+11. Stop both smoke-test processes cleanly, validate every checksum entry, and compute both archive SHA-256 values.
+12. Deliver both Portable ZIPs separately from the Skill ZIP.
 
 ## Release constraints
 
 - Require Windows x64 and Node.js 22 or later for building and for the `system-node` runtime.
+- Release packaging must run from a clean `HEAD` with an annotated `node-agent-v<agent>-portable-v<portable>` tag resolving to that exact commit. Do not use Desktop `v*` tags for Node portable releases.
 - Install staging dependencies once with `npm ci --omit=dev --ignore-scripts`, then derive both editions from the same common staging tree.
 - Never copy source `node_modules` into an archive.
 - Never include dev dependencies, build caches, repository history, credentials, user data, or existing configuration.
@@ -55,6 +60,7 @@ Report:
 - Node Agent version
 - Portable version
 - Skill version
+- Release tag and full Git commit
 - Build Node.js version and architecture
 - Both edition names, ZIP paths, byte sizes, and SHA-256 values
 - Runtime presence/absence checks for each edition

@@ -109,7 +109,11 @@ test('request timing distinguishes concurrency from the next orchestration gap',
   store.recordToolCall({
     tool: 'server_info', arguments: {}, result: {
       ok: true,
-      phase_durations_ms: { preflight_ms: 4, plan_ms: 2, commit_ms: 3, total_ms: 9 }
+      phase_durations_ms: {
+        preflight_ms: 4, plan_ms: 2, commit_ms: 3, total_ms: 9,
+        baseline_capture_ms: 5, error_enrichment_ms: 1,
+        harness_begin_ms: 6, dispatch_ms: 2, harness_finish_ms: 7, serialization_ms: 1
+      }
     },
     startedTsMs: 1_000, durationMs: 10, requestTiming: firstTiming
   });
@@ -133,12 +137,24 @@ test('request timing distinguishes concurrency from the next orchestration gap',
   assert.equal(result.records[0].phase_plan_ms, 2);
   assert.equal(result.records[0].phase_commit_ms, 3);
   assert.equal(result.records[0].phase_total_ms, 9);
+  assert.equal(result.records[0].phase_baseline_capture_ms, 5);
+  assert.equal(result.records[0].phase_error_enrichment_ms, 1);
+  assert.equal(result.records[0].phase_harness_begin_ms, 6);
+  assert.equal(result.records[0].phase_dispatch_ms, 2);
+  assert.equal(result.records[0].phase_harness_finish_ms, 7);
+  assert.equal(result.records[0].phase_serialization_ms, 1);
   assert.equal(result.aggregate.phase_latency.preflight.samples, 1);
   assert.equal(result.aggregate.phase_latency.preflight.total_ms, 4);
   assert.equal(result.aggregate.phase_latency.preflight.avg_ms, 4);
   assert.equal(result.aggregate.phase_latency.preflight.p50_ms, 4);
   assert.equal(result.aggregate.phase_latency.preflight.p95_ms, 4);
   assert.equal(result.aggregate.phase_latency.total.total_ms, 9);
+  assert.equal(result.aggregate.phase_latency.baseline_capture.total_ms, 5);
+  assert.equal(result.aggregate.phase_latency.error_enrichment.total_ms, 1);
+  assert.equal(result.aggregate.phase_latency.harness_begin.total_ms, 6);
+  assert.equal(result.aggregate.phase_latency.dispatch.total_ms, 2);
+  assert.equal(result.aggregate.phase_latency.harness_finish.total_ms, 7);
+  assert.equal(result.aggregate.phase_latency.serialization.total_ms, 1);
   const serverInfoStats = result.aggregate.tools.find(tool => tool.tool === 'server_info');
   assert.equal(serverInfoStats.phase_latency.commit.samples, 1);
   assert.equal(serverInfoStats.phase_latency.commit.max_ms, 3);
@@ -180,7 +196,26 @@ test('outcome taxonomy separates recoverable tool failures from internal errors'
   for (const [code, , expected] of cases) assert.equal(byCode.get(code), expected, code);
 });
 
-test('repeated failure detection resets on success, changed input, burst, and concurrency', async t => {
+test('wait request timeout is classified separately from process timeout', async t => {
+  const { dataDir } = await fixture(t);
+  const store = new ToolUsageStore(dataDir, {
+    profileId: 'wait-taxonomy-profile', runtimeBootId: 'wait-taxonomy-runtime', serverVersion: '0.19.0'
+  });
+  const waitTimeout = store.recordToolCall({
+    tool: 'wait_command', arguments: { session_id: 'session-a', timeout_ms: 20 },
+    result: { ok: true, request_timed_out: true, process_timed_out: false, process_still_running: true },
+    startedTsMs: 1_000, durationMs: 20, requestTiming: requestTiming()
+  });
+  const processTimeout = store.recordToolCall({
+    tool: 'wait_command', arguments: { session_id: 'session-b', timeout_ms: 20 },
+    result: { ok: false, request_timed_out: false, process_timed_out: true, process_still_running: false },
+    startedTsMs: 1_100, durationMs: 1, requestTiming: requestTiming({ activityBurstSequence: 2 })
+  });
+  assert.equal(waitTimeout.outcome_class, 'wait_timeout');
+  assert.equal(processTimeout.outcome_class, 'timeout');
+});
+
+test('repeated failure detection resets on success and burst while counting concurrent duplicates', async t => {
   const { dataDir } = await fixture(t);
   const store = new ToolUsageStore(dataDir, {
     profileId: 'repeat-profile', runtimeBootId: 'repeat-runtime', serverVersion: '0.19.0'
@@ -215,10 +250,12 @@ test('repeated failure detection resets on success, changed input, burst, and co
   const newBurst = call({ path: 'main.txt', edits: [{ type: 'replace', old_text: 'different', new_text: 'b' }] }, requestTiming({ activityBurstId: 8, activityBurstSequence: 1 }));
   assert.equal(newBurst.repeat_failure_count, 1);
   const concurrent = call({ path: 'main.txt', edits: [{ type: 'replace', old_text: 'different', new_text: 'b' }] }, requestTiming({ activityBurstId: 8, activityBurstSequence: 2, concurrentRequest: true }));
-  assert.equal(concurrent.repeat_failure_count, 1);
-  assert.equal(concurrent.repeated_failure, false);
+  assert.equal(concurrent.repeat_failure_count, 2);
+  assert.equal(concurrent.repeated_failure, true);
+  assert.equal(concurrent.concurrent_duplicate_failure, true);
   const afterConcurrent = call({ path: 'main.txt', edits: [{ type: 'replace', old_text: 'different', new_text: 'b' }] }, requestTiming({ activityBurstId: 8, activityBurstSequence: 3 }));
-  assert.equal(afterConcurrent.repeat_failure_count, 1);
+  assert.equal(afterConcurrent.repeat_failure_count, 3);
+  assert.equal(afterConcurrent.repeated_failure, true);
 
   const success = call(
     { path: 'main.txt', edits: [{ type: 'replace', old_text: 'different', new_text: 'b' }] },
@@ -231,11 +268,13 @@ test('repeated failure detection resets on success, changed input, burst, and co
   await store.flush();
   const queried = await store.query({ scope: 'all', exclude_tools: [] });
   const repeated = queried.optimization.repeated_failures;
-  assert.equal(repeated.retry_count, 1);
-  assert.equal(repeated.chain_count, 1);
-  assert.equal(repeated.wasted_duration_ms, 1);
-  assert.equal(repeated.max_attempt_count, 2);
-  assert.equal(repeated.top[0].signature, first.failure_signature);
+  assert.equal(repeated.retry_count, 3);
+  assert.equal(repeated.chain_count, 2);
+  assert.equal(repeated.wasted_duration_ms, 3);
+  assert.equal(repeated.max_attempt_count, 3);
+  assert.equal(repeated.top[0].signature, concurrent.failure_signature);
+  assert.equal(repeated.top[0].retry_count, 2);
+  assert.equal(repeated.top[0].max_attempt_count, 3);
   assert.equal(repeated.top[0].error_code, 'EDIT_MATCH_COUNT_MISMATCH');
   assert.match(repeated.recovery_hint, /Stop retrying unchanged arguments/);
 });
@@ -339,10 +378,35 @@ test('query aggregates percentiles, errors, bursts, parallel observations and as
   });
   await store.flush();
 
+  const summary = await store.query({
+    scope: 'current_runtime', exclude_tools: [],
+    burst_idle_ms: 1_000, sort_by: 'p95_ms', top: 10
+  });
+  assert.equal(summary.response_profile, 'summary');
+  assert.deepEqual(summary.detail_sections, {
+    records: false,
+    slowest: false,
+    largest: false,
+    activity_bursts: false
+  });
+  assert.deepEqual(summary.records, []);
+  assert.equal(summary.slowest, null);
+  assert.equal(summary.largest, null);
+  assert.equal(summary.performance.activity_bursts, null);
+
   const result = await store.query({
     scope: 'current_runtime', exclude_tools: [], include_records: true,
+    include_slowest: true, include_largest: true, include_bursts: true,
     include_payloads: false, burst_idle_ms: 1_000, sort_by: 'p95_ms', top: 10
   });
+  assert.equal(result.response_profile, 'detailed');
+  assert.deepEqual(result.detail_sections, {
+    records: true,
+    slowest: true,
+    largest: true,
+    activity_bursts: true
+  });
+  assert.ok(Buffer.byteLength(JSON.stringify(summary)) < Buffer.byteLength(JSON.stringify(result)));
   assert.equal(result.matched_lines, 4);
   assert.equal(result.matched_async_session_events, 1);
   assert.equal(result.aggregate.calls, 4);

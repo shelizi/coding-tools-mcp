@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { CURRENT_CONFIG_SCHEMA_VERSION, loadConfig, loadConfigBundle } from '../dist/config.js';
 
+// Never let destructive missing-key/tamper fixtures target a developer's live Agent data directory.
+delete process.env.CTMCP_DATA_DIR;
+
 function legacyDocument(root, dataDir, overrides = {}) {
   return {
     host: '127.0.0.1',
@@ -34,6 +37,26 @@ async function fixture(prefix = 'ctmcp-config') {
   const configFile = path.join(dataDir, 'agent.json');
   return { root, dataDir, configFile };
 }
+
+test('command timeout ceiling defaults to 30 minutes and supports a bounded environment override', async () => {
+  const { root, dataDir, configFile } = await fixture('ctmcp-command-timeout');
+  await writeFile(configFile, JSON.stringify(legacyDocument(root, dataDir)));
+  const previous = process.env.CTMCP_COMMAND_TIMEOUT_MAX_MS;
+  delete process.env.CTMCP_COMMAND_TIMEOUT_MAX_MS;
+  try {
+    const defaults = await loadConfig(configFile);
+    assert.equal(defaults.limits.commandTimeoutMaxMs, 1_800_000);
+    process.env.CTMCP_COMMAND_TIMEOUT_MAX_MS = '3600000';
+    const overridden = await loadConfig(configFile);
+    assert.equal(overridden.limits.commandTimeoutMaxMs, 3_600_000);
+    process.env.CTMCP_COMMAND_TIMEOUT_MAX_MS = '3600001';
+    const clamped = await loadConfig(configFile);
+    assert.equal(clamped.limits.commandTimeoutMaxMs, 3_600_000);
+  } finally {
+    if (previous === undefined) delete process.env.CTMCP_COMMAND_TIMEOUT_MAX_MS;
+    else process.env.CTMCP_COMMAND_TIMEOUT_MAX_MS = previous;
+  }
+});
 
 test('loadConfig canonicalizes folder identities and rejects duplicate physical roots', async () => {
   const canonicalFixture = await fixture('ctmcp-canonical-folders');
@@ -237,11 +260,24 @@ test('loadConfig rejects a future config schema version', async () => {
   await assert.rejects(loadConfig(configFile), /Unsupported config schema_version/);
 });
 
-test('loadConfig rejects an encrypted secret store whose master key is missing', async () => {
+test('loadConfig restores a missing primary secret key from its local backup', async () => {
   const { root, dataDir, configFile } = await fixture('ctmcp-missing-key');
   await writeFile(configFile, JSON.stringify(legacyDocument(root, dataDir)));
   const loaded = await loadConfigBundle(configFile);
+  const backupPath = `${loaded.secretKeyPath}.backup`;
+  const backup = await readFile(backupPath, 'utf8');
   await rm(loaded.secretKeyPath);
+  const restored = await loadConfigBundle(configFile);
+  assert.equal(restored.config.oauth.password, 'legacy-password');
+  assert.equal(await readFile(restored.secretKeyPath, 'utf8'), backup);
+});
+
+test('loadConfig rejects an encrypted secret store when both master key copies are missing', async () => {
+  const { root, dataDir, configFile } = await fixture('ctmcp-missing-both-keys');
+  await writeFile(configFile, JSON.stringify(legacyDocument(root, dataDir)));
+  const loaded = await loadConfigBundle(configFile);
+  await rm(loaded.secretKeyPath);
+  await rm(`${loaded.secretKeyPath}.backup`);
   await assert.rejects(loadConfig(configFile), /exists without its key/);
 });
 

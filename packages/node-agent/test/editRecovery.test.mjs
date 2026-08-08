@@ -106,6 +106,24 @@ test('precise edit contracts aggregate invalid fields with guarded recovery meta
   assert.equal(mixed.error.details.recovery_actions[0].action, 'choose_edit_mode');
 });
 
+test('canonical edit rejects no-op during cheap preflight before harness tracking', async t => {
+  const { root, ctx, meta } = await fixture(t);
+  await writeFile(path.join(root, 'main.txt'), 'same\n');
+
+  const result = await callTool(ctx, 'edit', {
+    files: [{
+      path: 'main.txt',
+      edits: [{ type: 'replace', old_text: 'same', new_text: 'same' }]
+    }]
+  }, meta);
+
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(result.error.code, 'PATCH_FAILED');
+  assert.ok(Number(result.phase_durations_ms?.preflight_ms) >= 0, JSON.stringify(result));
+  assert.equal(Object.hasOwn(result.phase_durations_ms ?? {}, 'harness_begin_ms'), false);
+  assert.equal(await readFile(path.join(root, 'main.txt'), 'utf8'), 'same\n');
+});
+
 test('edit_many reports the failed file index before writing any file', async t => {
   const { root, ctx, meta } = await fixture(t);
   await writeFile(path.join(root, 'first.txt'), 'first\n');

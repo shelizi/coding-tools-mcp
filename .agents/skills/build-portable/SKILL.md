@@ -13,6 +13,8 @@ npm run desktop:portable
 
 The script builds the frontend, builds the Tauri release with the required `custom-protocol` feature, copies the executable, creates the versioned ZIP, and prints SHA-256 hashes.
 
+Portable ZIP filenames and ZIP top-level directories are versioned. The expanded latest-build directory is stable and versionless (`dist-portable/Coding.Tools.MCP_x64_portable`) so each successful build replaces it instead of accumulating extracted copies.
+
 ## Guardrails
 
 - `package.json` is the single source of truth for the release version. For every new requested portable release build, run `npm run version:patch` exactly once before compiling. This updates the source version and synchronizes the npm/Cargo metadata; `src-tauri/tauri.conf.json` reads the version directly from `package.json`. A retry of the same failed build only reruns `npm run desktop:portable` and does not increment again.
@@ -26,7 +28,7 @@ The script builds the frontend, builds the Tauri release with the required `cust
 
 After the script succeeds:
 
-- Confirm the versioned folder contains `Coding Tools MCP.exe`.
-- Confirm the ZIP contains that folder and executable.
+- Confirm the stable expanded folder contains `Coding Tools MCP.exe`.
+- Confirm the versioned ZIP contains its versioned top-level folder and executable.
 - Report the ZIP path, byte size, and SHA-256 hash.
 - Launch the packaged executable when desktop interaction is available and confirm it renders embedded UI rather than `localhost`.

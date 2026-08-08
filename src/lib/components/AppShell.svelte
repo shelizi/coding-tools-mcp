@@ -9,12 +9,11 @@
     children: Snippet;
     sidebar: Snippet;
     onAddWorkspace?: () => void | Promise<void>;
-    onAddWslWorkspace?: () => void | Promise<void>;
     onQuickSetup?: () => void | Promise<void>;
     settingsNav?: Snippet;
   }
 
-  let { children, sidebar, onAddWorkspace, onAddWslWorkspace, onQuickSetup, settingsNav }: Props = $props();
+  let { children, sidebar, onAddWorkspace, onQuickSetup, settingsNav }: Props = $props();
 </script>
 
 <div class="app-layout">
@@ -36,11 +35,6 @@
       {#if onAddWorkspace}
         <button type="button" class="tx-btn-primary tx-btn-sidebar" onclick={onAddWorkspace}>
           {$t("Add workspace")}
-        </button>
-      {/if}
-      {#if onAddWslWorkspace}
-        <button type="button" class="tx-btn-ghost tx-btn-sidebar tx-btn-sidebar-secondary" onclick={onAddWslWorkspace}>
-          {$t("Add WSL workspace")}
         </button>
       {/if}
     </div>

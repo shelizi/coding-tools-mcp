@@ -24,6 +24,8 @@ pub struct HarnessStatus {
     pub recoverable: bool,
     pub branch: Option<String>,
     pub head: Option<String>,
+    pub current_head: Option<String>,
+    pub task_baseline_head: Option<String>,
     pub baseline_matches: Option<bool>,
     pub capabilities: HashMap<String, CapabilityStatus>,
     pub next_actions: Vec<String>,

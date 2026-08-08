@@ -200,6 +200,7 @@ Environment variables take precedence over the JSON file and encrypted secret st
 agent.json                    public, versioned settings
 agent-secrets.enc.json        AES-256-GCM encrypted secrets
 agent-secrets.key             random 256-bit local master key
+agent-secrets.key.backup      local recovery copy of the master key
 builtin-tunnel-identity.enc.json  encrypted tunnel device identity
 ```
 
@@ -226,7 +227,7 @@ A minimal configuration looks like:
 
 On first startup with a legacy configuration, the Agent writes the secrets to `agent-secrets.enc.json`, removes plaintext secret fields from `agent.json`, adds `schema_version: 1`, and deletes the legacy plaintext `oauth-token-secret` file after successful migration. Future schema versions are rejected instead of being interpreted incorrectly.
 
-The encrypted file and master key are both local files. They prevent accidental disclosure through configuration sharing, logs, backups of `agent.json`, and management API responses, but they are not a substitute for an OS keychain against an attacker running as the same user. Files use mode `0600` on POSIX; Windows inherits the ACL of `CTMCP_DATA_DIR`.
+The encrypted file, master key, and recovery key copy are local files. On startup, the Agent restores a missing primary key from `agent-secrets.key.backup` after verifying that it decrypts the existing store. They prevent accidental disclosure through configuration sharing, logs, backups of `agent.json`, and management API responses, but they are not a substitute for an OS keychain against an attacker running as the same user. Files use mode `0600` on POSIX; Windows inherits the ACL of `CTMCP_DATA_DIR`.
 
 Secret updates are written to the effective data directory selected by `CTMCP_DATA_DIR` or `dataDir`. Without an environment override, changing `dataDir` through the management UI creates a complete encrypted secret store in the new directory before updating `agent.json`. The old encrypted store is not deleted automatically because another configuration may share that data directory. If the environment override is later removed, that intentionally selects a different state and secret directory.
 

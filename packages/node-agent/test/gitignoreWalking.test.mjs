@@ -160,7 +160,7 @@ test('list and search respect root, nested and negated gitignore rules', async t
   ]);
 });
 
-test('include_ignored and include_hidden remain independent while .git is always excluded', async t => {
+test('ignored, hidden, and generated traversal are independent while .git is always excluded', async t => {
   const { root, ctx, meta } = await fixture(t);
   await put(root, '.gitignore', 'ignored.txt\n');
   await put(root, '.ignore', 'ignore-file.txt\n');
@@ -175,7 +175,9 @@ test('include_ignored and include_hidden remain independent while .git is always
   assert.deepEqual(defaults, ['visible.txt']);
 
   const ignored = await listedPaths(ctx, meta, { include_ignored: true });
-  assert.deepEqual(ignored, ['ignore-file.txt', 'ignored.txt', 'info-ignored.txt', 'node_modules/pkg.txt', 'visible.txt']);
+  assert.deepEqual(ignored, ['ignore-file.txt', 'ignored.txt', 'info-ignored.txt', 'visible.txt']);
+  const generated = await listedPaths(ctx, meta, { include_ignored: true, include_generated: true });
+  assert.deepEqual(generated, ['ignore-file.txt', 'ignored.txt', 'info-ignored.txt', 'node_modules/pkg.txt', 'visible.txt']);
 
   const hidden = await listedPaths(ctx, meta, { include_hidden: true });
   assert.ok(hidden.includes('.gitignore'));
@@ -199,8 +201,12 @@ test('include_ignored and include_hidden remain independent while .git is always
   assert.ok(all.includes('ignored.txt'));
   assert.ok(all.includes('ignore-file.txt'));
   assert.ok(all.includes('info-ignored.txt'));
-  assert.ok(all.includes('node_modules/pkg.txt'));
+  assert.ok(!all.includes('node_modules/pkg.txt'));
   assert.ok(!all.some(value => value.toLowerCase().startsWith('.git/')));
+
+  const everything = await listedPaths(ctx, meta, { include_hidden: true, include_ignored: true, include_generated: true });
+  assert.ok(everything.includes('node_modules/pkg.txt'));
+  assert.ok(!everything.some(value => value.toLowerCase().startsWith('.git/')));
 
   const directGit = await callTool(ctx, 'list_files', {
     path: '.git',

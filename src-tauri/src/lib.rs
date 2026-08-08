@@ -49,7 +49,9 @@ pub fn export_behavioral_parity_fixtures() -> serde_json::Value {
             "process_admission": limits.process_admission,
             "global_blocking_admission": limits.global_blocking_admission,
             "global_process_admission": limits.global_process_admission,
-            "active_sessions": limits.active_sessions
+            "active_sessions": limits.active_sessions,
+            "command_timeout_default_ms": tools::DEFAULT_COMMAND_TIMEOUT_MAX_MS,
+            "command_timeout_absolute_max_ms": tools::ABSOLUTE_COMMAND_TIMEOUT_MAX_MS
         },
         "workspace": tools::hub::behavioral_parity_fixture(),
         "process_start": tools::process_start_behavioral_parity_fixture(),
@@ -62,7 +64,7 @@ pub fn export_behavioral_parity_fixtures() -> serde_json::Value {
 use app_state::AppState;
 #[cfg(feature = "desktop")]
 use commands::{
-    add_workspace_folder, create_workspace, create_wsl_workspace, delete_frp_profile,
+    add_workspace_folder, add_wsl_workspace_folder, create_workspace, delete_frp_profile,
     delete_workspace, get_actions_runtime_status, get_app_settings, get_download_config,
     get_frp_snippet, get_last_workspace_id, get_proxy, get_runtime_status, get_shared_secret,
     get_workspace_secret, install_software, list_frp_profiles, list_history_sessions,
@@ -177,10 +179,10 @@ pub fn run() {
             read_history_session,
             read_workspace_telemetry,
             create_workspace,
-            create_wsl_workspace,
             list_wsl_distributions,
             update_workspace,
             add_workspace_folder,
+            add_wsl_workspace_folder,
             remove_workspace_folder,
             open_workspace_directory,
             delete_workspace,

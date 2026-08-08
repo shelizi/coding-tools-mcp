@@ -2,6 +2,7 @@ name: Publish Tunnel Server
 
 on:
   push:
+    # Production tunnel-server auto-build follows the main branch.
     branches:
       - main
     paths:

@@ -86,8 +86,8 @@ async function optionalFile(full: string): Promise<Buffer | undefined> {
   }
 }
 
-function verifyExpected(operation: JsonObject, relative: string, bytes: Buffer | undefined): void {
-  if (operation.expected_sha256 === undefined) return;
+function verifyExpected(operation: JsonObject, relative: string, bytes: Buffer | undefined, enabled: boolean): void {
+  if (!enabled || operation.expected_sha256 === undefined) return;
   const expected = String(operation.expected_sha256).toLowerCase();
   const actual = bytes ? sha256(bytes) : 'missing';
   if (expected !== actual) {
@@ -251,7 +251,7 @@ export async function fileOpsTool(ctx: ToolContext, key: string, args: JsonObjec
     const operations = Array.isArray(args.operations) ? args.operations as JsonObject[] : [];
     if (!operations.length) throw new FileOpsError('INVALID_ARGUMENT', 'operations must not be empty');
     const dryRun = args.dry_run === true;
-    const confirm = args.confirm === true;
+    const confirm = args.confirm === true || !ctx.config.securityPolicy.requireWriteConfirmation;
     const staged = new Map<string, Buffer | null>();
     const versions = new Map<string, string | null>();
     const directories: PlannedDirectory[] = [];
@@ -283,7 +283,7 @@ export async function fileOpsTool(ctx: ToolContext, key: string, args: JsonObjec
         if (before && overwrite && !confirm) throw new FileOpsError('DANGEROUS_OPERATION_REQUIRES_CONFIRMATION', `Overwriting an existing file requires confirm=true: ${relative}`, 'permission', false, { path: relative, operation_index: index });
         if (before && !overwrite) throw new FileOpsError('FILE_ALREADY_EXISTS', `Create target already exists: ${relative}`, 'conflict', false, { path: relative, operation_index: index });
         if (!touched.add(relative)) throw new FileOpsError('INVALID_ARGUMENT', `duplicate file_ops target: ${relative}`);
-        verifyExpected(operation, relative, before);
+        verifyExpected(operation, relative, before, ctx.config.securityPolicy.verifyWriteConflicts);
         versions.set(relative, before ? sha256(before) : null);
         const content = Buffer.from(String(operation.content ?? ''), 'utf8');
         staged.set(relative, content);
@@ -294,7 +294,7 @@ export async function fileOpsTool(ctx: ToolContext, key: string, args: JsonObjec
 
       const source = await optionalFile(full);
       if (!source) throw new FileOpsError('FILE_NOT_FOUND', `File not found: ${relative}`, 'not_found', false, { path: relative, operation_index: index });
-      verifyExpected(operation, relative, source);
+      verifyExpected(operation, relative, source, ctx.config.securityPolicy.verifyWriteConflicts);
 
       if (kind === 'delete') {
         if (criticalFile(relative) && !confirm) throw new FileOpsError('DANGEROUS_OPERATION_REQUIRES_CONFIRMATION', `Deleting a critical project file requires confirm=true: ${relative}`, 'permission', false, { path: relative, operation_index: index });
@@ -326,7 +326,7 @@ export async function fileOpsTool(ctx: ToolContext, key: string, args: JsonObjec
     }
 
     if (!dryRun) {
-      await verifyVersions(root, versions);
+      if (ctx.config.securityPolicy.verifyWriteConflicts) await verifyVersions(root, versions);
       const committed = await commitStaged(root, staged, versions);
       const createdDirectories = new Set(committed.createdDirectories);
       try {

@@ -7,6 +7,9 @@ import { ApplicationConfigStore, loadApplication } from '../dist/application.js'
 import { loadConfigBundle } from '../dist/config.js';
 import { createAgentRuntime } from '../dist/server.js';
 
+// Workspace fixtures must never inherit and mutate a developer's live Agent data directory.
+delete process.env.CTMCP_DATA_DIR;
+
 function configDocument(root, dataDir, port, overrides = {}) {
   return {
     schema_version: 1,
@@ -225,7 +228,7 @@ test('workspace management API scopes settings, dashboards and authorization pas
     workspaceStore: store,
     runtimeRegistry: runtimes
   });
-  await createAgentRuntime(secondaryProfile.loaded.config, { runtimeRegistry: runtimes });
+  const secondaryRuntime = await createAgentRuntime(secondaryProfile.loaded.config, { runtimeRegistry: runtimes });
   const port = await listen(primaryRuntime.server);
   t.after(() => new Promise(resolve => primaryRuntime.server.close(resolve)));
   const base = `http://127.0.0.1:${port}`;
@@ -255,7 +258,11 @@ test('workspace management API scopes settings, dashboards and authorization pas
     headers: { ...headers, origin: base }
   }).then(response => response.json());
   assert.notEqual(regenerated.value, originalPassword);
+  assert.equal(regenerated.restartRequired, false);
+  assert.deepEqual(regenerated.appliedImmediately, ['oauth']);
   assert.equal(store.secret('secondary', 'oauthPassword'), regenerated.value);
+  assert.equal(secondaryRuntime.oauth.password, regenerated.value);
+  assert.equal(secondaryRuntime.context.config.oauth.password, regenerated.value);
 
   const secondarySnapshot = snapshot.workspaces.find(workspace => workspace.id === 'secondary');
   const saveResponse = await fetch(`${base}/admin/api/workspaces/secondary/config`, {

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { ApplicationConfigStore, loadApplication } from './application.js';
+import { restartSupervisedFromArgv } from './cliOptions.js';
 import { CURRENT_CONFIG_SCHEMA_VERSION } from './config.js';
 import type { WorkspaceRuntimeRecord } from './management.js';
 import { createAgentRuntime, type AgentRuntime } from './server.js';
@@ -15,7 +16,7 @@ const workspaceStore = new ApplicationConfigStore(application);
 const runtimeRegistry = new Map<string, WorkspaceRuntimeRecord>();
 
 const RESTART_EXIT_CODE = 75;
-const restartSupervised = process.env.CTMCP_RESTART_SUPERVISED === '1';
+const restartSupervised = restartSupervisedFromArgv(process.argv);
 interface RunningWorkspace {
   id: string;
   name: string;
@@ -73,6 +74,8 @@ try {
         endpoint.enrollmentCompleted
       )
     });
+    const runtimeRecord = runtimeRegistry.get(workspace.id);
+    if (runtimeRecord) runtimeRecord.tunnel = tunnel;
     const item = { id: workspace.id, name: workspace.name, primary, runtime, tunnel };
     running.push(item);
 

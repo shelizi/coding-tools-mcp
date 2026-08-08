@@ -123,6 +123,38 @@ test('invalid built-in tunnel configuration records a recoverable error status',
   assert.match(context.tunnelStatus.lastError, /builtin\/clients/);
 });
 
+test('built-in tunnel reconfigure can disable the runtime without restarting the agent', async () => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-tunnel-reconfigure-'));
+  const config = {
+    host: '127.0.0.1',
+    port: 3789,
+    dataDir,
+    permissionMode: 'trusted',
+    oauth: { clientId: 'chatgpt', password: 'test-password', tokenSecret: 'a sufficiently long test token secret' },
+    folders: [{ id: 'repo', name: 'Repo', path: dataDir }],
+    limits: { blockingConcurrency: 4, processConcurrency: 4, activeSessionLimit: 16, maxOutputBytes: 1024 * 1024 },
+    tunnel: {
+      enabled: false,
+      publicUrl: 'https://tunnel.example/builtin/clients/device_1/mcp'
+    }
+  };
+  const context = await createToolContext(config);
+  const manager = new BuiltinTunnelManager(config, context);
+
+  await manager.reconfigure(undefined, undefined);
+  assert.equal(config.tunnel, undefined);
+  assert.equal(context.config.tunnel, undefined);
+  assert.equal(config.publicBaseUrl, undefined);
+  assert.equal(context.config.publicBaseUrl, undefined);
+  assert.deepEqual(context.tunnelStatus, {
+    enabled: false,
+    state: 'disabled',
+    workers: 0,
+    connectedWorkers: 0,
+    completedRequests: 0
+  });
+});
+
 test('WorkerPolicy validation and pool planning match Rust behavior', () => {
   const policy = normalizeWorkerPolicy(defaultPolicy);
   assert.equal(configuredMaxConnecting(policy), 4);

@@ -80,21 +80,6 @@ pub fn list_wsl_distributions() -> AppResult<Vec<String>> {
     }
 }
 
-#[tauri::command]
-pub fn create_wsl_workspace(
-    state: State<'_, AppState>,
-    distro: String,
-    linux_path: String,
-    name: Option<String>,
-) -> AppResult<WorkspaceProfile> {
-    let distro = distro.trim();
-    let linux_path = linux_path.trim();
-    validate_wsl_location(distro, linux_path)?;
-    let path = wsl_unc_path(distro, linux_path);
-    validate_folder_path(&path)?;
-    create_workspace_inner(&state, path, name)
-}
-
 fn validate_wsl_location(distro: &str, linux_path: &str) -> AppResult<()> {
     if distro.is_empty()
         || distro.contains(['/', '\\', '\0'])
@@ -189,6 +174,31 @@ pub fn add_workspace_folder(
     name: Option<String>,
 ) -> AppResult<WorkspaceProfile> {
     validate_folder_path(&path)?;
+    add_workspace_folder_inner(&state, id, path, name)
+}
+
+#[tauri::command]
+pub fn add_wsl_workspace_folder(
+    state: State<'_, AppState>,
+    id: String,
+    distro: String,
+    linux_path: String,
+    name: Option<String>,
+) -> AppResult<WorkspaceProfile> {
+    let distro = distro.trim();
+    let linux_path = linux_path.trim();
+    validate_wsl_location(distro, linux_path)?;
+    let path = wsl_unc_path(distro, linux_path);
+    validate_folder_path(&path)?;
+    add_workspace_folder_inner(&state, id, path, name)
+}
+
+fn add_workspace_folder_inner(
+    state: &AppState,
+    id: String,
+    path: String,
+    name: Option<String>,
+) -> AppResult<WorkspaceProfile> {
     let updated = state.with_workspaces(|store| {
         let mut profile = store
             .get(&id)

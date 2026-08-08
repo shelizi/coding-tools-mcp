@@ -11,7 +11,9 @@ pub fn project_map(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
     let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
     let resolved = ws.resolve_read_path(path)?;
     if !resolved.path.is_dir() {
-        return Err(WorkspaceError::not_a_directory("project_map path must be a directory"));
+        return Err(WorkspaceError::not_a_directory(
+            "project_map path must be a directory",
+        ));
     }
     let max_files = args
         .get("max_files")
@@ -36,6 +38,10 @@ pub fn project_map(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         .get("include_ignored")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let include_generated = args
+        .get("include_generated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let mut builder = WalkBuilder::new(&resolved.path);
     builder
@@ -43,6 +49,13 @@ pub fn project_map(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         .hidden(!include_hidden)
         .max_depth(Some(max_depth + 1))
         .require_git(false);
+    builder.filter_entry(move |entry| {
+        entry.file_name().to_str().map_or(true, |name| {
+            !name.eq_ignore_ascii_case(".git")
+                && (include_generated
+                    || !crate::tools::workspace::DEFAULT_EXCLUDED_NAMES.contains(&name))
+        })
+    });
     if include_ignored {
         builder
             .ignore(false)
@@ -67,10 +80,13 @@ pub fn project_map(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
             continue;
         }
         let rel = relative_display(ws.root(), p);
-        if ws.is_ignored_path(p, include_hidden, include_ignored) {
+        if ws.is_ignored_path(p, include_hidden, include_ignored, include_generated) {
             continue;
         }
-        let depth = p.strip_prefix(&resolved.path).map(|v| v.components().count()).unwrap_or(0);
+        let depth = p
+            .strip_prefix(&resolved.path)
+            .map(|v| v.components().count())
+            .unwrap_or(0);
         if tree.len() < max_entries {
             tree.push(json!({
                 "path": rel,
@@ -134,7 +150,9 @@ pub fn project_map(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         .map(|(language, files)| json!({"language": language, "files": files}))
         .collect::<Vec<_>>();
     languages.sort_by(|a, b| {
-        b["files"].as_u64().cmp(&a["files"].as_u64())
+        b["files"]
+            .as_u64()
+            .cmp(&a["files"].as_u64())
             .then_with(|| a["language"].as_str().cmp(&b["language"].as_str()))
     });
 
@@ -180,48 +198,113 @@ fn collect_commands(manifests: &[Value], scripts: &BTreeMap<String, String>) -> 
     commands
 }
 
-fn manifest_info(file_name: &str, path: &Path) -> Option<(&'static str, &'static str, Vec<&'static str>)> {
+fn manifest_info(
+    file_name: &str,
+    path: &Path,
+) -> Option<(&'static str, &'static str, Vec<&'static str>)> {
     match file_name {
-        "Cargo.toml" => Some(("cargo", "Rust", vec!["cargo check", "cargo test", "cargo fmt --check"])),
-        "package.json" => Some(("npm", "JavaScript/TypeScript", vec!["npm test", "npm run build"])),
-        "pyproject.toml" => Some(("pyproject", "Python", vec!["python -m pytest", "python -m compileall ."])),
+        "Cargo.toml" => Some((
+            "cargo",
+            "Rust",
+            vec!["cargo check", "cargo test", "cargo fmt --check"],
+        )),
+        "package.json" => Some((
+            "npm",
+            "JavaScript/TypeScript",
+            vec!["npm test", "npm run build"],
+        )),
+        "pyproject.toml" => Some((
+            "pyproject",
+            "Python",
+            vec!["python -m pytest", "python -m compileall ."],
+        )),
         "requirements.txt" => Some(("pip", "Python", vec!["python -m pytest"])),
         "setup.py" | "setup.cfg" => Some(("setuptools", "Python", vec!["python -m pytest"])),
         "go.mod" => Some(("go", "Go", vec!["go test ./...", "go vet ./..."])),
         "pom.xml" => Some(("maven", "Java", vec!["mvn test", "mvn package"])),
-        "build.gradle" | "build.gradle.kts" => Some(("gradle", "Java/Kotlin", vec!["gradle test", "gradle build"])),
+        "build.gradle" | "build.gradle.kts" => {
+            Some(("gradle", "Java/Kotlin", vec!["gradle test", "gradle build"]))
+        }
         "composer.json" => Some(("composer", "PHP", vec!["composer test"])),
         "Gemfile" => Some(("bundler", "Ruby", vec!["bundle exec rake test"])),
         "CMakeLists.txt" => Some(("cmake", "C/C++", vec!["cmake --build build"])),
-        _ if path.extension().and_then(|v| v.to_str()) == Some("sln") => Some(("dotnet-solution", "C#/.NET", vec!["dotnet build", "dotnet test"])),
-        _ if path.extension().and_then(|v| v.to_str()) == Some("csproj") => Some(("dotnet-project", "C#/.NET", vec!["dotnet build", "dotnet test"])),
+        _ if path.extension().and_then(|v| v.to_str()) == Some("sln") => Some((
+            "dotnet-solution",
+            "C#/.NET",
+            vec!["dotnet build", "dotnet test"],
+        )),
+        _ if path.extension().and_then(|v| v.to_str()) == Some("csproj") => Some((
+            "dotnet-project",
+            "C#/.NET",
+            vec!["dotnet build", "dotnet test"],
+        )),
         _ => None,
     }
 }
 
 fn language_for_path(path: &Path) -> Option<&'static str> {
-    match path.extension().and_then(|v| v.to_str()).unwrap_or_default().to_ascii_lowercase().as_str() {
-        "rs" => Some("Rust"), "py" => Some("Python"), "cs" => Some("C#"),
-        "js" | "mjs" | "cjs" => Some("JavaScript"), "ts" | "tsx" => Some("TypeScript"),
-        "jsx" => Some("JavaScript/JSX"), "java" => Some("Java"), "kt" | "kts" => Some("Kotlin"),
-        "go" => Some("Go"), "php" => Some("PHP"), "rb" => Some("Ruby"), "swift" => Some("Swift"),
-        "c" | "h" => Some("C"), "cc" | "cpp" | "cxx" | "hpp" => Some("C++"),
-        "fs" | "fsx" => Some("F#"), "vb" => Some("Visual Basic"),
-        "html" | "htm" => Some("HTML"), "css" | "scss" | "sass" => Some("CSS"),
-        "sql" => Some("SQL"), "sh" | "bash" | "zsh" => Some("Shell"), "ps1" => Some("PowerShell"),
+    match path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "rs" => Some("Rust"),
+        "py" => Some("Python"),
+        "cs" => Some("C#"),
+        "js" | "mjs" | "cjs" => Some("JavaScript"),
+        "ts" | "tsx" => Some("TypeScript"),
+        "jsx" => Some("JavaScript/JSX"),
+        "java" => Some("Java"),
+        "kt" | "kts" => Some("Kotlin"),
+        "go" => Some("Go"),
+        "php" => Some("PHP"),
+        "rb" => Some("Ruby"),
+        "swift" => Some("Swift"),
+        "c" | "h" => Some("C"),
+        "cc" | "cpp" | "cxx" | "hpp" => Some("C++"),
+        "fs" | "fsx" => Some("F#"),
+        "vb" => Some("Visual Basic"),
+        "html" | "htm" => Some("HTML"),
+        "css" | "scss" | "sass" => Some("CSS"),
+        "sql" => Some("SQL"),
+        "sh" | "bash" | "zsh" => Some("Shell"),
+        "ps1" => Some("PowerShell"),
         _ => None,
     }
 }
 
 fn is_entrypoint(file_name: &str, path: &Path) -> bool {
-    matches!(file_name, "main.rs" | "lib.rs" | "main.py" | "app.py" | "manage.py" | "Program.cs" | "Startup.cs" | "index.js" | "index.ts" | "main.js" | "main.ts" | "main.tsx" | "App.tsx")
-        || path.components().any(|c| c.as_os_str() == "bin")
+    matches!(
+        file_name,
+        "main.rs"
+            | "lib.rs"
+            | "main.py"
+            | "app.py"
+            | "manage.py"
+            | "Program.cs"
+            | "Startup.cs"
+            | "index.js"
+            | "index.ts"
+            | "main.js"
+            | "main.ts"
+            | "main.tsx"
+            | "App.tsx"
+    ) || path.components().any(|c| c.as_os_str() == "bin")
 }
 
 fn is_test_dir(path: &Path) -> bool {
-    path.file_name().and_then(|v| v.to_str()).is_some_and(|name| matches!(name, "test" | "tests" | "spec" | "__tests__"))
+    path.file_name()
+        .and_then(|v| v.to_str())
+        .is_some_and(|name| matches!(name, "test" | "tests" | "spec" | "__tests__"))
 }
 
 fn is_test_file(file_name: &str, path: &Path) -> bool {
-    file_name.contains(".test.") || file_name.contains(".spec.") || file_name.starts_with("test_") || file_name.ends_with("_test.py") || file_name.ends_with("_test.go") || is_test_dir(path.parent().unwrap_or(Path::new("")))
+    file_name.contains(".test.")
+        || file_name.contains(".spec.")
+        || file_name.starts_with("test_")
+        || file_name.ends_with("_test.py")
+        || file_name.ends_with("_test.go")
+        || is_test_dir(path.parent().unwrap_or(Path::new("")))
 }

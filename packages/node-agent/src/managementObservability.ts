@@ -18,6 +18,8 @@ const TELEMETRY_RECORD_FIELDS = [
   'history_lock_wait_ms', 'session_registry_wait_ms', 'actual_wait_ms', 'snapshot_ms',
   'resource_lock_wait_ms', 'operation_lock_wait_ms', 'batch_queue_wait_ms',
   'phase_preflight_ms', 'phase_plan_ms', 'phase_commit_ms', 'phase_total_ms',
+  'phase_baseline_capture_ms', 'phase_error_enrichment_ms', 'phase_harness_begin_ms',
+  'phase_dispatch_ms', 'phase_harness_finish_ms', 'phase_serialization_ms',
   'failure_signature', 'repeat_failure_count', 'repeated_failure', 'retry_without_change',
   'request_json_bytes', 'response_json_bytes', 'response_bytes', 'status',
   'termination_reason', 'exit_code', 'verification_ok', 'process_timed_out',

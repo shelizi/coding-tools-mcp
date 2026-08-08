@@ -122,16 +122,17 @@ test('baseline follows Git ignore rules and does not descend into linked worktre
   assert.equal(status.writable, true);
 });
 
-test('non-ignored untracked files remain protected by the baseline', async () => {
+test('non-ignored untracked file drift remains visible without blocking writes', async () => {
   const state = await fixture();
   await writeFile(path.join(state.root, 'notes.txt'), 'before\n');
-  const started = await callTool(state.ctx, 'start_task', { objective: 'Protect untracked files' }, state.meta);
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Track untracked files' }, state.meta);
   assert.equal(started.task.baseline.entries.some(entry => entry.path === 'notes.txt'), true);
 
   await writeFile(path.join(state.root, 'notes.txt'), 'after\n');
   const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
   assert.equal(status.baseline_matches, false);
-  assert.equal(status.writable, false);
+  assert.equal(status.writable, true);
+  assert.equal(status.capabilities.write.status, 'available');
 });
 
 test('project_state computes clean from the complete file set before max_files truncation', async () => {
@@ -186,18 +187,18 @@ test('task_context trims a production-sized baseline without quadratic work', { 
   assert.ok(elapsedMs < 5_000, `large task_context took ${elapsedMs}ms`);
 });
 
-test('external changes block real writes while dry runs remain available', async () => {
+test('external changes remain writable and are adopted before real writes', async () => {
   const state = await fixture();
-  const started = await callTool(state.ctx, 'start_task', { objective: 'Protect active task' }, state.meta);
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Track active task' }, state.meta);
   assert.equal(started.ok, true);
   await writeFile(path.join(state.root, 'tracked.txt'), 'external\n');
   const externalHash = sha256('external\n');
 
   const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
   assert.equal(status.baseline_matches, false);
-  assert.equal(status.writable, false);
-  assert.equal(status.capabilities.write.status, 'denied');
-  assert.deepEqual(status.next_actions.slice(0, 3), ['project_state', 'git_diff', 'refresh_baseline']);
+  assert.equal(status.writable, true);
+  assert.equal(status.capabilities.write.status, 'available');
+  assert.deepEqual(status.next_actions.slice(0, 2), ['project_state', 'git_diff']);
 
   const dryRun = await callTool(state.ctx, 'edit_file', {
     path: 'tracked.txt',
@@ -208,34 +209,32 @@ test('external changes block real writes while dry runs remain available', async
   assert.equal(dryRun.ok, true);
   assert.equal(dryRun.applied, false);
 
-  const blocked = await callTool(state.ctx, 'edit_file', {
+  const applied = await callTool(state.ctx, 'edit_file', {
     path: 'tracked.txt',
     expected_sha256: externalHash,
-    edits: [{ type: 'replace', old_text: 'external\n', new_text: 'blocked\n' }]
+    edits: [{ type: 'replace', old_text: 'external\n', new_text: 'applied\n' }]
   }, state.meta);
-  assert.equal(blocked.ok, false);
-  assert.equal(blocked.error.code, 'FILE_CHANGED_EXTERNALLY');
-  assert.equal(blocked.error.category, 'permission');
-  assert.equal(blocked.error.retryable, false);
-  assert.equal(blocked.harness.baseline_matches, false);
-  assert.equal(await readFile(path.join(state.root, 'tracked.txt'), 'utf8'), 'external\n');
+  assert.equal(applied.ok, true);
+  assert.equal(await readFile(path.join(state.root, 'tracked.txt'), 'utf8'), 'applied\n');
+  const adoptedStatus = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(adoptedStatus.baseline_matches, true);
+  assert.equal(adoptedStatus.writable, true);
 });
 
-test('branch or HEAD changes return BASELINE_STALE before starting a process', async () => {
+test('branch or HEAD changes are adopted before starting a process', async () => {
   const state = await fixture();
-  await callTool(state.ctx, 'start_task', { objective: 'Keep Git baseline' }, state.meta);
+  await callTool(state.ctx, 'start_task', { objective: 'Track Git baseline' }, state.meta);
   await git(state.root, 'checkout', '-b', 'external-branch');
 
-  const blocked = await callTool(state.ctx, 'exec_command', {
+  const result = await callTool(state.ctx, 'exec_command', {
     program: 'git',
     args: ['status'],
     yield_time_ms: 30_000
   }, state.meta);
-  assert.equal(blocked.ok, false);
-  assert.equal(blocked.error.code, 'BASELINE_STALE');
-  assert.equal(blocked.error.retryable, false);
-  assert.equal(blocked.harness.baseline_matches, false);
-  assert.equal(blocked.session_id, undefined);
+  assert.equal(result.ok, true);
+  const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(status.baseline_matches, true);
+  assert.equal(status.writable, true);
 });
 
 test('successful tracked mutations refresh expected state and persist change evidence', async () => {
@@ -280,11 +279,11 @@ test('successful tracked mutations refresh expected state and persist change evi
 
   const log = await callTool(state.ctx, 'operation_log', { cursor: 0, limit: 100 }, state.meta);
   const editRows = log.operations.filter(row => row.tool === 'edit');
-  assert.deepEqual(editRows.map(row => row.kind), ['started', 'completed']);
+  assert.deepEqual(editRows.map(row => row.kind), ['completed', 'started']);
   assert.equal(editRows[0].id, editRows[1].id);
-  assert.equal(editRows[1].task_id, taskId);
-  assert.deepEqual(editRows[1].affected_files, []);
-  assert.deepEqual(editRows[1].result_summary.affected_files, edited.affected_files);
+  assert.equal(editRows[0].task_id, taskId);
+  assert.deepEqual(editRows[0].affected_files, []);
+  assert.deepEqual(editRows[0].result_summary.affected_files, edited.affected_files);
 });
 
 test('finish_task summary persists an immutable change selected by change_id', async () => {
@@ -415,7 +414,7 @@ test('operation logs persist bounded execution diagnostics without raw process p
   const operationIds = [executed.harness_operation_id, reattached.harness_operation_id];
   for (const operationId of operationIds) {
     const correlated = log.operations.filter(row => row.id === operationId);
-    assert.deepEqual(correlated.map(row => row.kind), ['started', 'failed']);
+    assert.deepEqual(correlated.map(row => row.kind), ['failed', 'started']);
   }
   const terminal = log.operations.find(row => row.id === executed.harness_operation_id && row.kind === 'failed');
   assert.ok(terminal, JSON.stringify(log));
@@ -506,6 +505,60 @@ test('operation logs are isolated per workspace and survive Agent restart', asyn
     workspaceDirs.filter(entry => entry.isDirectory()).map(entry => entry.name).sort(),
     [alphaWorkspaceId, betaWorkspaceId].sort()
   );
+});
+
+test('active task conflicts are state-aware and use lightweight error enrichment', async () => {
+  const state = await fixture();
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Keep active task' }, state.meta);
+  assert.ok(Number(started.phase_durations_ms.baseline_capture_ms) >= 0);
+  assert.ok(Number(started.phase_durations_ms.dispatch_ms) >= 0);
+  assert.ok(Number(started.phase_durations_ms.serialization_ms) >= 0);
+  await writeFile(path.join(state.root, 'tracked.txt'), 'external\n');
+
+  const duplicate = await callTool(state.ctx, 'start_task', { objective: 'Duplicate task' }, state.meta);
+  assert.equal(duplicate.ok, false);
+  assert.equal(duplicate.error.code, 'TASK_ALREADY_ACTIVE');
+  assert.equal(duplicate.error.retryable, false);
+  assert.equal(duplicate.error.details.retry_mode, 'after_state_change');
+  assert.equal(duplicate.error.details.active_task_id, started.task.id);
+  assert.equal(duplicate.error.details.recovery_actions[0].tool, 'task_context');
+  assert.equal(duplicate.harness.baseline_check_performed, false);
+  assert.equal(duplicate.harness.baseline_matches, null);
+  assert.equal(duplicate.phase_durations_ms.harness_begin_ms, undefined);
+  assert.ok(Number(duplicate.phase_durations_ms.dispatch_ms) >= 0);
+  assert.ok(Number(duplicate.phase_durations_ms.error_enrichment_ms) >= 0);
+  assert.equal(duplicate.phase_durations_ms.baseline_capture_ms, undefined);
+  assert.ok(Number(duplicate.phase_durations_ms.serialization_ms) >= 0);
+});
+
+test('disabling automatic baseline checks keeps task evidence without adopting external drift', async () => {
+  const state = await fixture();
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Track without automatic baseline scans' }, state.meta);
+  const originalFingerprint = started.task.expected_fingerprint;
+  state.ctx.config.securityPolicy.enforceHarnessBaseline = false;
+  await writeFile(path.join(state.root, 'tracked.txt'), 'external\n');
+
+  const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(status.baseline_check_enabled, false);
+  assert.equal(status.baseline_check_performed, false);
+  assert.equal(status.baseline_matches, null);
+
+  const edited = await callTool(state.ctx, 'edit_file', {
+    path: 'tracked.txt',
+    expected_sha256: sha256('external\n'),
+    edits: [{ type: 'replace', old_text: 'external\n', new_text: 'changed\n' }]
+  }, state.meta);
+  assert.equal(edited.ok, true);
+  assert.equal(edited.phase_durations_ms.baseline_capture_ms, undefined);
+  assert.ok(Number(edited.phase_durations_ms.harness_begin_ms) >= 0);
+  assert.ok(Number(edited.phase_durations_ms.dispatch_ms) >= 0);
+  assert.ok(Number(edited.phase_durations_ms.harness_finish_ms) >= 0);
+  assert.ok(Number(edited.phase_durations_ms.serialization_ms) >= 0);
+  const context = await callTool(state.ctx, 'task_context', { task_id: started.task.id }, state.meta);
+  assert.equal(context.task.expected_fingerprint, originalFingerprint);
+  assert.ok(context.events.some(item => item.kind === 'operation_started' && item.tool_name === 'edit'));
+  const startedEvent = context.events.find(item => item.kind === 'operation_started' && item.tool_name === 'edit');
+  assert.equal(startedEvent.result_summary.baseline_check_performed, false);
 });
 
 test('exec_many remains outside the Rust write-baseline gate', async () => {

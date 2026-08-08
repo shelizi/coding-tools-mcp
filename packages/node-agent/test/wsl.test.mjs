@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { normalizeConfig } from '../dist/config.js';
 import { formatterExecutableCandidates, formatterLaunchSpec } from '../dist/formatterTools.js';
 import { defaultPolicy, resolveCommandSpec, validateToolPolicy } from '../dist/policy.js';
+import { normalizeSecurityPolicy } from '../dist/securityPolicy.js';
 import { runBuffered } from '../dist/processes.js';
 import { relativeInside, resolveInside, rootAndCwd } from '../dist/workspace.js';
 import {
@@ -15,11 +16,16 @@ const ROOT = String.raw`\\wsl.localhost\Ubuntu-24.04\opt\src\Sample Project`;
 
 function context() {
   return {
-    config: {
+    config: normalizeConfig({
       permissionMode: 'trusted',
+      toolProfile: 'core',
       policy: defaultPolicy(),
+      securityPolicy: normalizeSecurityPolicy(undefined, 'trusted', 'core'),
       folders: [{ id: 'repo', name: 'Repo', path: ROOT }]
-    },
+    }, {
+      oauthPassword: 'wsl-test-password',
+      oauthTokenSecret: 'wsl-test-token-secret-that-is-long-enough'
+    }, {}),
     selections: new Map([['wsl-test', 'repo']]),
     defaultCwds: new Map()
   };

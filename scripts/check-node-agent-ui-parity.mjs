@@ -151,7 +151,7 @@ export async function validateUiParity(root = workspace) {
   requireText(errors, source.managementTest, 'management health validators reject incomplete local metadata contracts', 'health contract validation test');
   requireText(errors, source.managementTest, 'mcpChallenge?.status', 'active MCP OAuth challenge regression');
   requireText(errors, source.harnessTest, 'operation logs persist bounded execution diagnostics without raw process payloads', 'persisted operation diagnostics regression');
-  for (const marker of ["yield_time_ms: 0", "['started', 'failed']"]) {
+  for (const marker of ["yield_time_ms: 0", "['failed', 'started']"]) {
     requireText(errors, source.harnessTest, marker, 'async process terminal correlation regression');
   }
   for (const marker of ['TELEMETRY_COMMAND_SECRET', 'OP_LOG_REASON_MARKER', 'OP_LOG_COMMAND_MARKER', 'OP_LOG_MULTILINE_TAIL', 'OPERATION_COMMAND_SECRET', 'COMMAND_FAILED', "status: 'running'", 'process_exit_code', 'warning_count', 'HISTORY_SESSION_KEY_SECRET', 'HISTORY_PATH_OUTSIDE_WORKSPACE', "host: 'localhost:9'", 'globalBlockingConcurrency', 'workspaceLocalEntries']) {

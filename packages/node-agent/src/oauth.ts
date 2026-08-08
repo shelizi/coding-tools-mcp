@@ -185,10 +185,10 @@ function tokenError(error: string, description: string): TokenResponse {
 }
 
 export class OAuthRuntime {
-  readonly clientId: string;
-  readonly clientSecret?: string;
-  readonly password: string;
-  readonly tokenSecret: string;
+  clientId: string;
+  clientSecret?: string;
+  password: string;
+  tokenSecret: string;
   readonly #pending = new Map<string, PendingCode>();
   readonly #now: () => number;
 
@@ -199,6 +199,15 @@ export class OAuthRuntime {
     this.password = requireConfiguredSecret(config.password, 'OAuth password');
     this.tokenSecret = requireConfiguredSecret(config.tokenSecret, 'OAuth token secret');
     this.#now = now;
+  }
+
+  update(config: AgentConfig['oauth']): void {
+    const replacement = new OAuthRuntime(config, this.#now);
+    this.clientId = replacement.clientId;
+    this.clientSecret = replacement.clientSecret;
+    this.password = replacement.password;
+    this.tokenSecret = replacement.tokenSecret;
+    this.#pending.clear();
   }
 
   clientIdAllowed(clientId: string): boolean {

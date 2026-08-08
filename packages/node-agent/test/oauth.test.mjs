@@ -104,6 +104,28 @@ test('OAuthRuntime rejects missing credentials and ignores blank optional client
   assert.equal(new OAuthRuntime(oauthConfig({ clientSecret: ' ' })).clientSecret, undefined);
 });
 
+test('OAuthRuntime updates credentials and clears pending authorization codes', () => {
+  const base = 'https://public.example/builtin/clients/oauth-test';
+  const runtime = new OAuthRuntime(oauthConfig({ clientSecret: 'old-client-secret' }));
+  const authorized = runtime.authorizeSubmit(authorizationForm('before-rotation'), base);
+  const code = new URL(authorized.location).searchParams.get('code');
+  assert.ok(code);
+
+  runtime.update(oauthConfig({
+    password: 'rotated-password',
+    clientSecret: 'rotated-client-secret'
+  }));
+  assert.equal(runtime.password, 'rotated-password');
+  assert.equal(runtime.clientSecret, 'rotated-client-secret');
+
+  const form = tokenForm(code);
+  form.set('client_secret', 'rotated-client-secret');
+  assert.deepEqual(runtime.exchangeToken(form, {}, base).body, {
+    error: 'invalid_grant',
+    error_description: 'Unknown or already-used authorization code'
+  });
+});
+
 test('issuing a new code removes expired pending codes like Rust', () => {
   let now = 0;
   const base = 'https://public.example/builtin/clients/oauth-test';

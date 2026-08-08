@@ -14,6 +14,10 @@ import { createAgentRuntime, createAgentServer } from '../dist/server.js';
 import { startAndYield, waitForSession } from '../dist/processes.js';
 import { AGENT_VERSION } from '../dist/version.js';
 
+// Test config documents own their temporary dataDir/port. Do not inherit developer-machine overrides.
+delete process.env.CTMCP_DATA_DIR;
+delete process.env.CTMCP_PORT;
+
 function document(root, dataDir) {
   return {
     host: '127.0.0.1',
@@ -58,6 +62,19 @@ function editable(config, overrides = {}) {
 
 function managementToken(html) {
   return html.match(/name="ctmcp-admin-token" content="([A-Za-z0-9_-]+)"/)?.[1];
+}
+
+async function withoutEnvironmentOverrides(keys, callback) {
+  const previous = new Map(keys.map(key => [key, process.env[key]]));
+  for (const key of keys) delete process.env[key];
+  try {
+    return await callback();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 }
 
 let managementPortSequence = 0;
@@ -116,10 +133,32 @@ async function startManagementServer(t) {
   const loaded = await loadConfigBundle(configPath);
   loaded.config.port = 0;
   const store = new ConfigStore(loaded);
-  const runtime = await createAgentRuntime(loaded.config, { configStore: store });
+  const runtimeRegistry = new Map();
+  const runtime = await createAgentRuntime(loaded.config, { configStore: store, runtimeRegistry });
+  const tunnelReconfigurations = [];
+  const workspaceId = loaded.config.workspaceId ?? runtime.context.workspaceProfileId;
+  const runtimeRecord = runtimeRegistry.get(workspaceId);
+  if (runtimeRecord) {
+    runtimeRecord.tunnel = {
+      async reconfigure(tunnel, publicBaseUrl) {
+        tunnelReconfigurations.push({
+          tunnel: tunnel ? structuredClone(tunnel) : undefined,
+          publicBaseUrl
+        });
+        if (tunnel) runtime.context.config.tunnel = structuredClone(tunnel);
+        else delete runtime.context.config.tunnel;
+        if (publicBaseUrl) runtime.context.config.publicBaseUrl = publicBaseUrl;
+        else delete runtime.context.config.publicBaseUrl;
+      }
+    };
+  }
   const port = await listenOnFetchSafePort(runtime.server);
   t.after(() => new Promise(resolve => runtime.server.close(resolve)));
-  return { root, dataDir, configPath, loaded, store, context: runtime.context, base: `http://127.0.0.1:${port}` };
+  return {
+    root, dataDir, configPath, loaded, store, context: runtime.context,
+    oauth: runtime.oauth, runtimeRegistry, tunnelReconfigurations,
+    base: `http://127.0.0.1:${port}`
+  };
 }
 
 test('management UI is loopback-only, token protected and never returns configured secrets', async t => {
@@ -153,6 +192,7 @@ test('management UI is loopback-only, token protected and never returns configur
   const script = await scriptResponse.text();
   assert.match(script, /命令 Sessions/);
   assert.match(script, /React 管理介面/);
+  assert.match(script, /選擇 Workspace 資料夾/);
   assert.doesNotMatch(script, new RegExp(token));
   assert.equal(styleResponse.status, 200);
   assert.match(styleResponse.headers.get('content-type'), /text\/css/);
@@ -210,8 +250,335 @@ test('management UI is loopback-only, token protected and never returns configur
   const status = await statusResponse.json();
   assert.equal(status.configuredToolProfile, 'core');
   assert.equal(status.toolProfile, 'trusted-core');
-  assert.equal(status.tools, 34);
+  assert.equal(status.tools, 35);
   assert.match(status.toolsetRevision, /^[0-9a-f]{16}$/);
+});
+
+test('management folder picker lists directories without exposing files', async t => {
+  const runtime = await startManagementServer(t);
+  const childA = path.join(runtime.root, 'child-a');
+  const childB = path.join(runtime.root, 'child-b');
+  await Promise.all([
+    mkdir(childA),
+    mkdir(childB),
+    writeFile(path.join(runtime.root, 'not-a-directory.txt'), 'hidden from picker\n')
+  ]);
+
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(pageHtml);
+  assert.ok(token);
+  const headers = { 'x-ctmcp-admin-token': token, origin: runtime.base };
+  const workspaceId = runtime.context.config.workspaceId ?? runtime.context.workspaceProfileId;
+  const response = await fetch(`${runtime.base}/admin/api/directories?workspaceId=${encodeURIComponent(workspaceId)}&path=${encodeURIComponent(runtime.root)}`, { headers });
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.ok, true);
+  assert.equal(payload.path, path.normalize(runtime.root));
+  assert.equal(payload.parent, path.dirname(path.normalize(runtime.root)));
+  assert.deepEqual(payload.directories.map(entry => entry.name), ['child-a', 'child-b']);
+  assert.deepEqual(payload.directories.map(entry => entry.path), [childA, childB]);
+  assert.equal(payload.totalDirectories, 2);
+  assert.equal(payload.truncated, false);
+  assert.ok(payload.roots.includes(path.parse(runtime.root).root));
+
+  const unknownWorkspaceResponse = await fetch(`${runtime.base}/admin/api/directories?workspaceId=missing-workspace`, { headers });
+  assert.equal(unknownWorkspaceResponse.status, 404);
+  assert.equal((await unknownWorkspaceResponse.json()).error.code, 'WORKSPACE_NOT_FOUND');
+
+  const fileResponse = await fetch(`${runtime.base}/admin/api/directories?path=${encodeURIComponent(path.join(runtime.root, 'not-a-directory.txt'))}`, { headers });
+  assert.equal(fileResponse.status, 400);
+  assert.equal((await fileResponse.json()).error.code, 'DIRECTORY_BROWSE_FAILED');
+
+  const missingResponse = await fetch(`${runtime.base}/admin/api/directories?path=${encodeURIComponent(path.join(runtime.root, 'missing'))}`, { headers });
+  assert.equal(missingResponse.status, 404);
+  assert.equal((await missingResponse.json()).error.code, 'DIRECTORY_BROWSE_FAILED');
+});
+
+
+test('management hot-applies idle workspace folder changes without restart', async t => {
+  const runtime = await startManagementServer(t);
+  const nextRoot = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-hot-root-'));
+  t.after(() => rm(nextRoot, { recursive: true, force: true }));
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(pageHtml);
+  assert.ok(token);
+
+  runtime.loaded.config.port = runtime.loaded.document.port;
+  runtime.context.config.port = runtime.loaded.document.port;
+  const previousWorkspaceOverride = process.env.CTMCP_WORKSPACES;
+  delete process.env.CTMCP_WORKSPACES;
+  try {
+    const response = await fetch(`${runtime.base}/admin/api/config`, {
+      method: 'PUT',
+      headers: {
+        'x-ctmcp-admin-token': token,
+        'content-type': 'application/json',
+        origin: runtime.base
+      },
+      body: JSON.stringify(editable(runtime.loaded.config, {
+        folders: [{ id: 'repo', name: 'Hot root', path: nextRoot }]
+      }))
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    const canonicalRoot = await realpath(nextRoot);
+    assert.equal(result.restartRequired, false);
+    assert.deepEqual(result.appliedImmediately, ['folders']);
+    assert.equal(result.hotApplyDeferredReason, null);
+    assert.equal(runtime.loaded.config.folders[0].path, canonicalRoot);
+    assert.equal(runtime.context.config.folders[0].path, canonicalRoot);
+    assert.equal(runtime.context.folderRuntimes.get('repo')?.workspacePath, canonicalRoot);
+
+    const snapshot = await fetch(`${runtime.base}/admin/api/config`, {
+      headers: { 'x-ctmcp-admin-token': token }
+    }).then(item => item.json());
+    assert.equal(snapshot.restartRequired, false);
+    assert.equal(snapshot.effective.folders[0].path, canonicalRoot);
+  } finally {
+    if (previousWorkspaceOverride === undefined) delete process.env.CTMCP_WORKSPACES;
+    else process.env.CTMCP_WORKSPACES = previousWorkspaceOverride;
+  }
+});
+
+test('management hot-applies policy and live limits without restart', async t => {
+  const runtime = await startManagementServer(t);
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(pageHtml);
+  assert.ok(token);
+  runtime.loaded.config.port = runtime.loaded.document.port;
+  runtime.context.config.port = runtime.loaded.document.port;
+
+  await withoutEnvironmentOverrides([
+    'CTMCP_WORKSPACES', 'CTMCP_ALLOWED_COMMANDS', 'CTMCP_WORKSPACE_LOCAL_ENTRIES',
+    'CTMCP_WORKSPACE_SCRIPT_EXTENSIONS', 'CTMCP_MAX_PATCH_BYTES',
+    'CTMCP_ACTIVE_SESSION_LIMIT', 'CTMCP_MAX_OUTPUT_BYTES', 'CTMCP_COMMAND_TIMEOUT_MAX_MS',
+    'CTMCP_BLOCKING_CONCURRENCY', 'CTMCP_PROCESS_CONCURRENCY',
+    'CTMCP_GLOBAL_BLOCKING_CONCURRENCY', 'CTMCP_GLOBAL_PROCESS_CONCURRENCY'
+  ], async () => {
+    const policy = {
+      ...runtime.loaded.config.policy,
+      allowedCommands: [...runtime.loaded.config.policy.allowedCommands, 'hot-apply-test-command'],
+      workspaceLocalEntries: !runtime.loaded.config.policy.workspaceLocalEntries,
+      maxPatchBytes: runtime.loaded.config.policy.maxPatchBytes + 1
+    };
+    const limits = {
+      ...runtime.loaded.config.limits,
+      blockingConcurrency: runtime.loaded.config.limits.blockingConcurrency + 1,
+      processConcurrency: runtime.loaded.config.limits.processConcurrency + 1,
+      globalBlockingConcurrency: runtime.loaded.config.limits.globalBlockingConcurrency + 1,
+      globalProcessConcurrency: runtime.loaded.config.limits.globalProcessConcurrency + 1,
+      activeSessionLimit: runtime.loaded.config.limits.activeSessionLimit + 1,
+      maxOutputBytes: runtime.loaded.config.limits.maxOutputBytes + 1_024,
+      commandTimeoutMaxMs: Math.min(runtime.loaded.config.limits.commandTimeoutMaxMs + 60_000, 3_600_000)
+    };
+    const response = await fetch(`${runtime.base}/admin/api/config`, {
+      method: 'PUT',
+      headers: {
+        'x-ctmcp-admin-token': token,
+        'content-type': 'application/json',
+        origin: runtime.base
+      },
+      body: JSON.stringify(editable(runtime.loaded.config, { policy, limits }))
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.restartRequired, false);
+    assert.deepEqual([...result.appliedImmediately].sort(), [
+      'limits.activeSessionLimit', 'limits.blockingConcurrency',
+      'limits.commandTimeoutMaxMs', 'limits.globalBlockingConcurrency', 'limits.globalProcessConcurrency',
+      'limits.maxOutputBytes', 'limits.processConcurrency', 'policy'
+    ]);
+    assert.deepEqual(runtime.loaded.config.policy, policy);
+    assert.deepEqual(runtime.context.config.policy, policy);
+    assert.equal(runtime.loaded.config.limits.activeSessionLimit, limits.activeSessionLimit);
+    assert.equal(runtime.context.config.limits.activeSessionLimit, limits.activeSessionLimit);
+    assert.equal(runtime.loaded.config.limits.maxOutputBytes, limits.maxOutputBytes);
+    assert.equal(runtime.context.config.limits.maxOutputBytes, limits.maxOutputBytes);
+    assert.equal(runtime.loaded.config.limits.commandTimeoutMaxMs, limits.commandTimeoutMaxMs);
+    assert.equal(runtime.context.config.limits.commandTimeoutMaxMs, limits.commandTimeoutMaxMs);
+    assert.equal(runtime.context.folderRuntimes.get('repo')?.admission.blocking.limit, limits.blockingConcurrency);
+    assert.equal(runtime.context.folderRuntimes.get('repo')?.admission.process.limit, limits.processConcurrency);
+    assert.equal(runtime.context.hubAdmission.blocking.limit, limits.globalBlockingConcurrency);
+    assert.equal(runtime.context.hubAdmission.process.limit, limits.globalProcessConcurrency);
+  });
+});
+
+test('management hot-applies OAuth credentials without restart', async t => {
+  const runtime = await startManagementServer(t);
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(pageHtml);
+  assert.ok(token);
+  runtime.loaded.config.port = runtime.loaded.document.port;
+  runtime.context.config.port = runtime.loaded.document.port;
+
+  await withoutEnvironmentOverrides([
+    'CTMCP_WORKSPACES', 'CTMCP_OAUTH_CLIENT_ID', 'CTMCP_OAUTH_CLIENT_SECRET',
+    'CTMCP_OAUTH_PASSWORD', 'CTMCP_OAUTH_TOKEN_SECRET'
+  ], async () => {
+    const oauth = {
+      clientId: 'chatgpt-rotated',
+      password: 'rotated-management-password',
+      clientSecret: 'rotated-management-client-secret',
+      clearClientSecret: false
+    };
+    const response = await fetch(`${runtime.base}/admin/api/config`, {
+      method: 'PUT',
+      headers: {
+        'x-ctmcp-admin-token': token,
+        'content-type': 'application/json',
+        origin: runtime.base
+      },
+      body: JSON.stringify(editable(runtime.loaded.config, { oauth }))
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.restartRequired, false);
+    assert.deepEqual(result.appliedImmediately, ['oauth']);
+    assert.equal(runtime.oauth.clientId, oauth.clientId);
+    assert.equal(runtime.oauth.password, oauth.password);
+    assert.equal(runtime.oauth.clientSecret, oauth.clientSecret);
+    assert.equal(runtime.context.config.oauth.clientId, oauth.clientId);
+    assert.equal(runtime.loaded.config.oauth.clientId, oauth.clientId);
+  });
+});
+
+test('management hot-applies tunnel configuration through the runtime controller', async t => {
+  const runtime = await startManagementServer(t);
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(pageHtml);
+  assert.ok(token);
+  runtime.loaded.config.port = runtime.loaded.document.port;
+  runtime.context.config.port = runtime.loaded.document.port;
+
+  await withoutEnvironmentOverrides([
+    'CTMCP_WORKSPACES', 'CTMCP_PUBLIC_BASE_URL', 'CTMCP_BUILTIN_ENABLED',
+    'CTMCP_BUILTIN_PUBLIC_URL', 'CTMCP_BUILTIN_ENROLLMENT_URL'
+  ], async () => {
+    const publicBaseUrl = 'https://tunnel.example/builtin/clients/device_1';
+    const tunnel = {
+      enabled: true,
+      publicUrl: `${publicBaseUrl}/mcp`,
+      enrollmentUrl: '',
+      clearEnrollmentUrl: false
+    };
+    const response = await fetch(`${runtime.base}/admin/api/config`, {
+      method: 'PUT',
+      headers: {
+        'x-ctmcp-admin-token': token,
+        'content-type': 'application/json',
+        origin: runtime.base
+      },
+      body: JSON.stringify(editable(runtime.loaded.config, { publicBaseUrl, tunnel }))
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.restartRequired, false);
+    assert.deepEqual(result.appliedImmediately, ['tunnel']);
+    assert.equal(runtime.tunnelReconfigurations.length, 1);
+    assert.equal(runtime.tunnelReconfigurations[0].publicBaseUrl, publicBaseUrl);
+    assert.equal(runtime.tunnelReconfigurations[0].tunnel.enabled, true);
+    assert.equal(runtime.tunnelReconfigurations[0].tunnel.publicUrl, `${publicBaseUrl}/mcp`);
+    assert.equal(runtime.tunnelReconfigurations[0].tunnel.enrollmentUrl, undefined);
+    assert.match(runtime.tunnelReconfigurations[0].tunnel.stateFile, /builtin-tunnel-identity\.enc\.json$/);
+    assert.equal(runtime.context.config.tunnel.publicUrl, `${publicBaseUrl}/mcp`);
+    assert.equal(runtime.loaded.config.tunnel.publicUrl, `${publicBaseUrl}/mcp`);
+    assert.equal(runtime.loaded.config.publicBaseUrl, publicBaseUrl);
+  });
+});
+
+test('management defers a busy concurrency lane without replacing its semaphore', async t => {
+  const runtime = await startManagementServer(t);
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(pageHtml);
+  assert.ok(token);
+  runtime.loaded.config.port = runtime.loaded.document.port;
+  runtime.context.config.port = runtime.loaded.document.port;
+
+  await withoutEnvironmentOverrides([
+    'CTMCP_WORKSPACES', 'CTMCP_GLOBAL_PROCESS_CONCURRENCY'
+  ], async () => {
+    const previousLimit = runtime.context.hubAdmission.process.limit;
+    const release = await runtime.context.hubAdmission.process.acquire();
+    try {
+      const limits = {
+        ...runtime.loaded.config.limits,
+        globalProcessConcurrency: previousLimit + 1
+      };
+      const response = await fetch(`${runtime.base}/admin/api/config`, {
+        method: 'PUT',
+        headers: {
+          'x-ctmcp-admin-token': token,
+          'content-type': 'application/json',
+          origin: runtime.base
+        },
+        body: JSON.stringify(editable(runtime.loaded.config, { limits }))
+      });
+      assert.equal(response.status, 200);
+      const result = await response.json();
+      assert.equal(result.restartRequired, true);
+      assert.deepEqual(result.appliedImmediately, []);
+      assert.match(result.hotApplyDeferredReason, /globalProcessConcurrency/);
+      assert.equal(runtime.context.hubAdmission.process.limit, previousLimit);
+      assert.equal(runtime.context.config.limits.globalProcessConcurrency, previousLimit);
+    } finally {
+      release();
+    }
+  });
+});
+
+test('management hot-applies security policy telemetry and tool catalog changes', async t => {
+  const runtime = await startManagementServer(t);
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(pageHtml);
+  assert.ok(token);
+  runtime.loaded.config.port = runtime.loaded.document.port;
+  runtime.context.config.port = runtime.loaded.document.port;
+
+  await withoutEnvironmentOverrides([
+    'CTMCP_WORKSPACES', 'CTMCP_PERMISSION_MODE', 'CTMCP_TOOL_PROFILE'
+  ], async () => {
+    const securityPolicy = {
+      ...runtime.loaded.config.securityPolicy,
+      requireShellConfirmation: !runtime.loaded.config.securityPolicy.requireShellConfirmation,
+      redactTelemetry: !runtime.loaded.config.securityPolicy.redactTelemetry,
+      enforceHarnessBaseline: false
+    };
+    const safeResponse = await fetch(`${runtime.base}/admin/api/config`, {
+      method: 'PUT',
+      headers: {
+        'x-ctmcp-admin-token': token,
+        'content-type': 'application/json',
+        origin: runtime.base
+      },
+      body: JSON.stringify(editable(runtime.loaded.config, { securityPolicy }))
+    });
+    assert.equal(safeResponse.status, 200);
+    const safeResult = await safeResponse.json();
+    assert.equal(safeResult.restartRequired, false);
+    assert.deepEqual(safeResult.appliedImmediately, ['securityPolicy']);
+    assert.deepEqual(runtime.context.config.securityPolicy, securityPolicy);
+    assert.equal(runtime.context.config.securityPolicyCustomized, true);
+    assert.equal(runtime.context.usageStore.redactTelemetry, securityPolicy.redactTelemetry);
+    const reloaded = await loadConfigBundle(runtime.configPath);
+    assert.equal(reloaded.config.securityPolicy.enforceHarnessBaseline, false);
+
+    const catalogChangingPolicy = { ...securityPolicy, restrictToolCatalog: false };
+    const deferredResponse = await fetch(`${runtime.base}/admin/api/config`, {
+      method: 'PUT',
+      headers: {
+        'x-ctmcp-admin-token': token,
+        'content-type': 'application/json',
+        origin: runtime.base
+      },
+      body: JSON.stringify(editable(runtime.loaded.config, { securityPolicy: catalogChangingPolicy }))
+    });
+    assert.equal(deferredResponse.status, 200);
+    const deferredResult = await deferredResponse.json();
+    assert.equal(deferredResult.restartRequired, false);
+    assert.deepEqual(deferredResult.appliedImmediately, ['securityPolicy', 'toolCatalog']);
+    assert.equal(runtime.context.config.securityPolicy.restrictToolCatalog, false);
+    assert.equal(runtime.context.config.activeToolProfile, 'advanced');
+  });
 });
 
 test('management core is separated from the React UI implementation', async () => {
@@ -227,7 +594,7 @@ test('management core is separated from the React UI implementation', async () =
   assert.match(appSource, /react-bootstrap/);
   assert.match(appSource, /useAgentQueries/);
   assert.match(formSource, /Workspace 資料夾/);
-  assert.match(formSource, /工具 Profile/);
+  assert.match(formSource, /限制工具清單/);
   assert.doesNotMatch(`${appSource}\n${formSource}`, /dangerouslySetInnerHTML|innerHTML/);
 });
 
@@ -640,7 +1007,7 @@ test('management API atomically saves restart configuration while preserving omi
 
   const payload = editable(runtime.loaded.config, {
     port: 4791,
-    permissionMode: 'guarded',
+    securityPolicy: { ...runtime.loaded.config.securityPolicy, blockNetworkCommands: true },
     folders: [
       { id: 'repo', name: 'Primary', path: path.join(runtime.root, 'nested', '..') },
       { id: 'second', name: 'Second', path: runtime.dataDir }
@@ -821,7 +1188,7 @@ test('management save copies encrypted secrets when the data directory changes',
   assert.equal(restarted.config.oauth.tokenSecret, 'management-test-token-secret-that-is-long-enough');
 });
 
-test('management validates saved tool profiles and reports the permission-resolved profile', async () => {
+test('management derives compatibility permission and tool profiles from security policy', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-profile-root-'));
   const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-profile-data-'));
   const configPath = path.join(dataDir, 'agent.json');
@@ -829,20 +1196,21 @@ test('management validates saved tool profiles and reports the permission-resolv
   const loaded = await loadConfigBundle(configPath);
   const store = new ConfigStore(loaded);
 
-  await assert.rejects(
-    store.save(editable(loaded.config, { toolProfile: 'not-a-profile' })),
-    /toolProfile is invalid/
-  );
-
+  const guardedPolicy = { ...loaded.config.securityPolicy, blockNetworkCommands: true };
   const result = await store.save(editable(loaded.config, {
-    permissionMode: 'guarded',
-    toolProfile: 'core'
+    permissionMode: 'dangerous',
+    toolProfile: 'not-a-profile',
+    securityPolicy: guardedPolicy
   }));
   assert.equal(result.restartRequired, true);
-  assert.equal(result.saved.toolProfile, 'core');
-  assert.equal(result.saved.activeToolProfile, 'guarded-core');
+  assert.equal(result.saved.permissionMode, 'guarded');
+  assert.equal(result.saved.toolProfile, 'trusted-core');
+  assert.equal(result.saved.activeToolProfile, 'trusted-core');
+  assert.deepEqual(result.saved.securityPolicy, guardedPolicy);
   const persisted = JSON.parse(await readFile(configPath, 'utf8'));
-  assert.equal(persisted.toolProfile, 'core');
+  assert.equal(persisted.permissionMode, 'guarded');
+  assert.equal(persisted.toolProfile, 'trusted-core');
+  assert.deepEqual(persisted.securityPolicy, guardedPolicy);
 });
 
 test('management UI can be disabled without disabling the headless server', async t => {

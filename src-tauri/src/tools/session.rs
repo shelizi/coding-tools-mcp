@@ -1807,11 +1807,7 @@ pub async fn wait_command_async(
         .and_then(Value::as_u64)
         .unwrap_or(0)
         .min(30_000);
-    let effective_wait_ms = if heartbeat_ms == 0 {
-        timeout_ms
-    } else {
-        timeout_ms.min(heartbeat_ms.max(1000))
-    };
+    let effective_wait_ms = timeout_ms;
     let until = args
         .get("until")
         .and_then(Value::as_str)
@@ -1834,7 +1830,7 @@ pub async fn wait_command_async(
             .get("process_still_running")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let heartbeat = !changed && heartbeat_ms > 0 && process_still_running;
+        let heartbeat = false;
         let next_cursor = object
             .get("next_cursor")
             .and_then(Value::as_u64)
@@ -1846,10 +1842,7 @@ pub async fn wait_command_async(
         object.insert("actual_wait_ms".into(), json!(actual_wait_ms));
         object.insert("snapshot_ms".into(), json!(snapshot_ms));
         object.insert("heartbeat".into(), Value::Bool(heartbeat));
-        object.insert(
-            "request_timed_out".into(),
-            Value::Bool(!changed && !heartbeat),
-        );
+        object.insert("request_timed_out".into(), Value::Bool(!changed));
         object.insert("wait_timeout_ms".into(), json!(timeout_ms));
         object.insert("effective_wait_ms".into(), json!(effective_wait_ms));
         object.insert("heartbeat_ms".into(), json!(heartbeat_ms));
@@ -1863,7 +1856,6 @@ pub async fn wait_command_async(
                         "session_id": session_id,
                         "cursor": next_cursor,
                         "timeout_ms": timeout_ms,
-                        "heartbeat_ms": if heartbeat_ms == 0 { 10_000 } else { heartbeat_ms },
                         "until": until,
                         "output_mode": "delta"
                     }
@@ -1872,9 +1864,7 @@ pub async fn wait_command_async(
         }
         object.insert(
             "suggestion".into(),
-            json!(if heartbeat {
-                "命令仍在运行；沿用 next_actions 可保持连接活跃且不会重复启动命令"
-            } else if !changed {
+            json!(if !changed {
                 "本次等待没有新事件；沿用 next_actions 继续既有 session，不要重新调用 exec_command"
             } else if process_still_running {
                 "已收到增量输出；沿用 next_actions 继续既有 session"

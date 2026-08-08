@@ -52,13 +52,60 @@ fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         .and_then(Value::as_u64)
         .unwrap_or(50)
         .clamp(1, 200) as usize;
-    let operations = ctx
+    let order = args.get("order").and_then(Value::as_str).unwrap_or("desc");
+    if !matches!(order, "asc" | "desc") {
+        return Err(tool_error("INVALID_ARGUMENT", "order must be asc or desc"));
+    }
+    let tool_filter = args.get("tool").and_then(Value::as_str);
+    let kind_filter = args.get("kind").and_then(Value::as_str);
+    let errors_only = args
+        .get("errors_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let since_ts_ms = args.get("since_ts_ms").and_then(Value::as_u64);
+
+    let mut operations = ctx
         .harness
-        .list_operations(offset, limit)
+        .list_operations(0, usize::MAX)
         .map_err(map_error)?;
+    operations.retain(|operation| {
+        tool_filter.map_or(true, |tool| operation.tool == tool)
+            && kind_filter.map_or(true, |kind| operation.kind == kind)
+            && since_ts_ms.map_or(true, |since| {
+                operation
+                    .created_at
+                    .parse::<u64>()
+                    .is_ok_and(|created_at| created_at >= since)
+            })
+            && (!errors_only
+                || operation.kind == "failed"
+                || operation.result_summary.get("ok").and_then(Value::as_bool) == Some(false))
+    });
+    if order == "desc" {
+        operations.reverse();
+    }
+
+    let total_matching = operations.len();
+    let page = operations
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let next_offset = offset.saturating_add(page.len());
+    let has_more = next_offset < total_matching;
+
     Ok(json!({
-        "operations": operations,
-        "next_cursor": offset + operations.len()
+        "operations": page,
+        "order": order,
+        "filters": {
+            "tool": tool_filter,
+            "kind": kind_filter,
+            "errors_only": errors_only,
+            "since_ts_ms": since_ts_ms
+        },
+        "total_matching": total_matching,
+        "has_more": has_more,
+        "next_cursor": has_more.then_some(next_offset)
     }))
 }
 
@@ -477,6 +524,44 @@ mod tests {
 
     use super::*;
     use crate::harness::model::{BaselineEntry, ProjectBaseline};
+    use crate::tools::ToolContext;
+
+    #[test]
+    fn operation_log_defaults_to_recent_first_and_filters_failures() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context");
+
+        for (id, tool, kind, ok) in [
+            ("one", "git_status", "completed", true),
+            ("two", "exec_command", "failed", false),
+            ("three", "git_commit", "completed", true),
+        ] {
+            ctx.harness
+                .record_operation(
+                    Some(id),
+                    None,
+                    tool,
+                    kind,
+                    json!({"reason": id}),
+                    json!({"ok": ok}),
+                )
+                .expect("record operation");
+        }
+
+        let recent = operation_log(&ctx, &json!({"limit": 2})).expect("recent operation log");
+        let recent = recent["operations"].as_array().expect("recent operations");
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0]["id"], "three");
+        assert_eq!(recent[1]["id"], "two");
+
+        let errors = operation_log(&ctx, &json!({"errors_only": true})).expect("error log");
+        let errors = errors["operations"].as_array().expect("error operations");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["id"], "two");
+    }
 
     #[test]
     fn task_context_trims_large_baseline_without_quadratic_work() {

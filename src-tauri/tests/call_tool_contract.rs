@@ -310,9 +310,9 @@ fn request_permissions_exposes_public_schema_and_grants_in_dangerous_mode() {
         .contains(&json!("network")));
 
     let fx = tiny_js_fixture();
-    let mut ctx = ctx_for(&fx.root);
-    ctx.permission_mode = "dangerous".into();
-    ctx.policy.permission_mode = "dangerous".into();
+    let ctx = ctx_for(&fx.root);
+    let runtime = ctx.runtime_config();
+    ctx.update_runtime_config(runtime.policy, runtime.tool_profile, "dangerous".into());
     let args = json!({
         "tool_name": "exec_command",
         "permission": "network",

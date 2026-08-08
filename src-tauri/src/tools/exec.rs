@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+use coding_tools_command_policy::resolved_command_timeout_ms as resolve_command_timeout_ms;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
@@ -21,6 +22,7 @@ use crate::tools::process_start::{
 use crate::tools::redaction::arguments_reference_sensitive_source;
 use crate::tools::session::{ExecSession, OutputMode, OutputOptions, DETACHED_SESSION_GRACE};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
+use crate::tools::{ABSOLUTE_COMMAND_TIMEOUT_MAX_MS, DEFAULT_COMMAND_TIMEOUT_MAX_MS};
 
 #[derive(Clone, Debug)]
 struct ExecSpec {
@@ -171,6 +173,16 @@ fn is_cargo_command(spec: &ExecSpec) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("cargo"))
         || spec.display.to_ascii_lowercase().contains("cargo ")
         || spec.display.to_ascii_lowercase().contains("tauri build")
+}
+
+fn resolved_command_timeout_ms(args: &Value, spec: &ExecSpec) -> u64 {
+    resolve_command_timeout_ms(
+        args.get("timeout_ms").and_then(Value::as_u64),
+        command_kind(args),
+        &spec.display,
+        DEFAULT_COMMAND_TIMEOUT_MAX_MS,
+        ABSOLUTE_COMMAND_TIMEOUT_MAX_MS,
+    )
 }
 
 fn command_argument_value(args: &[String], name: &str) -> Option<String> {
@@ -366,8 +378,10 @@ pub async fn exec_command_async(ctx: &ToolContext, args: &Value) -> Result<Value
         .unwrap_or("workspace")
         .to_string();
     validate_child_process_scope(ctx, args)?;
-    let spec = resolve_exec_spec(args, &workdir.path, ctx.workspace.root(), &ctx.policy)?;
-    let post_checks = resolve_post_checks(args, &workdir.path, ctx.workspace.root(), &ctx.policy)?;
+    let runtime = ctx.runtime_config();
+    let spec = resolve_exec_spec(args, &workdir.path, ctx.workspace.root(), &runtime.policy)?;
+    let post_checks =
+        resolve_post_checks(args, &workdir.path, ctx.workspace.root(), &runtime.policy)?;
     let output_options = OutputOptions::from_args(args, OutputMode::Tail);
 
     let legacy_native = !ctx.workspace.is_wsl()
@@ -400,10 +414,7 @@ pub async fn exec_command_async(ctx: &ToolContext, args: &Value) -> Result<Value
             return Ok(tool_ok(result));
         }
     }
-    let timeout_ms = args
-        .get("timeout_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(30_000);
+    let timeout_ms = resolved_command_timeout_ms(args, &spec);
     let yield_ms = args
         .get("yield_time_ms")
         .and_then(Value::as_u64)
@@ -746,6 +757,34 @@ fn validate_wsl_exec_paths(cwd: &Path, spec: &ExecSpec) -> Result<(), WorkspaceE
     let Some(workspace_location) = crate::workspace::parse_wsl_path(cwd) else {
         return Ok(());
     };
+    for (key, value) in &spec.env {
+        if !valid_wsl_environment_key(key) || value.contains('\0') {
+            return Err(WorkspaceError::ToolDetails {
+                code: "WSL_ENVIRONMENT_INVALID",
+                message: format!("env contains an invalid WSL environment entry: {key}"),
+                category: "validation",
+                retryable: false,
+                details: json!({
+                    "key": key,
+                    "suggestion": "Use a non-empty environment name that does not start with '-' and contains neither '=' nor NUL."
+                }),
+            });
+        }
+    }
+    for key in &spec.remove_env {
+        if !valid_wsl_environment_key(key) {
+            return Err(WorkspaceError::ToolDetails {
+                code: "WSL_ENVIRONMENT_INVALID",
+                message: format!("remove_env contains an invalid WSL environment name: {key}"),
+                category: "validation",
+                retryable: false,
+                details: json!({
+                    "key": key,
+                    "suggestion": "Use a non-empty environment name that does not start with '-' and contains neither '=' nor NUL."
+                }),
+            });
+        }
+    }
     let values = std::iter::once(("program".to_string(), spec.program.as_str())).chain(
         spec.args
             .iter()
@@ -777,7 +816,7 @@ fn validate_wsl_exec_paths(cwd: &Path, spec: &ExecSpec) -> Result<(), WorkspaceE
             }
             continue;
         }
-        if looks_like_windows_drive_path(value) {
+        if looks_like_windows_host_path(value) {
             return Err(WorkspaceError::ToolDetails {
                 code: "WSL_HOST_PATH_REQUIRES_TRANSLATION",
                 message: format!(
@@ -803,6 +842,14 @@ fn looks_like_windows_drive_path(value: &str) -> bool {
         && bytes[0].is_ascii_alphabetic()
         && bytes[1] == b':'
         && matches!(bytes[2], b'\\' | b'/')
+}
+
+fn looks_like_windows_host_path(value: &str) -> bool {
+    looks_like_windows_drive_path(value) || value.starts_with(r"\\")
+}
+
+fn valid_wsl_environment_key(key: &str) -> bool {
+    !key.is_empty() && !key.starts_with('-') && !key.contains(['=', '\0'])
 }
 
 fn resolve_post_checks(
@@ -845,7 +892,7 @@ fn resolve_post_checks(
                     .get("timeout_ms")
                     .and_then(Value::as_u64)
                     .unwrap_or(30_000)
-                    .clamp(1, 600_000),
+                    .clamp(1, ABSOLUTE_COMMAND_TIMEOUT_MAX_MS),
             );
             let max_output_bytes = check
                 .get("max_output_bytes")
@@ -1465,7 +1512,8 @@ pub fn exec_health_check(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
             json!({"cmd": r#"sh -c "printf exec-health; printf exec-health-stderr >&2""#})
         }
     };
-    let spec = resolve_exec_spec(&probe_args, &cwd, ctx.workspace.root(), &ctx.policy)?;
+    let runtime = ctx.runtime_config();
+    let spec = resolve_exec_spec(&probe_args, &cwd, ctx.workspace.root(), &runtime.policy)?;
     let identity = execution_identity(&probe_args, &spec, &cwd, 5000, false, "", &[]);
     let result = crate::task_runtime::block_on(run_command(
         ctx,
@@ -1652,7 +1700,6 @@ fn merge_exec_result(
                             "session_id": session_id,
                             "cursor": cursor,
                             "timeout_ms": 120000,
-                            "heartbeat_ms": 10000,
                             "until": "finalized",
                             "output_mode": "delta"
                         }
@@ -1697,17 +1744,7 @@ fn resolve_program(
 
     let wsl_workspace = crate::workspace::parse_wsl_path(workspace_root).is_some();
     if wsl_workspace && trimmed.starts_with('/') {
-        let base_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
-        let stem = base_name.strip_suffix(".exe").unwrap_or(base_name);
-        if policy.allowed_commands.contains(stem) {
-            return Ok(trimmed.to_string());
-        }
-        return Err(WorkspaceError::Tool {
-            code: "EXECUTABLE_OUTSIDE_WORKSPACE",
-            message: format!("Workspace 外可执行文件被拒绝: {trimmed}"),
-            category: "security",
-            retryable: false,
-        });
+        return resolve_wsl_absolute_program(trimmed, workspace_root, policy);
     }
     let explicit_path = trimmed.contains(['/', '\\']);
     let candidate = if Path::new(trimmed).is_absolute() {
@@ -1739,14 +1776,7 @@ fn resolve_program(
                 retryable: false,
             });
         }
-        let extension = resolved
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| format!(".{}", value.to_ascii_lowercase()))
-            .unwrap_or_default();
-        if policy.workspace_local_entries
-            && (extension.is_empty() || policy.workspace_script_extensions.contains(&extension))
-        {
+        if workspace_local_program_allowed(&resolved, policy) {
             if wsl_workspace {
                 return Ok(trimmed.replace('\\', "/"));
             }
@@ -1786,6 +1816,108 @@ fn resolve_program(
         })
 }
 
+fn resolve_wsl_absolute_program(
+    raw: &str,
+    workspace_root: &Path,
+    policy: &crate::tools::policy::PolicySettings,
+) -> Result<String, WorkspaceError> {
+    let normalized =
+        normalize_wsl_absolute_program_path(raw).ok_or_else(|| WorkspaceError::Tool {
+            code: "EXECUTABLE_OUTSIDE_WORKSPACE",
+            message: format!("Workspace 外可执行文件被拒绝: {raw}"),
+            category: "security",
+            retryable: false,
+        })?;
+    let location = crate::workspace::parse_wsl_path(workspace_root)
+        .ok_or_else(|| WorkspaceError::invalid_argument("WSL workspace location is unavailable"))?;
+    let host_candidate = PathBuf::from(crate::workspace::wsl_unc_path(
+        &location.distro,
+        &normalized,
+    ));
+
+    if host_candidate.is_file() {
+        if let (Ok(resolved), Ok(canonical_workspace)) =
+            (host_candidate.canonicalize(), workspace_root.canonicalize())
+        {
+            if resolved.starts_with(&canonical_workspace) {
+                if workspace_local_program_allowed(&resolved, policy) {
+                    return Ok(normalized);
+                }
+                return Err(WorkspaceError::Tool {
+                    code: "COMMAND_REJECTED",
+                    message: format!("Workspace 本地入口未获允许: {raw}"),
+                    category: "policy",
+                    retryable: false,
+                });
+            }
+        }
+    }
+
+    let base_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let stem = base_name.strip_suffix(".exe").unwrap_or(base_name);
+    if policy.allowed_commands.contains(stem) && is_trusted_wsl_system_program(&normalized) {
+        return Ok(normalized);
+    }
+
+    Err(WorkspaceError::Tool {
+        code: "EXECUTABLE_OUTSIDE_WORKSPACE",
+        message: format!("Workspace 外可执行文件被拒绝: {raw}"),
+        category: "security",
+        retryable: false,
+    })
+}
+
+fn normalize_wsl_absolute_program_path(raw: &str) -> Option<String> {
+    if !raw.starts_with('/') || raw.contains(['\\', '\0']) || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for segment in raw.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            value => segments.push(value),
+        }
+    }
+    Some(if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    })
+}
+
+fn is_trusted_wsl_system_program(path: &str) -> bool {
+    let Some((parent, name)) = path.rsplit_once('/') else {
+        return false;
+    };
+    !name.is_empty()
+        && matches!(
+            parent,
+            "/bin"
+                | "/sbin"
+                | "/usr/bin"
+                | "/usr/sbin"
+                | "/usr/local/bin"
+                | "/usr/local/sbin"
+                | "/snap/bin"
+        )
+}
+
+fn workspace_local_program_allowed(
+    resolved: &Path,
+    policy: &crate::tools::policy::PolicySettings,
+) -> bool {
+    let extension = resolved
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{}", value.to_ascii_lowercase()))
+        .unwrap_or_default();
+    policy.workspace_local_entries
+        && (extension.is_empty() || policy.workspace_script_extensions.contains(&extension))
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -1796,6 +1928,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn assert_failure_result(error: WorkspaceError, expected_code: &str) {
+        // Kept near timeout inference tests so failures remain easy to diagnose.
         let spec = ExecSpec {
             display: "missing-command".into(),
             program: "missing-command".into(),
@@ -1852,6 +1985,46 @@ mod tests {
         )
         .expect("allowlisted absolute WSL program");
         assert_eq!(absolute.program, "/usr/bin/cargo");
+
+        let spoofed = resolve_exec_spec(
+            &json!({"program": "/tmp/cargo", "args": ["check"]}),
+            root,
+            root,
+            &crate::tools::policy::PolicySettings::default(),
+        )
+        .expect_err("allowlisted basename outside trusted system directories must be rejected")
+        .to_error_value();
+        assert_eq!(spoofed["code"], "EXECUTABLE_OUTSIDE_WORKSPACE");
+
+        let traversed = resolve_exec_spec(
+            &json!({"program": "/usr/bin/../../tmp/cargo", "args": ["check"]}),
+            root,
+            root,
+            &crate::tools::policy::PolicySettings::default(),
+        )
+        .expect_err("path traversal must not disguise an untrusted executable")
+        .to_error_value();
+        assert_eq!(traversed["code"], "EXECUTABLE_OUTSIDE_WORKSPACE");
+    }
+
+    #[test]
+    fn wsl_absolute_program_normalization_is_lexical_and_bounded() {
+        assert_eq!(
+            normalize_wsl_absolute_program_path("/usr/bin/../local/bin/cargo"),
+            Some("/usr/local/bin/cargo".into())
+        );
+        assert_eq!(
+            normalize_wsl_absolute_program_path("/usr//bin/./cargo"),
+            Some("/usr/bin/cargo".into())
+        );
+        assert_eq!(
+            normalize_wsl_absolute_program_path("/../../tmp/cargo"),
+            None
+        );
+        assert!(is_trusted_wsl_system_program("/usr/bin/cargo"));
+        assert!(is_trusted_wsl_system_program("/snap/bin/prettier"));
+        assert!(!is_trusted_wsl_system_program("/tmp/cargo"));
+        assert!(!is_trusted_wsl_system_program("/home/dev/bin/cargo"));
     }
 
     #[cfg(windows)]
@@ -1885,6 +2058,36 @@ mod tests {
         .to_error_value();
         assert_eq!(host_path["code"], "WSL_HOST_PATH_REQUIRES_TRANSLATION");
         assert_eq!(host_path["details"]["position"], "args[0]");
+
+        let unc_host_path = resolve_exec_spec(
+            &json!({"program": "cargo", "args": [r"\\server\share\Cargo.toml"]}),
+            root,
+            root,
+            &policy,
+        )
+        .expect_err("Windows UNC host path must be rejected")
+        .to_error_value();
+        assert_eq!(unc_host_path["code"], "WSL_HOST_PATH_REQUIRES_TRANSLATION");
+
+        let invalid_env = resolve_exec_spec(
+            &json!({"program": "cargo", "args": ["check"], "env": {"--help": "1"}}),
+            root,
+            root,
+            &policy,
+        )
+        .expect_err("option-like WSL environment names must be rejected")
+        .to_error_value();
+        assert_eq!(invalid_env["code"], "WSL_ENVIRONMENT_INVALID");
+
+        let invalid_removed_env = resolve_exec_spec(
+            &json!({"program": "cargo", "args": ["check"], "remove_env": ["A=B"]}),
+            root,
+            root,
+            &policy,
+        )
+        .expect_err("invalid removed WSL environment names must be rejected")
+        .to_error_value();
+        assert_eq!(invalid_removed_env["code"], "WSL_ENVIRONMENT_INVALID");
     }
 
     #[test]
@@ -2049,7 +2252,6 @@ mod tests {
                         "session_id": initial["session_id"],
                         "cursor": initial["next_cursor"],
                         "timeout_ms": 10_000,
-                        "heartbeat_ms": 10_000,
                         "until": "finalized"
                     }),
                 )
@@ -2078,7 +2280,6 @@ mod tests {
                         "session_id": initial["session_id"],
                         "cursor": initial["next_cursor"],
                         "timeout_ms": 10_000,
-                        "heartbeat_ms": 10_000,
                         "until": "finalized"
                     }),
                 )
@@ -2233,7 +2434,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(process_runtime)]
-    fn duplicate_operations_reattach_and_support_recovery_heartbeats() {
+    fn duplicate_operations_reattach_and_ignore_legacy_wait_heartbeats() {
         let workspace = tempdir().expect("workspace");
         let harness = tempdir().expect("harness");
         let ctx =
@@ -2278,7 +2479,7 @@ mod tests {
             .iter()
             .any(|session| session["session_id"] == session_id));
 
-        let heartbeat = call_tool(
+        let waited = call_tool(
             &ctx,
             "wait_command",
             &json!({
@@ -2290,12 +2491,23 @@ mod tests {
                 "output_mode": "none"
             }),
         );
-        assert_eq!(heartbeat["heartbeat"], true, "{heartbeat}");
-        assert_eq!(heartbeat["request_timed_out"], false, "{heartbeat}");
-        assert_eq!(heartbeat["process_still_running"], true, "{heartbeat}");
+        assert_eq!(waited["heartbeat"], false, "{waited}");
+        assert_eq!(waited["request_timed_out"], true, "{waited}");
+        assert_eq!(waited["effective_wait_ms"], 1000, "{waited}");
+        assert!(
+            waited["actual_wait_ms"].as_u64().unwrap_or(0) >= 900,
+            "{waited}"
+        );
+        assert_eq!(waited["process_still_running"], true, "{waited}");
         assert_eq!(
-            heartbeat["next_actions"][0]["arguments"]["session_id"], session_id,
-            "{heartbeat}"
+            waited["next_actions"][0]["arguments"]["session_id"], session_id,
+            "{waited}"
+        );
+        assert!(
+            waited["next_actions"][0]["arguments"]
+                .get("heartbeat_ms")
+                .is_none(),
+            "{waited}"
         );
 
         let conflict = call_tool(

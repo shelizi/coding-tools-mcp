@@ -4,9 +4,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
-use crate::tools::policy::PolicySettings;
-use crate::tools::{ExecutionLimits, SharedToolContext, ToolContext, Workspace};
-use crate::workspace::{compare_wsl_paths, AuthConfig, WorkspaceFolder, WorkspaceProfile};
+use crate::tools::{
+    ExecutionLimits, SharedRuntimeToolConfig, SharedToolContext, ToolContext, Workspace,
+};
+use crate::workspace::{
+    compare_wsl_paths, AuthConfig, RuntimeConfig, WorkspaceFolder, WorkspaceProfile,
+};
 
 const MAX_CONVERSATION_CONTEXTS: usize = 128;
 
@@ -17,9 +20,7 @@ pub(crate) fn behavioral_parity_fixture() -> Value {
 #[derive(Clone)]
 pub struct HubConfig {
     pub auth: AuthConfig,
-    pub policy: PolicySettings,
-    pub tool_profile: String,
-    pub permission_mode: String,
+    pub runtime_config: SharedRuntimeToolConfig,
     pub limits: ExecutionLimits,
     pub execution_resource_namespace: String,
 }
@@ -98,7 +99,7 @@ pub fn sync_live_hub(profile: &WorkspaceProfile) -> Result<bool, String> {
     let Some(router) = router else {
         return Ok(false);
     };
-    router.sync(profile.folders.clone())?;
+    router.sync(profile.folders.clone(), &profile.runtime)?;
     Ok(true)
 }
 
@@ -336,11 +337,12 @@ impl HubRouter {
         }
     }
 
-    fn sync(&self, folders: Vec<WorkspaceFolder>) -> Result<(), String> {
+    fn sync(&self, folders: Vec<WorkspaceFolder>, runtime: &RuntimeConfig) -> Result<(), String> {
         if folders.is_empty() {
             return Err("工具區至少需要一個資料夾。".into());
         }
         validate_unique_folder_paths(&folders)?;
+        self.config.runtime_config.update_from_runtime(runtime);
         let mut state = lock_state(self);
         state.contexts.retain(|_, context| {
             folders
@@ -511,12 +513,10 @@ impl HubRouter {
             Workspace::new_with_execution(PathBuf::from(&folder.path), folder.execution.clone())
                 .map_err(|error| error.message())?;
         let created = Arc::new(
-            ToolContext::from_workspace_with_profile_id_and_resource_ids_and_limits(
+            ToolContext::from_workspace_with_shared_runtime_config_and_resource_ids_and_limits(
                 workspace,
                 self.config.auth.clone(),
-                self.config.policy.clone(),
-                self.config.tool_profile.clone(),
-                self.config.permission_mode.clone(),
+                self.config.runtime_config.clone(),
                 self.profile_id.clone(),
                 format!(
                     "{}--{}--{}",
@@ -781,9 +781,11 @@ mod tests {
     fn test_config(namespace: &str) -> HubConfig {
         HubConfig {
             auth: AuthConfig::default(),
-            policy: PolicySettings::default(),
-            tool_profile: "full".into(),
-            permission_mode: "trusted".into(),
+            runtime_config: SharedRuntimeToolConfig::new(
+                crate::tools::policy::PolicySettings::default(),
+                "full".into(),
+                "trusted".into(),
+            ),
             limits: ExecutionLimits::default(),
             execution_resource_namespace: namespace.into(),
         }
@@ -905,6 +907,68 @@ mod tests {
         });
         for context in contexts.iter().skip(1) {
             assert!(Arc::ptr_eq(&contexts[0], context));
+        }
+    }
+
+    #[test]
+    fn sync_hot_applies_runtime_config_to_cached_and_new_contexts() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folders = vec![WorkspaceFolder {
+            id: "workspace".into(),
+            name: "Workspace".into(),
+            path: workspace.path().display().to_string(),
+            execution: Default::default(),
+        }];
+        let router = HubRouter::new(
+            "runtime-sync-test".into(),
+            folders.clone(),
+            test_config("runtime-sync"),
+        )
+        .expect("router");
+        let cached = router
+            .context_for_folder("workspace", Some("cached-conversation"))
+            .expect("cached context");
+        assert_eq!(cached.runtime_config().tool_profile, "trusted-core");
+
+        let mut runtime = crate::workspace::RuntimeConfig::default();
+        runtime.tool_profile = "advanced".into();
+        runtime.permission_mode = "dangerous".into();
+        runtime.allowed_commands = "node,git".into();
+        runtime.workspace_local_entries = false;
+        runtime.workspace_script_extensions = ".js,.ts".into();
+        router
+            .sync(folders.clone(), &runtime)
+            .expect("hot apply runtime");
+
+        let updated = cached.runtime_config();
+        assert_eq!(updated.tool_profile, "advanced");
+        assert_eq!(updated.permission_mode, "dangerous");
+        assert_eq!(updated.policy.permission_mode, "dangerous");
+        assert!(!updated.policy.workspace_local_entries);
+        assert!(updated.policy.allowed_commands.contains("node"));
+        assert!(updated.policy.workspace_script_extensions.contains(".ts"));
+
+        let cached_again = router
+            .context_for_folder("workspace", Some("cached-conversation"))
+            .expect("same cached context");
+        assert!(Arc::ptr_eq(&cached, &cached_again));
+        let created_after_update = router
+            .context_for_folder("workspace", Some("new-conversation"))
+            .expect("new context");
+        assert_eq!(
+            created_after_update.runtime_config().tool_profile,
+            "advanced"
+        );
+
+        runtime.tool_profile = "read-only".into();
+        runtime.permission_mode = "read-only".into();
+        runtime.allowed_commands = "python".into();
+        router.sync(folders, &runtime).expect("second hot apply");
+        for context in [&cached, &created_after_update] {
+            let current = context.runtime_config();
+            assert_eq!(current.tool_profile, "read-only");
+            assert_eq!(current.permission_mode, "read-only");
+            assert!(current.policy.allowed_commands.contains("python"));
         }
     }
 

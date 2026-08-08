@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -158,7 +159,7 @@ fn mutation_lock_groups(ctx: &ToolContext, name: &str, args: &Value) -> Vec<Muta
             vec![MutationLockGroup::WorkspaceContent]
         }
         "git_restore" => vec![MutationLockGroup::WorkspaceContent, MutationLockGroup::Git],
-        "git_branch" | "git_stage" | "git_commit" => vec![MutationLockGroup::Git],
+        "git_branch" | "git_stage" | "git_commit" | "git_push" => vec![MutationLockGroup::Git],
         "start_task" | "update_task" | "pause_task" | "resume_task" | "finish_task" => {
             vec![MutationLockGroup::Task]
         }
@@ -2151,13 +2152,14 @@ async fn call_exec_tool_async_with_policy(
     permission_override: bool,
 ) -> Value {
     let effective_args = apply_default_cwd(ctx, name, args);
+    let runtime = ctx.runtime_config();
     let mut override_policy;
     let policy = if permission_override {
-        override_policy = ctx.policy.clone();
+        override_policy = runtime.policy.clone();
         override_policy.permission_mode = "dangerous".into();
         &override_policy
     } else {
-        &ctx.policy
+        &runtime.policy
     };
     if let Err(error) =
         validate_tool_arguments_for_workspace(name, &effective_args, policy, Some(&ctx.workspace))
@@ -2178,10 +2180,11 @@ async fn call_exec_tool_async_with_policy(
 
 async fn call_permission_tool_async(ctx: SharedToolContext, name: &str, args: &Value) -> Value {
     let effective_args = apply_default_cwd(ctx.as_ref(), name, args);
+    let runtime = ctx.runtime_config();
     if let Err(error) = validate_tool_arguments_for_workspace(
         name,
         &effective_args,
-        &ctx.policy,
+        &runtime.policy,
         Some(&ctx.workspace),
     ) {
         return policy_tool_err(ctx.as_ref(), name, &effective_args, error);
@@ -2220,7 +2223,8 @@ async fn resume_pending_operation_async(
             .get("confirm")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let approved = explicitly_approved || ctx.policy.skip_permission_gates();
+    let runtime = ctx.runtime_config();
+    let approved = explicitly_approved || runtime.policy.skip_permission_gates();
     if !approved {
         ctx.pending_operations.put_back(operation);
         return Err(WorkspaceError::ToolDetails {
@@ -2302,10 +2306,11 @@ async fn resume_pending_operation_async(
 
 async fn call_session_tool_async(ctx: &ToolContext, name: &str, args: &Value) -> Value {
     let effective_args = apply_default_cwd(ctx, name, args);
+    let runtime = ctx.runtime_config();
     if let Err(error) = validate_tool_arguments_for_workspace(
         name,
         &effective_args,
-        &ctx.policy,
+        &runtime.policy,
         Some(&ctx.workspace),
     ) {
         return policy_tool_err(ctx, name, &effective_args, error);
@@ -2346,13 +2351,14 @@ fn call_tool_inner(
     permission_override: bool,
 ) -> Value {
     let effective_args = apply_default_cwd(ctx, name, args);
+    let runtime = ctx.runtime_config();
     let mut override_policy;
     let policy = if permission_override {
-        override_policy = ctx.policy.clone();
+        override_policy = runtime.policy.clone();
         override_policy.permission_mode = "dangerous".into();
         &override_policy
     } else {
-        &ctx.policy
+        &runtime.policy
     };
     if let Err(e) =
         validate_tool_arguments_for_workspace(name, &effective_args, policy, Some(&ctx.workspace))
@@ -2365,6 +2371,36 @@ fn call_tool_inner(
             Ok(value) => value,
             Err(error) => attach_harness_status(ctx, tool_err(error), false),
         };
+    }
+
+    if name == "edit" {
+        let preflight_started = Instant::now();
+        let mut preflight_args = effective_args.as_ref().clone();
+        if let Some(object) = preflight_args.as_object_mut() {
+            object.insert("dry_run".into(), Value::Bool(true));
+        }
+        let preflight = patch::edit(ctx, &preflight_args);
+        let terminal = args.get("dry_run").and_then(Value::as_bool) == Some(true)
+            || preflight
+                .as_ref()
+                .ok()
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                == Some("proposal_required")
+            || preflight.is_err();
+        if terminal {
+            let mut output = match preflight {
+                Ok(value) => value,
+                Err(error) => tool_err(error),
+            };
+            if let Some(object) = output.as_object_mut() {
+                object.insert(
+                    "phase_durations_ms".into(),
+                    json!({"preflight_ms": preflight_started.elapsed().as_millis()}),
+                );
+            }
+            return output;
+        }
     }
 
     let tracking = match begin_tracked_call(ctx, name, args, &effective_args) {
@@ -2409,6 +2445,7 @@ fn call_tool_inner(
         "git_branch" => git::git_branch(ws, &effective_args),
         "git_stage" => git::git_stage(ws, &effective_args),
         "git_commit" => git::git_commit(ws, &effective_args),
+        "git_push" => git::git_push(ws, &effective_args),
         "git_restore" => git::git_restore(ws, &effective_args),
         "view_image" => image_tool::view_image(ws, &effective_args),
         "request_permissions" => request_permissions(ctx, &effective_args),
@@ -2428,6 +2465,7 @@ fn call_tool_inner(
 }
 
 fn request_permissions(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
+    let runtime = ctx.runtime_config();
     if let Some(resume_id) = args.get("resume_id").and_then(Value::as_str) {
         let operation = ctx.pending_operations.take(resume_id)?;
         let explicitly_approved = args
@@ -2438,7 +2476,7 @@ fn request_permissions(ctx: &ToolContext, args: &Value) -> Result<Value, Workspa
                 .get("confirm")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-        let approved = explicitly_approved || ctx.policy.skip_permission_gates();
+        let approved = explicitly_approved || runtime.policy.skip_permission_gates();
         if !approved {
             ctx.pending_operations.put_back(operation);
             return Err(WorkspaceError::ToolDetails {
@@ -2479,7 +2517,7 @@ fn request_permissions(ctx: &ToolContext, args: &Value) -> Result<Value, Workspa
         return Ok(resumed);
     }
 
-    if ctx.policy.skip_permission_gates() {
+    if runtime.policy.skip_permission_gates() {
         Ok(tool_ok(json!({
             "ok": true,
             "status": "granted",
@@ -2632,7 +2670,12 @@ fn apply_default_cwd<'a>(ctx: &ToolContext, name: &str, args: &'a Value) -> Cow<
                 &["path", "destination"],
             );
         }
-        "git_stage" | "git_commit" | "git_restore" => {
+        "git_stage" | "git_commit" | "git_push" | "git_restore" => {
+            if let Some(repo_path) = effective.get("repo_path").and_then(Value::as_str) {
+                effective["repo_path"] = Value::String(prefix_relative_path(&base, repo_path));
+            } else if name == "git_push" {
+                effective["repo_path"] = Value::String(base.clone());
+            }
             if let Some(paths) = effective.get("paths").and_then(Value::as_array).cloned() {
                 effective["paths"] = Value::Array(
                     paths
@@ -2710,6 +2753,7 @@ fn requires_write_baseline(name: &str, args: &Value) -> bool {
             .get("dry_run")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        "git_push" => false,
         _ => false,
     }
 }
@@ -2728,6 +2772,7 @@ fn standalone_operation(name: &str) -> bool {
             | "git_branch"
             | "git_stage"
             | "git_commit"
+            | "git_push"
             | "git_restore"
     )
 }
@@ -2744,6 +2789,7 @@ fn should_log_operation(name: &str) -> bool {
                 | "git_branch"
                 | "git_stage"
                 | "git_commit"
+                | "git_push"
                 | "git_restore"
         )
 }
@@ -2795,15 +2841,91 @@ fn attach_standalone_metadata(output: &mut Value, recovery_hint: &str) {
 }
 
 fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String> {
-    let exposed = crate::tools::registry::exposed_tool_names(&ctx.tool_profile);
+    let runtime = ctx.runtime_config();
+    let exposed = crate::tools::registry::exposed_tool_names(&runtime.tool_profile);
     actions
         .into_iter()
         .filter(|action| exposed.contains(&action.as_str()))
         .collect()
 }
 
+fn git_dir_for_workspace(root: &Path) -> Option<PathBuf> {
+    let marker = root.join(".git");
+    if marker.is_dir() {
+        return Some(marker);
+    }
+    let pointer = fs::read_to_string(marker).ok()?;
+    let raw = pointer.trim().strip_prefix("gitdir:")?.trim();
+    let path = Path::new(raw);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    })
+}
+
+fn common_git_dir(git_dir: &Path) -> PathBuf {
+    let Some(raw) = fs::read_to_string(git_dir.join("commondir")).ok() else {
+        return git_dir.to_path_buf();
+    };
+    let path = Path::new(raw.trim());
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        git_dir.join(path)
+    }
+}
+
+fn fast_workspace_git_head(root: &Path) -> Option<String> {
+    let git_dir = git_dir_for_workspace(root)?;
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    let Some(reference) = head.strip_prefix("ref: ").map(str::trim) else {
+        return (!head.is_empty()).then(|| head.to_string());
+    };
+    let common_dir = common_git_dir(&git_dir);
+    for base in [&git_dir, &common_dir] {
+        if let Ok(value) = fs::read_to_string(base.join(reference)) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    for base in [&git_dir, &common_dir] {
+        let Ok(packed) = fs::read_to_string(base.join("packed-refs")) else {
+            continue;
+        };
+        for line in packed.lines() {
+            if line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            let Some((value, name)) = line.split_once(' ') else {
+                continue;
+            };
+            if name.trim() == reference && !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
-    let tools = crate::tools::registry::exposed_tool_names(&ctx.tool_profile);
+    let runtime = ctx.runtime_config();
+    let tools = crate::tools::registry::exposed_tool_names(&runtime.tool_profile);
+    let toolset_revision = crate::tools::registry::toolset_revision(&runtime.tool_profile);
+    let runtime_build_git_sha = option_env!("CTMCP_BUILD_GIT_SHA").unwrap_or("unknown");
+    let workspace_git_head = fast_workspace_git_head(ctx.workspace.root());
+    let runtime_matches_workspace = workspace_git_head.as_deref().and_then(|head| {
+        (runtime_build_git_sha != "unknown").then_some(head == runtime_build_git_sha)
+    });
+    let runtime_revision_warning = (runtime_matches_workspace == Some(false)).then(|| {
+        format!(
+            "Running MCP build {runtime_build_git_sha} differs from workspace HEAD {}. Restart/rebuild before trusting live schemas or behavior.",
+            workspace_git_head.as_deref().unwrap_or("unknown")
+        )
+    });
     let (blocking_limit, global_blocking_limit) = ctx
         .admission_for("read_file")
         .map(|(_, local, _, global, _)| (local, global))
@@ -2819,11 +2941,17 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         "protocol_version": crate::mcp::LATEST_PROTOCOL_VERSION,
         "supported_protocol_versions": crate::mcp::SUPPORTED_PROTOCOL_VERSIONS,
         "workspace": ctx.workspace.root_display(),
-        "permission_mode": ctx.permission_mode,
+        "permission_mode": &runtime.permission_mode,
         "default_cwd": ctx.default_cwd_display(),
-        "network_allowed": ctx.policy.network_allowed(),
-        "tool_profile": ctx.tool_profile,
-        "toolset_revision": crate::tools::registry::toolset_revision(&ctx.tool_profile),
+        "network_allowed": runtime.policy.network_allowed(),
+        "tool_profile": &runtime.tool_profile,
+        "toolset_revision": toolset_revision,
+        "runtime_revision": {
+            "build_git_sha": runtime_build_git_sha,
+            "workspace_git_head": workspace_git_head,
+            "matches_workspace": runtime_matches_workspace,
+            "warning": runtime_revision_warning
+        },
         "auth_enabled": ctx.auth.auth_enabled(),
         "auth_type": ctx.auth.auth_type,
         "endpoint_path": "/mcp",
@@ -2855,9 +2983,9 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
                 "available": true,
                 "sandbox_enforced": false,
                 "boundary": "policy_only",
-                "workspace_local_entries": ctx.policy.workspace_local_entries,
-                "script_extensions": ctx.policy.workspace_script_extensions.iter().cloned().collect::<Vec<_>>(),
-                "system_command_allowlist": ctx.policy.allowed_commands.iter().cloned().collect::<Vec<_>>()
+                "workspace_local_entries": runtime.policy.workspace_local_entries,
+                "script_extensions": runtime.policy.workspace_script_extensions.iter().cloned().collect::<Vec<_>>(),
+                "system_command_allowlist": runtime.policy.allowed_commands.iter().cloned().collect::<Vec<_>>()
             }
         },
         "tools": tools,
@@ -2893,10 +3021,46 @@ mod tests {
     use crate::tools::ToolContext;
 
     use super::{
-        apply_default_cwd, begin_tracked_call, call_tool_async, collect_parallelism_observations,
-        command_parallel_signature, default_exec_many_parallelism, finish_tracked_call,
-        parallel_pair_key, parse_exec_batch_commands, resolve_exec_many_decision_with_history,
+        apply_default_cwd, begin_tracked_call, call_tool, call_tool_async,
+        collect_parallelism_observations, command_parallel_signature,
+        default_exec_many_parallelism, finish_tracked_call, parallel_pair_key,
+        parse_exec_batch_commands, resolve_exec_many_decision_with_history,
     };
+
+    #[test]
+    fn fast_workspace_git_head_reads_normal_and_linked_worktree_refs_without_git_processes() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let git_dir = workspace.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("refs/heads")).expect("git refs");
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("head");
+        std::fs::write(git_dir.join("refs/heads/main"), "0123456789abcdef\n").expect("ref");
+        assert_eq!(
+            super::fast_workspace_git_head(workspace.path()).as_deref(),
+            Some("0123456789abcdef")
+        );
+
+        let linked = tempfile::tempdir().expect("linked workspace");
+        let common = tempfile::tempdir().expect("common git dir");
+        let worktree_git = common.path().join("worktrees/linked");
+        std::fs::create_dir_all(&worktree_git).expect("worktree git dir");
+        std::fs::create_dir_all(common.path().join("refs/heads")).expect("common refs");
+        std::fs::write(
+            linked.path().join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .expect("git pointer");
+        std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/linked\n").expect("head");
+        std::fs::write(worktree_git.join("commondir"), "../..\n").expect("common pointer");
+        std::fs::write(
+            common.path().join("refs/heads/linked"),
+            "fedcba9876543210\n",
+        )
+        .expect("linked ref");
+        assert_eq!(
+            super::fast_workspace_git_head(linked.path()).as_deref(),
+            Some("fedcba9876543210")
+        );
+    }
 
     #[test]
     fn default_cwd_rewrite_borrows_until_a_path_change_is_required() {
@@ -2918,6 +3082,42 @@ mod tests {
         ctx.set_default_cwd(subdir);
         let rewritten = apply_default_cwd(&ctx, "apply_patch", &arguments);
         assert!(matches!(rewritten, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn canonical_edit_rejects_noop_before_harness_tracking() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        std::fs::write(workspace.path().join("main.txt"), "same\n").expect("fixture");
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context");
+
+        let result = call_tool(
+            &ctx,
+            "edit",
+            &json!({
+                "files": [{
+                    "path": "main.txt",
+                    "edits": [{"type": "replace", "old_text": "same", "new_text": "same"}]
+                }]
+            }),
+        );
+
+        assert_eq!(result["ok"], false, "{result}");
+        assert_eq!(result["error"]["code"], "PATCH_FAILED", "{result}");
+        assert!(
+            result["phase_durations_ms"]["preflight_ms"].is_number(),
+            "{result}"
+        );
+        assert!(
+            result["phase_durations_ms"]["harness_begin_ms"].is_null(),
+            "{result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("main.txt")).expect("fixture"),
+            "same\n"
+        );
     }
 
     #[test]

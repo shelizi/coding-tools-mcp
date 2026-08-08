@@ -4,6 +4,7 @@ import type {
   ConfigUpdatePayload,
   DashboardPayload,
   DiagnosticsPayload,
+  DirectoryBrowsePayload,
   HealthCheckPayload,
   HistoryDetailPayload,
   HistoryListPayload,
@@ -56,6 +57,14 @@ export function fetchDashboard(workspaceId?: string, signal?: AbortSignal): Prom
 
 export function fetchConfig(signal?: AbortSignal): Promise<ConfigSnapshot> {
   return request('/admin/api/config', {}, signal);
+}
+
+export function browseDirectories(path?: string, workspaceId?: string, signal?: AbortSignal): Promise<DirectoryBrowsePayload> {
+  const query = new URLSearchParams();
+  if (path) query.set('path', path);
+  if (workspaceId) query.set('workspaceId', workspaceId);
+  const suffix = query.size ? `?${query}` : '';
+  return request(`/admin/api/directories${suffix}`, {}, signal);
 }
 
 export function saveWorkspaceConfig(workspaceId: string, payload: ConfigUpdatePayload): Promise<ConfigSaveResult> {

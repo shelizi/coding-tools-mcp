@@ -35,6 +35,11 @@ function hostSessionKey(args: JsonObject): string | undefined {
   return value || undefined;
 }
 
+function fallbackSessionKey(args: JsonObject): string | undefined {
+  const value = typeof args._fallback_session_key === 'string' ? args._fallback_session_key.trim() : '';
+  return value || undefined;
+}
+
 function samePath(left: string, right: string): boolean {
   const normalize = (value: string): string => process.platform === 'win32' ? value.toLowerCase() : value;
   return normalize(path.resolve(left)) === normalize(path.resolve(right));
@@ -98,7 +103,21 @@ function resolveSessionKey(args: JsonObject): { key: string; source: string } {
   if (explicit) return { key: explicit, source: 'explicit_session_key' };
   const host = hostSessionKey(args);
   if (host) return { key: host, source: 'platform_conversation_id' };
-  throw new HistoryError('SESSION_ID_UNAVAILABLE', 'A stable ChatGPT session identifier is required.', 'validation');
+  const fallback = fallbackSessionKey(args);
+  if (fallback) return { key: fallback, source: 'stable_runtime_fallback' };
+  throw new HistoryError(
+    'SESSION_ID_UNAVAILABLE',
+    'A stable ChatGPT session identifier is required.',
+    'validation',
+    false,
+    {
+      explicit_session_key_present: false,
+      host_session_key_present: false,
+      fallback_session_key_present: false,
+      accepted_identity_sources: ['session_key', 'openai/session', 'x-openai-session', 'stable_runtime_fallback'],
+      suggestion: 'Pass an explicit session_key or use a host/runtime that provides a stable conversation identity.'
+    }
+  );
 }
 
 function requiredCheckpointArgument(args: JsonObject, name: string): string {
@@ -195,12 +214,14 @@ export async function bootstrapHistory(ctx: ToolContext, key: string, args: Json
   const resolvedSession = resolveSessionKey(args);
   const sessionKey = resolvedSession.key;
   const hostMismatch = hostSessionKey(args) !== undefined && hostSessionKey(args) !== sessionKey;
+  const fallbackMismatch = fallbackSessionKey(args) !== undefined && fallbackSessionKey(args) !== sessionKey;
   const location = await historyLocation(ctx, key, args);
   await mkdir(location.dir, { recursive: true });
   const historyLock = await acquireHistoryLock(location.dir);
   try {
     const warnings: string[] = [];
     if (hostMismatch) warnings.push('宿主会话标识与显式 session_key 不一致，已使用显式 session_key 保持会话连续。');
+    if (fallbackMismatch) warnings.push('运行时回退会话标识与显式 session_key 不一致，已使用显式 session_key 保持会话连续。');
     try { await readFile(path.join(location.dir, 'README.md'), 'utf8'); }
     catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code ?? '') : '';
@@ -321,6 +342,7 @@ export async function bootstrapHistory(ctx: ToolContext, key: string, args: Json
       session_key: sessionKey,
       session_key_source: resolvedSession.source,
       host_session_key_mismatch: hostMismatch,
+      fallback_session_key_mismatch: fallbackMismatch,
       history_numbers: historyNumbers,
       history_numbers_omitted_count: historyNumbersOmittedCount,
       history_number_window: HISTORY_NUMBER_WINDOW,
@@ -369,6 +391,7 @@ export async function checkpointHistory(ctx: ToolContext, key: string, args: Jso
   const sessionKey = requiredCheckpointArgument(args, 'session_key');
   const expectedPath = requiredCheckpointArgument(args, 'expected_path').replaceAll('\\', '/');
   const hostMismatch = hostSessionKey(args) !== undefined && hostSessionKey(args) !== sessionKey;
+  const fallbackMismatch = fallbackSessionKey(args) !== undefined && fallbackSessionKey(args) !== sessionKey;
   const location = await historyLocation(ctx, key, args);
   try {
     const info = await stat(location.dir);
@@ -417,7 +440,7 @@ export async function checkpointHistory(ctx: ToolContext, key: string, args: Jso
     const timestamp = nowTimestamp();
     const built = checkpointFromArgs(args, timestamp);
     const record = built.record;
-    const redacted = redactCheckpointRecord(record);
+    const redacted = ctx.config.securityPolicy.redactHistory ? redactCheckpointRecord(record) : false;
     const records = parseCheckpointRecords(document.content);
     const existing = records.find(item => item.turn_id === record.turn_id);
     let duplicateIgnored = false;
@@ -472,6 +495,7 @@ export async function checkpointHistory(ctx: ToolContext, key: string, args: Jso
       session_key: sessionKey,
       expected_path: expectedPath,
       host_session_key_mismatch: hostMismatch,
+      fallback_session_key_mismatch: fallbackMismatch,
       turn_id: record.turn_id,
       created: false,
       updated,

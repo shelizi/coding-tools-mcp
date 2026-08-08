@@ -2,7 +2,7 @@
 
 This directory tracks behavior implemented in the Rust Client that is missing or materially incomplete in the pure Node.js Agent.
 
-The verified re-audit baseline is commit `673be6430f274f954b4b51bc8b5b2034239f743a` using the ancestor-anchor policy, Desktop Client `0.1.37`, Node Agent `0.29.5`, and client compatibility `0.1.37`.
+The verified re-audit baseline is commit `a9ecac570119a38c5034845847e1aee8ac2e2a82` using the ancestor-anchor policy, Desktop Client `0.1.40`, Node Agent `0.29.8`, and client compatibility `0.1.40`.
 
 ## Commands
 
@@ -57,7 +57,7 @@ The re-audit implementation sequence `NP-017` through `NP-024` is complete, incl
 3. `NP-027` aligns HTTP methods, `Allow` headers, notifications, client responses, and transport errors.
 4. `NP-028` promotes the planned assertions to required executable checks and exports Rust MCP transport constants.
 
-Phase 5 first completed in Node Agent `0.28.3` and remains required parity coverage in `0.29.5`. Origin and protocol validation, strict JSON-RPC classification, streamable-HTTP heartbeats, HTTP method/client-response semantics, WSS streaming, and Rust-generated transport guards remain protected.
+Phase 5 first completed in Node Agent `0.28.3` and remains required parity coverage in `0.29.6`. Origin and protocol validation, strict JSON-RPC classification, streamable-HTTP heartbeats, HTTP method/client-response semantics, WSS streaming, and Rust-generated transport guards remain protected.
 
 Management UI synchronization is tracked separately in `../node-agent-ui-parity/CHECKLIST.md` so desktop-only exclusions do not distort the shared MCP behavioral roadmap.
 

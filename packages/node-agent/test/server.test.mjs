@@ -18,6 +18,16 @@ async function rpc(endpoint, token, request) {
   return response.json();
 }
 
+async function rpcResponse(endpoint, token, request, extraHeaders = {}) {
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...extraHeaders },
+    body: JSON.stringify(request)
+  });
+  assert.equal(response.status, 200);
+  return { response, body: await response.json() };
+}
+
 test('scoped OAuth PKCE and MCP workspace flow', async t => {
   const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-http-'));
   const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-http-state-'));
@@ -77,8 +87,26 @@ test('scoped OAuth PKCE and MCP workspace flow', async t => {
   const endpoint = `${localBase}${prefix}/mcp`;
   const initialized = await rpc(endpoint, token, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } });
   assert.equal(initialized.result.protocolVersion, '2025-11-25');
-  const listedTools = await rpc(endpoint, token, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
-  assert.equal(listedTools.result.tools.length, 49);
+  const listedResponse = await rpcResponse(endpoint, token, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+  const listedTools = listedResponse.body;
+  assert.equal(listedTools.result.tools.length, 50);
+  assert.equal(listedResponse.response.headers.get('x-coding-tools-toolset-revision'), listedTools.result.toolsetRevision);
+  assert.equal(listedResponse.response.headers.get('x-coding-tools-agent-version'), initialized.result.serverInfo.version);
+  assert.ok(Number(listedResponse.response.headers.get('x-coding-tools-runtime-started-at')) > 0);
+
+  const staleCatalog = await rpc(endpoint, token, {
+    jsonrpc: '2.0', id: 22, method: 'tools/call',
+    params: {
+      name: 'list_workspace_folders',
+      arguments: {},
+      _meta: { 'coding-tools/toolset-revision': 'stale-revision' }
+    }
+  });
+  assert.equal(staleCatalog.result, undefined);
+  assert.equal(staleCatalog.error.code, -32602);
+  assert.equal(staleCatalog.error.data.error_code, 'TOOLSET_REVISION_MISMATCH');
+  assert.equal(staleCatalog.error.data.reason, 'stale_tool_catalog');
+  assert.equal(staleCatalog.error.data.toolset_revision, listedTools.result.toolsetRevision);
 
   const missingMetaList = await rpc(endpoint, token, {
     jsonrpc: '2.0', id: 20, method: 'tools/call',

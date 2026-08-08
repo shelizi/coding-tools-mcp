@@ -44,10 +44,10 @@
       open
       class="tx-dialog"
       aria-modal="true"
-      aria-labelledby="wsl-workspace-title"
+      aria-labelledby="wsl-folder-title"
     >
       <div>
-        <h2 id="wsl-workspace-title" class="text-base font-semibold">{$t("Add WSL workspace")}</h2>
+        <h2 id="wsl-folder-title" class="text-base font-semibold">{$t("Add WSL folder")}</h2>
         <p class="mt-1 text-xs text-[var(--color-text-muted)]">
           {$t("Commands run inside WSL while the desktop client accesses files through the WSL share.")}
         </p>
@@ -75,7 +75,7 @@
         </label>
 
         <label class="tx-field">
-          <span class="tx-label">{$t("Workspace name (optional)")}</span>
+          <span class="tx-label">{$t("Folder name (optional)")}</span>
           <input class="tx-input" bind:value={name} autocomplete="off" disabled={busy} />
         </label>
 
@@ -88,7 +88,7 @@
             {$t("Cancel")}
           </button>
           <button type="submit" class="tx-btn-primary" disabled={busy || !distro || !linuxPath.trim()}>
-            {busy ? $t("Adding…") : $t("Add workspace")}
+            {busy ? $t("Adding…") : $t("Add folder")}
           </button>
         </div>
       </form>

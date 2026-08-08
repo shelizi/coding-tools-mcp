@@ -436,7 +436,7 @@ export async function gitBranchTool(ctx: ToolContext, key: string, args: JsonObj
   }
   else if (action === 'switch') argv = ['switch', name];
   else if (action === 'delete') {
-    if (args.confirm !== true) return fail('DANGEROUS_OPERATION_REQUIRES_CONFIRMATION', 'Deleting a branch requires confirm=true');
+    if (ctx.config.securityPolicy.requireWriteConfirmation && args.confirm !== true) return fail('DANGEROUS_OPERATION_REQUIRES_CONFIRMATION', 'Deleting a branch requires confirm=true');
     argv = ['branch', args.force === true ? '-D' : '-d', name];
   } else throw new Error('invalid git branch action');
   const command = ['git', ...argv];
@@ -550,6 +550,82 @@ export async function gitCommitTool(ctx: ToolContext, key: string, args: JsonObj
   });
 }
 
+export async function gitPushTool(ctx: ToolContext, key: string, args: JsonObject): Promise<JsonObject> {
+  const target = await resolveGitTarget(ctx, key, args);
+  const mismatch = repoTargetMismatch(target, args.expected_repo_fingerprint);
+  if (mismatch) return mismatch;
+  await ensureExpectedHead(target, args.expected_head);
+  const remote = validateGitRef(args.remote, 'origin');
+  const branch = args.branch !== undefined
+    ? validateGitRef(args.branch)
+    : target.branch !== 'HEAD'
+      ? target.branch
+      : '';
+  if (!branch) throw new Error('branch is required when HEAD is detached');
+  const dryRun = args.dry_run === true;
+  const argv = ['push'];
+  if (dryRun) argv.push('--dry-run');
+  if (args.set_upstream === true) argv.push('--set-upstream');
+  argv.push(remote, branch);
+  const result = await runGitAt(target.root, argv, 120_000);
+  if (result.code !== 0) {
+    const message = (result.stderr || result.stdout).trim();
+    const lowered = message.toLowerCase();
+    if (lowered.includes('authentication failed') || lowered.includes('failed to authenticate') || lowered.includes('could not read username')) {
+      return {
+        ok: false,
+        error: {
+          code: 'GIT_AUTHENTICATION_FAILED',
+          message,
+          category: 'authentication',
+          retryable: true,
+          details: {
+            remote,
+            branch,
+            suggestion: 'Refresh the Git credential/token for this remote, then retry the same git_push request.'
+          }
+        }
+      };
+    }
+    return {
+      ok: false,
+      error: {
+        code: 'GIT_PUSH_FAILED',
+        message,
+        category: 'git',
+        retryable: false,
+        details: { remote, branch, stdout: result.stdout.trim() }
+      }
+    };
+  }
+  return ok({
+    dry_run: dryRun,
+    applied: !dryRun,
+    remote,
+    branch,
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
+    repo: targetMetadata(target),
+    status: await gitStatusTool(ctx, key, { path: target.repoPath }),
+    affected_files: [],
+    warnings: []
+  });
+}
+
+export async function gitRuntimeRevisionInfo(ctx: ToolContext, key: string): Promise<JsonObject> {
+  try {
+    const target = await resolveGitTarget(ctx, key, { repo_path: '.' });
+    const committed = await runGitAt(target.root, ['show', '-s', '--format=%ct', 'HEAD'], 5_000);
+    const committedAtMs = committed.code === 0 ? Number.parseInt(committed.stdout.trim(), 10) * 1000 : NaN;
+    return {
+      workspace_git_head: target.head,
+      workspace_head_committed_at_ms: Number.isFinite(committedAtMs) ? committedAtMs : null
+    };
+  } catch {
+    return { workspace_git_head: null, workspace_head_committed_at_ms: null };
+  }
+}
+
 export interface GitRestoreSnapshot {
   head: string;
   paths: string[];
@@ -644,7 +720,7 @@ export async function gitRestoreTool(ctx: ToolContext, key: string, args: JsonOb
   const mismatch = repoTargetMismatch(target, args.expected_repo_fingerprint);
   if (mismatch) return mismatch;
   await ensureExpectedHead(target, args.expected_head);
-  if (args.confirm !== true) return fail('DANGEROUS_OPERATION_REQUIRES_CONFIRMATION', 'git_restore discards or unstages changes and requires confirm=true');
+  if (ctx.config.securityPolicy.requireWriteConfirmation && args.confirm !== true) return fail('DANGEROUS_OPERATION_REQUIRES_CONFIRMATION', 'git_restore discards or unstages changes and requires confirm=true');
   const paths = target.repoPath === '.' ? preflightPaths : gitPaths(ctx, key, args, true, target);
   if (!paths.length) throw new Error('paths are required');
   const argv = ['restore'];

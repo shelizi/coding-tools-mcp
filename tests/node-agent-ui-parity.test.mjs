@@ -14,7 +14,8 @@ async function read(relative) {
 test('Node Agent UI parity checklist is complete and executable', async () => {
   const result = await validateUiParity();
   assert.deepEqual(result.errors, []);
-  assert.equal(result.version, '0.29.5');
+  const packageMetadata = JSON.parse(await read('packages/node-agent/package.json'));
+  assert.equal(result.version, packageMetadata.version);
   assert.deepEqual(result.items, ['UI-001', 'UI-002', 'UI-003', 'UI-004', 'UI-005', 'UI-006', 'UI-007']);
   assert.equal(result.checks, 7);
 });
@@ -133,7 +134,7 @@ test('operation-log integration omits raw payloads and keeps Rust and Node debug
     assert.match(processes, new RegExp(marker));
   }
   assert.match(harnessTest, /yield_time_ms: 0/);
-  assert.match(harnessTest, /\['started', 'failed'\]/);
+  assert.match(harnessTest, /\['failed', 'started'\]/);
   assert.match(managementTest, /status: 'running'/);
 });
 

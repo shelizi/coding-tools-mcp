@@ -125,11 +125,11 @@ async function authorize(localBase) {
 
 test('generated profile catalogs match Rust counts, membership and revisions', () => {
   const expectedCounts = {
-    advanced: 49,
+    advanced: 50,
     'read-only': 18,
-    'compat-readonly-all': 49,
-    'guarded-core': 35,
-    'trusted-core': 34
+    'compat-readonly-all': 50,
+    'guarded-core': 36,
+    'trusted-core': 35
   };
   for (const [profile, count] of Object.entries(expectedCounts)) {
     const tools = toolsForProfile(profile);
@@ -154,7 +154,7 @@ test('generated profile catalogs match Rust counts, membership and revisions', (
 test('compat-readonly-all keeps all tools while rewriting annotations', () => {
   const advanced = new Map(toolsForProfile('advanced').map(tool => [tool.name, tool]));
   const compatibility = toolsForProfile('compat-readonly-all');
-  assert.equal(compatibility.length, 49);
+  assert.equal(compatibility.length, 50);
   for (const tool of compatibility) {
     assert.equal(tool.annotations.readOnlyHint, true, tool.name);
     assert.equal(tool.annotations.destructiveHint, false, tool.name);
@@ -277,4 +277,42 @@ test('HTTP tools/list, server_info and mcp/info expose one profile contract', as
   assert.equal(hidden.error.data.error_code, 'UNKNOWN_TOOL');
   assert.equal(hidden.error.data.toolset_revision, expectedRevision);
   assert.deepEqual(hidden.error.data.available_tools, expectedNames);
+
+  runtime.context.config.toolProfile = 'advanced';
+  runtime.context.config.activeToolProfile = 'advanced';
+  const advancedNames = toolNamesForProfile('advanced');
+  const advancedRevision = toolsetRevisionForProfile('advanced');
+
+  const updatedHealth = (await requestLocal(`${localBase}/health`)).json();
+  assert.equal(updatedHealth.toolProfile, 'advanced');
+  assert.equal(updatedHealth.tools, advancedNames.length);
+  assert.equal(updatedHealth.toolsetRevision, advancedRevision);
+
+  const updatedInfo = (await requestLocal(`${localBase}/mcp/info`)).json();
+  assert.equal(updatedInfo.toolProfile, 'advanced');
+  assert.deepEqual(updatedInfo.tools, advancedNames);
+  assert.equal(updatedInfo.toolsetRevision, advancedRevision);
+
+  const updatedList = await rpc(endpoint, token, {
+    jsonrpc: '2.0', id: 4, method: 'tools/list', params: {}
+  });
+  assert.deepEqual(updatedList.result.tools.map(tool => tool.name), advancedNames);
+  assert.equal(updatedList.result.toolsetRevision, advancedRevision);
+
+  const newlyExposed = await rpc(endpoint, token, {
+    jsonrpc: '2.0', id: 5, method: 'tools/call',
+    params: { name: 'start_task', arguments: {}, _meta: { 'openai/session': 'profile-http' } }
+  });
+  assert.equal(newlyExposed.error, undefined);
+  assert.ok(newlyExposed.result);
+
+  runtime.context.config.toolProfile = 'read-only';
+  runtime.context.config.activeToolProfile = 'read-only';
+  const hiddenAgain = await rpc(endpoint, token, {
+    jsonrpc: '2.0', id: 6, method: 'tools/call',
+    params: { name: 'start_task', arguments: {}, _meta: { 'openai/session': 'profile-http' } }
+  });
+  assert.equal(hiddenAgain.error.code, -32602);
+  assert.equal(hiddenAgain.error.data.toolset_revision, toolsetRevisionForProfile('read-only'));
+  assert.deepEqual(hiddenAgain.error.data.available_tools, toolNamesForProfile('read-only'));
 });

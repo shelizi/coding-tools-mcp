@@ -1,6 +1,6 @@
 [package]
 name = "coding-tools-mcp-desktop"
-version = "0.1.37"
+version = "0.1.40"
 description = "Coding Tools MCP desktop client"
 authors = ["Coding Tools MCP Contributors"]
 edition = "2021"
@@ -52,6 +52,7 @@ flate2 = "1"
 tar = "0.4"
 fs2 = "0.4"
 coding-tools-tunnel-protocol = { path = "../crates/tunnel-protocol" }
+coding-tools-command-policy = { path = "../crates/command-policy" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 futures-util = "0.3"

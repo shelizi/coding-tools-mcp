@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { loadConfigBundle, resolveConfigPath, type LoadedConfig } from './config.js';
-import { ConfigStore } from './management.js';
+import { ConfigStore, type RuntimeHotApplyTarget } from './management.js';
 import { generateAuthorizationPassword } from './secrets.js';
 import type { JsonObject, WorkspaceRegistryDocument } from './types.js';
 
@@ -167,14 +167,14 @@ export class ApplicationConfigStore {
     return workspace;
   }
 
-  async saveWorkspace(id: string, value: unknown): Promise<JsonObject> {
+  async saveWorkspace(id: string, value: unknown, runtime?: RuntimeHotApplyTarget): Promise<JsonObject> {
     const workspace = this.workspace(id);
     const input = value && typeof value === 'object' && !Array.isArray(value)
       ? value as Record<string, unknown>
       : {};
     const name = String(input.name ?? workspace.name).trim();
     if (!name || name.length > 128) throw new Error('workspace name must contain 1 to 128 characters');
-    const result = await workspace.store.save(input);
+    const result = await workspace.store.save(input, runtime);
     if (name !== workspace.name) {
       workspace.name = name;
       const entry = this.registry.workspaces.find(item => item.id === id);
@@ -182,6 +182,7 @@ export class ApplicationConfigStore {
       entry.name = name;
       await writeRegistry(this.registryPath, this.registry);
       workspace.store.current.workspaceName = name;
+      if (runtime) runtime.context.config.workspaceName = name;
     }
     return { ...result, id, name };
   }
@@ -190,11 +191,18 @@ export class ApplicationConfigStore {
     return this.workspace(id).store.secret(key);
   }
 
-  async regenerateSecret(id: string, key: 'oauthPassword'): Promise<JsonObject> {
+  async regenerateSecret(id: string, key: 'oauthPassword', runtime?: RuntimeHotApplyTarget): Promise<JsonObject> {
     const value = key === 'oauthPassword' ? generateAuthorizationPassword() : '';
     const workspace = this.workspace(id);
-    await workspace.store.replaceSecret(key, value);
-    return { ok: true, workspaceId: id, key, value, restartRequired: true };
+    const applied = await workspace.store.replaceSecret(key, value, runtime);
+    return {
+      ok: true,
+      workspaceId: id,
+      key,
+      value,
+      restartRequired: !applied,
+      appliedImmediately: applied ? ['oauth'] : []
+    };
   }
 
   applyResolvedBuiltinTunnel(id: string, publicUrl: string, enrollmentCompleted: boolean): Promise<void> {

@@ -14,6 +14,7 @@ import {
   MAX_RETAINED_FINALIZED_SESSIONS,
   ProcessRequestLifecycle,
   pruneProcessSessions,
+  resolvedCommandTimeoutMs,
   startAndYield,
   waitForSession
 } from '../dist/processes.js';
@@ -21,6 +22,18 @@ import { createAgentRuntime, createToolContext } from '../dist/server.js';
 import { callTool } from '../dist/tools.js';
 
 const nodeProgram = path.basename(process.execPath);
+
+test('known build and packaging commands inherit the configured long timeout when omitted', () => {
+  const max = 30 * 60_000;
+  assert.equal(resolvedCommandTimeoutMs({}, 'cmd.exe /d /s /c npm run desktop:portable', max), max);
+  assert.equal(resolvedCommandTimeoutMs({}, 'npm --prefix packages/node-agent run build:server', max), max);
+  assert.equal(resolvedCommandTimeoutMs({}, 'npm run node-agent:parity:check', max), max);
+  assert.equal(resolvedCommandTimeoutMs({}, 'npm --prefix packages/node-agent run sync:rust-contract', max), max);
+  assert.equal(resolvedCommandTimeoutMs({}, 'cargo test --manifest-path src-tauri/Cargo.toml', max), max);
+  assert.equal(resolvedCommandTimeoutMs({}, 'cargo clippy --manifest-path src-tauri/Cargo.toml', max), max);
+  assert.equal(resolvedCommandTimeoutMs({}, 'node scripts/check.mjs', max), 30_000);
+  assert.equal(resolvedCommandTimeoutMs({ timeout_ms: 600_000 }, 'npm run desktop:portable', max), 600_000);
+});
 
 function config(root, dataDir, maxOutputBytes = 1024 * 1024) {
   return {
@@ -136,40 +149,35 @@ test('interactive sessions expose stdin state, byte counts, timing and closed-in
   assert.equal(rejected.error.retryable, false);
 });
 
-test('wait_command returns heartbeat timing, next actions and output-ref correction metadata', async t => {
+test('wait_command ignores the legacy heartbeat interval and uses the full server wait window', async t => {
   const state = await fixture(t);
   const started = await callTool(state.ctx, 'exec_command', {
     program: nodeProgram,
-    args: ['-e', 'setTimeout(() => process.exit(0), 2500)'],
-    tty: true,
+    args: ['-e', 'setInterval(() => {}, 1000)'],
     yield_time_ms: 0,
     timeout_ms: 10_000
   }, state.meta);
   assert.equal(started.operation_id, null);
 
-  const heartbeatPromise = callTool(state.ctx, 'wait_command', {
+  const waited = await callTool(state.ctx, 'wait_command', {
     session_id: started.session_id,
     cursor: started.latest_cursor,
-    timeout_ms: 3_000,
-    heartbeat_ms: 1_000,
-    until: 'output_or_exit',
+    timeout_ms: 600,
+    heartbeat_ms: 50,
+    until: 'finalized',
     output_mode: 'delta'
   }, state.meta);
-  await new Promise(resolve => setTimeout(resolve, 100));
-  const stateOnlyChange = await callTool(state.ctx, 'send_input', {
-    session_id: started.session_id,
-    close_stdin: true
-  }, state.meta);
-  assert.equal(stateOnlyChange.stdin_closed, true);
-  const heartbeat = await heartbeatPromise;
-  assert.equal(heartbeat.heartbeat, true, JSON.stringify(heartbeat));
-  assert.equal(heartbeat.request_timed_out, false);
-  assert.equal(heartbeat.effective_wait_ms, 1000);
-  assert.ok(heartbeat.actual_wait_ms >= 800);
-  assert.ok(Array.isArray(heartbeat.next_actions));
-  assert.equal(heartbeat.wait_until, 'output_or_exit');
-  assert.equal(typeof heartbeat.session_registry_wait_ms, 'number');
-  assert.equal(typeof heartbeat.snapshot_ms, 'number');
+  assert.equal(waited.heartbeat, false, JSON.stringify(waited));
+  assert.equal(waited.request_timed_out, true);
+  assert.equal(waited.effective_wait_ms, 600);
+  assert.ok(waited.actual_wait_ms >= 500, JSON.stringify(waited));
+  assert.equal(waited.process_still_running, true);
+  assert.ok(Array.isArray(waited.next_actions));
+  assert.equal(waited.next_actions[0].arguments.timeout_ms, 600);
+  assert.equal(Object.hasOwn(waited.next_actions[0].arguments, 'heartbeat_ms'), false);
+  assert.equal(waited.wait_until, 'finalized');
+  assert.equal(typeof waited.session_registry_wait_ms, 'number');
+  assert.equal(typeof waited.snapshot_ms, 'number');
 
   const mistaken = await callTool(state.ctx, 'wait_command', {
     session_id: started.output_refs.stdout,
@@ -180,8 +188,34 @@ test('wait_command returns heartbeat timing, next actions and output-ref correct
   assert.equal(mistaken.error.retryable, true);
   assert.equal(mistaken.error.details.corrected_session_id, started.session_id);
 
-  const finalized = await waitFinal(state, started.session_id);
-  assert.equal(finalized.command_ok, true);
+  const killed = await callTool(state.ctx, 'kill_session', {
+    session_id: started.session_id,
+    signal: 'KILL',
+    wait_ms: 5_000
+  }, state.meta);
+  assert.equal(killed.evicted, true, JSON.stringify(killed));
+});
+
+test('Windows TERM kill_session forcefully terminates the managed tree like Rust', { skip: process.platform !== 'win32' }, async t => {
+  const state = await fixture(t);
+  const started = await callTool(state.ctx, 'exec_command', {
+    program: nodeProgram,
+    args: ['-e', 'require("node:http").createServer((_req, res) => res.end("ok")).listen(0); setInterval(() => {}, 1000)'],
+    yield_time_ms: 0,
+    timeout_ms: 30_000
+  }, state.meta);
+  assert.equal(started.process_still_running, true, JSON.stringify(started));
+
+  const killed = await callTool(state.ctx, 'kill_session', {
+    session_id: started.session_id,
+    signal: 'TERM',
+    wait_ms: 5_000
+  }, state.meta);
+  assert.equal(killed.ok, true, JSON.stringify(killed));
+  assert.equal(killed.status, 'killed', JSON.stringify(killed));
+  assert.equal(killed.killed, true, JSON.stringify(killed));
+  assert.equal(killed.process_still_running, false, JSON.stringify(killed));
+  assert.equal(killed.evicted, true, JSON.stringify(killed));
 });
 
 test('operation reattachment, conflict and automatic dedupe grace match Rust', async t => {

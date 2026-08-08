@@ -1,6 +1,6 @@
 {
   "name": "coding-tools-mcp-desktop",
-  "version": "0.1.37",
+  "version": "0.1.40",
   "description": "Coding Tools MCP desktop client",
   "type": "module",
   "scripts": {
@@ -38,8 +38,11 @@
     "rust:check:headless": "cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --lib && cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --test headless_core && cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib task_runtime::headless::tests",
     "rust:fmt": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/rustfmt-changed.ps1",
     "rust:fmt:check": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/rustfmt-changed.ps1 -Check",
+    "precommit": "node scripts/precommit.mjs",
+    "hooks:install": "node scripts/install-git-hooks.mjs",
     "rust:test": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-fast.ps1",
     "rust:test:full": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-full.ps1",
+    "rust:command-policy:test": "cargo test --manifest-path crates/command-policy/Cargo.toml",
     "rust:benchmark": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/benchmark-runtime.ps1",
     "version:sync": "node scripts/sync-version.mjs",
     "version:check": "node scripts/sync-version.mjs --check",

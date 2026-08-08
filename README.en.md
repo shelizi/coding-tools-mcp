@@ -339,8 +339,11 @@ Requirements: Node.js 20+, Rust stable, and the [Tauri 2 prerequisites](https://
 
 ```bash
 npm install
+npm run hooks:install
 npm run desktop
 ```
+
+`hooks:install` points this clone's `core.hooksPath` at the tracked `.githooks` directory. On commit, fully staged Rust files are formatted and re-staged automatically. If a staged Rust file also has unstaged hunks, the hook stops without modifying the index so unrelated changes cannot be pulled into the commit accidentally.
 
 Useful verification commands:
 

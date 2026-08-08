@@ -3,8 +3,11 @@
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import Trash2 from "@lucide/svelte/icons/trash-2";
   import { confirm, open } from "@tauri-apps/plugin-dialog";
+  import WslFolderDialog from "$lib/components/WslFolderDialog.svelte";
   import {
     addWorkspaceFolder,
+    addWslWorkspaceFolder,
+    listWslDistributions,
     openWorkspaceDirectory,
     removeWorkspaceFolder,
   } from "$lib/api/workspaces";
@@ -20,6 +23,9 @@
 
   let { profile, onChanged, onFoldersChanged }: Props = $props();
   let busyAction = $state("");
+  let wslDialogOpen = $state(false);
+  let wslDistributions = $state<string[]>([]);
+  let wslError = $state("");
 
   const folders = $derived(workspaceFolders(profile));
 
@@ -47,6 +53,44 @@
       showToast($t("Folder added to the workspace. MCP stays connected; running Actions will prompt for a restart to refresh the manifest."), { kind: "success" });
     } catch (error) {
       showToast(String(error), { kind: "error", title: $t("Could not add folder") });
+    } finally {
+      busyAction = "";
+    }
+  }
+
+  async function chooseWslFolder() {
+    if (busyAction) return;
+    busyAction = "wsl-open";
+    try {
+      wslError = "";
+      wslDistributions = await listWslDistributions();
+      if (wslDistributions.length === 0) {
+        throw new Error($t("No WSL distributions are installed."));
+      }
+      wslDialogOpen = true;
+    } catch (error) {
+      showToast(String(error), {
+        kind: "error",
+        title: $t("Failed to open WSL"),
+        duration: 8000,
+      });
+    } finally {
+      busyAction = "";
+    }
+  }
+
+  async function addWslFolder(distro: string, linuxPath: string, name?: string) {
+    if (busyAction) return;
+    busyAction = "wsl-add";
+    wslError = "";
+    try {
+      const updated = await addWslWorkspaceFolder(profile.id, distro, linuxPath, name);
+      await onChanged(updated);
+      await onFoldersChanged?.(updated);
+      wslDialogOpen = false;
+      showToast($t("Folder added to the workspace. MCP stays connected; running Actions will prompt for a restart to refresh the manifest."), { kind: "success" });
+    } catch (error) {
+      wslError = String(error);
     } finally {
       busyAction = "";
     }
@@ -102,15 +146,26 @@
         {$t("MCP and Actions require an explicit folder selection; no default folder is used.")}
       </p>
     </div>
-    <button
-      type="button"
-      class="tx-btn-primary shrink-0"
-      disabled={Boolean(busyAction)}
-      onclick={() => void chooseFolder()}
-    >
-      <FolderPlus size={15} class="inline-block" />
-      <span class="ml-1">{busyAction === "add" ? $t("Selecting…") : $t("Add folder")}</span>
-    </button>
+    <div class="flex shrink-0 flex-wrap items-center gap-2">
+      <button
+        type="button"
+        class="tx-btn-ghost"
+        disabled={Boolean(busyAction)}
+        onclick={() => void chooseWslFolder()}
+      >
+        <FolderPlus size={15} class="inline-block" />
+        <span class="ml-1">{$t("Add WSL folder")}</span>
+      </button>
+      <button
+        type="button"
+        class="tx-btn-primary"
+        disabled={Boolean(busyAction)}
+        onclick={() => void chooseFolder()}
+      >
+        <FolderPlus size={15} class="inline-block" />
+        <span class="ml-1">{busyAction === "add" ? $t("Selecting…") : $t("Add folder")}</span>
+      </button>
+    </div>
   </div>
 
   <div class="mt-4 grid gap-2">
@@ -118,9 +173,18 @@
       <article class="rounded-[12px] border border-[var(--color-border)] px-3 py-3">
         <div class="flex min-w-0 flex-wrap items-center justify-between gap-3">
           <div class="min-w-0 flex-1">
-            <span class="block truncate text-sm font-medium text-[var(--color-text-primary)]">
-              {folder.name}
-            </span>
+            <div class="flex min-w-0 items-center gap-2">
+              <span class="block truncate text-sm font-medium text-[var(--color-text-primary)]">
+                {folder.name}
+              </span>
+              <span class="shrink-0 rounded-full border border-[var(--color-border)] px-2 py-0.5 text-[10px] text-[var(--color-text-muted)]">
+                {#if folder.execution?.kind === "wsl"}
+                  {$t("WSL")} · {folder.execution.distro}
+                {:else}
+                  {$t("Local")}
+                {/if}
+              </span>
+            </div>
             <p class="tx-mono mt-1 truncate text-xs text-[var(--color-text-muted)]" title={folder.path}>
               {folder.path}
             </p>
@@ -152,3 +216,12 @@
     {/each}
   </div>
 </section>
+
+<WslFolderDialog
+  open={wslDialogOpen}
+  distributions={wslDistributions}
+  busy={busyAction === "wsl-add"}
+  error={wslError}
+  onClose={() => (wslDialogOpen = false)}
+  onSubmit={addWslFolder}
+/>

@@ -256,7 +256,8 @@ export async function projectMapTool(ctx: ToolContext, key: string, args: JsonOb
     maxResults: Math.min(60_000, maxFiles + maxEntries + 1),
     includeDirectories: true,
     includeHidden: args.include_hidden === true,
-    includeIgnored
+    includeIgnored,
+    includeGenerated: args.include_generated === true
   });
   const tree = entries.slice(0, maxEntries).map(entry => ({
     path: entry.path,
@@ -340,7 +341,7 @@ export async function listFilesTool(ctx: ToolContext, key: string, args: JsonObj
   const root = selected.root;
   const base = selected.full;
   if (!(await stat(base)).isDirectory()) throw new Error('NOT_A_DIRECTORY');
-  const maxResults = Math.max(1, Math.min(50_000, Number(args.max_results ?? 5_000)));
+  const maxResults = Math.max(1, Math.min(50_000, Number(args.max_results ?? 1_000)));
   const recursive = args.recursive !== false;
   const maxDepth = recursive ? Math.max(1, Math.min(20, Number(args.max_depth ?? 20))) : 1;
   let entries = await walk(root, base, {
@@ -348,7 +349,8 @@ export async function listFilesTool(ctx: ToolContext, key: string, args: JsonObj
     maxResults: 50_000,
     includeDirectories: true,
     includeHidden: args.include_hidden === true,
-    includeIgnored: args.include_ignored === true
+    includeIgnored: args.include_ignored === true,
+    includeGenerated: args.include_generated === true
   });
   const rawPatterns = [...(Array.isArray(args.patterns) ? args.patterns.map(String) : []), ...(args.glob ? [String(args.glob)] : [])];
   const includePatterns = (rawPatterns.length ? rawPatterns : ['**']).map(globRegex);
@@ -383,7 +385,7 @@ export async function searchTextTool(ctx: ToolContext, key: string, args: JsonOb
   if (queries.some(query => !query.query)) throw new Error('queries[].query is required');
   const filenameQuery = args.filename_query === undefined ? undefined : String(args.filename_query);
   if (!queries.length && !filenameQuery) throw new Error('query, queries, or filename_query is required');
-  const requestedMax = Number(args.max_results ?? 1_000);
+  const requestedMax = Number(args.max_results ?? 200);
   const maxResults = Math.max(1, Math.min(10_000, requestedMax));
   const cursor = Math.max(0, Number(args.cursor ?? 0));
   const requestedPreview = Number(args.max_preview_bytes ?? 512);
@@ -403,7 +405,8 @@ export async function searchTextTool(ctx: ToolContext, key: string, args: JsonOb
     maxDepth: 20,
     maxResults: 50_000,
     includeHidden: args.include_hidden === true,
-    includeIgnored: args.include_ignored === true
+    includeIgnored: args.include_ignored === true,
+    includeGenerated: args.include_generated === true
   })).filter(entry => entry.type === 'file').sort((left, right) => left.path.localeCompare(right.path));
   const matches: JsonObject[] = [];
   const files: JsonObject[] = [];

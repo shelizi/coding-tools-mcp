@@ -8,14 +8,17 @@ import {
 import {
   restoreAgentSecretFiles, snapshotAgentSecretFiles, writeAgentSecrets, type SecretStoreState
 } from './secrets.js';
-import { sendJson } from './oauth.js';
+import { OAuthRuntime, sendJson } from './oauth.js';
+import { Semaphore } from './runtime.js';
 import {
   configurableToolProfiles, toolNamesForProfile, toolsetRevisionForProfile
 } from './catalog.js';
 import { AGENT_VERSION } from './version.js';
 import { dashboardPayload } from './dashboard.js';
-import { allFolderRuntimes } from './folderRuntime.js';
+import { allFolderRuntimes, applyWorkspaceFolderConfiguration } from './folderRuntime.js';
+import { managementDirectoryPayload } from './managementDirectories.js';
 import { handleManagementUiRequest, isManagementUiPath } from './managementUi.js';
+import { ABSOLUTE_COMMAND_TIMEOUT_MAX_MS } from './executionLimits.js';
 import {
   ManagementObservabilityError,
   managementDiagnosticsPayload,
@@ -28,6 +31,9 @@ import {
 import { canonicalizeWorkspaceFolders } from './workspace.js';
 import { normalizeWorkspacePath } from './wsl.js';
 import { parseBuiltinPublicUrl } from './tunnel.js';
+import {
+  compatibilityPermissionMode, compatibilityToolProfile, normalizeSecurityPolicy
+} from './securityPolicy.js';
 import type {
   AgentConfig, AgentConfigDocument, AgentSecrets, JsonObject, PermissionMode, ToolContext, ToolProfileSetting, WorkspaceFolder
 } from './types.js';
@@ -99,6 +105,7 @@ function safeConfig(config: AgentConfig, secrets: AgentSecrets, effective: boole
     permissionMode: config.permissionMode,
     toolProfile: config.toolProfile,
     activeToolProfile: config.activeToolProfile,
+    securityPolicy: config.securityPolicy,
     policy: config.policy,
     management: { enabled: config.management.enabled },
     oauth: {
@@ -130,6 +137,134 @@ function restartRequired(current: AgentConfig, document: AgentConfigDocument, se
   desired.workspaceId = current.workspaceId;
   desired.workspaceName = current.workspaceName;
   return JSON.stringify(current) !== JSON.stringify(desired);
+}
+
+function sameRuntimeValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+const hotApplyLimitKeys = ['activeSessionLimit', 'maxOutputBytes', 'commandTimeoutMaxMs'] as const;
+type ConcurrencyLimitKey = 'blockingConcurrency' | 'processConcurrency' | 'globalBlockingConcurrency' | 'globalProcessConcurrency';
+
+export interface TunnelRuntimeController {
+  reconfigure(tunnel: AgentConfig['tunnel'], publicBaseUrl?: string): Promise<void>;
+}
+
+export interface RuntimeHotApplyTarget {
+  context: ToolContext;
+  oauth?: OAuthRuntime;
+  tunnel?: TunnelRuntimeController;
+}
+
+interface RuntimeConfigurationApplyResult {
+  applied: string[];
+  deferredReasons: string[];
+}
+
+function applyConcurrencyLimit(
+  current: AgentConfig,
+  context: ToolContext,
+  desired: AgentConfig,
+  key: ConcurrencyLimitKey,
+  lanes: readonly Semaphore[],
+  replace: (limit: number) => void,
+  result: RuntimeConfigurationApplyResult
+): void {
+  if (context.config.limits[key] === desired.limits[key]) return;
+  if (lanes.some(lane => lane.active > 0 || lane.queued > 0)) {
+    result.deferredReasons.push(`${key} is still in use by active or queued work.`);
+    return;
+  }
+  replace(desired.limits[key]);
+  current.limits[key] = desired.limits[key];
+  context.config.limits[key] = desired.limits[key];
+  result.applied.push(`limits.${key}`);
+}
+
+async function applyRuntimeConfiguration(
+  current: AgentConfig,
+  runtime: RuntimeHotApplyTarget,
+  desired: AgentConfig
+): Promise<RuntimeConfigurationApplyResult> {
+  const context = runtime.context;
+  const result: RuntimeConfigurationApplyResult = { applied: [], deferredReasons: [] };
+  if (!sameRuntimeValue(context.config.policy, desired.policy)) {
+    current.policy = structuredClone(desired.policy);
+    context.config.policy = structuredClone(desired.policy);
+    result.applied.push('policy');
+  }
+
+  for (const key of hotApplyLimitKeys) {
+    if (context.config.limits[key] === desired.limits[key]) continue;
+    current.limits[key] = desired.limits[key];
+    context.config.limits[key] = desired.limits[key];
+    result.applied.push(`limits.${key}`);
+  }
+
+  const folderRuntimes = allFolderRuntimes(context);
+  applyConcurrencyLimit(
+    current, context, desired, 'blockingConcurrency',
+    folderRuntimes.map(runtime => runtime.admission.blocking),
+    limit => { for (const runtime of folderRuntimes) runtime.admission.blocking = new Semaphore(limit); },
+    result
+  );
+  applyConcurrencyLimit(
+    current, context, desired, 'processConcurrency',
+    folderRuntimes.map(runtime => runtime.admission.process),
+    limit => { for (const runtime of folderRuntimes) runtime.admission.process = new Semaphore(limit); },
+    result
+  );
+  applyConcurrencyLimit(
+    current, context, desired, 'globalBlockingConcurrency', [context.hubAdmission.blocking],
+    limit => { context.hubAdmission.blocking = new Semaphore(limit); }, result
+  );
+  applyConcurrencyLimit(
+    current, context, desired, 'globalProcessConcurrency', [context.hubAdmission.process],
+    limit => { context.hubAdmission.process = new Semaphore(limit); }, result
+  );
+
+  const catalogChanged = context.config.activeToolProfile !== desired.activeToolProfile;
+  const securityChanged = context.config.permissionMode !== desired.permissionMode
+    || !sameRuntimeValue(context.config.securityPolicy, desired.securityPolicy)
+    || catalogChanged;
+  if (securityChanged) {
+    context.usageStore.setRedactTelemetry(desired.securityPolicy.redactTelemetry);
+    for (const target of [current, context.config]) {
+      target.permissionMode = desired.permissionMode;
+      target.toolProfile = desired.toolProfile;
+      target.activeToolProfile = desired.activeToolProfile;
+      target.securityPolicy = structuredClone(desired.securityPolicy);
+      target.securityPolicyCustomized = desired.securityPolicyCustomized;
+    }
+    result.applied.push('securityPolicy');
+    if (catalogChanged) result.applied.push('toolCatalog');
+  } else {
+    current.toolProfile = desired.toolProfile;
+    context.config.toolProfile = desired.toolProfile;
+    current.securityPolicyCustomized = desired.securityPolicyCustomized;
+    context.config.securityPolicyCustomized = desired.securityPolicyCustomized;
+  }
+
+  if (!sameRuntimeValue(context.config.oauth, desired.oauth) && runtime.oauth) {
+    runtime.oauth.update(desired.oauth);
+    current.oauth = structuredClone(desired.oauth);
+    context.config.oauth = structuredClone(desired.oauth);
+    result.applied.push('oauth');
+  }
+
+  if (!sameRuntimeValue(context.config.tunnel, desired.tunnel) && runtime.tunnel) {
+    try {
+      await runtime.tunnel.reconfigure(desired.tunnel, desired.publicBaseUrl);
+      if (context.config.tunnel) current.tunnel = structuredClone(context.config.tunnel);
+      else delete current.tunnel;
+      if (context.config.publicBaseUrl) current.publicBaseUrl = context.config.publicBaseUrl;
+      else delete current.publicBaseUrl;
+      result.applied.push('tunnel');
+    } catch (error) {
+      result.deferredReasons.push(`Tunnel reconfiguration failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return result;
 }
 
 export class ConfigStore {
@@ -173,13 +308,19 @@ export class ConfigStore {
     return this.secrets[key] ?? this.current.oauth.password;
   }
 
-  async replaceSecret(key: 'oauthPassword', value: string): Promise<void> {
+  async replaceSecret(key: 'oauthPassword', value: string, runtime?: RuntimeHotApplyTarget): Promise<boolean> {
     if (!value.trim()) throw new Error(`${key} must not be blank`);
     const nextSecrets = { ...this.secrets, [key]: value };
     const targetDataDir = resolveDataDir(this.document);
     const secretState = await writeAgentSecrets(targetDataDir, nextSecrets);
     this.secrets = secretState.secrets;
     this.secretStorePath = secretState.storePath;
+    if (!runtime?.oauth || process.env.CTMCP_OAUTH_PASSWORD !== undefined) return false;
+    const oauth = { ...runtime.context.config.oauth, password: value };
+    runtime.oauth.update(oauth);
+    this.current.oauth = structuredClone(oauth);
+    runtime.context.config.oauth = structuredClone(oauth);
+    return true;
   }
 
   async applyResolvedBuiltinTunnel(publicUrl: string, enrollmentCompleted: boolean): Promise<void> {
@@ -223,19 +364,19 @@ export class ConfigStore {
     this.current.publicBaseUrl = endpoint.baseUrl;
   }
 
-  async save(value: unknown): Promise<JsonObject> {
+  async save(value: unknown, runtime?: RuntimeHotApplyTarget): Promise<JsonObject> {
     const input = record(value, 'config');
     const oauthInput = record(input.oauth ?? {}, 'oauth');
     const limitsInput = record(input.limits ?? {}, 'limits');
     const policyInput = record(input.policy ?? this.current.policy, 'policy');
+    const securityPolicyInput = record(input.securityPolicy ?? this.current.securityPolicy, 'securityPolicy');
     const managementInput = record(input.management ?? {}, 'management');
     const tunnelInput = record(input.tunnel ?? {}, 'tunnel');
     const nextSecrets = structuredClone(this.secrets);
 
-    const mode = stringValue(input.permissionMode, 'permissionMode', this.current.permissionMode, 32) as PermissionMode;
-    if (!permissionModes.has(mode)) throw new Error('permissionMode is invalid');
-    const toolProfile = stringValue(input.toolProfile, 'toolProfile', this.current.toolProfile, 64) as ToolProfileSetting;
-    if (!configurableToolProfiles.includes(toolProfile)) throw new Error('toolProfile is invalid');
+    const securityPolicy = normalizeSecurityPolicy(securityPolicyInput as Partial<AgentConfig['securityPolicy']>);
+    const mode = compatibilityPermissionMode(securityPolicy);
+    const toolProfile = compatibilityToolProfile(securityPolicy);
 
     const oauth: AgentConfigDocument['oauth'] = {
       clientId: stringValue(oauthInput.clientId, 'oauth.clientId', this.current.oauth.clientId, 256)
@@ -276,6 +417,7 @@ export class ConfigStore {
       dataDir: path.resolve(stringValue(input.dataDir, 'dataDir', this.current.dataDir, 4096)),
       permissionMode: mode,
       toolProfile,
+      securityPolicy,
       policy: {
         allowedCommands: Array.isArray(policyInput.allowedCommands)
           ? policyInput.allowedCommands.map(String)
@@ -295,7 +437,14 @@ export class ConfigStore {
         globalBlockingConcurrency: integerValue(limitsInput.globalBlockingConcurrency, 'limits.globalBlockingConcurrency', this.current.limits.globalBlockingConcurrency, 1, 65_535),
         globalProcessConcurrency: integerValue(limitsInput.globalProcessConcurrency, 'limits.globalProcessConcurrency', this.current.limits.globalProcessConcurrency, 1, 65_535),
         activeSessionLimit: integerValue(limitsInput.activeSessionLimit, 'limits.activeSessionLimit', this.current.limits.activeSessionLimit, 1, 65_535),
-        maxOutputBytes: integerValue(limitsInput.maxOutputBytes, 'limits.maxOutputBytes', this.current.limits.maxOutputBytes, 1_024, 16 * 1024 * 1024)
+        maxOutputBytes: integerValue(limitsInput.maxOutputBytes, 'limits.maxOutputBytes', this.current.limits.maxOutputBytes, 1_024, 16 * 1024 * 1024),
+        commandTimeoutMaxMs: integerValue(
+          limitsInput.commandTimeoutMaxMs,
+          'limits.commandTimeoutMaxMs',
+          this.current.limits.commandTimeoutMaxMs,
+          1,
+          ABSOLUTE_COMMAND_TIMEOUT_MAX_MS
+        )
       },
       ...(tunnel ? { tunnel } : {})
     };
@@ -324,6 +473,31 @@ export class ConfigStore {
     this.secrets = secretState.secrets;
     this.secretStorePath = secretState.storePath;
     const saved = validateConfigDocument(document);
+    const desired = normalizeConfig(document, this.secrets);
+    desired.workspaceId = this.current.workspaceId;
+    desired.workspaceName = this.current.workspaceName;
+    const currentSecurityStable = this.current.permissionMode === desired.permissionMode
+      && this.current.activeToolProfile === desired.activeToolProfile
+      && sameRuntimeValue(this.current.securityPolicy, desired.securityPolicy);
+    if (currentSecurityStable) {
+      this.current.toolProfile = desired.toolProfile;
+      this.current.securityPolicyCustomized = desired.securityPolicyCustomized;
+    }
+    const appliedImmediately: string[] = [];
+    const hotApplyDeferredReasons: string[] = [];
+    if (runtime) {
+      const folderApply = applyWorkspaceFolderConfiguration(runtime.context, desired.folders);
+      if (folderApply.applied) {
+        this.current.folders = desired.folders.map(folder => ({ ...folder }));
+        appliedImmediately.push('folders');
+      } else if (folderApply.changed && folderApply.deferredReason) {
+        hotApplyDeferredReasons.push(folderApply.deferredReason);
+      }
+      const runtimeApply = await applyRuntimeConfiguration(this.current, runtime, desired);
+      appliedImmediately.push(...runtimeApply.applied);
+      hotApplyDeferredReasons.push(...runtimeApply.deferredReasons);
+    }
+    const hotApplyDeferredReason = hotApplyDeferredReasons.length ? hotApplyDeferredReasons.join(' ') : null;
     const needsRestart = restartRequired(this.current, document, this.secrets);
     return {
       ok: true,
@@ -331,9 +505,15 @@ export class ConfigStore {
       configPath: this.configPath,
       secretStorePath: this.secretStorePath,
       restartRequired: needsRestart,
+      appliedImmediately,
+      hotApplyDeferredReason,
       saved: safeConfig(saved, this.secrets, false),
       environmentOverrides: environmentKeys.filter(key => process.env[key] !== undefined),
-      warning: needsRestart ? 'The configuration file was saved. Restart the agent to apply it.' : null
+      warning: needsRestart
+        ? hotApplyDeferredReason ?? (appliedImmediately.length
+          ? 'Some settings were applied immediately. Restart the agent to apply the remaining settings.'
+          : 'The configuration file was saved. Restart the agent to apply it.')
+        : null
     };
   }
 }
@@ -375,19 +555,19 @@ async function requestBody(req: IncomingMessage, limit = 512 * 1024): Promise<un
 export interface WorkspaceManagementStore {
   readonly primaryWorkspaceId: string;
   snapshot(): JsonObject;
-  saveWorkspace(id: string, value: unknown): Promise<JsonObject>;
+  saveWorkspace(id: string, value: unknown, runtime?: RuntimeHotApplyTarget): Promise<JsonObject>;
   secret(id: string, key: 'oauthPassword'): string;
-  regenerateSecret(id: string, key: 'oauthPassword'): Promise<JsonObject>;
+  regenerateSecret(id: string, key: 'oauthPassword', runtime?: RuntimeHotApplyTarget): Promise<JsonObject>;
 }
 
-export interface WorkspaceRuntimeRecord {
-  context: ToolContext;
+export interface WorkspaceRuntimeRecord extends RuntimeHotApplyTarget {
   startedAt: number;
 }
 
 export interface ManagementOptions {
   configStore: ConfigStore;
   context: ToolContext;
+  oauth: OAuthRuntime;
   startedAt: number;
   adminToken: string;
   requestRestart?: () => void;
@@ -398,14 +578,14 @@ export interface ManagementOptions {
 function runtimeRecords(options: ManagementOptions): Array<[string, WorkspaceRuntimeRecord]> {
   if (options.runtimeRegistry?.size) return [...options.runtimeRegistry.entries()];
   const id = options.context.config.workspaceId ?? options.context.workspaceProfileId;
-  return [[id, { context: options.context, startedAt: options.startedAt }]];
+  return [[id, { context: options.context, oauth: options.oauth, startedAt: options.startedAt }]];
 }
 
 function runtimeRecord(options: ManagementOptions, workspaceId: string): WorkspaceRuntimeRecord | undefined {
   const registered = options.runtimeRegistry?.get(workspaceId);
   if (registered) return registered;
   const currentId = options.context.config.workspaceId ?? options.context.workspaceProfileId;
-  return workspaceId === currentId ? { context: options.context, startedAt: options.startedAt } : undefined;
+  return workspaceId === currentId ? { context: options.context, oauth: options.oauth, startedAt: options.startedAt } : undefined;
 }
 
 function statusPayload(options: ManagementOptions): JsonObject {
@@ -413,7 +593,7 @@ function statusPayload(options: ManagementOptions): JsonObject {
   const primaryId = options.workspaceStore?.primaryWorkspaceId
     ?? options.context.config.workspaceId
     ?? options.context.workspaceProfileId;
-  const primary = options.runtimeRegistry?.get(primaryId) ?? { context: options.context, startedAt: options.startedAt };
+  const primary = options.runtimeRegistry?.get(primaryId) ?? { context: options.context, oauth: options.oauth, startedAt: options.startedAt };
   const sessions = records.flatMap(([, record]) => (
     allFolderRuntimes(record.context).flatMap(runtime => [...runtime.sessions.values()])
   ));
@@ -476,6 +656,14 @@ function observabilityError(res: ServerResponse, error: unknown): void {
   });
 }
 
+function directoryBrowseError(res: ServerResponse, error: unknown): void {
+  const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+  const status = code === 'ENOENT' ? 404 : code === 'EACCES' || code === 'EPERM' ? 403 : 400;
+  sendJson(res, status, {
+    error: { code: 'DIRECTORY_BROWSE_FAILED', message: error instanceof Error ? error.message : String(error) }
+  });
+}
+
 function localListenerBaseUrl(req: IncomingMessage): string {
   const port = req.socket.localPort;
   if (!port) throw new ManagementObservabilityError(500, 'LOCAL_LISTENER_UNAVAILABLE', 'Local listener address is unavailable.');
@@ -516,8 +704,26 @@ export async function handleManagementRequest(req: IncomingMessage, res: ServerR
       sendJson(res, 404, { error: { code: 'WORKSPACE_NOT_FOUND', message: `Workspace was not found: ${workspaceId}` } });
       return true;
     }
-    const selected = record ?? { context: options.context, startedAt: options.startedAt };
+    const selected = record ?? { context: options.context, oauth: options.oauth, startedAt: options.startedAt };
     sendJson(res, 200, await dashboardPayload(selected.context, selected.startedAt));
+    return true;
+  }
+  if (pathname === '/admin/api/directories' && req.method === 'GET') {
+    const requestUrl = new URL(req.url ?? pathname, `http://${req.headers.host ?? '127.0.0.1'}`);
+    const workspaceId = requestUrl.searchParams.get('workspaceId')?.trim();
+    const selected = workspaceId ? runtimeRecord(options, workspaceId) : undefined;
+    if (workspaceId && !selected) {
+      sendJson(res, 404, { error: { code: 'WORKSPACE_NOT_FOUND', message: `Workspace was not found: ${workspaceId}` } });
+      return true;
+    }
+    try {
+      sendJson(res, 200, await managementDirectoryPayload(
+        selected?.context.config ?? options.context.config,
+        requestUrl.searchParams.get('path')
+      ));
+    } catch (error) {
+      directoryBrowseError(res, error);
+    }
     return true;
   }
 
@@ -584,7 +790,8 @@ export async function handleManagementRequest(req: IncomingMessage, res: ServerR
   }
   if (pathname === '/admin/api/config' && req.method === 'PUT') {
     try {
-      const result = await options.configStore.save(await requestBody(req));
+      const workspaceId = options.context.config.workspaceId ?? options.context.workspaceProfileId;
+      const result = await options.configStore.save(await requestBody(req), runtimeRecord(options, workspaceId));
       sendJson(res, 200, result);
     } catch (error) {
       managementError(res, error);
@@ -597,7 +804,12 @@ export async function handleManagementRequest(req: IncomingMessage, res: ServerR
     const [, workspaceId, action] = workspaceRoute;
     try {
       if (action === 'config' && req.method === 'PUT') {
-        sendJson(res, 200, await options.workspaceStore.saveWorkspace(workspaceId, await requestBody(req)));
+        const selected = runtimeRecord(options, workspaceId);
+        sendJson(res, 200, await options.workspaceStore.saveWorkspace(
+          workspaceId,
+          await requestBody(req),
+          selected
+        ));
         return true;
       }
       if (action === 'secrets/oauth-password' && req.method === 'GET') {
@@ -605,7 +817,11 @@ export async function handleManagementRequest(req: IncomingMessage, res: ServerR
         return true;
       }
       if (action === 'secrets/oauth-password/regenerate' && req.method === 'POST') {
-        sendJson(res, 200, await options.workspaceStore.regenerateSecret(workspaceId, 'oauthPassword'));
+        sendJson(res, 200, await options.workspaceStore.regenerateSecret(
+          workspaceId,
+          'oauthPassword',
+          runtimeRecord(options, workspaceId)
+        ));
         return true;
       }
     } catch (error) {

@@ -531,6 +531,13 @@
 
   async function saveMcpPolicy(draft: RuntimePolicyDraft) {
     if (!profile) return;
+    const requiresRestart =
+      draft.transportMode !== profile.runtime.transport_mode ||
+      draft.blockingAdmissionLimit !== profile.runtime.blocking_admission_limit ||
+      draft.processAdmissionLimit !== profile.runtime.process_admission_limit ||
+      draft.globalBlockingAdmissionLimit !== profile.runtime.global_blocking_admission_limit ||
+      draft.globalProcessAdmissionLimit !== profile.runtime.global_process_admission_limit ||
+      draft.activeSessionLimit !== profile.runtime.active_session_limit;
     const next: WorkspaceProfile = {
       ...profile,
       runtime: {
@@ -549,8 +556,10 @@
       },
     };
     if (!(await persistProfile("save.mcp.policy", next))) return;
-    await promptServiceRestart(mcpStatus === "running", $t("MCP service"));
-    await promptServiceRestart(actionsStatus === "running", $t("Actions service"));
+    if (requiresRestart) {
+      await promptServiceRestart(mcpStatus === "running", $t("MCP service"));
+      await promptServiceRestart(actionsStatus === "running", $t("Actions service"));
+    }
   }
 
   async function saveActionsPolicy(draft: ActionsPolicyDraft) {

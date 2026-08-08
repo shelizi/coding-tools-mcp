@@ -11,7 +11,7 @@ use regex::Regex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::platform::wsl::std_command_for_workspace;
+use crate::platform::wsl::std_command_for_workspace_with_env;
 use crate::tools::workspace::{tool_ok, Workspace, WorkspaceError};
 
 #[derive(Debug, Clone)]
@@ -704,6 +704,89 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     })))
 }
 
+pub fn git_push(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+    let target = resolve_git_target(ws, args)?;
+    verify_expected_head(&target, args)?;
+    let remote = validate_git_ref(
+        args.get("remote")
+            .and_then(Value::as_str)
+            .unwrap_or("origin"),
+    )?;
+    let branch = match args.get("branch").and_then(Value::as_str) {
+        Some(branch) => validate_git_ref(branch)?,
+        None if target.branch != "HEAD" => target.branch.as_str(),
+        None => {
+            return Err(WorkspaceError::invalid_argument(
+                "branch is required when HEAD is detached",
+            ))
+        }
+    };
+    let dry_run = args
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let set_upstream = args
+        .get("set_upstream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut git_args = vec!["push".to_string()];
+    if dry_run {
+        git_args.push("--dry-run".into());
+    }
+    if set_upstream {
+        git_args.push("--set-upstream".into());
+    }
+    git_args.push(remote.to_string());
+    git_args.push(branch.to_string());
+
+    let completed = run_git_strings(&target.root, &git_args, Duration::from_secs(120))?;
+    if !completed.success {
+        let lowered = completed.stderr.to_ascii_lowercase();
+        if lowered.contains("authentication failed")
+            || lowered.contains("failed to authenticate")
+            || lowered.contains("could not read username")
+        {
+            return Err(WorkspaceError::ToolDetails {
+                code: "GIT_AUTHENTICATION_FAILED",
+                message: completed.stderr.trim().to_string(),
+                category: "authentication",
+                retryable: true,
+                details: json!({
+                    "remote": remote,
+                    "branch": branch,
+                    "suggestion": "Refresh the Git credential/token for this remote, then retry the same git_push request."
+                }),
+            });
+        }
+        return Err(WorkspaceError::ToolDetails {
+            code: "GIT_PUSH_FAILED",
+            message: completed.stderr.trim().to_string(),
+            category: "git",
+            retryable: false,
+            details: json!({
+                "remote": remote,
+                "branch": branch,
+                "stdout": completed.stdout
+            }),
+        });
+    }
+
+    let status = git_status(ws, &json!({"path": target.repo_path}))?;
+    Ok(tool_ok(json!({
+        "dry_run": dry_run,
+        "applied": !dry_run,
+        "remote": remote,
+        "branch": branch,
+        "stdout": completed.stdout.trim(),
+        "stderr": completed.stderr.trim(),
+        "repo": target.metadata(),
+        "status": status,
+        "affected_files": [],
+        "warnings": []
+    })))
+}
+
 pub fn git_restore(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     prevalidate_git_paths(ws, args)?;
     let target = resolve_git_target(ws, args)?;
@@ -1080,11 +1163,11 @@ fn run_git(
         .iter()
         .map(|arg| (*arg).to_string())
         .collect::<Vec<_>>();
-    let mut cmd = std_command_for_workspace("git", &command_args, cwd);
+    let git_env = [("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())];
+    let mut cmd = std_command_for_workspace_with_env("git", &command_args, cwd, &git_env, &[]);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .stderr(Stdio::piped());
 
     #[cfg(windows)]
     {

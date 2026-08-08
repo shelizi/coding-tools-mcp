@@ -65,6 +65,18 @@ async function writeHistory(root, files) {
   return dir;
 }
 
+test('bootstrap uses the stable runtime identity when the host session id is missing', async t => {
+  const { ctx } = await fixture(t, 'ctmcp-history-missing-session-');
+  const selected = await callTool(ctx, 'switch_workspace_folder', { folder_id: 'repo' }, {});
+  assert.equal(selected.ok, true, JSON.stringify(selected));
+  const result = await callTool(ctx, 'history_session_bootstrap', {}, {});
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.session_key, ctx.conversations.fallbackKey);
+  assert.equal(result.session_key_source, 'stable_runtime_fallback');
+  assert.equal(result.host_session_key_mismatch, false);
+  assert.equal(result.fallback_session_key_mismatch, false);
+});
+
 test('bootstrap writes the shared Rust index format and resumes idempotently', async t => {
   const { root, ctx, meta } = await fixture(t);
   const dir = await writeHistory(root, {

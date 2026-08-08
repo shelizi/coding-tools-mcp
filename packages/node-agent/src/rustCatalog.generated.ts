@@ -36,11 +36,37 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minimum": 0,
           "type": "integer"
         },
+        "errors_only": {
+          "default": false,
+          "type": "boolean"
+        },
+        "kind": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
         "limit": {
           "default": 50,
           "maximum": 200,
           "minimum": 1,
           "type": "integer"
+        },
+        "order": {
+          "default": "desc",
+          "enum": [
+            "desc",
+            "asc"
+          ],
+          "type": "string"
+        },
+        "since_ts_ms": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tool": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
         }
       },
       "type": "object"
@@ -148,11 +174,11 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "type": "boolean"
         },
         "include_bursts": {
-          "default": true,
+          "default": false,
           "type": "boolean"
         },
         "include_largest": {
-          "default": true,
+          "default": false,
           "type": "boolean"
         },
         "include_payloads": {
@@ -168,7 +194,7 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "type": "boolean"
         },
         "include_slowest": {
-          "default": true,
+          "default": false,
           "type": "boolean"
         },
         "limit": {
@@ -856,6 +882,11 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "include_generated": {
+          "default": false,
+          "description": "Include generated dependency/build trees such as node_modules, target, dist, and build. .git remains excluded.",
+          "type": "boolean"
+        },
         "include_hidden": {
           "default": false,
           "type": "boolean"
@@ -929,6 +960,11 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "description": "Alias for a single patterns entry",
           "type": "string"
         },
+        "include_generated": {
+          "default": false,
+          "description": "Include generated dependency/build trees such as node_modules, target, dist, and build. .git remains excluded.",
+          "type": "boolean"
+        },
         "include_hidden": {
           "default": false,
           "type": "boolean"
@@ -944,7 +980,7 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "type": "integer"
         },
         "max_results": {
-          "default": 5000,
+          "default": 1000,
           "maximum": 50000,
           "minimum": 1,
           "type": "integer"
@@ -1027,6 +1063,11 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "description": "Alias appended to include_globs",
           "type": "string"
         },
+        "include_generated": {
+          "default": false,
+          "description": "Include generated dependency/build trees such as node_modules, target, dist, and build. .git remains excluded.",
+          "type": "boolean"
+        },
         "include_globs": {
           "items": {
             "type": "string"
@@ -1060,7 +1101,7 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "type": "integer"
         },
         "max_results": {
-          "default": 1000,
+          "default": 200,
           "maximum": 10000,
           "minimum": 1,
           "type": "integer"
@@ -1833,7 +1874,7 @@ export const rustCatalog: readonly ToolDefinition[] = [
               },
               "timeout_ms": {
                 "default": 30000,
-                "maximum": 600000,
+                "maximum": 3600000,
                 "minimum": 1,
                 "type": "integer"
               }
@@ -1886,7 +1927,7 @@ export const rustCatalog: readonly ToolDefinition[] = [
         },
         "timeout_ms": {
           "default": 30000,
-          "maximum": 600000,
+          "maximum": 3600000,
           "minimum": 1,
           "type": "integer"
         },
@@ -1922,6 +1963,17 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "action": {
+          "default": "run",
+          "description": "Run or reattach by default; status returns immediately, cancel terminates active graph children, and forget releases a completed retained graph immediately.",
+          "enum": [
+            "run",
+            "status",
+            "cancel",
+            "forget"
+          ],
+          "type": "string"
+        },
         "commands": {
           "items": {
             "additionalProperties": false,
@@ -2041,7 +2093,7 @@ export const rustCatalog: readonly ToolDefinition[] = [
               },
               "timeout_ms": {
                 "default": 30000,
-                "maximum": 600000,
+                "maximum": 3600000,
                 "minimum": 1,
                 "type": "integer"
               },
@@ -2083,14 +2135,38 @@ export const rustCatalog: readonly ToolDefinition[] = [
           ],
           "type": "string"
         },
+        "operation_id": {
+          "description": "Stable retained graph identifier. Reuse it without commands to reattach to the same exec_many graph instead of starting duplicate commands.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "description": "Optional reason recorded when cancelling a retained graph.",
+          "type": "string"
+        },
+        "result_mode": {
+          "description": "Controls per-command result detail. When omitted, run/reattach preserves full results while status/cancel use compact summaries to avoid repeating large stdout/stderr payloads.",
+          "enum": [
+            "full",
+            "summary",
+            "none"
+          ],
+          "type": "string"
+        },
         "stop_on_error": {
           "default": true,
           "type": "boolean"
+        },
+        "yield_time_ms": {
+          "default": 30000,
+          "description": "How long this exec_many call waits for graph completion before returning retained progress. The graph continues running after this window.",
+          "maximum": 30000,
+          "minimum": 0,
+          "type": "integer"
         }
       },
-      "required": [
-        "commands"
-      ],
       "type": "object"
     },
     "name": "exec_many",
@@ -2115,7 +2191,7 @@ export const rustCatalog: readonly ToolDefinition[] = [
         },
         "heartbeat_ms": {
           "default": 0,
-          "description": "Return a heartbeat at this interval while the process remains quiet so transports stay active without restarting the command.",
+          "description": "Deprecated compatibility field. Accepted but ignored for application wait timing; MCP transport heartbeats keep long requests alive automatically.",
           "maximum": 30000,
           "minimum": 0,
           "type": "integer"
@@ -2773,6 +2849,59 @@ export const rustCatalog: readonly ToolDefinition[] = [
   },
   {
     "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Git push"
+    },
+    "description": "Push the current or selected branch to a remote with expected-HEAD guards and structured authentication errors.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "branch": {
+          "description": "Defaults to the current branch; required for detached HEAD.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "dry_run": {
+          "default": false,
+          "type": "boolean"
+        },
+        "expected_head": {
+          "type": "string"
+        },
+        "expected_repo_fingerprint": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "type": "string"
+        },
+        "remote": {
+          "default": "origin",
+          "minLength": 1,
+          "type": "string"
+        },
+        "repo_path": {
+          "default": ".",
+          "description": "Workspace-relative Git repository or linked worktree root",
+          "type": "string"
+        },
+        "set_upstream": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "git_push",
+    "title": "Git push"
+  },
+  {
+    "annotations": {
       "destructiveHint": true,
       "idempotentHint": false,
       "openWorldHint": false,
@@ -2890,7 +3019,8 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "tool_name": {
           "enum": [
             "exec_command",
-            "apply_patch"
+            "apply_patch",
+            "git_push"
           ],
           "type": "string"
         },
@@ -3010,6 +3140,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "git_branch",
     "git_stage",
     "git_commit",
+    "git_push",
     "git_restore",
     "request_permissions",
     "view_image"
@@ -3081,6 +3212,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "git_branch",
     "git_stage",
     "git_commit",
+    "git_push",
     "git_restore",
     "request_permissions",
     "view_image"
@@ -3118,6 +3250,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "git_branch",
     "git_stage",
     "git_commit",
+    "git_push",
     "git_restore",
     "request_permissions",
     "view_image"
@@ -3155,6 +3288,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "git_branch",
     "git_stage",
     "git_commit",
+    "git_push",
     "git_restore",
     "view_image"
   ]
@@ -3310,6 +3444,13 @@ export const rustToolAnnotationOverridesByProfile: Readonly<Record<ToolProfile, 
       "readOnlyHint": true,
       "title": "Git commit"
     },
+    "git_push": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Git push"
+    },
     "git_restore": {
       "destructiveHint": false,
       "idempotentHint": true,
@@ -3329,16 +3470,18 @@ export const rustToolAnnotationOverridesByProfile: Readonly<Record<ToolProfile, 
   "trusted-core": {}
 };
 export const rustToolsetRevisionByProfile: Readonly<Record<ToolProfile, string>> = {
-  "advanced": "1e7541b936fd26c5",
-  "read-only": "55c41c31ff9e7f6f",
-  "compat-readonly-all": "49ee626138ccae60",
-  "guarded-core": "ae32d612e23a21a3",
-  "trusted-core": "2e258d0c6310ed00"
+  "advanced": "cd6a370aaabd35ab",
+  "read-only": "d3e63ccd8e6c0b19",
+  "compat-readonly-all": "a93ab448d6add11b",
+  "guarded-core": "8da48d46317ec605",
+  "trusted-core": "d105229c9e8b32d2"
 };
 export const rustBehavioralParityFixtures: Readonly<Record<string, unknown>> = {
   "execution_limits": {
     "active_sessions": 512,
     "blocking_admission": 128,
+    "command_timeout_absolute_max_ms": 3600000,
+    "command_timeout_default_ms": 1800000,
     "global_blocking_admission": 1024,
     "global_process_admission": 512,
     "process_admission": 64

@@ -24,7 +24,13 @@ const PHASE_METRICS = [
   ['preflight', 'phase_preflight_ms'],
   ['plan', 'phase_plan_ms'],
   ['commit', 'phase_commit_ms'],
-  ['total', 'phase_total_ms']
+  ['total', 'phase_total_ms'],
+  ['baseline_capture', 'phase_baseline_capture_ms'],
+  ['error_enrichment', 'phase_error_enrichment_ms'],
+  ['harness_begin', 'phase_harness_begin_ms'],
+  ['dispatch', 'phase_dispatch_ms'],
+  ['harness_finish', 'phase_harness_finish_ms'],
+  ['serialization', 'phase_serialization_ms']
 ] as const;
 const REDACTED = '[REDACTED]';
 const MUTATING_TOOLS = new Set([
@@ -60,8 +66,17 @@ const STRUCTURED_FIELDS = [
   'parallel_history_samples', 'parallel_blocked_pair_count', 'recommended_max_parallel',
   'inferred_lock_group_count', 'parallel_observation_count',
   'parallelism_observation_truncated', 'wait_timeout_ms', 'effective_wait_ms',
-  'heartbeat_ms', 'heartbeat', 'deduplicated', 'attached_to_session_id', 'detached',
-  'command_fingerprint', 'process_id', 'process_tree_contained', 'process_tree_control',
+  'wait_timed_out', 'wait_completed', 'process_completed', 'terminal',
+  'progress_since_last_wait', 'next_wait_ms', 'heartbeat_ms', 'heartbeat',
+  'deduplicated', 'coalesced_inflight', 'coalesced_wait_ms',
+  'graph_operation_id', 'graph_action', 'graph_status', 'graph_completed', 'graph_execution_ok', 'graph_progress_ok', 'control_ok', 'reattached', 'graph_deduplicated', 'graph_yield_ms', 'graph_wait_ms',
+  'cancel_requested', 'cancel_accepted', 'cancelled_session_count', 'forgotten',
+  'result_mode', 'results_included', 'result_output_included', 'results_omitted_count',
+  'graph_created_ts_ms', 'graph_completed_ts_ms', 'retention_expires_ts_ms', 'retention_remaining_ms',
+  'retained_graph_count', 'capacity_evicted_graph_count',
+  'completed_command_count', 'running_command_count', 'pending_command_count',
+  'attached_to_session_id', 'detached', 'command_fingerprint', 'process_id',
+  'process_tree_contained', 'process_tree_control',
   'resolved_by', 'retention_seconds', 'wait_until', 'sensitive_data_redacted',
   'redaction_count'
 ] as const;
@@ -72,6 +87,9 @@ const ARRAY_COUNTS: ReadonlyArray<readonly [string, string]> = [
   ['recovery_actions', 'recovery_action_count'],
   ['failed_command_ids', 'failed_command_id_count'],
   ['skipped_command_ids', 'skipped_command_id_count'],
+  ['completed_command_ids', 'completed_command_id_count'],
+  ['running_command_ids', 'running_command_id_count'],
+  ['pending_command_ids', 'pending_command_id_count'],
   ['events', 'event_count'],
   ['affected_files', 'affected_file_count'],
   ['entries', 'entry_count'],
@@ -98,6 +116,7 @@ export interface ToolUsageStoreOptions {
   maxBytes?: number;
   retainedFiles?: number;
   queueCapacity?: number;
+  redactTelemetry?: boolean;
   now?: () => number;
 }
 
@@ -282,18 +301,18 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return '...[TRUNCATED]';
 }
 
-function sanitizeValue(value: unknown, key?: string): unknown {
-  if (key && isSensitiveKey(key)) return REDACTED;
-  if (Array.isArray(value)) return value.map(item => sanitizeValue(item));
+function sanitizeValue(value: unknown, key?: string, redact = true): unknown {
+  if (redact && key && isSensitiveKey(key)) return REDACTED;
+  if (Array.isArray(value)) return value.map(item => sanitizeValue(item, undefined, redact));
   if (isRecord(value)) {
-    return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [childKey, sanitizeValue(child, childKey)]));
+    return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [childKey, sanitizeValue(child, childKey, redact)]));
   }
   if (typeof value === 'string') {
-    const redacted = redactSensitiveText(value).value;
-    const characters = [...redacted];
+    const sanitized = redact ? redactSensitiveText(value).value : value;
+    const characters = [...sanitized];
     return characters.length > MAX_LOG_STRING_CHARS
       ? `${characters.slice(0, MAX_LOG_STRING_CHARS).join('')}...[TRUNCATED]`
-      : redacted;
+      : sanitized;
   }
   return value;
 }
@@ -314,12 +333,13 @@ function requestMutates(tool: string, args: JsonObject): boolean {
   return MUTATING_TOOLS.has(tool);
 }
 
-function commandPreview(args: JsonObject): string | undefined {
-  if (typeof args.cmd === 'string') return redactSensitiveText(args.cmd).value;
-  if (typeof args.script === 'string') return redactSensitiveText(args.script).value;
+function commandPreview(args: JsonObject, redact = true): string | undefined {
+  if (typeof args.cmd === 'string') return redact ? redactSensitiveText(args.cmd).value : args.cmd;
+  if (typeof args.script === 'string') return redact ? redactSensitiveText(args.script).value : args.script;
   if (typeof args.program !== 'string') return undefined;
   const argv = Array.isArray(args.args) ? args.args.map(String) : [];
-  return redactSensitiveText([args.program, ...argv].join(' ')).value;
+  const preview = [args.program, ...argv].join(' ');
+  return redact ? redactSensitiveText(preview).value : preview;
 }
 
 export function classifyCommandText(command: string): string {
@@ -355,16 +375,17 @@ function warningSeverityCounts(result: JsonObject): JsonObject {
   return output;
 }
 
-function copyResultMetrics(record: JsonObject, tool: string, result: JsonObject): void {
-  for (const field of STRUCTURED_FIELDS) if (result[field] !== undefined) record[field] = sanitizeValue(result[field], field);
+function copyResultMetrics(record: JsonObject, tool: string, result: JsonObject, redact: boolean): void {
+  for (const field of STRUCTURED_FIELDS) if (result[field] !== undefined) record[field] = sanitizeValue(result[field], field, redact);
   if (isRecord(result.phase_durations_ms)) {
-    for (const phase of ['preflight_ms', 'plan_ms', 'commit_ms', 'total_ms']) {
-      if (result.phase_durations_ms[phase] !== undefined) record[`phase_${phase}`] = numberValue(result.phase_durations_ms[phase]);
+    for (const [phase] of PHASE_METRICS) {
+      const source = `${phase}_ms`;
+      if (result.phase_durations_ms[source] !== undefined) record[`phase_${source}`] = numberValue(result.phase_durations_ms[source]);
     }
   }
   if (tool === 'exec_many') {
-    if (Array.isArray(result.parallelism_observations)) record.parallelism_observations = sanitizeValue(result.parallelism_observations.slice(0, 128));
-    if (Array.isArray(result.parallel_decision_reasons)) record.parallel_decision_reasons = sanitizeValue(result.parallel_decision_reasons.slice(0, 16));
+    if (Array.isArray(result.parallelism_observations)) record.parallelism_observations = sanitizeValue(result.parallelism_observations.slice(0, 128), undefined, redact);
+    if (Array.isArray(result.parallel_decision_reasons)) record.parallel_decision_reasons = sanitizeValue(result.parallel_decision_reasons.slice(0, 16), undefined, redact);
   }
   if (tool === 'format_files') {
     const mappings: ReadonlyArray<readonly [string, string]> = [
@@ -380,18 +401,18 @@ function copyResultMetrics(record: JsonObject, tool: string, result: JsonObject)
     record.format_unexpected_change_count = Array.isArray(result.unexpected_changes) ? result.unexpected_changes.length : 0;
   }
   if (isRecord(result.error)) {
-    if (result.error.code !== undefined) record.error_code = sanitizeValue(result.error.code, 'code');
-    if (result.error.category !== undefined) record.error_category = sanitizeValue(result.error.category, 'category');
+    if (result.error.code !== undefined) record.error_code = sanitizeValue(result.error.code, 'code', redact);
+    if (result.error.category !== undefined) record.error_category = sanitizeValue(result.error.category, 'category', redact);
     if (result.error.retryable !== undefined) record.error_retryable = result.error.retryable;
     if (isRecord(result.error.details)) {
       for (const field of ['stage', 'reason', 'suggestion', 'recommended_tool', 'recommended_format', 'patch_bytes', 'replacement_bytes', 'path', 'file_index', 'edit_index', 'start_line', 'end_line', 'actual_sha256', 'expected_sha256', 'actual_occurrences', 'expected_occurrences', 'recovery_reason']) {
-        if (result.error.details[field] !== undefined) record[`error_${field}`] = sanitizeValue(result.error.details[field], field);
+        if (result.error.details[field] !== undefined) record[`error_${field}`] = sanitizeValue(result.error.details[field], field, redact);
       }
       record.recovery_action_count = Array.isArray(result.error.details.recovery_actions) ? result.error.details.recovery_actions.length : numberValue(record.recovery_action_count);
     }
   }
   if (result.duration_ms !== undefined) record.tool_reported_duration_ms = result.duration_ms;
-  for (const field of ['suggestion', 'recovery_hint']) if (result[field] !== undefined) record[field] = sanitizeValue(result[field], field);
+  for (const field of ['suggestion', 'recovery_hint']) if (result[field] !== undefined) record[field] = sanitizeValue(result[field], field, redact);
   if (typeof result.stdout === 'string') record.stdout_bytes = Buffer.byteLength(result.stdout);
   if (typeof result.stderr === 'string') record.stderr_bytes = Buffer.byteLength(result.stderr);
   for (const [source, destination] of ARRAY_COUNTS) if (Array.isArray(result[source])) record[destination] = result[source].length;
@@ -401,7 +422,8 @@ function copyResultMetrics(record: JsonObject, tool: string, result: JsonObject)
 function classifyOutcome(record: JsonObject, outcome: string): string {
   const code = String(record.error_code ?? record.rpc_error_code ?? '');
   const category = String(record.error_category ?? '');
-  if (record.request_timed_out === true || record.process_timed_out === true) return 'timeout';
+  if (record.process_timed_out === true) return 'timeout';
+  if (record.request_timed_out === true) return 'wait_timeout';
   if (record.command_ok === false) {
     if (record.verification_ok === false) return 'verification_failure';
     if (Number(record.process_exit_code ?? 0) !== 0) return 'process_failure';
@@ -454,7 +476,7 @@ function failureSignature(record: JsonObject): string | null {
 }
 
 function buildToolCallRecord(store: ToolUsageStore, input: ToolUsageInput): JsonObject {
-  const sanitizedArguments = sanitizeValue(input.arguments) as JsonObject;
+  const sanitizedArguments = sanitizeValue(input.arguments, undefined, store.redactTelemetry) as JsonObject;
   const argumentBytes = jsonBytes(sanitizedArguments);
   const resultBytes = jsonBytes(input.result);
   const outcome = input.result.ok === true ? 'success' : 'tool_error';
@@ -500,13 +522,13 @@ function buildToolCallRecord(store: ToolUsageStore, input: ToolUsageInput): Json
   const keys = Object.keys(sanitizedArguments).sort();
   record.argument_keys = keys;
   record.argument_field_bytes = Object.fromEntries(keys.map(key => [key, jsonBytes(sanitizedArguments[key]).length]));
-  const preview = commandPreview(input.arguments);
+  const preview = commandPreview(input.arguments, store.redactTelemetry);
   if (preview !== undefined) {
     record.command_kind = classifyCommandText(preview);
-    record.command_preview = sanitizeValue(preview);
+    record.command_preview = sanitizeValue(preview, undefined, store.redactTelemetry);
   }
-  for (const field of ['reason', 'workdir', 'path', 'output_mode']) if (input.arguments[field] !== undefined) record[`argument_${field}`] = sanitizeValue(input.arguments[field], field);
-  copyResultMetrics(record, input.tool, input.result);
+  for (const field of ['reason', 'workdir', 'path', 'output_mode']) if (input.arguments[field] !== undefined) record[`argument_${field}`] = sanitizeValue(input.arguments[field], field, store.redactTelemetry);
+  copyResultMetrics(record, input.tool, input.result, store.redactTelemetry);
   record.outcome_class = classifyOutcome(record, outcome);
   return record;
 }
@@ -516,7 +538,13 @@ function newPhaseLatency(): Record<PhaseName, PhaseStats> {
     preflight: { totalMs: 0, durations: [] },
     plan: { totalMs: 0, durations: [] },
     commit: { totalMs: 0, durations: [] },
-    total: { totalMs: 0, durations: [] }
+    total: { totalMs: 0, durations: [] },
+    baseline_capture: { totalMs: 0, durations: [] },
+    error_enrichment: { totalMs: 0, durations: [] },
+    harness_begin: { totalMs: 0, durations: [] },
+    dispatch: { totalMs: 0, durations: [] },
+    harness_finish: { totalMs: 0, durations: [] },
+    serialization: { totalMs: 0, durations: [] }
   };
 }
 
@@ -980,6 +1008,7 @@ export class ToolUsageStore {
   readonly maxBytes: number;
   readonly retainedFiles: number;
   readonly queueCapacity: number;
+  redactTelemetry: boolean;
   readonly now: () => number;
   #queue: JsonObject[] = [];
   #drainPromise?: Promise<void>;
@@ -990,9 +1019,8 @@ export class ToolUsageStore {
   #burstSequence = 0;
   #activeRequests = 0;
   #callSequence = 0;
-  #lastFailureSignature?: string;
-  #lastFailureBurstId = 0;
-  #repeatFailureCount = 0;
+  #failureCountsByBurst = new Map<string, number>();
+  #failureBurstId = 0;
   #dashboardCache?: { createdAt: number; value: JsonObject };
 
   constructor(dataDir: string, options: ToolUsageStoreOptions = {}) {
@@ -1006,38 +1034,34 @@ export class ToolUsageStore {
     this.maxBytes = Math.max(1, Math.trunc(options.maxBytes ?? TOOL_USAGE_LOG_MAX_BYTES));
     this.retainedFiles = Math.max(0, Math.trunc(options.retainedFiles ?? TOOL_USAGE_RETAINED_FILES));
     this.queueCapacity = Math.max(1, Math.trunc(options.queueCapacity ?? TOOL_USAGE_QUEUE_CAPACITY));
+    this.redactTelemetry = options.redactTelemetry ?? true;
     this.now = options.now ?? Date.now;
   }
 
   nextCallSequence(): number { this.#callSequence += 1; return this.#callSequence; }
 
+  setRedactTelemetry(value: boolean): void {
+    this.redactTelemetry = value;
+  }
+
   #annotateRepeatedFailure(record: JsonObject): void {
+    const burstId = numberValue(record.activity_burst_id);
+    if (burstId !== this.#failureBurstId) {
+      this.#failureBurstId = burstId;
+      this.#failureCountsByBurst.clear();
+    }
     const signature = failureSignature(record);
     if (!signature) {
-      this.#lastFailureSignature = undefined;
-      this.#lastFailureBurstId = 0;
-      this.#repeatFailureCount = 0;
+      if (!isErrorRecord(record)) this.#failureCountsByBurst.clear();
       return;
     }
-    const burstId = numberValue(record.activity_burst_id);
-    const concurrent = record.concurrent_request === true;
-    const repeated = !concurrent
-      && this.#lastFailureSignature === signature
-      && this.#lastFailureBurstId === burstId;
-    const count = repeated ? this.#repeatFailureCount + 1 : 1;
+    const count = (this.#failureCountsByBurst.get(signature) ?? 0) + 1;
+    this.#failureCountsByBurst.set(signature, count);
     record.failure_signature = signature;
     record.repeat_failure_count = count;
     record.repeated_failure = count > 1;
     record.retry_without_change = count > 1;
-    if (concurrent) {
-      this.#lastFailureSignature = undefined;
-      this.#lastFailureBurstId = 0;
-      this.#repeatFailureCount = 0;
-    } else {
-      this.#lastFailureSignature = signature;
-      this.#lastFailureBurstId = burstId;
-      this.#repeatFailureCount = count;
-    }
+    record.concurrent_duplicate_failure = count > 1 && record.concurrent_request === true;
   }
 
   beginRequest(startedTsMs = this.now()): ToolRequestTiming {
@@ -1229,10 +1253,10 @@ export class ToolUsageStore {
     const includeRecords = args.include_records === true;
     const includePayloads = args.include_payloads === true;
     const aggregateEnabled = args.aggregate !== false;
-    const includeSlowest = args.include_slowest !== false;
-    const includeLargest = args.include_largest !== false;
+    const includeSlowest = args.include_slowest === true;
+    const includeLargest = args.include_largest === true;
     const includePerformance = args.include_performance !== false;
-    const includeBursts = args.include_bursts !== false;
+    const includeBursts = args.include_bursts === true;
     const includeAsyncSessions = args.include_async_sessions !== false;
     const burstIdleMs = integer(args.burst_idle_ms, DEFAULT_BURST_IDLE_MS, 1000, 3_600_000);
     const errorsOnly = args.errors_only === true;
@@ -1343,6 +1367,13 @@ export class ToolUsageStore {
       matched_lines: matchedLines,
       matched_async_session_events: matchedAsync,
       invalid_complete_lines: invalidLines,
+      response_profile: includeRecords || includeSlowest || includeLargest || includeBursts ? 'detailed' : 'summary',
+      detail_sections: {
+        records: includeRecords,
+        slowest: includeSlowest,
+        largest: includeLargest,
+        activity_bursts: includeBursts
+      },
       records: recent,
       slowest: includeSlowest ? slowest : null,
       largest: includeLargest ? largest : null,

@@ -8,6 +8,10 @@ import { ConfigStore } from '../dist/management.js';
 import { readAgentSecrets } from '../dist/secrets.js';
 import { createAgentRuntime } from '../dist/server.js';
 
+// Keep restart tests isolated from real-user data-dir and port overrides.
+delete process.env.CTMCP_DATA_DIR;
+delete process.env.CTMCP_PORT;
+
 function configDocument(root, dataDir) {
   return {
     host: '127.0.0.1',

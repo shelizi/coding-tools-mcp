@@ -48,8 +48,6 @@ if %NODE_MAJOR% LSS 22 (
   goto :failed
 )
 
-if not defined CTMCP_RESTART_SUPERVISED set "CTMCP_RESTART_SUPERVISED=1"
-
 cd /d "%AGENT_DIR%"
 if errorlevel 1 (
   echo ERROR: Unable to enter the Node Agent directory.
@@ -91,7 +89,7 @@ if errorlevel 1 (
 )
 
 :run_agent
-node "%AGENT_DIR%\dist\cli.js" %*
+node "%AGENT_DIR%\dist\cli.js" --restart-supervised %*
 set "EXIT_CODE=%ERRORLEVEL%"
 if "%EXIT_CODE%"=="75" (
   echo.

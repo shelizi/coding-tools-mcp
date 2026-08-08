@@ -15,6 +15,7 @@ _tauri-scaffold
 /old/
 
 # Rust
+/target/
 src-tauri/target
 crates/*/target
 services/*/target

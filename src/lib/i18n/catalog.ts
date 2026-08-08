@@ -2,7 +2,8 @@ export const MESSAGES = {
   Language: ["Language", "語言", "语言", "言語"],
   "Desktop Console": ["Desktop Console", "桌面主控台", "桌面控制台", "デスクトップコンソール"],
   "Add workspace": ["Add workspace", "新增工具區", "添加工具区", "ワークスペースを追加"],
-  "Add WSL workspace": ["Add WSL workspace", "新增 WSL 工具區", "添加 WSL 工作区", "WSL ワークスペースを追加"],
+  "Add WSL folder": ["Add WSL folder", "加入 WSL 資料夾", "加入 WSL 文件夹", "WSL フォルダーを追加"],
+  Local: ["Local", "本機", "本机", "ローカル"],
   WSL: ["WSL", "WSL", "WSL", "WSL"],
   "Commands run inside WSL while the desktop client accesses files through the WSL share.": [
     "Commands run inside WSL while the desktop client accesses files through the WSL share.",
@@ -13,6 +14,7 @@ export const MESSAGES = {
   "WSL distribution": ["WSL distribution", "WSL distribution", "WSL 分发版", "WSL ディストリビューション"],
   "Linux folder path": ["Linux folder path", "Linux 資料夾路徑", "Linux 文件夹路径", "Linux フォルダーパス"],
   "Workspace name (optional)": ["Workspace name (optional)", "工具區名稱（選填）", "工作区名称（可选）", "ワークスペース名（任意）"],
+  "Folder name (optional)": ["Folder name (optional)", "資料夾名稱（選填）", "文件夹名称（可选）", "フォルダー名（任意）"],
   "No WSL distributions are installed.": ["No WSL distributions are installed.", "尚未安裝任何 WSL distribution。", "尚未安装任何 WSL 分发版。", "WSL ディストリビューションがインストールされていません。"],
   "Failed to open WSL": ["Failed to open WSL", "無法開啟 WSL", "无法打开 WSL", "WSL を開けませんでした"],
   "Adding…": ["Adding…", "新增中…", "添加中…", "追加中…"],

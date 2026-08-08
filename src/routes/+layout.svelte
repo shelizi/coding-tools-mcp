@@ -6,15 +6,12 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import AppShell from "$lib/components/AppShell.svelte";
   import ToastHost from "$lib/components/ToastHost.svelte";
-  import WslWorkspaceDialog from "$lib/components/WslWorkspaceDialog.svelte";
   import WorkspaceNavItem from "$lib/components/WorkspaceNavItem.svelte";
   import {
     createWorkspace,
-    createWslWorkspace,
     getActionsRuntimeStatus,
     getRuntimeStatus,
     listWorkspaces,
-    listWslDistributions,
   } from "$lib/api/workspaces";
   import { getLastWorkspaceId } from "$lib/api/settings";
   import { actionsRuntimeStates, mcpRuntimeStates, workspaces } from "$lib/stores/app";
@@ -23,10 +20,6 @@
   import type { RuntimeState } from "$lib/types";
 
   let { children } = $props();
-  let wslDialogOpen = $state(false);
-  let wslDistributions = $state<string[]>([]);
-  let wslBusy = $state(false);
-  let wslError = $state("");
 
   async function refreshWorkspaces() {
     const items = await listWorkspaces();
@@ -73,38 +66,6 @@
     goto(`/workspace/${id}`);
   }
 
-  async function openWslWorkspaceDialog() {
-    try {
-      wslError = "";
-      wslDistributions = await listWslDistributions();
-      if (wslDistributions.length === 0) {
-        throw new Error($t("No WSL distributions are installed."));
-      }
-      wslDialogOpen = true;
-    } catch (error) {
-      showToast(String(error), {
-        title: $t("Failed to open WSL"),
-        kind: "error",
-        duration: 8000,
-      });
-    }
-  }
-
-  async function addWslWorkspace(distro: string, linuxPath: string, name?: string) {
-    wslBusy = true;
-    wslError = "";
-    try {
-      const profile = await createWslWorkspace(distro, linuxPath, name);
-      await refreshWorkspaces();
-      wslDialogOpen = false;
-      goto(`/workspace/${profile.id}`);
-    } catch (error) {
-      wslError = String(error);
-    } finally {
-      wslBusy = false;
-    }
-  }
-
   function openQuickSetup() {
     goto("/quick-setup");
   }
@@ -141,7 +102,6 @@
 
 <AppShell
   onAddWorkspace={addWorkspace}
-  onAddWslWorkspace={openWslWorkspaceDialog}
   onQuickSetup={openQuickSetup}
 >
   {#snippet settingsNav()}
@@ -194,11 +154,3 @@
 </AppShell>
 
 <ToastHost />
-<WslWorkspaceDialog
-  open={wslDialogOpen}
-  distributions={wslDistributions}
-  busy={wslBusy}
-  error={wslError}
-  onClose={() => (wslDialogOpen = false)}
-  onSubmit={addWslWorkspace}
-/>

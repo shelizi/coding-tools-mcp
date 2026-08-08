@@ -690,6 +690,71 @@ export class BuiltinTunnelManager {
     }
   }
 
+  async reconfigure(tunnel: AgentConfig['tunnel'], publicBaseUrl?: string): Promise<void> {
+    const previousTunnel = this.config.tunnel ? structuredClone(this.config.tunnel) : undefined;
+    const previousPublicBaseUrl = this.config.publicBaseUrl;
+    await this.stop();
+    this.#identity = undefined;
+    this.#endpoint = undefined;
+    this.#policy = undefined;
+    this.#demandTarget = 0;
+    this.#demandSeenAt = 0;
+    this.#lastPressureAt = 0;
+    this.#idleExcessSince = 0;
+    this.#recycledWorkers = 0;
+    if (tunnel) {
+      this.config.tunnel = structuredClone(tunnel);
+      this.context.config.tunnel = structuredClone(tunnel);
+    } else {
+      delete this.config.tunnel;
+      delete this.context.config.tunnel;
+    }
+    if (publicBaseUrl) {
+      this.config.publicBaseUrl = publicBaseUrl;
+      this.context.config.publicBaseUrl = publicBaseUrl;
+    } else {
+      delete this.config.publicBaseUrl;
+      delete this.context.config.publicBaseUrl;
+    }
+    if (!tunnel?.enabled) {
+      this.context.tunnelStatus = {
+        enabled: false, state: 'disabled', workers: 0, connectedWorkers: 0, completedRequests: 0
+      };
+      return;
+    }
+    try {
+      await this.start();
+    } catch (error) {
+      await this.stop();
+      if (previousTunnel) {
+        this.config.tunnel = structuredClone(previousTunnel);
+        this.context.config.tunnel = structuredClone(previousTunnel);
+      } else {
+        delete this.config.tunnel;
+        delete this.context.config.tunnel;
+      }
+      if (previousPublicBaseUrl) {
+        this.config.publicBaseUrl = previousPublicBaseUrl;
+        this.context.config.publicBaseUrl = previousPublicBaseUrl;
+      } else {
+        delete this.config.publicBaseUrl;
+        delete this.context.config.publicBaseUrl;
+      }
+      if (previousTunnel?.enabled) {
+        try {
+          await this.start();
+        } catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], 'Tunnel reconfiguration failed and the previous tunnel could not be restored.');
+        }
+      } else {
+        this.context.tunnelStatus = {
+          enabled: false, state: 'disabled', workers: 0, connectedWorkers: 0, completedRequests: 0
+        };
+      }
+      throw error;
+    }
+  }
+
   #now(): number {
     return this.options.now?.() ?? Date.now();
   }

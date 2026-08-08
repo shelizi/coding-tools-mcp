@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::tools::{
     call_tool, call_tool_async, list_tools_for_profile, wrap_mcp_tool_result, ExecutionLimits,
-    SharedToolContext, ToolContext, Workspace,
+    SharedRuntimeToolConfig, SharedToolContext, ToolContext, Workspace,
 };
 use crate::workspace::{AuthConfig, WorkspaceFolder};
 
@@ -28,17 +28,18 @@ pub fn handle_request(state: &SharedState, body: &Value) -> Value {
         return Value::Null;
     }
 
+    let runtime = state.runtime_config();
     let result = match method {
         "initialize" => Ok(initialize_result(
             params.get("protocolVersion").and_then(Value::as_str),
-            &state.tool_profile,
+            &runtime.tool_profile,
         )),
         "ping" => Ok(serde_json::json!({})),
         "tools/list" => {
-            let tools = list_tools_for_profile(&state.tool_profile);
+            let tools = list_tools_for_profile(&runtime.tool_profile);
             Ok(serde_json::json!({
                 "tools": tools,
-                "toolsetRevision": crate::tools::registry::toolset_revision(&state.tool_profile)
+                "toolsetRevision": crate::tools::registry::toolset_revision(&runtime.tool_profile)
             }))
         }
         "tools/call" => handle_tools_call(state, &params),
@@ -97,9 +98,10 @@ fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value
     let args = tool_arguments(name, params);
 
     let canonical_name = crate::tools::registry::canonical_tool_name(name);
-    let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
+    let runtime = state.runtime_config();
+    let known = crate::tools::registry::exposed_tool_names(&runtime.tool_profile);
     if !known.iter().any(|n| n == &canonical_name) {
-        return Err(unknown_tool_error(state, name, &known));
+        return Err(unknown_tool_error(name, &known, &runtime.tool_profile));
     }
 
     let host_session_key = host_session_key(params);
@@ -130,9 +132,10 @@ async fn handle_tools_call_async(state: SharedState, params: Value) -> Result<Va
         .ok_or_else(|| serde_json::json!({ "code": -32602, "message": "Missing tool name" }))?;
     let args = tool_arguments(name, &params);
     let canonical_name = crate::tools::registry::canonical_tool_name(name).to_string();
-    let known = crate::tools::registry::exposed_tool_names(&state.tool_profile);
+    let runtime = state.runtime_config();
+    let known = crate::tools::registry::exposed_tool_names(&runtime.tool_profile);
     if !known.iter().any(|known_name| known_name == &canonical_name) {
-        return Err(unknown_tool_error(&state, name, &known));
+        return Err(unknown_tool_error(name, &known, &runtime.tool_profile));
     }
 
     let host_session_key = host_session_key(&params);
@@ -202,7 +205,7 @@ fn host_session_key(params: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn unknown_tool_error(state: &SharedState, name: &str, known: &[&str]) -> Value {
+fn unknown_tool_error(name: &str, known: &[&str], tool_profile: &str) -> Value {
     serde_json::json!({
         "code": -32602,
         "message": format!("Unknown tool: {name}"),
@@ -212,7 +215,7 @@ fn unknown_tool_error(state: &SharedState, name: &str, known: &[&str]) -> Value 
             "error_category": "catalog",
             "retryable": true,
             "suggestion": "Refresh tools/list and retry with the current tool catalog.",
-            "toolset_revision": crate::tools::registry::toolset_revision(&state.tool_profile),
+            "toolset_revision": crate::tools::registry::toolset_revision(tool_profile),
             "available_tools": known
         }
     })
@@ -277,15 +280,16 @@ pub fn new_state(
         bootstrap_folder.execution.clone(),
     )
     .map_err(|error| error.message())?;
+    let runtime_config = SharedRuntimeToolConfig::new(policy, tool_profile, permission_mode);
+    let execution_resource_id = format!("{}--mcp--{}", profile_id, bootstrap_folder.id);
     let state = Arc::new(
-        ToolContext::from_workspace_with_profile_id_and_resource_id_and_limits(
+        ToolContext::from_workspace_with_shared_runtime_config_and_resource_ids_and_limits(
             workspace,
             auth.clone(),
-            policy.clone(),
-            tool_profile.clone(),
-            permission_mode.clone(),
+            runtime_config.clone(),
             profile_id.clone(),
-            format!("{}--mcp--{}", profile_id, bootstrap_folder.id),
+            execution_resource_id.clone(),
+            execution_resource_id,
             limits,
         ),
     );
@@ -296,9 +300,7 @@ pub fn new_state(
         state.clone(),
         crate::tools::hub::HubConfig {
             auth,
-            policy,
-            tool_profile,
-            permission_mode,
+            runtime_config,
             limits,
             execution_resource_namespace: "mcp".into(),
         },
@@ -461,6 +463,84 @@ mod tests {
                 .expect("toolset revision")
                 .len(),
             16
+        );
+    }
+
+    #[test]
+    fn runtime_tool_profile_updates_catalog_without_listener_restart() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        let state = Arc::new(
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context"),
+        );
+
+        let initial = handle_request(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}),
+        );
+        let initial_names = initial["result"]["tools"]
+            .as_array()
+            .expect("initial tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        let initial_revision = initial["result"]["toolsetRevision"]
+            .as_str()
+            .expect("initial revision")
+            .to_string();
+        assert!(!initial_names.contains(&"start_task"));
+
+        let runtime = state.runtime_config();
+        state.update_runtime_config(runtime.policy, "advanced".into(), runtime.permission_mode);
+
+        let advanced = handle_request(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+        );
+        let advanced_names = advanced["result"]["tools"]
+            .as_array()
+            .expect("advanced tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        let advanced_revision = advanced["result"]["toolsetRevision"]
+            .as_str()
+            .expect("advanced revision")
+            .to_string();
+        assert!(advanced_names.contains(&"start_task"));
+        assert_ne!(advanced_revision, initial_revision);
+
+        let initialized = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18"}
+            }),
+        );
+        assert_eq!(
+            initialized["result"]["serverInfo"]["toolsetRevision"],
+            advanced_revision
+        );
+
+        let runtime = state.runtime_config();
+        state.update_runtime_config(runtime.policy, "guarded-core".into(), "guarded".into());
+        let hidden = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "start_task", "arguments": {"objective": "hidden"}}
+            }),
+        );
+        let guarded = state.runtime_config();
+        assert_eq!(hidden["error"]["data"]["error_code"], "UNKNOWN_TOOL");
+        assert_eq!(
+            hidden["error"]["data"]["toolset_revision"],
+            crate::tools::registry::toolset_revision(&guarded.tool_profile)
         );
     }
 
@@ -881,10 +961,15 @@ mod tests {
     async fn permission_resume_exec_uses_the_async_process_lane() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let harness = tempfile::tempdir().expect("harness tempdir");
-        let mut context =
+        let context =
             ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
                 .expect("tool context");
-        context.tool_profile = "guarded-core".into();
+        let runtime = context.runtime_config();
+        context.update_runtime_config(
+            runtime.policy,
+            "guarded-core".into(),
+            runtime.permission_mode,
+        );
         let state = Arc::new(context);
 
         #[cfg(windows)]

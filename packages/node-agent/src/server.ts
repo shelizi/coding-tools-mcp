@@ -1,5 +1,6 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import path from 'node:path';
 import type { AgentConfig, JsonObject, ToolContext } from './types.js';
 import {
   resolveToolProfile, toolNamesForProfile, toolsForProfile, toolsetRevisionForProfile
@@ -17,6 +18,7 @@ import {
 } from './management.js';
 import { AGENT_VERSION, CLIENT_COMPAT_VERSION } from './version.js';
 import { defaultPolicy } from './policy.js';
+import { legacySecurityPolicy } from './securityPolicy.js';
 import { disposeProcessSessions, ProcessRequestLifecycle } from './processes.js';
 import { ToolUsageStore } from './toolUsage.js';
 import { createFolderRuntime } from './folderRuntime.js';
@@ -37,6 +39,45 @@ import {
 } from './mcpTransport.js';
 
 const supportedProtocols = new Set<string>(SUPPORTED_MCP_PROTOCOL_VERSIONS);
+
+interface ToolCatalogSnapshot {
+  profile: AgentConfig['activeToolProfile'];
+  tools: ReturnType<typeof toolsForProfile>;
+  names: ReturnType<typeof toolNamesForProfile>;
+  revision: string;
+}
+
+const toolCatalogCache = new Map<AgentConfig['activeToolProfile'], ToolCatalogSnapshot>();
+
+function currentToolCatalog(context: ToolContext): ToolCatalogSnapshot {
+  const profile = context.config.activeToolProfile;
+  const cached = toolCatalogCache.get(profile);
+  if (cached) return cached;
+  const catalog = {
+    profile,
+    tools: toolsForProfile(profile),
+    names: toolNamesForProfile(profile),
+    revision: toolsetRevisionForProfile(profile)
+  };
+  toolCatalogCache.set(profile, catalog);
+  return catalog;
+}
+
+function setRuntimeRevisionHeaders(res: ServerResponse, catalog: ToolCatalogSnapshot, startedAt: number): void {
+  res.setHeader('x-coding-tools-toolset-revision', catalog.revision);
+  res.setHeader('x-coding-tools-runtime-started-at', String(startedAt));
+  res.setHeader('x-coding-tools-agent-version', AGENT_VERSION);
+}
+
+function requestedToolsetRevision(req: IncomingMessage, params: JsonObject): string {
+  const metadata = params._meta && typeof params._meta === 'object' && !Array.isArray(params._meta)
+    ? params._meta as JsonObject
+    : {};
+  const metaRevision = String(metadata['coding-tools/toolset-revision'] ?? '').trim();
+  if (metaRevision) return metaRevision;
+  const header = req.headers['x-coding-tools-toolset-revision'];
+  return String(Array.isArray(header) ? header[0] ?? '' : header ?? '').trim();
+}
 
 async function body(req: IncomingMessage, limit = 1024 * 1024): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -84,11 +125,13 @@ export async function createToolContext(config: AgentConfig): Promise<ToolContex
   config.policy ??= defaultPolicy();
   config.toolProfile ??= 'advanced';
   config.activeToolProfile ??= resolveToolProfile(config.toolProfile, config.permissionMode);
+  config.securityPolicy ??= legacySecurityPolicy(config.permissionMode, config.toolProfile);
+  config.securityPolicyCustomized ??= false;
   const folders = await canonicalizeWorkspaceFolders(config.folders);
   config = { ...config, folders };
   const state = new StateStore(config.dataDir);
   await state.load();
-  const usageStore = new ToolUsageStore(config.dataDir);
+  const usageStore = new ToolUsageStore(config.dataDir, { redactTelemetry: config.securityPolicy.redactTelemetry });
   const folderRuntimes = new Map(config.folders.map(folder => [folder.id, createFolderRuntime(config, folder)]));
   const firstRuntime = folderRuntimes.values().next().value;
   if (!firstRuntime) throw new Error('at least one workspace folder is required');
@@ -97,11 +140,17 @@ export async function createToolContext(config: AgentConfig): Promise<ToolContex
     process: new Semaphore(config.limits.globalProcessConcurrency ?? 512),
     locks: new KeyedMutex()
   };
-  const conversations = new ConversationStore();
+  const workspaceProfileId = config.workspaceId ?? deriveWorkspaceProfileId(config.folders);
+  const dataDirIdentity = createHash('sha256').update(path.resolve(config.dataDir)).digest('hex').slice(0, 16);
+  const conversations = await ConversationStore.open({
+    fallbackKey: `runtime-fallback:${workspaceProfileId}:${dataDirIdentity}`,
+    persistencePath: path.join(config.dataDir, `conversation-state-${workspaceProfileId}.json`),
+    allowedFolderIds: config.folders.map(folder => folder.id)
+  });
   return {
     config,
     conversations,
-    workspaceProfileId: config.workspaceId ?? deriveWorkspaceProfileId(config.folders),
+    workspaceProfileId,
     selections: conversations.selectionMap,
     defaultCwds: conversations.cwdMap,
     folderRuntimes,
@@ -162,12 +211,8 @@ export async function createAgentRuntime(config: AgentConfig, options: AgentRunt
   const oauth = new OAuthRuntime(config.oauth);
   const startedAt = Date.now();
   const workspaceId = config.workspaceId ?? context.workspaceProfileId;
-  options.runtimeRegistry?.set(workspaceId, { context, startedAt });
+  options.runtimeRegistry?.set(workspaceId, { context, oauth, startedAt });
   const adminToken = options.configStore ? randomBytes(32).toString('base64url') : '';
-  const activeToolProfile = config.activeToolProfile;
-  const exposedTools = toolsForProfile(activeToolProfile);
-  const exposedToolNames = toolNamesForProfile(activeToolProfile);
-  const exposedToolsetRevision = toolsetRevisionForProfile(activeToolProfile);
   const server = createServer(async (req, res) => {
     let requestId: unknown = null;
     let processLifecycle: ProcessRequestLifecycle | undefined;
@@ -183,10 +228,13 @@ export async function createAgentRuntime(config: AgentConfig, options: AgentRunt
       const prefix = routePrefix(config);
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? `${config.host}:${config.port}`}`);
       const pathname = localPath(url.pathname, prefix);
+      const catalog = currentToolCatalog(context);
+      setRuntimeRevisionHeaders(res, catalog, startedAt);
 
       if (options.configStore && await handleManagementRequest(req, res, url.pathname, {
         configStore: options.configStore,
         context,
+        oauth,
         startedAt,
         adminToken,
         requestRestart: options.requestRestart,
@@ -196,7 +244,7 @@ export async function createAgentRuntime(config: AgentConfig, options: AgentRunt
 
       if (req.method === 'GET' && isAuthorizationMetadata(url.pathname, prefix)) return sendJson(res, 200, authorizationMetadata(base, oauth));
       if (req.method === 'GET' && isResourceMetadata(url.pathname, prefix)) return sendJson(res, 200, resourceMetadata(base));
-      if (pathname === '/health' && req.method === 'GET') return sendJson(res, 200, { ok: true, server: 'coding-tools-mcp-node', version: AGENT_VERSION, clientCompatVersion: CLIENT_COMPAT_VERSION, toolProfile: activeToolProfile, toolsetRevision: exposedToolsetRevision, tools: exposedTools.length, tunnel: context.tunnelStatus, headless: true, management: { enabled: config.management?.enabled === true } });
+      if (pathname === '/health' && req.method === 'GET') return sendJson(res, 200, { ok: true, server: 'coding-tools-mcp-node', version: AGENT_VERSION, clientCompatVersion: CLIENT_COMPAT_VERSION, toolProfile: catalog.profile, toolsetRevision: catalog.revision, tools: catalog.tools.length, tunnel: context.tunnelStatus, headless: true, management: { enabled: config.management?.enabled === true } });
 
       if (pathname === '/oauth/authorize' && req.method === 'GET') {
         const scoped = new URL(url.toString());
@@ -222,9 +270,10 @@ export async function createAgentRuntime(config: AgentConfig, options: AgentRunt
           protocolVersion: LATEST_MCP_PROTOCOL_VERSION,
           supportedProtocolVersions: SUPPORTED_MCP_PROTOCOL_VERSIONS,
           transport: 'streamable-http',
-          toolProfile: activeToolProfile,
-          toolsetRevision: exposedToolsetRevision,
-          tools: exposedToolNames
+          toolProfile: catalog.profile,
+          toolsetRevision: catalog.revision,
+          tools: catalog.names,
+          runtimeStartedAtMs: startedAt
         });
       }
       if (pathname !== '/mcp') return text(res, 404, 'Not found');
@@ -283,15 +332,30 @@ export async function createAgentRuntime(config: AgentConfig, options: AgentRunt
               ? requested
               : LATEST_MCP_PROTOCOL_VERSION,
             capabilities: { tools: { listChanged: false }, logging: {} },
-            serverInfo: { name: 'coding-tools-mcp-node', title: 'Coding Tools MCP Node Agent', version: AGENT_VERSION, toolsetRevision: exposedToolsetRevision },
-            instructions: 'Call list_workspace_folders, switch_workspace_folder, then history_session_bootstrap before project tools. FRP and Cloudflare transports are intentionally unsupported.'
+            serverInfo: { name: 'coding-tools-mcp-node', title: 'Coding Tools MCP Node Agent', version: AGENT_VERSION, toolsetRevision: catalog.revision, runtimeStartedAtMs: startedAt },
+            instructions: 'Call list_workspace_folders, switch_workspace_folder, then history_session_bootstrap before project tools. Hosts should refresh tools/list when x-coding-tools-toolset-revision or runtimeStartedAtMs changes. FRP and Cloudflare transports are intentionally unsupported.'
           };
         } else if (method === 'ping') result = {};
-        else if (method === 'tools/list') result = { tools: exposedTools, toolsetRevision: exposedToolsetRevision };
+        else if (method === 'tools/list') result = { tools: catalog.tools, toolsetRevision: catalog.revision };
         else if (method === 'tools/call') {
           const params = (request.params ?? {}) as JsonObject;
           const name = String(params.name ?? '');
-          if (!exposedToolNames.includes(name)) throw Object.assign(new Error(`Unknown tool: ${name}`), {
+          const clientToolsetRevision = requestedToolsetRevision(req, params);
+          if (clientToolsetRevision && clientToolsetRevision !== catalog.revision) throw Object.assign(new Error('Tool catalog revision changed; refresh tools/list before retrying the tool call.'), {
+            rpcCode: -32602,
+            rpcData: {
+              reason: 'stale_tool_catalog',
+              error_code: 'TOOLSET_REVISION_MISMATCH',
+              error_category: 'catalog',
+              retryable: true,
+              client_toolset_revision: clientToolsetRevision,
+              toolset_revision: catalog.revision,
+              runtime_started_at_ms: startedAt,
+              available_tools: catalog.names,
+              suggestion: 'Refresh tools/list and retry with the current tool catalog.'
+            }
+          });
+          if (!catalog.names.includes(name)) throw Object.assign(new Error(`Unknown tool: ${name}`), {
             rpcCode: -32602,
             rpcData: {
               reason: 'unknown_tool',
@@ -299,8 +363,8 @@ export async function createAgentRuntime(config: AgentConfig, options: AgentRunt
               error_category: 'catalog',
               retryable: true,
               suggestion: 'Refresh tools/list and retry with the current tool catalog.',
-              toolset_revision: exposedToolsetRevision,
-              available_tools: exposedToolNames
+              toolset_revision: catalog.revision,
+              available_tools: catalog.names
             }
           });
           processLifecycle = new ProcessRequestLifecycle(context);
@@ -350,6 +414,7 @@ export async function createAgentRuntime(config: AgentConfig, options: AgentRunt
     oauth.dispose();
     void (async () => {
       await disposeProcessSessions(context);
+      await context.conversations.flush();
       await context.usageStore.flush();
     })();
   });

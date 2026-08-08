@@ -1,4 +1,4 @@
-import type { JsonObject } from './types.js';
+import type { JsonObject, SecurityPolicy } from './types.js';
 
 export const REDACTED = '[REDACTED]';
 const RESULT_WARNING = 'Sensitive values were automatically redacted from the tool result.';
@@ -198,16 +198,21 @@ function redactSensitiveSourceOutput(toolName: string, sensitiveSource: boolean,
 export class OutputRedactionContext {
   readonly toolName: string;
   readonly sensitiveSource: boolean;
+  readonly redactValues: boolean;
+  readonly withholdSources: boolean;
 
-  constructor(toolName: string, argumentsValue: unknown) {
+  constructor(toolName: string, argumentsValue: unknown, policy?: Pick<SecurityPolicy, 'redactSensitiveOutput' | 'withholdSensitiveSourceOutput'>) {
     this.toolName = toolName;
     this.sensitiveSource = argumentsReferenceSensitiveSource(argumentsValue);
+    this.redactValues = policy?.redactSensitiveOutput ?? true;
+    this.withholdSources = policy?.withholdSensitiveSourceOutput ?? true;
   }
 
   redact<T>(value: T): T {
+    if (!this.redactValues && !this.withholdSources) return value;
     const state: RedactionState = { count: 0 };
-    redactSensitiveSourceOutput(this.toolName, this.sensitiveSource, value, state);
-    const redacted = redactValue(value, undefined, state) as T;
+    if (this.withholdSources) redactSensitiveSourceOutput(this.toolName, this.sensitiveSource, value, state);
+    const redacted = (this.redactValues ? redactValue(value, undefined, state) : value) as T;
     if (state.count > 0 && isRecord(redacted)) {
       const object = redacted as JsonObject;
       object.sensitive_data_redacted = true;
@@ -218,8 +223,8 @@ export class OutputRedactionContext {
   }
 }
 
-export function redactToolOutput<T>(toolName: string, argumentsValue: unknown, value: T): T {
-  return new OutputRedactionContext(toolName, argumentsValue).redact(value);
+export function redactToolOutput<T>(toolName: string, argumentsValue: unknown, value: T, policy?: Pick<SecurityPolicy, 'redactSensitiveOutput' | 'withholdSensitiveSourceOutput'>): T {
+  return new OutputRedactionContext(toolName, argumentsValue, policy).redact(value);
 }
 
 export function processRedactionWarning(): string {

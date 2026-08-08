@@ -337,13 +337,17 @@ pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     let max_results = args
         .get("max_results")
         .and_then(Value::as_u64)
-        .unwrap_or(5000) as usize;
+        .unwrap_or(1000) as usize;
     let include_hidden = args
         .get("include_hidden")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let include_ignored = args
         .get("include_ignored")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let include_generated = args
+        .get("include_generated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
@@ -357,7 +361,12 @@ pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         .into_iter()
         .filter_entry(|entry| {
             entry.path() == resolved.path
-                || !ws.is_ignored_path(entry.path(), include_hidden, include_ignored)
+                || !ws.is_ignored_path(
+                    entry.path(),
+                    include_hidden,
+                    include_ignored,
+                    include_generated,
+                )
         })
         .filter_map(Result::ok)
     {
@@ -423,7 +432,7 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
     let requested_max_results = args
         .get("max_results")
         .and_then(Value::as_u64)
-        .unwrap_or(1000);
+        .unwrap_or(200);
     let max_results = requested_max_results.clamp(1, 10_000) as usize;
     let cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0) as usize;
     let requested_max_preview = args
@@ -445,6 +454,10 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         .unwrap_or(false);
     let include_ignored = args
         .get("include_ignored")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let include_generated = args
+        .get("include_generated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let files_only = args
@@ -478,7 +491,12 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         })
         .transpose()?;
 
-    let file_paths = search_file_paths(&resolved.path, include_hidden, include_ignored);
+    let file_paths = search_file_paths(
+        &resolved.path,
+        include_hidden,
+        include_ignored,
+        include_generated,
+    );
     let mut matches = Vec::new();
     let mut files = Vec::new();
     let mut query_counts = vec![0usize; queries.len()];
@@ -489,7 +507,9 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
     let mut truncated = false;
 
     'files: for p in file_paths {
-        if !ws.is_safe_read_path(&p) || ws.is_ignored_path(&p, include_hidden, include_ignored) {
+        if !ws.is_safe_read_path(&p)
+            || ws.is_ignored_path(&p, include_hidden, include_ignored, include_generated)
+        {
             continue;
         }
         let rel = relative_display(ws.root(), &p);
@@ -735,7 +755,12 @@ fn build_matcher(
         .map_err(|error| WorkspaceError::invalid_argument(format!("Invalid regex: {error}")))
 }
 
-fn search_file_paths(path: &Path, include_hidden: bool, include_ignored: bool) -> Vec<PathBuf> {
+fn search_file_paths(
+    path: &Path,
+    include_hidden: bool,
+    include_ignored: bool,
+    include_generated: bool,
+) -> Vec<PathBuf> {
     if path.is_file() {
         return vec![path.to_path_buf()];
     }
@@ -745,6 +770,13 @@ fn search_file_paths(path: &Path, include_hidden: bool, include_ignored: bool) -
         .follow_links(false)
         .hidden(!include_hidden)
         .require_git(false);
+    builder.filter_entry(move |entry| {
+        entry.file_name().to_str().map_or(true, |name| {
+            !name.eq_ignore_ascii_case(".git")
+                && (include_generated
+                    || !crate::tools::workspace::DEFAULT_EXCLUDED_NAMES.contains(&name))
+        })
+    });
     if include_ignored {
         builder
             .ignore(false)
@@ -752,14 +784,6 @@ fn search_file_paths(path: &Path, include_hidden: bool, include_ignored: bool) -
             .git_global(false)
             .git_exclude(false)
             .parents(false);
-    } else {
-        builder.filter_entry(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .map(|name| !crate::tools::workspace::DEFAULT_EXCLUDED_NAMES.contains(&name))
-                .unwrap_or(true)
-        });
     }
     builder
         .build()
@@ -1020,6 +1044,66 @@ mod tests {
         assert_eq!(result["returned_count"], 1);
         assert_eq!(result["entries"][0]["path"], "src");
         assert_eq!(result["entries"][0]["type"], "directory");
+    }
+
+    #[test]
+    fn generated_trees_require_explicit_opt_in_for_list_and_search() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("visible.txt"), "needle\n").expect("visible");
+        fs::create_dir_all(workspace.path().join("node_modules/pkg")).expect("generated dir");
+        fs::write(
+            workspace.path().join("node_modules/pkg/index.txt"),
+            "needle\n",
+        )
+        .expect("generated");
+        fs::create_dir_all(workspace.path().join(".git/objects")).expect("git dir");
+        fs::write(workspace.path().join(".git/objects/secret.txt"), "needle\n").expect("git file");
+        let ws = Workspace::new(workspace.path().to_path_buf()).expect("workspace");
+
+        let listed = list_files(&ws, &json!({"include_ignored": true})).expect("listed");
+        let paths = listed["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter_map(|entry| entry["path"].as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"visible.txt"));
+        assert!(!paths.iter().any(|path| path.starts_with("node_modules/")));
+        assert!(!paths.iter().any(|path| path.starts_with(".git/")));
+
+        let generated = list_files(
+            &ws,
+            &json!({"include_ignored": true, "include_generated": true}),
+        )
+        .expect("generated list");
+        let generated_paths = generated["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter_map(|entry| entry["path"].as_str())
+            .collect::<Vec<_>>();
+        assert!(generated_paths.contains(&"node_modules/pkg/index.txt"));
+        assert!(!generated_paths.iter().any(|path| path.starts_with(".git/")));
+
+        let searched =
+            search_text(&ws, &json!({"query": "needle", "include_ignored": true})).expect("search");
+        assert_eq!(searched["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(searched["matches"][0]["path"], "visible.txt");
+
+        let searched_generated = search_text(
+            &ws,
+            &json!({"query": "needle", "include_ignored": true, "include_generated": true}),
+        )
+        .expect("generated search");
+        let matched_paths = searched_generated["matches"]
+            .as_array()
+            .expect("matches")
+            .iter()
+            .filter_map(|entry| entry["path"].as_str())
+            .collect::<Vec<_>>();
+        assert!(matched_paths.contains(&"visible.txt"));
+        assert!(matched_paths.contains(&"node_modules/pkg/index.txt"));
+        assert!(!matched_paths.iter().any(|path| path.starts_with(".git/")));
     }
 
     #[test]

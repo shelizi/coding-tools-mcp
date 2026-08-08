@@ -8,14 +8,34 @@ import Col from 'react-bootstrap/Col';
 import Form from 'react-bootstrap/Form';
 import Row from 'react-bootstrap/Row';
 import Stack from 'react-bootstrap/Stack';
+import { DirectoryPickerModal } from './DirectoryPickerModal';
 import type {
   ConfigSaveResult,
   WorkspaceConfigSnapshot,
   ConfigUpdatePayload,
-  PermissionMode,
-  ToolProfileSetting,
+  SecurityPolicy,
   WorkspaceFolder
 } from '../types';
+
+const SECURITY_OPTIONS: ReadonlyArray<{ key: keyof SecurityPolicy; title: string; description: string; highRisk?: boolean }> = [
+  { key: 'restrictToolCatalog', title: '限制工具清單', description: '只公開核心工具；取消後公開完整 advanced 工具集。' },
+  { key: 'enforceCommandAllowlist', title: '命令白名單', description: '只允許預設或手動加入的 executable。' },
+  { key: 'requireDangerousConfirmation', title: '危險命令確認', description: 'rm -rf、git reset --hard 等高破壞命令需要 confirm=true。' },
+  { key: 'requireShellConfirmation', title: 'Shell 執行確認', description: 'PowerShell、cmd、sh、pipe、redirect 與 chain 需要 confirm=true。' },
+  { key: 'blockNetworkCommands', title: '封鎖網路命令', description: '阻擋 curl、wget、ssh、HTTP client 等網路型命令。' },
+  { key: 'enforceWorkspaceBoundary', title: 'Workspace 邊界', description: '讀寫、工作目錄與 executable 必須留在設定的 Workspace。', highRisk: true },
+  { key: 'protectRepositoryMetadata', title: '保護 .git / .github', description: '禁止直接覆寫、移動或遞迴刪除 Git metadata 與 workflow。', highRisk: true },
+  { key: 'blockSymlinkEscape', title: '阻擋 Symlink 逃逸', description: '拒絕經由符號連結讀寫 Workspace 外部路徑。', highRisk: true },
+  { key: 'protectEnvironmentVariables', title: '保護程序環境', description: '禁止覆寫 PATH、COMSPEC、LD_PRELOAD、DYLD 等載入與解析變數。', highRisk: true },
+  { key: 'enforceHarnessBaseline', title: 'Harness 自動基線檢查', description: '寫入或執行前自動掃描 HEAD 與檔案基線。關閉後仍保留 Task / Operation 追蹤；儲存設定後會持久保留。' },
+  { key: 'requireWriteConfirmation', title: '寫入與刪除確認', description: '覆寫、關鍵檔刪除、Git restore 與全專案格式化需要確認。' },
+  { key: 'verifyWriteConflicts', title: '寫入衝突檢查', description: '套用前驗證 SHA、版本與檔案內容未被其他程序修改。', highRisk: true },
+  { key: 'enforceResourceLimits', title: '一般資源限制', description: '套用命令時間、輸出、payload、檔案數與並行上限；最低防崩潰硬限制仍保留。' },
+  { key: 'redactSensitiveOutput', title: '機敏值遮罩', description: '遮罩 Token、密碼、私鑰、Authorization 與疑似 credential 值。', highRisk: true },
+  { key: 'withholdSensitiveSourceOutput', title: '機敏來源整段隱藏', description: '讀取 .env、SSH key、credentials 等來源時隱藏完整 content/stdout。', highRisk: true },
+  { key: 'redactTelemetry', title: 'Telemetry 遮罩', description: '持久化工具使用紀錄前先遮罩參數、結果與錯誤內容。', highRisk: true },
+  { key: 'redactHistory', title: 'History 遮罩', description: '寫入開發 checkpoint 與歷史 Markdown 前先移除機敏值。', highRisk: true }
+];
 
 interface ConfigFormProps {
   snapshot: WorkspaceConfigSnapshot;
@@ -29,8 +49,7 @@ interface FormState {
   port: string;
   publicBaseUrl: string;
   dataDir: string;
-  permissionMode: PermissionMode;
-  toolProfile: ToolProfileSetting;
+  securityPolicy: SecurityPolicy;
   managementEnabled: boolean;
   oauthClientId: string;
   oauthPassword: string;
@@ -47,6 +66,7 @@ interface FormState {
   globalProcessConcurrency: string;
   activeSessionLimit: string;
   maxOutputBytes: string;
+  commandTimeoutMaxMs: string;
   tunnelEnabled: boolean;
   tunnelPublicUrl: string;
   tunnelEnrollmentUrl: string;
@@ -66,8 +86,7 @@ function createState(snapshot: WorkspaceConfigSnapshot): FormState {
     port: String(config.port),
     publicBaseUrl: config.publicBaseUrl,
     dataDir: config.dataDir,
-    permissionMode: config.permissionMode,
-    toolProfile: config.toolProfile,
+    securityPolicy: { ...config.securityPolicy },
     managementEnabled: config.management.enabled,
     oauthClientId: config.oauth.clientId,
     oauthPassword: '',
@@ -84,6 +103,7 @@ function createState(snapshot: WorkspaceConfigSnapshot): FormState {
     globalProcessConcurrency: String(config.limits.globalProcessConcurrency),
     activeSessionLimit: String(config.limits.activeSessionLimit),
     maxOutputBytes: String(config.limits.maxOutputBytes),
+    commandTimeoutMaxMs: String(config.limits.commandTimeoutMaxMs),
     tunnelEnabled: config.tunnel.enabled,
     tunnelPublicUrl: config.tunnel.publicUrl,
     tunnelEnrollmentUrl: '',
@@ -148,8 +168,7 @@ function payload(state: FormState): ConfigUpdatePayload {
     port: integer(state.port, 'Port', 1, 65_535),
     publicBaseUrl: state.publicBaseUrl.trim(),
     dataDir: state.dataDir.trim(),
-    permissionMode: state.permissionMode,
-    toolProfile: state.toolProfile,
+    securityPolicy: state.securityPolicy,
     management: { enabled: state.managementEnabled },
     oauth: {
       clientId: state.oauthClientId.trim(),
@@ -170,7 +189,8 @@ function payload(state: FormState): ConfigUpdatePayload {
       globalBlockingConcurrency: integer(state.globalBlockingConcurrency, '全域檔案/Git 併發', 1, 65_535),
       globalProcessConcurrency: integer(state.globalProcessConcurrency, '全域程序併發', 1, 65_535),
       activeSessionLimit: integer(state.activeSessionLimit, 'Session 上限', 1, 65_535),
-      maxOutputBytes: integer(state.maxOutputBytes, '每串流保留 bytes', 1_024, 16 * 1024 * 1024)
+      maxOutputBytes: integer(state.maxOutputBytes, '每串流保留 bytes', 1_024, 16 * 1024 * 1024),
+      commandTimeoutMaxMs: integer(state.commandTimeoutMaxMs, '命令 timeout 上限', 1, 3_600_000)
     },
     tunnel: {
       enabled: state.tunnelEnabled,
@@ -184,9 +204,11 @@ function payload(state: FormState): ConfigUpdatePayload {
 export function ConfigForm({ snapshot, saving, onSave }: ConfigFormProps) {
   const [state, setState] = useState(() => createState(snapshot));
   const [message, setMessage] = useState<FormMessage | null>(null);
+  const [folderPickerIndex, setFolderPickerIndex] = useState<number | null>(null);
 
   useEffect(() => {
     setState(createState(snapshot));
+    setFolderPickerIndex(null);
   }, [snapshot]);
 
   const updateFolder = (index: number, key: keyof WorkspaceFolder, value: string) => {
@@ -220,9 +242,36 @@ export function ConfigForm({ snapshot, saving, onSave }: ConfigFormProps) {
         clearClientSecret: false,
         clearEnrollmentUrl: false
       }));
+      const appliedImmediately = result.appliedImmediately ?? [];
+      const immediateLabels: Record<string, string> = {
+        folders: 'Workspace 資料夾',
+        policy: '命令與檔案 Policy',
+        'limits.activeSessionLimit': 'Session 上限',
+        'limits.maxOutputBytes': '輸出保留上限',
+        'limits.commandTimeoutMaxMs': '命令 timeout 上限',
+        'limits.blockingConcurrency': 'Workspace 檔案／Git 併發',
+        'limits.processConcurrency': 'Workspace 程序併發',
+        'limits.globalBlockingConcurrency': '全域檔案／Git 併發',
+        'limits.globalProcessConcurrency': '全域程序併發',
+        securityPolicy: '權限、Telemetry 與安全策略',
+        toolCatalog: '工具目錄',
+        oauth: 'OAuth 憑證',
+        tunnel: 'Tunnel 連線'
+      };
+      const appliedSummary = appliedImmediately.map(key => immediateLabels[key] ?? key).join('、');
       setMessage({
         variant: result.restartRequired ? 'warning' : 'success',
-        text: result.restartRequired ? '設定已儲存，請重新啟動 Agent 套用。' : '設定已儲存，目前不需要重新啟動。'
+        text: result.restartRequired
+          ? result.hotApplyDeferredReason
+            ? appliedSummary
+              ? `${appliedSummary}已立即套用；部分執行中工作尚未釋放資源，其餘設定請重新啟動 Agent 後生效。`
+              : '設定已儲存；部分執行中工作尚未釋放資源，請重新啟動 Agent 套用。'
+            : appliedSummary
+              ? `${appliedSummary}已立即套用；其餘設定請重新啟動 Agent 後生效。`
+              : '設定已儲存，請重新啟動 Agent 套用。'
+          : appliedSummary
+            ? `${appliedSummary}已立即套用，不需要重新啟動。`
+            : '設定已儲存，目前不需要重新啟動。'
       });
     } catch (error) {
       setMessage({ variant: 'danger', text: error instanceof Error ? error.message : String(error) });
@@ -230,16 +279,17 @@ export function ConfigForm({ snapshot, saving, onSave }: ConfigFormProps) {
   };
 
   return (
-    <Form onSubmit={submit}>
-      {snapshot.environmentOverrides.length ? (
+    <>
+      <Form onSubmit={submit}>
+        {snapshot.environmentOverrides.length ? (
         <Alert variant="info">
           下列環境變數會優先於設定檔：<code>{snapshot.environmentOverrides.join(', ')}</code>
         </Alert>
       ) : (
         <Alert variant="secondary">目前沒有環境變數覆寫。</Alert>
-      )}
+        )}
 
-      <Accordion alwaysOpen defaultActiveKey={['server', 'workspaces']} className="settings-accordion">
+        <Accordion alwaysOpen defaultActiveKey={['server', 'workspaces']} className="settings-accordion">
         <Accordion.Item eventKey="identity">
           <Accordion.Header>Workspace</Accordion.Header>
           <Accordion.Body>
@@ -267,32 +317,10 @@ export function ConfigForm({ snapshot, saving, onSave }: ConfigFormProps) {
                   <Form.Control type="number" min={1} max={65_535} value={state.port} onChange={event => setState(current => ({ ...current, port: event.target.value }))} />
                 </Form.Group>
               </Col>
-              <Col md={6} xl={4}>
-                <Form.Group controlId="permissionMode">
-                  <Form.Label>權限模式</Form.Label>
-                  <Form.Select value={state.permissionMode} onChange={event => setState(current => ({ ...current, permissionMode: event.target.value as PermissionMode }))}>
-                    <option value="read-only">read-only</option>
-                    <option value="guarded">guarded</option>
-                    <option value="trusted">trusted</option>
-                    <option value="dangerous">dangerous</option>
-                  </Form.Select>
-                </Form.Group>
-              </Col>
-              <Col md={6} xl={4}>
-                <Form.Group controlId="toolProfile">
-                  <Form.Label>工具 Profile</Form.Label>
-                  <Form.Select value={state.toolProfile} onChange={event => setState(current => ({ ...current, toolProfile: event.target.value as ToolProfileSetting }))}>
-                    <option value="core">core（依權限自動）</option>
-                    <option value="trusted-core">trusted-core</option>
-                    <option value="guarded-core">guarded-core</option>
-                    <option value="read-only">read-only</option>
-                    <option value="advanced">advanced</option>
-                    <option value="compat-readonly-all">compat-readonly-all</option>
-                  </Form.Select>
-                  <Form.Text className="text-secondary">
-                    儲存值：{snapshot.saved.toolProfile} · 生效值：{snapshot.effective.activeToolProfile}
-                  </Form.Text>
-                </Form.Group>
+              <Col xs={12}>
+                <Alert variant="secondary" className="mb-0">
+                  Profile 與權限模式已改為下方的自訂安全策略。每個保護都能獨立開關；取消高風險項目會讓工具取得更廣泛的主機權限。
+                </Alert>
               </Col>
               <Col xs={12}>
                 <Form.Group controlId="publicBaseUrl">
@@ -314,8 +342,34 @@ export function ConfigForm({ snapshot, saving, onSave }: ConfigFormProps) {
         </Accordion.Item>
 
         <Accordion.Item eventKey="policy">
-          <Accordion.Header>執行政策</Accordion.Header>
+          <Accordion.Header>自訂安全策略</Accordion.Header>
           <Accordion.Body>
+            <Alert variant={Object.entries(state.securityPolicy).some(([, enabled]) => !enabled) ? 'warning' : 'success'}>
+              勾選代表啟用保護。取消勾選會放寬限制；紅色標記項目可能暴露主機檔案、憑證或永久紀錄。
+            </Alert>
+            <Row className="g-3 mb-4">
+              {SECURITY_OPTIONS.map(option => (
+                <Col md={6} key={option.key}>
+                  <Card className={option.highRisk && !state.securityPolicy[option.key] ? 'border-danger h-100' : 'h-100'}>
+                    <Card.Body>
+                      <Form.Check
+                        type="switch"
+                        id={`security-${option.key}`}
+                        label={option.title}
+                        checked={state.securityPolicy[option.key]}
+                        onChange={event => setState(current => ({
+                          ...current,
+                          securityPolicy: { ...current.securityPolicy, [option.key]: event.target.checked }
+                        }))}
+                      />
+                      <div className="small text-secondary mt-2">{option.description}</div>
+                      {option.highRisk && !state.securityPolicy[option.key] ? <Badge bg="danger" className="mt-2">高風險：已關閉</Badge> : null}
+                    </Card.Body>
+                  </Card>
+                </Col>
+              ))}
+            </Row>
+            <h3 className="h6">命令與容量細節</h3>
             <Row className="g-3">
               <Col md={6}>
                 <Form.Group controlId="allowedCommands">
@@ -389,7 +443,11 @@ export function ConfigForm({ snapshot, saving, onSave }: ConfigFormProps) {
                       <Col md={11}>
                         <Form.Group controlId={`folder-path-${index}`}>
                           <Form.Label>絕對路徑</Form.Label>
-                          <Form.Control value={folder.path} onChange={event => updateFolder(index, 'path', event.target.value)} />
+                          <div className="input-group">
+                            <Form.Control value={folder.path} readOnly placeholder="尚未選擇資料夾" />
+                            <Button type="button" variant="outline-primary" onClick={() => setFolderPickerIndex(index)}>選擇資料夾</Button>
+                          </div>
+                          <Form.Text className="text-secondary">使用主機端資料夾選擇器，避免手動輸入錯誤或瀏覽器只回傳相對路徑。</Form.Text>
                         </Form.Group>
                       </Col>
                       <Col md={1} className="d-grid">
@@ -414,6 +472,7 @@ export function ConfigForm({ snapshot, saving, onSave }: ConfigFormProps) {
               <Col md={6} xl={4}><Form.Group controlId="globalProcessConcurrency"><Form.Label>全域程序併發</Form.Label><Form.Control type="number" min={1} max={65_535} value={state.globalProcessConcurrency} onChange={event => setState(current => ({ ...current, globalProcessConcurrency: event.target.value }))} /></Form.Group></Col>
               <Col md={6} xl={4}><Form.Group controlId="activeSessionLimit"><Form.Label>Session 上限</Form.Label><Form.Control type="number" min={1} max={65_535} value={state.activeSessionLimit} onChange={event => setState(current => ({ ...current, activeSessionLimit: event.target.value }))} /></Form.Group></Col>
               <Col md={6} xl={4}><Form.Group controlId="maxOutputBytes"><Form.Label>每串流保留 bytes</Form.Label><Form.Control type="number" min={1_024} max={16 * 1024 * 1024} value={state.maxOutputBytes} onChange={event => setState(current => ({ ...current, maxOutputBytes: event.target.value }))} /></Form.Group></Col>
+              <Col md={6} xl={4}><Form.Group controlId="commandTimeoutMaxMs"><Form.Label>命令 timeout 上限 (ms)</Form.Label><Form.Control type="number" min={1} max={3_600_000} value={state.commandTimeoutMaxMs} onChange={event => setState(current => ({ ...current, commandTimeoutMaxMs: event.target.value }))} /><Form.Text muted>預設 1,800,000 ms（30 分鐘），最高 3,600,000 ms（60 分鐘）。</Form.Text></Form.Group></Col>
             </Row>
           </Accordion.Body>
         </Accordion.Item>
@@ -439,15 +498,26 @@ export function ConfigForm({ snapshot, saving, onSave }: ConfigFormProps) {
             </Row>
           </Accordion.Body>
         </Accordion.Item>
-      </Accordion>
+        </Accordion>
 
-      <div className="settings-actions mt-4">
+        <div className="settings-actions mt-4">
         <Stack direction="horizontal" gap={3} className="flex-wrap">
           <Button type="submit" disabled={saving}>{saving ? '儲存中…' : '儲存設定'}</Button>
           <span className="small text-secondary">儲存採用加密 secrets + 公開設定 rollback，執行中的 Agent 不會被熱修改。</span>
         </Stack>
         {message ? <Alert variant={message.variant} className="mt-3 mb-0">{message.text}</Alert> : null}
-      </div>
-    </Form>
+        </div>
+      </Form>
+      <DirectoryPickerModal
+        show={folderPickerIndex !== null}
+        workspaceId={snapshot.id}
+        initialPath={folderPickerIndex === null ? '' : state.folders[folderPickerIndex]?.path ?? ''}
+        onCancel={() => setFolderPickerIndex(null)}
+        onSelect={selectedPath => {
+          if (folderPickerIndex !== null) updateFolder(folderPickerIndex, 'path', selectedPath);
+          setFolderPickerIndex(null);
+        }}
+      />
+    </>
   );
 }

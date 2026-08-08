@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
@@ -9,7 +9,10 @@ use crate::tools::permission::PendingOperationStore;
 use crate::tools::policy::PolicySettings;
 use crate::tools::session::SessionStore;
 use crate::tools::workspace::{relative_display, Workspace};
-use crate::workspace::AuthConfig;
+use crate::workspace::{AuthConfig, RuntimeConfig};
+
+pub const DEFAULT_COMMAND_TIMEOUT_MAX_MS: u64 = 30 * 60_000;
+pub const ABSOLUTE_COMMAND_TIMEOUT_MAX_MS: u64 = 60 * 60_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutionLimits {
@@ -63,6 +66,80 @@ impl ExecutionLimits {
             global_process_admission: global_process_admission.clamp(1, MAX_CONFIGURED_CONCURRENCY),
             active_sessions: active_sessions.clamp(1, MAX_CONFIGURED_CONCURRENCY),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeToolConfig {
+    pub policy: PolicySettings,
+    pub tool_profile: String,
+    pub permission_mode: String,
+}
+
+impl RuntimeToolConfig {
+    fn normalized(
+        mut policy: PolicySettings,
+        tool_profile: String,
+        permission_mode: String,
+    ) -> Self {
+        policy.permission_mode = permission_mode.clone();
+        Self {
+            policy,
+            tool_profile: crate::tools::registry::resolve_tool_profile(
+                &tool_profile,
+                &permission_mode,
+            )
+            .into(),
+            permission_mode,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SharedRuntimeToolConfig {
+    inner: Arc<RwLock<RuntimeToolConfig>>,
+}
+
+impl SharedRuntimeToolConfig {
+    pub fn new(policy: PolicySettings, tool_profile: String, permission_mode: String) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(RuntimeToolConfig::normalized(
+                policy,
+                tool_profile,
+                permission_mode,
+            ))),
+        }
+    }
+
+    pub fn from_runtime(runtime: &RuntimeConfig) -> Self {
+        Self::new(
+            PolicySettings::from_runtime(runtime),
+            runtime.tool_profile.clone(),
+            runtime.permission_mode.clone(),
+        )
+    }
+
+    pub fn snapshot(&self) -> RuntimeToolConfig {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn update(&self, policy: PolicySettings, tool_profile: String, permission_mode: String) {
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            RuntimeToolConfig::normalized(policy, tool_profile, permission_mode);
+    }
+
+    pub fn update_from_runtime(&self, runtime: &RuntimeConfig) {
+        self.update(
+            PolicySettings::from_runtime(runtime),
+            runtime.tool_profile.clone(),
+            runtime.permission_mode.clone(),
+        );
     }
 }
 
@@ -188,9 +265,7 @@ pub struct ToolContext {
     pub workspace: Workspace,
     pub profile_id: String,
     pub auth: AuthConfig,
-    pub policy: PolicySettings,
-    pub tool_profile: String,
-    pub permission_mode: String,
+    runtime_config: SharedRuntimeToolConfig,
     pub harness: Harness,
     default_cwd: Mutex<PathBuf>,
     pub sessions: Arc<SessionStore>,
@@ -236,7 +311,7 @@ impl ToolContext {
             workspace,
             auth,
             policy,
-            crate::tools::registry::resolve_tool_profile(&tool_profile, &permission_mode).into(),
+            tool_profile,
             permission_mode,
             harness_root,
         )
@@ -340,6 +415,29 @@ impl ToolContext {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_workspace_with_shared_runtime_config_and_resource_ids_and_limits(
+        workspace: Workspace,
+        auth: AuthConfig,
+        runtime_config: SharedRuntimeToolConfig,
+        profile_id: String,
+        execution_resource_id: String,
+        global_admission_resource_id: String,
+        limits: ExecutionLimits,
+    ) -> Self {
+        let harness_root = Harness::default_root().expect("无法初始化 Harness 数据目录");
+        Self::from_workspace_with_identity_and_runtime_config(
+            workspace,
+            auth,
+            runtime_config,
+            harness_root,
+            Some(profile_id),
+            Some(execution_resource_id),
+            Some(global_admission_resource_id),
+            limits,
+        )
+    }
+
     pub fn from_workspace_with_harness_root(
         workspace: Workspace,
         auth: AuthConfig,
@@ -374,6 +472,29 @@ impl ToolContext {
         explicit_global_admission_resource_id: Option<String>,
         limits: ExecutionLimits,
     ) -> Self {
+        Self::from_workspace_with_identity_and_runtime_config(
+            workspace,
+            auth,
+            SharedRuntimeToolConfig::new(policy, tool_profile, permission_mode),
+            harness_root,
+            explicit_profile_id,
+            explicit_execution_resource_id,
+            explicit_global_admission_resource_id,
+            limits,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_workspace_with_identity_and_runtime_config(
+        workspace: Workspace,
+        auth: AuthConfig,
+        runtime_config: SharedRuntimeToolConfig,
+        harness_root: PathBuf,
+        explicit_profile_id: Option<String>,
+        explicit_execution_resource_id: Option<String>,
+        explicit_global_admission_resource_id: Option<String>,
+        limits: ExecutionLimits,
+    ) -> Self {
         let root = workspace.root().to_path_buf();
         let harness = Harness::new(root.clone(), harness_root).expect("无法初始化 Harness");
         let profile_id = explicit_profile_id.unwrap_or_else(|| harness.workspace_id().to_string());
@@ -390,13 +511,7 @@ impl ToolContext {
             workspace,
             profile_id,
             auth,
-            policy,
-            tool_profile: crate::tools::registry::resolve_tool_profile(
-                &tool_profile,
-                &permission_mode,
-            )
-            .into(),
-            permission_mode,
+            runtime_config,
             harness,
             default_cwd: Mutex::new(root),
             sessions: resources.sessions.clone(),
@@ -411,6 +526,24 @@ impl ToolContext {
             _execution_resources: resources,
             _global_admission_resources: global_resources,
         }
+    }
+
+    pub fn runtime_config(&self) -> RuntimeToolConfig {
+        self.runtime_config.snapshot()
+    }
+
+    pub fn shared_runtime_config(&self) -> SharedRuntimeToolConfig {
+        self.runtime_config.clone()
+    }
+
+    pub fn update_runtime_config(
+        &self,
+        policy: PolicySettings,
+        tool_profile: String,
+        permission_mode: String,
+    ) {
+        self.runtime_config
+            .update(policy, tool_profile, permission_mode);
     }
 
     pub fn for_test(workspace_path: PathBuf, harness_root: PathBuf) -> Result<Self, String> {

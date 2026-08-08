@@ -347,8 +347,11 @@ MCP 與 Actions 可以在同一工作區同時執行，也可以分別使用不�
 
 ```bash
 npm install
+npm run hooks:install
 npm run desktop
 ```
+
+`hooks:install` 會把此 clone 的 `core.hooksPath` 指向 repo 內的 `.githooks`。提交 staged Rust 檔案時，pre-commit 只會格式化完整 staged 的檔案並重新 stage；若同一檔案同時存在 unstaged hunks，hook 會停止提交而不改動 index，避免意外把額外變更帶進 commit。
 
 常用驗證指令：
 

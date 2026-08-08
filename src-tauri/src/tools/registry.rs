@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use super::ABSOLUTE_COMMAND_TIMEOUT_MAX_MS;
+
 pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
     (
         "harness_status",
@@ -371,6 +373,14 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "git_push",
+        "Git push",
+        "Push the current or selected branch to a remote with expected-HEAD guards and structured authentication errors.",
+        false,
+        false,
+        true,
+    ),
+    (
         "git_restore",
         "Git restore",
         "Restore or unstage selected paths with explicit confirmation.",
@@ -430,6 +440,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "git_branch",
     "git_stage",
     "git_commit",
+    "git_push",
     "git_restore",
     "view_image",
 ];
@@ -467,6 +478,7 @@ pub const GUARDED_CORE_TOOLS: &[&str] = &[
     "git_branch",
     "git_stage",
     "git_commit",
+    "git_push",
     "git_restore",
     "request_permissions",
     "view_image",
@@ -531,6 +543,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "git_branch",
     "git_stage",
     "git_commit",
+    "git_push",
     "git_restore",
     "project_state",
     "start_task",
@@ -557,6 +570,7 @@ pub const MUTATING_TOOLS: &[&str] = &[
     "git_branch",
     "git_stage",
     "git_commit",
+    "git_push",
     "git_restore",
     "exec_command",
     "exec_many",
@@ -586,6 +600,7 @@ pub const SERIALIZED_WORKSPACE_TOOLS: &[&str] = &[
     "git_branch",
     "git_stage",
     "git_commit",
+    "git_push",
     "git_restore",
     "set_default_cwd",
     "start_task",
@@ -814,10 +829,10 @@ pub fn input_schema(name: &str) -> Value {
                 "aggregate": { "type": "boolean", "default": true },
                 "include_records": { "type": "boolean", "default": false },
                 "include_payloads": { "type": "boolean", "default": false },
-                "include_slowest": { "type": "boolean", "default": true },
-                "include_largest": { "type": "boolean", "default": true },
+                "include_slowest": { "type": "boolean", "default": false },
+                "include_largest": { "type": "boolean", "default": false },
                 "include_performance": { "type": "boolean", "default": true },
-                "include_bursts": { "type": "boolean", "default": true },
+                "include_bursts": { "type": "boolean", "default": false },
                 "include_async_sessions": { "type": "boolean", "default": true },
                 "burst_idle_ms": { "type": "integer", "minimum": 1000, "maximum": 3600000, "default": 120000 }
             },
@@ -879,7 +894,12 @@ pub fn input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {
                 "cursor": { "type": "integer", "minimum": 0, "default": 0 },
-                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
+                "order": { "type": "string", "enum": ["desc", "asc"], "default": "desc" },
+                "tool": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "kind": { "type": "string", "minLength": 1, "maxLength": 64 },
+                "errors_only": { "type": "boolean", "default": false },
+                "since_ts_ms": { "type": "integer", "minimum": 0 }
             },
             "additionalProperties": false
         }),
@@ -1010,7 +1030,8 @@ pub fn input_schema(name: &str) -> Value {
                 "max_entries": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 },
                 "max_depth": { "type": "integer", "minimum": 1, "maximum": 20, "default": 4 },
                 "include_hidden": { "type": "boolean", "default": false },
-                "include_ignored": { "type": "boolean", "default": false }
+                "include_ignored": { "type": "boolean", "default": false },
+                "include_generated": { "type": "boolean", "default": false, "description": "Include generated dependency/build trees such as node_modules, target, dist, and build. .git remains excluded." }
             },
             "additionalProperties": false
         }),
@@ -1026,7 +1047,8 @@ pub fn input_schema(name: &str) -> Value {
                 "max_depth": { "type": "integer", "minimum": 1, "maximum": 20, "default": 20 },
                 "include_hidden": { "type": "boolean", "default": false },
                 "include_ignored": { "type": "boolean", "default": false },
-                "max_results": { "type": "integer", "minimum": 1, "maximum": 50000, "default": 5000 }
+                "include_generated": { "type": "boolean", "default": false, "description": "Include generated dependency/build trees such as node_modules, target, dist, and build. .git remains excluded." },
+                "max_results": { "type": "integer", "minimum": 1, "maximum": 50000, "default": 1000 }
             },
             "additionalProperties": false
         }),
@@ -1071,7 +1093,8 @@ pub fn input_schema(name: &str) -> Value {
                 "cursor": { "type": "integer", "minimum": 0, "default": 0 },
                 "include_hidden": { "type": "boolean", "default": false },
                 "include_ignored": { "type": "boolean", "default": false },
-                "max_results": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 }
+                "include_generated": { "type": "boolean", "default": false, "description": "Include generated dependency/build trees such as node_modules, target, dist, and build. .git remains excluded." },
+                "max_results": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 200 }
             },
             "additionalProperties": false
         }),
@@ -1267,7 +1290,7 @@ pub fn input_schema(name: &str) -> Value {
                             "env": { "type": "object", "maxProperties": 64, "additionalProperties": { "type": "string", "maxLength": 4096 } },
                             "remove_env": { "type": "array", "maxItems": 64, "items": { "type": "string" } },
                             "workdir": { "type": "string", "default": "." },
-                            "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 600000, "default": 30000 },
+                            "timeout_ms": { "type": "integer", "minimum": 1, "maximum": ABSOLUTE_COMMAND_TIMEOUT_MAX_MS, "default": 30000 },
                             "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536 },
                             "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 30000 },
                             "output_mode": { "type": "string", "enum": ["tail", "none", "summary"], "default": "tail" },
@@ -1280,11 +1303,15 @@ pub fn input_schema(name: &str) -> Value {
                         "additionalProperties": false
                     }
                 },
+                "operation_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Stable retained graph identifier. Reuse it without commands to reattach to the same exec_many graph instead of starting duplicate commands." },
+                "action": { "type": "string", "enum": ["run", "status", "cancel", "forget"], "default": "run", "description": "Run or reattach by default; status returns immediately, cancel terminates active graph children, and forget releases a completed retained graph immediately." },
+                "reason": { "type": "string", "default": "", "description": "Optional reason recorded when cancelling a retained graph." },
+                "result_mode": { "type": "string", "enum": ["full", "summary", "none"], "description": "Controls per-command result detail. When omitted, run/reattach preserves full results while status/cancel use compact summaries to avoid repeating large stdout/stderr payloads." },
+                "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 30000, "description": "How long this exec_many call waits for graph completion before returning retained progress. The graph continues running after this window." },
                 "mode": { "type": "string", "enum": ["auto", "sequential", "parallel", "dag"], "default": "auto", "description": "Execution scheduler. Auto uses dependencies, hard safety rules, resource locks, and historical pair statistics. Unknown command pairs remain sequential until explicit parallel observations provide enough safe evidence; explicit parallel is never silently overridden." },
                 "max_parallel": { "type": "integer", "minimum": 1, "maximum": 256, "description": "Maximum concurrently running batch commands. Auto mode bounds the requested value by 8, workspace process admission, and historical resource-serialization recommendations." },
                 "stop_on_error": { "type": "boolean", "default": true }
             },
-            "required": ["commands"],
             "additionalProperties": false
         }),
         "exec_command" => {
@@ -1299,7 +1326,7 @@ pub fn input_schema(name: &str) -> Value {
                     "env": { "type": "object", "maxProperties": 64, "additionalProperties": { "type": "string", "maxLength": 4096 } },
                     "remove_env": { "type": "array", "maxItems": 64, "items": { "type": "string" } },
                     "workdir": { "type": "string", "default": "." },
-                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 600000, "default": 30000 },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": ABSOLUTE_COMMAND_TIMEOUT_MAX_MS, "default": 30000 },
                     "max_output_bytes": { "type": "integer", "minimum": 1024, "maximum": 1048576, "default": 65536 },
                     "yield_time_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 1000 },
                     "output_mode": { "type": "string", "enum": ["delta", "tail", "all", "none", "summary"], "default": "tail" },
@@ -1322,7 +1349,7 @@ pub fn input_schema(name: &str) -> Value {
                                 "env": { "type": "object", "maxProperties": 64, "additionalProperties": { "type": "string", "maxLength": 4096 } },
                                 "remove_env": { "type": "array", "maxItems": 64, "items": { "type": "string" } },
                                 "expected_exit_code": { "type": "integer", "default": 0 },
-                                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 600000, "default": 30000 },
+                                "timeout_ms": { "type": "integer", "minimum": 1, "maximum": ABSOLUTE_COMMAND_TIMEOUT_MAX_MS, "default": 30000 },
                                 "max_output_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 16384 },
                                 "confirm": { "type": "boolean", "default": false }
                             },
@@ -1372,7 +1399,7 @@ pub fn input_schema(name: &str) -> Value {
                 "session_id": { "type": "string", "minLength": 1 },
                 "cursor": { "type": "integer", "minimum": 0, "default": 0 },
                 "timeout_ms": { "type": "integer", "minimum": 0, "maximum": 120000, "default": 30000, "description": "Server-side event wait. Use until=finalized with a longer timeout for quiet long-running commands to reduce repeated polling." },
-                "heartbeat_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 0, "description": "Return a heartbeat at this interval while the process remains quiet so transports stay active without restarting the command." },
+                "heartbeat_ms": { "type": "integer", "minimum": 0, "maximum": 30000, "default": 0, "description": "Deprecated compatibility field. Accepted but ignored for application wait timing; MCP transport heartbeats keep long requests alive automatically." },
                 "until": { "type": "string", "enum": ["output_or_exit", "exit", "finalized"], "default": "output_or_exit" },
                 "output_mode": { "type": "string", "enum": ["delta", "tail", "all", "none", "summary"], "default": "delta" },
                 "max_output_bytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536 },
@@ -1535,6 +1562,20 @@ pub fn input_schema(name: &str) -> Value {
             "required": ["message"],
             "additionalProperties": false
         }),
+        "git_push" => json!({
+            "type": "object",
+            "properties": {
+                "repo_path": { "type": "string", "default": ".", "description": "Workspace-relative Git repository or linked worktree root" },
+                "remote": { "type": "string", "minLength": 1, "default": "origin" },
+                "branch": { "type": "string", "minLength": 1, "description": "Defaults to the current branch; required for detached HEAD." },
+                "set_upstream": { "type": "boolean", "default": false },
+                "expected_repo_fingerprint": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "expected_head": { "type": "string" },
+                "dry_run": { "type": "boolean", "default": false },
+                "reason": { "type": "string", "default": "" }
+            },
+            "additionalProperties": false
+        }),
         "git_restore" => json!({
             "type": "object",
             "properties": {
@@ -1560,7 +1601,7 @@ pub fn input_schema(name: &str) -> Value {
                 "confirm": { "type": "boolean", "default": false },
                 "tool_name": {
                     "type": "string",
-                    "enum": ["exec_command", "apply_patch"]
+                    "enum": ["exec_command", "apply_patch", "git_push"]
                 },
                 "permission": {
                     "type": "string",
@@ -1625,7 +1666,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{input_schema, list_tools_for_profile, P0_TOOLS};
+    use super::{input_schema, list_tools_for_profile, ABSOLUTE_COMMAND_TIMEOUT_MAX_MS, P0_TOOLS};
 
     #[test]
     fn read_only_annotations_match_the_tunnel_retry_contract() {
@@ -1653,7 +1694,7 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 34);
+        assert_eq!(tools.len(), 35);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
@@ -1667,6 +1708,7 @@ mod tests {
         assert!(names.contains(&"wait_command"));
         assert!(names.contains(&"resolve_operation"));
         assert!(names.contains(&"list_sessions"));
+        assert!(names.contains(&"git_push"));
         assert!(names.contains(&"send_input"));
         for removed in [
             "history_session_validate",
@@ -1693,8 +1735,8 @@ mod tests {
     fn guarded_core_adds_only_permission_requests() {
         let trusted = list_tools_for_profile("trusted-core");
         let guarded = list_tools_for_profile("guarded-core");
-        assert_eq!(trusted.len(), 34);
-        assert_eq!(guarded.len(), 35);
+        assert_eq!(trusted.len(), 35);
+        assert_eq!(guarded.len(), 36);
         assert!(guarded
             .iter()
             .any(|tool| tool["name"] == "request_permissions"));
@@ -1712,17 +1754,78 @@ mod tests {
             65_536
         );
 
+        let operation_log_schema = input_schema("operation_log");
+        assert_eq!(
+            operation_log_schema["properties"]["order"]["default"],
+            "desc"
+        );
+        assert_eq!(
+            operation_log_schema["properties"]["errors_only"]["default"],
+            false
+        );
+
+        let push_schema = input_schema("git_push");
+        assert_eq!(push_schema["properties"]["remote"]["default"], "origin");
+        assert_eq!(push_schema["properties"]["dry_run"]["default"], false);
+
         let diff_schema = input_schema("git_diff");
         assert_eq!(diff_schema["properties"]["context_lines"]["maximum"], 1000);
+
+        let list_schema = input_schema("list_files");
+        assert_eq!(list_schema["properties"]["max_results"]["default"], 1_000);
+        assert_eq!(
+            list_schema["properties"]["include_generated"]["default"],
+            false
+        );
+        let search_schema = input_schema("search_text");
+        assert_eq!(search_schema["properties"]["max_results"]["default"], 200);
+        assert_eq!(
+            search_schema["properties"]["include_generated"]["default"],
+            false
+        );
 
         let wait_schema = input_schema("wait_command");
         assert_eq!(wait_schema["properties"]["timeout_ms"]["maximum"], 120_000);
         assert_eq!(wait_schema["properties"]["heartbeat_ms"]["maximum"], 30_000);
+        assert!(wait_schema["properties"]["heartbeat_ms"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ignored"));
 
         let exec_schema = input_schema("exec_command");
         assert!(exec_schema["properties"]["operation_id"].is_object());
         assert!(exec_schema["properties"]["deduplicate"].is_object());
         assert!(exec_schema["properties"]["lock_group"].is_object());
+        assert_eq!(
+            exec_schema["properties"]["timeout_ms"]["maximum"],
+            ABSOLUTE_COMMAND_TIMEOUT_MAX_MS
+        );
+        assert_eq!(
+            exec_schema["properties"]["post_checks"]["items"]["properties"]["timeout_ms"]
+                ["maximum"],
+            ABSOLUTE_COMMAND_TIMEOUT_MAX_MS
+        );
+
+        let exec_many_schema = input_schema("exec_many");
+        assert!(exec_many_schema["properties"]["operation_id"].is_object());
+        assert_eq!(
+            exec_many_schema["properties"]["commands"]["items"]["properties"]["timeout_ms"]
+                ["maximum"],
+            ABSOLUTE_COMMAND_TIMEOUT_MAX_MS
+        );
+        assert_eq!(exec_many_schema["properties"]["action"]["default"], "run");
+        assert_eq!(
+            exec_many_schema["properties"]["action"]["enum"],
+            json!(["run", "status", "cancel", "forget"])
+        );
+        assert_eq!(
+            exec_many_schema["properties"]["result_mode"]["enum"],
+            json!(["full", "summary", "none"])
+        );
+        assert_eq!(
+            exec_many_schema["properties"]["yield_time_ms"]["default"],
+            30_000
+        );
 
         let resolve_schema = input_schema("resolve_operation");
         assert!(resolve_schema["properties"]["operation_id"].is_object());

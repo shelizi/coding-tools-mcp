@@ -16,4 +16,6 @@ Portable retries must not run the patch command again. Build or retry the curren
 npm run desktop:portable
 ```
 
+The Rust portable ZIP remains versioned as `Coding.Tools.MCP_<version>_x64_portable.zip`. Its expanded latest-build directory is always `dist-portable/Coding.Tools.MCP_x64_portable/` and is replaced on each successful build.
+
 CI runs `npm run version:check` to reject committed version drift.

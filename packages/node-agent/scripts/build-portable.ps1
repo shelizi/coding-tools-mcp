@@ -63,12 +63,14 @@ function Publish-PortablePackage {
     param(
         [Parameter(Mandatory = $true)][string]$PackagePath,
         [Parameter(Mandatory = $true)][string]$OutputDirectory,
-        [Parameter(Mandatory = $true)][string]$Edition
+        [Parameter(Mandatory = $true)][string]$Edition,
+        [Parameter(Mandatory = $true)][string]$ExpandedName
     )
 
     $packageName = Split-Path -Leaf $PackagePath
     $zipPath = Join-Path $OutputDirectory "$packageName.zip"
-    $expandedPath = Join-Path $OutputDirectory $packageName
+    $expandedPath = Join-Path $OutputDirectory $ExpandedName
+    $expandedStagingPath = Join-Path $OutputDirectory ".$ExpandedName.next-$([guid]::NewGuid().ToString('N'))"
 
     if (Test-Path -LiteralPath $zipPath) {
         Remove-Item -LiteralPath $zipPath -Force
@@ -76,18 +78,26 @@ function Publish-PortablePackage {
     Compress-Archive -LiteralPath $PackagePath -DestinationPath $zipPath -CompressionLevel Optimal
 
     try {
+        Copy-Item -LiteralPath $PackagePath -Destination $expandedStagingPath -Recurse
         if (Test-Path -LiteralPath $expandedPath) {
             Remove-Item -LiteralPath $expandedPath -Recurse -Force
         }
-        Copy-Item -LiteralPath $PackagePath -Destination $expandedPath -Recurse
+        Move-Item -LiteralPath $expandedStagingPath -Destination $expandedPath
+    } catch [System.UnauthorizedAccessException] {
+        Write-Warning "Expanded portable folder could not be replaced, usually because it is running. The ZIP is current: $zipPath"
     } catch [System.IO.IOException] {
         Write-Warning "Expanded portable folder could not be replaced, usually because it is running. The ZIP is current: $zipPath"
+    } finally {
+        if (Test-Path -LiteralPath $expandedStagingPath) {
+            Remove-Item -LiteralPath $expandedStagingPath -Recurse -Force
+        }
     }
 
     $zipInfo = Get-Item -LiteralPath $zipPath
     [pscustomobject]@{
         edition = $Edition
         packageName = $packageName
+        expandedPath = $expandedPath
         zipPath = $zipInfo.FullName
         bytes = $zipInfo.Length
         sha256 = Get-Sha256 -Path $zipPath
@@ -108,6 +118,33 @@ $portableVersion = [string]$portableMetadata.version
 $minimumNodeMajor = [int]$portableMetadata.minimumNodeMajor
 Assert-SemVer -Version $appVersion -Label 'Node Agent version'
 Assert-SemVer -Version $portableVersion -Label 'Portable version'
+
+$gitExecutable = (Get-Command git.exe -ErrorAction Stop).Source
+$gitCommit = [string](& $gitExecutable -C $repositoryRoot rev-parse HEAD)
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitCommit)) {
+    throw 'Unable to resolve the repository HEAD commit.'
+}
+$gitCommit = $gitCommit.Trim()
+$statusLines = @(& $gitExecutable -C $repositoryRoot status --porcelain --untracked-files=normal)
+if ($LASTEXITCODE -ne 0) {
+    throw 'Unable to inspect the repository worktree status.'
+}
+if ($statusLines.Count -gt 0) {
+    throw "Node portable release packaging requires a clean worktree.`n$($statusLines -join "`n")"
+}
+$gitTag = "node-agent-v${appVersion}-portable-v${portableVersion}"
+$tagType = [string](& $gitExecutable -C $repositoryRoot cat-file -t "refs/tags/$gitTag" 2>$null)
+if ($LASTEXITCODE -ne 0 -or $tagType.Trim() -ne 'tag') {
+    throw "Expected annotated Node portable release tag was not found: $gitTag"
+}
+$tagCommit = [string](& $gitExecutable -C $repositoryRoot rev-parse "$gitTag^{commit}" 2>$null)
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($tagCommit)) {
+    throw "Unable to resolve release tag commit: $gitTag"
+}
+$tagCommit = $tagCommit.Trim()
+if (-not $tagCommit.Equals($gitCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Release tag $gitTag resolves to $tagCommit but HEAD is $gitCommit."
+}
 
 if ([string]::IsNullOrWhiteSpace($NodeExecutable)) {
     $nodeCommand = Get-Command node.exe -ErrorAction Stop
@@ -141,6 +178,7 @@ if ($Edition -eq 'all' -or $Edition -eq 'bundled-node') {
     $editionDefinitions += [pscustomobject]@{
         edition = 'bundled-node'
         packageName = "${basePackageName}_bundled-node_win-x64"
+        expandedName = 'Coding.Tools.Node.Agent_portable_bundled-node_win-x64'
         bundled = $true
     }
 }
@@ -148,6 +186,7 @@ if ($Edition -eq 'all' -or $Edition -eq 'system-node') {
     $editionDefinitions += [pscustomobject]@{
         edition = 'system-node'
         packageName = "${basePackageName}_system-node_win-x64"
+        expandedName = 'Coding.Tools.Node.Agent_portable_system-node_win-x64'
         bundled = $false
     }
 }
@@ -240,7 +279,6 @@ if not defined CTMCP_DATA_DIR (
   )
 )
 if not defined CTMCP_PORT set "CTMCP_PORT=3789"
-if not defined CTMCP_RESTART_SUPERVISED set "CTMCP_RESTART_SUPERVISED=1"
 if not exist "%CTMCP_DATA_DIR%" mkdir "%CTMCP_DATA_DIR%" >nul 2>nul
 if not exist "%PORTABLE_ROOT%\logs" mkdir "%PORTABLE_ROOT%\logs" >nul 2>nul
 
@@ -262,7 +300,7 @@ echo.
 if "%OPEN_BROWSER%"=="1" start "" powershell.exe -NoProfile -WindowStyle Hidden -Command "$port=$env:CTMCP_PORT; for($i=0;$i -lt 80;$i++){try{$r=Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 ('http://127.0.0.1:'+$port+'/health'); if($r.StatusCode -eq 200){Start-Process ('http://127.0.0.1:'+$port+'/ui'); exit 0}}catch{}; Start-Sleep -Milliseconds 250}"
 
 :run_agent
-"%NODE_EXE%" "%AGENT_ENTRY%" %*
+"%NODE_EXE%" "%AGENT_ENTRY%" --restart-supervised %*
 set "EXIT_CODE=%ERRORLEVEL%"
 if "%EXIT_CODE%"=="75" (
   echo.
@@ -303,11 +341,6 @@ if not defined NODE_EXE (
 if errorlevel 1 goto :failed
 "@
 
-    $gitCommit = (& git.exe -C $repositoryRoot rev-parse HEAD).Trim()
-    if ($LASTEXITCODE -ne 0) {
-        $gitCommit = 'unknown'
-    }
-
     $artifacts = @()
     foreach ($definition in $editionDefinitions) {
         $editionPackage = Join-Path $stagingRoot $definition.packageName
@@ -339,6 +372,8 @@ Coding Tools MCP Node Agent Portable
 
 Node Agent version: $appVersion
 Portable package version: $portableVersion
+Release tag: $gitTag
+Git commit: $gitCommit
 Edition: $($definition.edition)
 $runtimeSummary
 
@@ -364,12 +399,12 @@ UI:  http://127.0.0.1:3789/ui
 
 Version policy
 --------------
-The Node Agent version and Portable package version are independent. The ChatGPT packaging Skill also has its own independent VERSION file and is not embedded in this archive.
+The Node Agent version and Portable package version are independent. This release is bound to $gitTag at commit $gitCommit. The ChatGPT packaging Skill also has its own independent VERSION file and is not embedded in this archive.
 "@
         Write-Utf8NoBom -Path (Join-Path $editionPackage 'README-PORTABLE.txt') -Content $readme
 
         $manifest = [ordered]@{
-            schemaVersion = 2
+            schemaVersion = 3
             nodeAgentVersion = $appVersion
             portableVersion = $portableVersion
             edition = [string]$definition.edition
@@ -381,6 +416,7 @@ The Node Agent version and Portable package version are independent. The ChatGPT
             minimumNodeMajor = $minimumNodeMajor
             archiveName = "$($definition.packageName).zip"
             gitCommit = $gitCommit
+            gitTag = $gitTag
             builtAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             versions = [ordered]@{
                 nodeAgent = 'packages/node-agent/package.json#version'
@@ -390,17 +426,24 @@ The Node Agent version and Portable package version are independent. The ChatGPT
         }
         Write-Utf8NoBom -Path (Join-Path $editionPackage 'portable-manifest.json') -Content ($manifest | ConvertTo-Json -Depth 5)
         Write-PackageChecksums -PackagePath $editionPackage
-        $artifacts += Publish-PortablePackage -PackagePath $editionPackage -OutputDirectory $OutputDirectory -Edition $definition.edition
+        $artifacts += Publish-PortablePackage `
+            -PackagePath $editionPackage `
+            -OutputDirectory $OutputDirectory `
+            -Edition $definition.edition `
+            -ExpandedName $definition.expandedName
     }
 
     Write-Host "Node Agent version: $appVersion"
     Write-Host "Portable version: $portableVersion"
+    Write-Host "Release tag: $gitTag"
+    Write-Host "Git commit: $gitCommit"
     Write-Host "Build Node.js: $($nodeInfo.version) win-x64"
     foreach ($artifact in $artifacts) {
         Write-Host "Edition: $($artifact.edition)"
         Write-Host "Portable ZIP: $($artifact.zipPath)"
         Write-Host "ZIP bytes: $($artifact.bytes)"
         Write-Host "ZIP SHA-256: $($artifact.sha256)"
+        Write-Host "Expanded portable: $($artifact.expandedPath)"
     }
 } finally {
     Pop-Location

@@ -145,6 +145,26 @@ test('exec_many validates every child before starting any process', async t => {
   assert.equal(ctx.sessions.size, 0);
 });
 
+test('exec_many rejects invalid graph structure before starting any process', async t => {
+  const { ctx, meta } = await fixture(t);
+  const base = { program: nodeProgram, args: ['-e', 'process.stdout.write("should-not-run")'] };
+  const cases = [
+    { name: 'duplicate ids', commands: [{ id: 'same', ...base }, { id: 'same', ...base }], message: /duplicate exec_many command id: same/ },
+    { name: 'unknown dependency', commands: [{ id: 'known', depends_on: ['missing'], ...base }], message: /depends on unknown command missing/ },
+    { name: 'self dependency', commands: [{ id: 'self', depends_on: ['self'], ...base }], message: /cannot depend on itself/ },
+    {
+      name: 'cycle',
+      commands: [{ id: 'left', depends_on: ['right'], ...base }, { id: 'right', depends_on: ['left'], ...base }],
+      message: /dependency cycle/
+    }
+  ];
+  for (const item of cases) {
+    const result = await expectPolicyError(ctx, meta, 'exec_many', { mode: 'dag', commands: item.commands }, 'INVALID_ARGUMENT');
+    assert.match(result.error.message, item.message, item.name);
+    assert.equal(ctx.sessions.size, 0, item.name);
+  }
+});
+
 test('mutation payload limits reject work before files change', async t => {
   const policy = { ...defaultPolicy(), maxPatchBytes: 64 };
   const { root, ctx, meta } = await fixture(t, 'trusted', policy);
@@ -162,13 +182,14 @@ test('mutation payload limits reject work before files change', async t => {
   assert.equal(await import('node:fs/promises').then(fs => fs.readFile(target, 'utf8')), 'original\n');
 });
 
-test('workdir and timeout stay within Rust policy bounds', async t => {
+test('workdir and timeout stay within configured command bounds', async t => {
   const { ctx, meta } = await fixture(t);
   await expectPolicyError(ctx, meta, 'exec_command', {
     program: nodeProgram, args: ['-e', ''], workdir: '..'
   }, 'PATH_OUTSIDE_WORKSPACE');
+  ctx.config.limits.commandTimeoutMaxMs = 1_800_000;
   await expectPolicyError(ctx, meta, 'exec_command', {
-    program: nodeProgram, args: ['-e', ''], timeout_ms: 600_001
+    program: nodeProgram, args: ['-e', ''], timeout_ms: 1_800_001
   }, 'INVALID_ARGUMENT');
   assert.equal(ctx.sessions.size, 0);
 });

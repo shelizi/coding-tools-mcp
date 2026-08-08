@@ -30,7 +30,7 @@ pub use software::{
 pub use telemetry::read_workspace_telemetry;
 pub use tunnel::{get_frp_snippet, restart_tunnel, start_tunnel, stop_tunnel, test_tunnel};
 pub use workspace::{
-    add_workspace_folder, create_workspace, create_wsl_workspace, delete_workspace,
+    add_workspace_folder, add_wsl_workspace_folder, create_workspace, delete_workspace,
     list_workspaces, list_wsl_distributions, open_workspace_directory, remove_workspace_folder,
     update_workspace,
 };

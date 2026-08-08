@@ -12,6 +12,26 @@ export type PermissionMode = 'read-only' | 'guarded' | 'trusted' | 'dangerous';
 export type ToolProfile = 'advanced' | 'read-only' | 'compat-readonly-all' | 'guarded-core' | 'trusted-core';
 export type ToolProfileSetting = ToolProfile | 'core';
 
+export interface SecurityPolicy {
+  restrictToolCatalog: boolean;
+  enforceCommandAllowlist: boolean;
+  requireDangerousConfirmation: boolean;
+  requireShellConfirmation: boolean;
+  blockNetworkCommands: boolean;
+  enforceWorkspaceBoundary: boolean;
+  protectRepositoryMetadata: boolean;
+  blockSymlinkEscape: boolean;
+  protectEnvironmentVariables: boolean;
+  enforceHarnessBaseline: boolean;
+  requireWriteConfirmation: boolean;
+  verifyWriteConflicts: boolean;
+  enforceResourceLimits: boolean;
+  redactSensitiveOutput: boolean;
+  withholdSensitiveSourceOutput: boolean;
+  redactTelemetry: boolean;
+  redactHistory: boolean;
+}
+
 export interface WorkspaceFolder {
   id: string;
   name: string;
@@ -44,6 +64,8 @@ export interface AgentConfig {
   permissionMode: PermissionMode;
   toolProfile: ToolProfileSetting;
   activeToolProfile: ToolProfile;
+  securityPolicy: SecurityPolicy;
+  securityPolicyCustomized: boolean;
   policy: {
     allowedCommands: string[];
     workspaceLocalEntries: boolean;
@@ -67,6 +89,7 @@ export interface AgentConfig {
     globalProcessConcurrency: number;
     activeSessionLimit: number;
     maxOutputBytes: number;
+    commandTimeoutMaxMs: number;
   };
   tunnel?: {
     enabled: boolean;
@@ -84,6 +107,7 @@ export interface AgentConfigDocument {
   dataDir?: string;
   permissionMode?: PermissionMode;
   toolProfile?: ToolProfileSetting | string;
+  securityPolicy?: Partial<SecurityPolicy>;
   policy?: {
     allowedCommands?: string[] | string;
     workspaceLocalEntries?: boolean;

@@ -7,6 +7,7 @@ use crate::tools::workspace::Workspace;
 use crate::workspace::ActionsConfig;
 
 use super::registry::{is_allowed_tool, is_mcp_only_tool};
+use super::ABSOLUTE_COMMAND_TIMEOUT_MAX_MS;
 
 static NETWORK_COMMAND_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 static DANGEROUS_COMMAND_PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -363,6 +364,9 @@ pub fn validate_tool_arguments_for_workspace(
 ) -> Result<(), PolicyError> {
     match tool_name {
         "exec_command" => validate_command_for_workspace(arguments, policy, workspace),
+        "git_push" if !policy.network_allowed() => Err(PolicyError(
+            "Network operation requires permission before git_push".into(),
+        )),
         "apply_patch" | "patch_check" => validate_patch(arguments, policy),
         "edit" => validate_edit(arguments, policy),
         "edit_file" => validate_edit_file(arguments, policy),
@@ -558,8 +562,8 @@ pub fn validate_command_for_workspace(
 
     validate_environment_arguments(arguments)?;
     if let Some(timeout_ms) = arguments.get("timeout_ms").and_then(Value::as_u64) {
-        if timeout_ms > 600_000 {
-            return Err(PolicyError("Command timeout exceeds 10 minutes".into()));
+        if timeout_ms > ABSOLUTE_COMMAND_TIMEOUT_MAX_MS {
+            return Err(PolicyError("Command timeout exceeds 60 minutes".into()));
         }
     }
     if let Some(post_checks) = arguments.get("post_checks") {
