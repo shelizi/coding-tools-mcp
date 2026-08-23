@@ -10,6 +10,7 @@
     type WorkspaceProfile,
   } from "$lib/types";
   import type { FrpProfileDto } from "$lib/api/settings";
+  import { getBackend } from "$lib/backend";
 
   interface Props {
     profile: WorkspaceProfile;
@@ -46,6 +47,8 @@
     onToggleActions,
     onNavigate,
   }: Props = $props();
+
+  const capabilities = getBackend().capabilities;
 </script>
 
 <div class="grid gap-4 lg:grid-cols-2">
@@ -79,27 +82,30 @@
     </div>
 
     <div class="mt-auto flex flex-wrap gap-2">
-      <button
-        type="button"
-        class="tx-btn-primary"
-        class:tx-btn-danger={mcpStatus === "running"}
-        disabled={mcpBusy || mcpStatus === "starting" || mcpStatus === "stopping"}
-        onclick={() => void onToggleMcp()}
-      >
-        {#if mcpBusy}
-          {$t("Working…")}
-        {:else if mcpStatus === "running"}
-          {$t("Stop")}
-        {:else}
-          {$t("Start")}
-        {/if}
-      </button>
+      {#if capabilities.runtimeSupervisor}
+        <button
+          type="button"
+          class="tx-btn-primary"
+          class:tx-btn-danger={mcpStatus === "running"}
+          disabled={mcpBusy || mcpStatus === "starting" || mcpStatus === "stopping"}
+          onclick={() => void onToggleMcp()}
+        >
+          {#if mcpBusy}
+            {$t("Working…")}
+          {:else if mcpStatus === "running"}
+            {$t("Stop")}
+          {:else}
+            {$t("Start")}
+          {/if}
+        </button>
+      {/if}
       <button type="button" class="tx-btn-secondary" onclick={() => onNavigate("mcp")}>
         {$t("Manage MCP")}
       </button>
     </div>
   </article>
 
+  {#if capabilities.actions}
   <article class="tx-card flex flex-col gap-4 p-5">
     <div class="flex items-start justify-between gap-4">
       <div>
@@ -152,6 +158,7 @@
       </button>
     </div>
   </article>
+  {/if}
 </div>
 
 <div class="tx-card mt-4 flex flex-wrap items-center justify-between gap-4 p-5">

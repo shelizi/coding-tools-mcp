@@ -1,6 +1,10 @@
 @import "tailwindcss" source(none);
 @source "./**/*.{html,js,svelte,ts}";
 
+.svelte-app {
+  display: contents;
+}
+
 /* ─── Application design tokens ─── */
 :root,
 [data-theme="light"] {

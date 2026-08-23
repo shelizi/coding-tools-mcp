@@ -26,6 +26,16 @@ fn tunnel_type_for(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &str 
     }
 }
 
+pub fn public_mcp_security_error(profile: &WorkspaceProfile) -> Option<String> {
+    let tunnel_type = tunnel_type_for(profile, TunnelServiceKind::Mcp).trim();
+    if tunnel_type.is_empty() || tunnel_type == "none" {
+        return None;
+    }
+    super::supervisor::validate_public_mcp_security(profile, TunnelServiceKind::Mcp)
+        .err()
+        .map(|error| error.to_string())
+}
+
 pub async fn maybe_start_for_runtime(
     profile: &WorkspaceProfile,
     kind: TunnelServiceKind,
@@ -82,4 +92,25 @@ pub async fn cleanup_orphan_for_runtime(
         return Ok(());
     }
     guard.cleanup_orphan(profile, kind, false).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_mcp_security_error_is_none_for_any_permission_mode() {
+        let mut profile = WorkspaceProfile::new("C:/workspace/security".into(), None);
+        profile.tunnel.tunnel_type = "builtin".into();
+        profile.tunnel.public_url = "https://mcp.example.com/clients/device/mcp".into();
+        profile.runtime.sandbox.enabled = false;
+
+        for permission_mode in ["guarded", "trusted", "dangerous"] {
+            profile.runtime.permission_mode = permission_mode.into();
+            assert_eq!(public_mcp_security_error(&profile), None);
+        }
+
+        profile.runtime.sandbox.enabled = true;
+        assert_eq!(public_mcp_security_error(&profile), None);
+    }
 }

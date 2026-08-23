@@ -1,6 +1,14 @@
 import { appendFile, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { ChangeSet, JsonObject, OperationRecord, PersistentState, TaskEvent, TaskRecord } from './types.js';
+import type {
+  ChangeSet,
+  OperationRecord,
+  PersistentState,
+  StateJsonObject,
+  StateStoreContract,
+  TaskEvent,
+  TaskRecord
+} from './state/contract.js';
 
 function writable(status: TaskRecord['status']): boolean {
   return ['active', 'paused', 'verifying', 'failed'].includes(status);
@@ -17,10 +25,10 @@ function operationFromUnknown(value: unknown): OperationRecord | undefined {
       ...(typeof row.task_id === 'string' ? { task_id: row.task_id } : {}),
       tool: row.tool,
       kind: row.kind,
-      input_summary: (row.input_summary && typeof row.input_summary === 'object' ? row.input_summary : {}) as JsonObject,
-      result_summary: (row.result_summary && typeof row.result_summary === 'object' ? row.result_summary : {}) as JsonObject,
+      input_summary: (row.input_summary && typeof row.input_summary === 'object' ? row.input_summary : {}) as StateJsonObject,
+      result_summary: (row.result_summary && typeof row.result_summary === 'object' ? row.result_summary : {}) as StateJsonObject,
       ...(typeof row.reason === 'string' ? { reason: row.reason } : {}),
-      affected_files: Array.isArray(row.affected_files) ? row.affected_files as JsonObject[] : [],
+      affected_files: Array.isArray(row.affected_files) ? row.affected_files as StateJsonObject[] : [],
       created_at: row.created_at
     };
   }
@@ -43,7 +51,7 @@ function operationFromUnknown(value: unknown): OperationRecord | undefined {
   return undefined;
 }
 
-export class StateStore {
+export class StateStore implements StateStoreContract {
   readonly file: string;
   readonly harnessRoot: string;
   #state: PersistentState = { tasks: {}, currentTasks: {}, taskEvents: {}, changeSets: {} };
@@ -74,9 +82,10 @@ export class StateStore {
       legacyOperations = Array.isArray(parsed.operations)
         ? parsed.operations.map(operationFromUnknown).filter((row): row is OperationRecord => Boolean(row))
         : [];
-      for (const [folderId, taskId] of Object.entries(this.#state.currentTasks)) {
+      for (const [scopeId, taskId] of Object.entries(this.#state.currentTasks)) {
         const task = this.#state.tasks[taskId];
-        if (!task || task.workspace_id !== folderId || !writable(task.status)) delete this.#state.currentTasks[folderId];
+        const taskScopeId = task?.scope_id ?? task?.workspace_id;
+        if (!task || taskScopeId !== scopeId || !writable(task.status)) delete this.#state.currentTasks[scopeId];
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -84,8 +93,8 @@ export class StateStore {
     this.#operations = [...legacyOperations, ...await this.loadOperationLogs()].slice(-5_000);
   }
 
-  task(folderId: string): TaskRecord | undefined {
-    const taskId = this.#state.currentTasks[folderId];
+  task(scopeId: string): TaskRecord | undefined {
+    const taskId = this.#state.currentTasks[scopeId];
     return taskId ? structuredClone(this.#state.tasks[taskId]) : undefined;
   }
 
@@ -153,19 +162,21 @@ export class StateStore {
     if (changed) await this.save();
   }
 
-  async setTask(folderId: string, task: TaskRecord, event?: TaskEvent): Promise<void> {
+  async setTask(scopeId: string, task: TaskRecord, event?: TaskEvent): Promise<void> {
     this.#state.tasks[task.id] = task;
-    if (writable(task.status)) this.#state.currentTasks[folderId] = task.id;
-    else if (this.#state.currentTasks[folderId] === task.id) delete this.#state.currentTasks[folderId];
+    const activeScopeId = task.scope_id ?? scopeId;
+    if (writable(task.status)) this.#state.currentTasks[activeScopeId] = task.id;
+    else if (this.#state.currentTasks[activeScopeId] === task.id) delete this.#state.currentTasks[activeScopeId];
     if (event) this.pushTaskEvent(event);
     await this.save();
   }
 
-  async setTaskAndChange(folderId: string, task: TaskRecord, change: ChangeSet, event: TaskEvent): Promise<void> {
+  async setTaskAndChange(scopeId: string, task: TaskRecord, change: ChangeSet, event: TaskEvent): Promise<void> {
     this.#state.tasks[task.id] = task;
     this.#state.changeSets[change.id] = change;
-    if (writable(task.status)) this.#state.currentTasks[folderId] = task.id;
-    else if (this.#state.currentTasks[folderId] === task.id) delete this.#state.currentTasks[folderId];
+    const activeScopeId = task.scope_id ?? scopeId;
+    if (writable(task.status)) this.#state.currentTasks[activeScopeId] = task.id;
+    else if (this.#state.currentTasks[activeScopeId] === task.id) delete this.#state.currentTasks[activeScopeId];
     this.pushTaskEvent(event);
     await this.save();
   }

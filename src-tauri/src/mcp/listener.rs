@@ -1,3 +1,6 @@
+mod lifecycle;
+mod routes;
+
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::Arc;
@@ -10,38 +13,40 @@ use axum::http::{
     HeaderMap, HeaderValue, StatusCode,
 };
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::Json;
 use futures_util::stream::unfold;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::auth::{
     authorization_server_metadata, authorize_get, authorize_post, external_base_url,
-    protected_resource_metadata, protected_resource_metadata_url, require_configured_secret,
-    token_exchange, verify_bearer_header, verify_oauth_bearer_header, AuthorizeForm,
-    AuthorizeParams, OAuthRuntime, TokenForm,
+    protected_resource_metadata, protected_resource_metadata_url, token_exchange,
+    verify_bearer_header, verify_oauth_bearer_header, AuthorizeForm, AuthorizeParams, OAuthRuntime,
+    TokenForm,
 };
 use crate::mcp::server::{
-    handle_request, handle_request_async, is_supported_protocol_version, new_state, SharedState,
-    LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    handle_request, handle_request_async, is_supported_protocol_version, permission_input_required,
+    SharedState, LATEST_LEGACY_PROTOCOL_VERSION, LATEST_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::mcp::session_activity::{self, SessionActivityGuard};
 use crate::mcp::telemetry::{
     begin_tool_request, format_request_log_value, record_tool_usage, ToolRequestTiming,
     ToolUsageInput,
 };
-use crate::secret::SecretStore;
-use crate::tools::policy::PolicySettings;
-use crate::tools::ExecutionLimits;
 use crate::tunnel::append_profile_log_buffered;
-use crate::workspace::{
-    parse_bind_address, socket_addr_for_bind, url_host_for_bind, AuthConfig, RuntimeConfig,
-    WorkspaceFolder,
-};
+use crate::workspace::{parse_bind_address, AuthConfig};
 
-pub type ShutdownSender = oneshot::Sender<()>;
+pub use lifecycle::{spawn_listener, ShutdownSender};
+
+#[cfg(test)]
+use lifecycle::bind_listener;
+#[cfg(test)]
+use routes::{
+    authorization_metadata_path, build_router, configured_route_prefix, prefixed_route,
+    protected_resource_metadata_path,
+};
 
 const MCP_STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MCP_STREAM_CHANNEL_CAPACITY: usize = 2;
@@ -67,6 +72,7 @@ struct ListenerState {
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
     transport_mode: String,
+    redact_telemetry: bool,
 }
 
 struct RpcExecutionContext {
@@ -96,205 +102,23 @@ fn json_byte_len(value: &Value) -> usize {
         .unwrap_or(0)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_listener(
-    port: u16,
-    folders: Vec<WorkspaceFolder>,
-    bootstrap_folder_id: String,
-    workspace_id: String,
-    auth: AuthConfig,
-    public_base_url: String,
-    oauth_client_secret: Option<String>,
-    oauth_password: Option<String>,
-    oauth_token_secret: Option<String>,
-    runtime: RuntimeConfig,
-) -> Result<(ShutdownSender, crate::task_runtime::JoinHandle<()>), String> {
-    let policy = PolicySettings::from_runtime(&runtime);
-    let mcp = new_state(
-        folders,
-        bootstrap_folder_id,
-        workspace_id.clone(),
-        auth.clone(),
-        policy,
-        runtime.tool_profile.clone(),
-        runtime.permission_mode.clone(),
-        ExecutionLimits::new_with_global(
-            runtime.blocking_admission_limit as usize,
-            runtime.process_admission_limit as usize,
-            runtime.global_blocking_admission_limit as usize,
-            runtime.global_process_admission_limit as usize,
-            runtime.active_session_limit as usize,
-        ),
-    )?;
-    let bearer_token = if auth.bearer_enabled() {
-        let key = "bearer_token";
-        let secret = if auth.use_shared_secrets {
-            SecretStore::get_shared(key).map_err(|e| e.to_string())?
-        } else {
-            SecretStore::get(&workspace_id, key).map_err(|e| e.to_string())?
-        };
-        Some(require_configured_secret(secret, "MCP bearer token")?)
-    } else {
-        None
-    };
-    let oauth_client_secret = oauth_client_secret.filter(|value| !value.trim().is_empty());
-    let configured_public_url = public_base_url.trim().to_string();
-    let bind_address = parse_bind_address(&runtime.bind_address)?.to_string();
-    let oauth = if auth.oauth_enabled() {
-        let oauth_base = if configured_public_url.is_empty() {
-            format!("http://{}:{port}", url_host_for_bind(&bind_address))
-        } else {
-            external_base_url(&HeaderMap::new(), port, &configured_public_url)
-        };
-        Some(Arc::new(OAuthRuntime::try_new(
-            oauth_base,
-            auth.oauth_client_id.clone(),
-            oauth_client_secret.clone(),
-            oauth_password,
-            oauth_token_secret,
-        )?))
-    } else {
-        None
-    };
-    let state = ListenerState {
-        mcp,
-        auth,
-        workspace_id,
-        bind_address: bind_address.clone(),
-        bind_port: port,
-        configured_public_url,
-        bearer_token,
-        oauth,
-        oauth_client_secret,
-        transport_mode: runtime.transport_mode.clone(),
-    };
-    // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
-    let listener = bind_listener(&bind_address, port)?;
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let profile_id = state.workspace_id.clone();
-    let handle = crate::task_runtime::spawn(async move {
-        let result = serve(listener, state, shutdown_rx).await;
-        if let Err(err) = &result {
-            append_profile_log_buffered(
-                &profile_id,
-                "stderr.log",
-                &format!("[mcp] listener stopped: {err}"),
-            );
-            eprintln!("mcp listener stopped: {err}");
-        } else {
-            append_profile_log_buffered(&profile_id, "stderr.log", "[mcp] listener stopped");
-        }
-    });
-    Ok((shutdown_tx, handle))
+fn json_rpc_response_message(body: &Value) -> bool {
+    body.get("method").is_none()
+        && body.get("id").is_some()
+        && (body.get("result").is_some() || body.get("error").is_some())
 }
 
-async fn serve(
-    listener: tokio::net::TcpListener,
-    state: ListenerState,
-    shutdown: oneshot::Receiver<()>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let profile_id = state.workspace_id.clone();
-    let transport_mode = state.transport_mode.clone();
-    let listening_address = listener.local_addr()?;
-    let app = build_router(state);
-
-    append_profile_log_buffered(
-        &profile_id,
-        "stdout.log",
-        &format!("[mcp] listening on http://{listening_address}/mcp transport={transport_mode}"),
-    );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = shutdown.await;
-        })
-        .await?;
-    Ok(())
-}
-
-fn build_router(state: ListenerState) -> Router {
-    let public_prefix = configured_route_prefix(&state.configured_public_url);
-    let mut router = service_routes_for_prefix("")
-        .route(
-            "/.well-known/oauth-authorization-server",
-            get(oauth_authorization_server_metadata),
-        )
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(oauth_protected_resource_metadata),
-        )
-        .route(
-            "/.well-known/oauth-protected-resource/mcp",
-            get(oauth_protected_resource_metadata),
-        );
-    if !public_prefix.is_empty() {
-        let authorization_metadata = authorization_metadata_path(&public_prefix);
-        let protected_metadata = protected_resource_metadata_path(&public_prefix);
-        router = router
-            .merge(service_routes_for_prefix(&public_prefix))
-            .route(
-                &authorization_metadata,
-                get(oauth_authorization_server_metadata),
-            )
-            .route(&protected_metadata, get(oauth_protected_resource_metadata));
-    }
-    router.with_state(state)
-}
-
-fn service_routes_for_prefix(prefix: &str) -> Router<ListenerState> {
-    let mcp = prefixed_route(prefix, "/mcp");
-    let mcp_info_path = prefixed_route(prefix, "/mcp/info");
-    let authorize = prefixed_route(prefix, "/oauth/authorize");
-    let token = prefixed_route(prefix, "/oauth/token");
-
-    Router::new()
-        .route(&mcp, get(mcp_get).post(mcp_post).delete(mcp_delete))
-        .route(&mcp_info_path, get(mcp_info))
-        .route(
-            &authorize,
-            get(oauth_authorize_get).post(oauth_authorize_post),
-        )
-        .route(&token, post(oauth_token_post))
-}
-
-fn authorization_metadata_path(prefix: &str) -> String {
-    format!(
-        "/.well-known/oauth-authorization-server{}",
-        prefix.trim_end_matches('/')
+fn modern_request_method_supported(method: &str) -> bool {
+    matches!(
+        method,
+        "server/discover"
+            | "tools/list"
+            | "tools/call"
+            | "tasks/get"
+            | "tasks/update"
+            | "tasks/cancel"
+            | "subscriptions/listen"
     )
-}
-
-fn protected_resource_metadata_path(prefix: &str) -> String {
-    format!(
-        "/.well-known/oauth-protected-resource{}/mcp",
-        prefix.trim_end_matches('/')
-    )
-}
-
-fn configured_route_prefix(configured_public_url: &str) -> String {
-    reqwest::Url::parse(configured_public_url.trim())
-        .ok()
-        .map(|url| url.path().trim_end_matches('/').to_string())
-        .filter(|path| !path.is_empty() && path != "/")
-        .unwrap_or_default()
-}
-
-fn prefixed_route(prefix: &str, route: &str) -> String {
-    if prefix.is_empty() {
-        route.to_string()
-    } else {
-        format!("{}{}", prefix.trim_end_matches('/'), route)
-    }
-}
-
-fn bind_listener(bind_address: &str, port: u16) -> Result<tokio::net::TcpListener, String> {
-    let addr = socket_addr_for_bind(bind_address, port)?;
-    let listener = std::net::TcpListener::bind(addr)
-        .map_err(|err| format!("MCP 監聽位址 {addr} 綁定失敗: {err}"))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|err| format!("MCP 本地端口 {port} 设置非阻塞失败: {err}"))?;
-    tokio::net::TcpListener::from_std(listener)
-        .map_err(|err| format!("MCP 本地监听器初始化失败: {err}"))
 }
 
 async fn mcp_info() -> Response {
@@ -348,6 +172,26 @@ async fn mcp_post(
         if let Some(response) = validate_json_rpc_message(&body) {
             return response;
         }
+        let modern_header = headers
+            .get("mcp-protocol-version")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim() == MODERN_PROTOCOL_VERSION);
+        if modern_header && json_rpc_response_message(&body) {
+            return transport_error_with_id(
+                StatusCode::BAD_REQUEST,
+                -32600,
+                body.get("id").cloned().unwrap_or(Value::Null),
+                "Streamable HTTP accepts only JSON-RPC requests or notifications from clients",
+            );
+        }
+        if let Some(response) = validate_modern_request(&headers, &body) {
+            return response;
+        }
+        let runtime = state.mcp.runtime_config();
+        if let Some(response) = validate_modern_tool_headers(&headers, &body, &runtime.tool_profile)
+        {
+            return response;
+        }
     } else if let Some(response) = require_mcp_auth(&state, &headers) {
         return response;
     }
@@ -376,9 +220,7 @@ async fn mcp_post(
         .and_then(Value::as_str);
     let arguments = format_request_log_value(&argument_value);
     let is_notification = body.get("method").is_some() && body.get("id").is_none();
-    let is_response = body.get("method").is_none()
-        && body.get("id").is_some()
-        && (body.get("result").is_some() || body.get("error").is_some());
+    let is_response = json_rpc_response_message(&body);
     let started_ts_ms = unix_timestamp_ms();
     let started_at = Instant::now();
     let session_activity = session_activity::begin(
@@ -410,8 +252,47 @@ async fn mcp_post(
     let protocol_version = headers
         .get("mcp-protocol-version")
         .and_then(|value| value.to_str().ok())
-        .unwrap_or(LATEST_PROTOCOL_VERSION)
+        .unwrap_or(LATEST_LEGACY_PROTOCOL_VERSION)
         .to_string();
+    if standard_transport
+        && protocol_version == MODERN_PROTOCOL_VERSION
+        && !is_notification
+        && !is_response
+        && !modern_request_method_supported(&method)
+    {
+        return transport_error_with_id(
+            StatusCode::NOT_FOUND,
+            -32601,
+            request_id,
+            &format!("Method not found: {method}"),
+        );
+    }
+    if standard_transport
+        && protocol_version == MODERN_PROTOCOL_VERSION
+        && method == "subscriptions/listen"
+    {
+        if request_id.is_null() {
+            return transport_error_with_id(
+                StatusCode::BAD_REQUEST,
+                -32600,
+                request_id,
+                "subscriptions/listen requires a JSON-RPC request id",
+            );
+        }
+        if modern_subscription_notifications(&body).is_none() {
+            return json_no_store(json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: notifications is required and must be a valid subscription filter"
+                }
+            }));
+        }
+        // This server currently advertises tools.listChanged=false and no prompt/resource
+        // notification capabilities, so the honored subset is intentionally empty.
+        return subscription_sse_response(request_id, json!({}), MCP_STREAM_HEARTBEAT_INTERVAL);
+    }
     append_profile_log_buffered(
         &state.workspace_id,
         "mcp-requests.log",
@@ -442,8 +323,17 @@ async fn mcp_post(
         return StatusCode::ACCEPTED.into_response();
     }
 
-    let fast_path = matches!(method.as_str(), "initialize" | "ping" | "tools/list")
-        || method.starts_with("notifications/");
+    let fast_path = matches!(
+        method.as_str(),
+        "initialize" | "server/discover" | "ping" | "tools/list"
+    ) || method.starts_with("notifications/");
+    let missing_elicitation_check = standard_transport
+        && protocol_version == MODERN_PROTOCOL_VERSION
+        && method == "tools/call"
+        && !modern_client_supports_elicitation(&body)
+        && !modern_request_has_input_responses(&body);
+    let response_id = request_id.clone();
+    let missing_elicitation_tool = tool_name.clone();
     let execution = execute_rpc(
         RpcExecutionContext {
             state,
@@ -461,10 +351,27 @@ async fn mcp_post(
         body,
         fast_path,
     );
-    if !fast_path && !is_notification {
+    if !fast_path && !is_notification && !missing_elicitation_check {
         return streaming_json_no_store(execution);
     }
     let response = execution.await;
+    if missing_elicitation_check
+        && response
+            .get("result")
+            .and_then(|result| result.get("resultType"))
+            .and_then(Value::as_str)
+            == Some("input_required")
+    {
+        return transport_error_with_data(
+            StatusCode::BAD_REQUEST,
+            -32021,
+            response_id,
+            &format!(
+                "Client capability elicitation is required to approve {missing_elicitation_tool}"
+            ),
+            json!({ "requiredCapabilities": { "elicitation": {} } }),
+        );
+    }
     if standard_transport && is_notification {
         StatusCode::ACCEPTED.into_response()
     } else {
@@ -475,13 +382,32 @@ async fn mcp_post(
 async fn execute_rpc(mut context: RpcExecutionContext, body: Value, fast_path: bool) -> Value {
     let profile_id = context.state.workspace_id.clone();
     let mcp = context.state.mcp.clone();
-    let result: Result<Value, String> = if fast_path {
+    let era_method_mismatch = (context.protocol_version == MODERN_PROTOCOL_VERSION
+        && matches!(context.method.as_str(), "initialize" | "ping"))
+        || (context.protocol_version != MODERN_PROTOCOL_VERSION
+            && context.method == "server/discover");
+    let result: Result<Value, String> = if era_method_mismatch {
+        Ok(json!({
+            "jsonrpc": "2.0",
+            "id": context.request_id.clone(),
+            "error": {
+                "code": -32601,
+                "message": format!("Method not found: {}", context.method)
+            }
+        }))
+    } else if fast_path {
         Ok(handle_request(&mcp, &body))
     } else {
         Ok(handle_request_async(mcp, body).await)
     };
     match result {
         Ok(response) => {
+            let runtime = context.state.mcp.runtime_config();
+            let response = if context.protocol_version == MODERN_PROTOCOL_VERSION {
+                decorate_modern_response(response, &context.method, &runtime.tool_profile)
+            } else {
+                response
+            };
             let duration_ms = context.started_at.elapsed().as_millis();
             append_profile_log_buffered(
                 &profile_id,
@@ -531,6 +457,7 @@ async fn execute_rpc(mut context: RpcExecutionContext, body: Value, fast_path: b
                     outcome,
                     response: Some(&response),
                     worker_error: None,
+                    redact_telemetry: context.state.redact_telemetry,
                 });
             }
             if context.tool_name == "exec_command" || context.tool_name == "exec_health_check" {
@@ -607,6 +534,7 @@ async fn execute_rpc(mut context: RpcExecutionContext, body: Value, fast_path: b
                     outcome: "worker_failed",
                     response: None,
                     worker_error: Some(&worker_error),
+                    redact_telemetry: context.state.redact_telemetry,
                 });
             }
             let error_body = json!({
@@ -650,16 +578,337 @@ fn validate_standard_connection(
             ));
         };
         if !is_supported_protocol_version(version.trim()) {
-            return Some(transport_error(
-                StatusCode::BAD_REQUEST,
-                -32600,
-                &format!("Unsupported MCP protocol version: {}", version.trim()),
-            ));
+            let requested = version.trim();
+            return Some(
+                (
+                    StatusCode::BAD_REQUEST,
+                    [(CACHE_CONTROL, "no-store")],
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": Value::Null,
+                        "error": {
+                            "code": -32022,
+                            "message": format!("Unsupported MCP protocol version: {requested}"),
+                            "data": {
+                                "supported": SUPPORTED_PROTOCOL_VERSIONS,
+                                "requested": requested
+                            }
+                        }
+                    })),
+                )
+                    .into_response(),
+            );
         }
     }
 
     require_mcp_auth(state, headers)
         .map(|response| with_authenticate_challenge(state, headers, response))
+}
+
+fn modern_request_meta(body: &Value) -> Option<&serde_json::Map<String, Value>> {
+    body.get("params")?.get("_meta")?.as_object()
+}
+
+fn modern_client_supports_elicitation(body: &Value) -> bool {
+    modern_request_meta(body)
+        .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
+        .and_then(Value::as_object)
+        .and_then(|capabilities| capabilities.get("elicitation"))
+        .is_some_and(Value::is_object)
+}
+
+fn modern_request_has_input_responses(body: &Value) -> bool {
+    body.get("params")
+        .and_then(|params| params.get("inputResponses"))
+        .is_some_and(Value::is_object)
+}
+
+fn modern_subscription_notifications(body: &Value) -> Option<&serde_json::Map<String, Value>> {
+    let notifications = body.get("params")?.get("notifications")?.as_object()?;
+    for key in [
+        "toolsListChanged",
+        "promptsListChanged",
+        "resourcesListChanged",
+    ] {
+        if notifications
+            .get(key)
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return None;
+        }
+    }
+    if let Some(resources) = notifications.get("resourceSubscriptions") {
+        let Some(resources) = resources.as_array() else {
+            return None;
+        };
+        if resources.iter().any(|value| !value.is_string()) {
+            return None;
+        }
+    }
+    Some(notifications)
+}
+
+fn modern_request_detected(headers: &HeaderMap, body: &Value) -> bool {
+    let header_modern = headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == MODERN_PROTOCOL_VERSION);
+    let body_modern = modern_request_meta(body)
+        .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == MODERN_PROTOCOL_VERSION);
+    header_modern || body_modern
+}
+
+fn transport_error_with_data(
+    status: StatusCode,
+    code: i64,
+    id: Value,
+    message: &str,
+    data: Value,
+) -> Response {
+    (
+        status,
+        [(CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message, "data": data }
+        })),
+    )
+        .into_response()
+}
+
+fn transport_error_with_id(status: StatusCode, code: i64, id: Value, message: &str) -> Response {
+    (
+        status,
+        [(CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message }
+        })),
+    )
+        .into_response()
+}
+
+fn decode_mcp_header_value(value: &str) -> Option<String> {
+    let prefix_len = "=?base64?".len();
+    if value.len() < prefix_len + 2
+        || !value[..prefix_len].eq_ignore_ascii_case("=?base64?")
+        || !value.ends_with("?=")
+    {
+        return Some(value.to_owned());
+    }
+    let encoded = &value[prefix_len..value.len() - 2];
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    String::from_utf8(decoded).ok()
+}
+
+fn mirrored_primitive_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn validate_modern_tool_headers(
+    headers: &HeaderMap,
+    body: &Value,
+    tool_profile: &str,
+) -> Option<Response> {
+    if !modern_request_detected(headers, body)
+        || body.get("method").and_then(Value::as_str) != Some("tools/call")
+    {
+        return None;
+    }
+    let params = body.get("params")?.as_object()?;
+    let tool_name = params.get("name")?.as_str()?;
+    let arguments = params.get("arguments").and_then(Value::as_object);
+    let tool = crate::tools::list_tools_for_profile(tool_profile)
+        .into_iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))?;
+    let properties = tool
+        .get("inputSchema")
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object)?;
+    for (property_name, property_schema) in properties {
+        let Some(header_suffix) = property_schema
+            .get("x-mcp-header")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let Some(body_value) = arguments.and_then(|values| values.get(property_name)) else {
+            continue;
+        };
+        if body_value.is_null() {
+            continue;
+        }
+        let Some(expected) = mirrored_primitive_value(body_value) else {
+            continue;
+        };
+        let header_name = format!("mcp-param-{}", header_suffix.to_ascii_lowercase());
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
+        let Some(raw_header) = headers
+            .get(header_name.as_str())
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Some(transport_error_with_id(
+                StatusCode::BAD_REQUEST,
+                -32020,
+                id,
+                &format!("Header mismatch: Mcp-Param-{header_suffix} header is required"),
+            ));
+        };
+        let Some(decoded) = decode_mcp_header_value(raw_header) else {
+            return Some(transport_error_with_id(
+                StatusCode::BAD_REQUEST,
+                -32020,
+                id,
+                &format!("Header mismatch: Mcp-Param-{header_suffix} header is malformed"),
+            ));
+        };
+        if decoded != expected {
+            return Some(transport_error_with_id(
+                StatusCode::BAD_REQUEST,
+                -32020,
+                id,
+                &format!(
+                    "Header mismatch: Mcp-Param-{header_suffix} header value '{decoded}' does not match body value '{expected}'"
+                ),
+            ));
+        }
+    }
+    None
+}
+
+fn validate_modern_request(headers: &HeaderMap, body: &Value) -> Option<Response> {
+    if !modern_request_detected(headers, body) {
+        return None;
+    }
+    let id = body.get("id").cloned().unwrap_or(Value::Null);
+    let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+    let protocol_header = headers
+        .get("mcp-protocol-version")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    let meta = modern_request_meta(body);
+    let body_protocol = meta
+        .and_then(|value| value.get("io.modelcontextprotocol/protocolVersion"))
+        .and_then(Value::as_str);
+    if protocol_header != Some(MODERN_PROTOCOL_VERSION) || body_protocol != protocol_header {
+        return Some(transport_error_with_id(
+            StatusCode::BAD_REQUEST,
+            -32020,
+            id,
+            "Header mismatch: MCP-Protocol-Version must match request _meta protocol version",
+        ));
+    }
+    let method_header = headers
+        .get("mcp-method")
+        .and_then(|value| value.to_str().ok());
+    if method_header != Some(method) {
+        return Some(transport_error_with_id(
+            StatusCode::BAD_REQUEST,
+            -32020,
+            id,
+            "Header mismatch: Mcp-Method must match the JSON-RPC method",
+        ));
+    }
+    let params = body.get("params").and_then(Value::as_object);
+    let expected_name = match method {
+        "tools/call" | "prompts/get" => params
+            .and_then(|value| value.get("name"))
+            .and_then(Value::as_str),
+        "resources/read" => params
+            .and_then(|value| value.get("uri"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    if matches!(method, "tools/call" | "prompts/get" | "resources/read") {
+        let name_header = headers
+            .get("mcp-name")
+            .and_then(|value| value.to_str().ok())
+            .and_then(decode_mcp_header_value);
+        if name_header.as_deref() != expected_name {
+            return Some(transport_error_with_id(
+                StatusCode::BAD_REQUEST,
+                -32020,
+                id,
+                "Header mismatch: Mcp-Name must match the request target",
+            ));
+        }
+    }
+    let capabilities =
+        meta.and_then(|value| value.get("io.modelcontextprotocol/clientCapabilities"));
+    if !capabilities.is_some_and(Value::is_object) {
+        return Some(transport_error_with_id(
+            StatusCode::BAD_REQUEST,
+            -32602,
+            id,
+            "Invalid request metadata: io.modelcontextprotocol/clientCapabilities is required",
+        ));
+    }
+    if let Some(client_info) =
+        meta.and_then(|value| value.get("io.modelcontextprotocol/clientInfo"))
+    {
+        let valid = client_info.as_object().is_some_and(|info| {
+            info.get("name").and_then(Value::as_str).is_some()
+                && info.get("version").and_then(Value::as_str).is_some()
+        });
+        if !valid {
+            return Some(transport_error_with_id(
+                StatusCode::BAD_REQUEST,
+                -32602,
+                id,
+                "Invalid request metadata: clientInfo requires name and version",
+            ));
+        }
+    }
+    None
+}
+
+fn decorate_modern_response(mut response: Value, method: &str, tool_profile: &str) -> Value {
+    if method == "tools/call" {
+        if let Some(input_required) = response.get("result").and_then(permission_input_required) {
+            response["result"] = input_required;
+        }
+    }
+    let Some(result) = response.get_mut("result").and_then(Value::as_object_mut) else {
+        return response;
+    };
+    result
+        .entry("resultType")
+        .or_insert_with(|| Value::String("complete".into()));
+    if matches!(
+        method,
+        "server/discover" | "tools/list" | "prompts/list" | "resources/list" | "resources/read"
+    ) {
+        result.entry("ttlMs").or_insert_with(|| json!(0));
+        result
+            .entry("cacheScope")
+            .or_insert_with(|| Value::String("private".into()));
+    }
+    let meta = result.entry("_meta").or_insert_with(|| json!({}));
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert(
+            "io.modelcontextprotocol/serverInfo".into(),
+            json!({
+                "name": "coding-tools-mcp",
+                "title": "Coding Tools MCP",
+                "version": env!("CARGO_PKG_VERSION"),
+                "toolsetRevision": crate::tools::registry::toolset_revision(tool_profile)
+            }),
+        );
+    }
+    response
 }
 
 fn validate_json_rpc_message(body: &Value) -> Option<Response> {
@@ -789,6 +1038,60 @@ fn transport_error(status: StatusCode, code: i64, message: &str) -> Response {
 
 fn json_no_store(value: Value) -> Response {
     ([(CACHE_CONTROL, "no-store")], Json(value)).into_response()
+}
+
+fn subscription_sse_response(
+    subscription_id: Value,
+    notifications: Value,
+    heartbeat_interval: Duration,
+) -> Response {
+    let (sender, receiver) =
+        mpsc::channel::<Result<Vec<u8>, Infallible>>(MCP_STREAM_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        let acknowledged = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {
+                "notifications": notifications,
+                "_meta": {
+                    "io.modelcontextprotocol/subscriptionId": subscription_id
+                }
+            }
+        });
+        let payload = format!("data: {}\n\n", acknowledged);
+        if sender.send(Ok(payload.into_bytes())).await.is_err() {
+            return;
+        }
+
+        let mut heartbeat = interval(heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                _ = sender.closed() => return,
+                _ = heartbeat.tick() => {
+                    let _ = sender.try_send(Ok(b":\n\n".to_vec()));
+                }
+            }
+        }
+    });
+
+    let stream = unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|chunk| (chunk, receiver))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "text/event-stream")
+        .header(CACHE_CONTROL, "no-store")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| {
+            transport_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                -32603,
+                "Failed to create subscription stream",
+            )
+        })
 }
 
 fn streaming_json_no_store<F>(execution: F) -> Response
@@ -943,7 +1246,7 @@ mod tests {
     use axum::http::{header::CACHE_CONTROL, HeaderMap, StatusCode};
     use axum::response::IntoResponse;
     use axum::Json;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use tempfile::TempDir;
 
     use crate::mcp::telemetry::format_log_value;
@@ -952,8 +1255,9 @@ mod tests {
 
     use super::{
         authorization_metadata_path, bind_listener, build_router, configured_route_prefix,
-        mcp_discovery_payload, mcp_get, mcp_info, mcp_post, origin_matches_listener,
-        prefixed_route, protected_resource_metadata_path, ListenerState,
+        decode_mcp_header_value, mcp_discovery_payload, mcp_get, mcp_info, mcp_post,
+        origin_matches_listener, prefixed_route, protected_resource_metadata_path,
+        validate_modern_tool_headers, ListenerState,
     };
 
     fn test_state(transport_mode: &str) -> (TempDir, TempDir, ListenerState) {
@@ -978,6 +1282,7 @@ mod tests {
             oauth: None,
             oauth_client_secret: None,
             transport_mode: transport_mode.into(),
+            redact_telemetry: true,
         };
         (workspace, harness, state)
     }
@@ -1035,6 +1340,405 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_permission_mrtr_requires_elicitation_capability() {
+        let (_workspace, _harness, state) = test_state("streamable-http");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, build_router(state)).await;
+        });
+        let client = reqwest::Client::new();
+        #[cfg(windows)]
+        let (shell, command) = ("powershell", "Write-Output mrtr-permission");
+        #[cfg(unix)]
+        let (shell, command) = ("sh", "printf mrtr-permission");
+        let request = |id: i64, capabilities: Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": "exec_command",
+                    "arguments": {
+                        "cmd": command,
+                        "shell": shell,
+                        "timeout_ms": 5000,
+                        "yield_time_ms": 5000
+                    },
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": capabilities
+                    }
+                }
+            })
+        };
+
+        let missing = client
+            .post(format!("http://{address}/mcp"))
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "exec_command")
+            .json(&request(51, json!({})))
+            .send()
+            .await
+            .expect("missing elicitation request");
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let missing_body: Value = missing.json().await.expect("missing elicitation json");
+        assert_eq!(missing_body["id"], 51);
+        assert_eq!(missing_body["error"]["code"], -32021);
+        assert_eq!(
+            missing_body["error"]["data"]["requiredCapabilities"],
+            json!({"elicitation": {}})
+        );
+
+        let capable = client
+            .post(format!("http://{address}/mcp"))
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "exec_command")
+            .json(&request(52, json!({"elicitation": {}})))
+            .send()
+            .await
+            .expect("elicitation capable request");
+        assert_eq!(capable.status(), StatusCode::OK);
+        let capable_body: Value = capable.json().await.expect("input required json");
+        assert_eq!(capable_body["result"]["resultType"], "input_required");
+        assert_eq!(
+            capable_body["result"]["inputRequests"]["permission_approval"]["method"],
+            "elicitation/create"
+        );
+        assert!(capable_body["result"]["requestState"]
+            .as_str()
+            .is_some_and(|state| state.starts_with("permission:")));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn modern_mcp_http_rejects_client_responses_and_returns_not_found_for_unknown_methods() {
+        let (_workspace, _harness, state) = test_state("streamable-http");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, build_router(state)).await;
+        });
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{address}/mcp"))
+            .header("mcp-protocol-version", "2026-07-28")
+            .json(&json!({"jsonrpc": "2.0", "id": 18, "result": {}}))
+            .send()
+            .await
+            .expect("modern client response POST");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response_body: Value = response.json().await.expect("modern response error json");
+        assert_eq!(response_body["id"], 18);
+        assert_eq!(response_body["error"]["code"], -32600);
+
+        let unknown = client
+            .post(format!("http://{address}/mcp"))
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "unknown/method")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 19,
+                "method": "unknown/method",
+                "params": {
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+            .send()
+            .await
+            .expect("unknown modern request");
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let unknown_body: Value = unknown.json().await.expect("unknown method error json");
+        assert_eq!(unknown_body["id"], 19);
+        assert_eq!(unknown_body["error"]["code"], -32601);
+
+        let legacy = client
+            .post(format!("http://{address}/mcp"))
+            .header("mcp-protocol-version", "2025-11-25")
+            .json(&json!({"jsonrpc": "2.0", "id": 20, "result": {}}))
+            .send()
+            .await
+            .expect("legacy client response POST");
+        assert_eq!(legacy.status(), StatusCode::ACCEPTED);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_subscriptions_listen_opens_sse_and_acknowledges_honored_filter() {
+        let (_workspace, _harness, state) = test_state("streamable-http");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, build_router(state)).await;
+        });
+        let client = reqwest::Client::new();
+        let mut response = client
+            .post(format!("http://{address}/mcp"))
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "subscriptions/listen")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 61,
+                "method": "subscriptions/listen",
+                "params": {
+                    "notifications": {
+                        "toolsListChanged": true,
+                        "promptsListChanged": true,
+                        "resourcesListChanged": true,
+                        "resourceSubscriptions": ["file:///unsupported.txt"]
+                    },
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                }
+            }))
+            .send()
+            .await
+            .expect("subscription listen request");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-accel-buffering")
+                .and_then(|value| value.to_str().ok()),
+            Some("no")
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(2), response.chunk())
+            .await
+            .expect("subscription acknowledgement timed out")
+            .expect("subscription chunk read")
+            .expect("subscription stream ended before acknowledgement");
+        let first = String::from_utf8(first.to_vec()).expect("utf8 subscription acknowledgement");
+        let data = first
+            .strip_prefix("data: ")
+            .and_then(|value| value.strip_suffix("\n\n"))
+            .expect("SSE data frame");
+        let acknowledged: Value = serde_json::from_str(data).expect("acknowledgement json");
+        assert_eq!(
+            acknowledged["method"],
+            "notifications/subscriptions/acknowledged"
+        );
+        assert_eq!(acknowledged["params"]["notifications"], json!({}));
+        assert_eq!(
+            acknowledged["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            61
+        );
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), response.chunk())
+                .await
+                .is_err(),
+            "listen stream should remain open after acknowledgement"
+        );
+        drop(response);
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(process_runtime)]
+    async fn modern_mcp_tasks_round_trip_over_streamable_http() {
+        let (_workspace, _harness, state) = test_state("streamable-http");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, build_router(state)).await;
+        });
+        let client = reqwest::Client::new();
+        let session = format!("http-tasks-{}", uuid::Uuid::new_v4());
+        let meta = json!({
+            "openai/session": session,
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            }
+        });
+        #[cfg(windows)]
+        let command = "powershell -NoProfile -Command \"Start-Sleep -Milliseconds 200; Write-Output http-task-complete\"";
+        #[cfg(unix)]
+        let command = "sh -c \"sleep 0.2; printf http-task-complete\"";
+
+        let created = client
+            .post(format!("http://{address}/mcp"))
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "exec_command")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 71,
+                "method": "tools/call",
+                "params": {
+                    "name": "exec_command",
+                    "arguments": {
+                        "cmd": command,
+                        "yield_time_ms": 0,
+                        "timeout_ms": 5000,
+                        "output_mode": "tail"
+                    },
+                    "_meta": meta.clone()
+                }
+            }))
+            .send()
+            .await
+            .expect("create task request");
+        assert_eq!(created.status(), StatusCode::OK);
+        let created: Value = created.json().await.expect("create task json");
+        assert_eq!(created["result"]["resultType"], "task", "{created}");
+        let task_id = created["result"]["taskId"]
+            .as_str()
+            .expect("task id")
+            .to_string();
+
+        let mut completed = None;
+        for attempt in 0..40 {
+            let response = client
+                .post(format!("http://{address}/mcp"))
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", "tasks/get")
+                .json(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 72 + attempt,
+                    "method": "tasks/get",
+                    "params": {"taskId": task_id, "_meta": meta.clone()}
+                }))
+                .send()
+                .await
+                .expect("get task request");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = response.json().await.expect("get task json");
+            assert_eq!(body["result"]["resultType"], "complete", "{body}");
+            if body["result"]["status"] == "completed" {
+                completed = Some(body["result"].clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let completed = completed.expect("HTTP task should complete");
+        assert_eq!(completed["result"]["isError"], false);
+        assert!(completed["result"]["structuredContent"]["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("http-task-complete"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn modern_mcp_discover_requires_routing_metadata_and_returns_modern_envelope() {
+        let (_workspace, _harness, state) = test_state("streamable-http");
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, build_router(state)).await;
+        });
+        let client = reqwest::Client::new();
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+
+        let missing_method = client
+            .post(format!("http://{address}/mcp"))
+            .header("mcp-protocol-version", "2026-07-28")
+            .json(&body)
+            .send()
+            .await
+            .expect("modern mismatch request");
+        assert_eq!(missing_method.status(), StatusCode::BAD_REQUEST);
+        let mismatch: serde_json::Value = missing_method.json().await.expect("mismatch json");
+        assert_eq!(mismatch["error"]["code"], -32020);
+        assert_eq!(mismatch["id"], 41);
+
+        let response = client
+            .post(format!("http://{address}/mcp"))
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "server/discover")
+            .json(&body)
+            .send()
+            .await
+            .expect("modern discover request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let discovered: serde_json::Value = response.json().await.expect("modern discover json");
+        assert_eq!(
+            discovered["result"]["supportedVersions"],
+            json!(["2026-07-28"])
+        );
+        assert_eq!(
+            discovered["result"]["capabilities"],
+            json!({
+                "tools": {"listChanged": false},
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            })
+        );
+        assert!(discovered["result"].get("protocolVersion").is_none());
+        assert_eq!(discovered["result"]["resultType"], "complete");
+        assert_eq!(discovered["result"]["ttlMs"], 0);
+        assert_eq!(discovered["result"]["cacheScope"], "private");
+        assert_eq!(
+            discovered["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "coding-tools-mcp"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn modern_mcp_param_headers_mirror_workspace_selector_and_accept_case_insensitive_base64() {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "read_file",
+                "arguments": {"path": "README.md", "workspace_folder_id": "folder-a"},
+                "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
+            }
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("mcp-protocol-version", "2026-07-28".parse().unwrap());
+        assert_eq!(
+            validate_modern_tool_headers(&headers, &body, "core")
+                .expect("missing mirrored header")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        headers.insert("mcp-param-workspace", "folder-a".parse().unwrap());
+        assert!(validate_modern_tool_headers(&headers, &body, "core").is_none());
+        assert_eq!(
+            decode_mcp_header_value("=?BASE64?IGZvbGRlci1h?=").as_deref(),
+            Some(" folder-a")
+        );
     }
 
     #[tokio::test]
@@ -1206,14 +1910,12 @@ mod tests {
         );
 
         tokio::time::timeout(Duration::from_secs(5), async {
-            while context.sessions.active_slots_available()
-                == context.sessions.active_session_limit()
-            {
+            while context.sessions.list(false, 1).is_empty() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
-        .expect("HTTP request did not start an exec session");
+        .expect("HTTP request did not register an exec session");
         assert_eq!(
             context.sessions.active_slots_available(),
             active_session_limit - 1

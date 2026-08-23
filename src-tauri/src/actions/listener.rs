@@ -23,7 +23,7 @@ use crate::tools::{
 };
 use crate::tunnel::append_profile_log_buffered;
 use crate::workspace::{
-    parse_bind_address, socket_addr_for_bind, url_host_for_bind, WorkspaceFolder,
+    parse_bind_address, socket_addr_for_bind, url_host_for_bind, SandboxConfig, WorkspaceFolder,
 };
 
 use super::auth::{require_actions_auth, AuthConfig};
@@ -56,6 +56,7 @@ pub fn spawn_listener(
     oauth_password: Option<String>,
     oauth_token_secret: Option<String>,
     policy: PolicySettings,
+    sandbox: SandboxConfig,
     execution_limits: ExecutionLimits,
 ) -> Result<(ShutdownSender, crate::task_runtime::JoinHandle<()>), String> {
     let api_key = if auth_type == "api_key" {
@@ -108,6 +109,7 @@ pub fn spawn_listener(
             oauth,
             oauth_client_secret,
             policy,
+            sandbox,
             execution_limits,
             shutdown_rx,
         )
@@ -143,6 +145,7 @@ async fn serve(
     oauth: Option<Arc<OAuthRuntime>>,
     oauth_client_secret: Option<String>,
     policy: PolicySettings,
+    sandbox: SandboxConfig,
     execution_limits: ExecutionLimits,
     shutdown: oneshot::Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -154,10 +157,11 @@ async fn serve(
                 auth_type: auth_type.clone(),
                 ..crate::workspace::AuthConfig::default()
             },
-            runtime_config: SharedRuntimeToolConfig::new(
+            runtime_config: SharedRuntimeToolConfig::new_with_sandbox(
                 policy.clone(),
                 "full".into(),
                 policy.permission_mode.clone(),
+                sandbox,
             ),
             limits: execution_limits,
             execution_resource_namespace: "actions".into(),

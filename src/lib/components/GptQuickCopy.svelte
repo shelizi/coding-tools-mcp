@@ -1,6 +1,7 @@
 <script lang="ts">
   import CopyFieldRow from "$lib/components/CopyFieldRow.svelte";
   import { getSecret, getSharedSecret } from "$lib/api/secrets";
+  import { getBackend, loadMcpAuthSecrets, readSecretIfAvailable } from "$lib/backend";
   import type { AuthConfig, WorkspaceProfile } from "$lib/types";
   import {
     actionsOAuthAuthorizeUrl,
@@ -39,36 +40,15 @@
     loading = true;
     try {
       if (service === "mcp") {
-        const useShared = auth.use_shared_secrets ?? false;
-        const fetchSecret = async (key: string, sharedKey: string) => {
-          const value = useShared
-            ? await getSharedSecret(sharedKey as Parameters<typeof getSharedSecret>[0])
-            : await getSecret(workspaceId, key as Parameters<typeof getSecret>[1]);
-          return value ?? "";
-        };
-        if (auth.type === "oauth") {
-          const clientId = useShared
-            ? ((await getSharedSecret("oauth_client_id")) ?? "")
-            : auth.oauth_client_id;
-          secrets = {
-            oauth_client_id: clientId,
-            oauth_client_secret: await fetchSecret("oauth_client_secret", "oauth_client_secret"),
-            oauth_password: await fetchSecret("oauth_password", "oauth_password"),
-          };
-        } else if (auth.type === "bearer") {
-          secrets = {
-            bearer_token: await fetchSecret("bearer_token", "bearer_token"),
-          };
-        } else {
-          secrets = {};
-        }
+        secrets = { ...(await loadMcpAuthSecrets(getBackend(), workspaceId, auth)) };
       } else {
-        const useShared = actions.use_shared_secrets ?? false;
+        const useShared = (actions.use_shared_secrets ?? false) && getBackend().capabilities.sharedSecretStore;
         const fetchSecret = async (key: string, sharedKey: string) => {
-          const value = useShared
-            ? await getSharedSecret(sharedKey as Parameters<typeof getSharedSecret>[0])
-            : await getSecret(workspaceId, key as Parameters<typeof getSecret>[1]);
-          return value ?? "";
+          return readSecretIfAvailable(async () =>
+            useShared
+              ? getSharedSecret(sharedKey as Parameters<typeof getSharedSecret>[0])
+              : getSecret(workspaceId, key as Parameters<typeof getSecret>[1]),
+          );
         };
         if (actions.auth_type === "api_key") {
           secrets = { actions_api_key: await fetchSecret("actions_api_key", "actions_api_key") };
@@ -121,7 +101,7 @@
       />
       {#if auth.type === "oauth"}
         <CopyFieldRow label="OAuth Client ID" value={secrets.oauth_client_id ?? auth.oauth_client_id} {loading} />
-        {#if !guidedMcp}
+        {#if !guidedMcp && getBackend().capabilities.staticBearerAuth}
           <CopyFieldRow
             label="OAuth Client Secret"
             value={secrets.oauth_client_secret ?? ""}
@@ -136,7 +116,7 @@
             : $t("Enter when ChatGPT authorizes for the first time")}
           {loading}
         />
-      {:else if auth.type === "bearer"}
+      {:else if auth.type === "bearer" && getBackend().capabilities.staticBearerAuth}
         <CopyFieldRow label="Bearer Token" value={secrets.bearer_token ?? ""} {loading} />
       {:else}
         <p class="text-xs text-[var(--color-text-muted)]">{$t("Authentication is disabled; use for local debugging only.")}</p>

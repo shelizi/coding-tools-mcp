@@ -11,6 +11,21 @@ import { dashboardPayload } from '../dist/dashboard.js';
 
 const nodeProgram = path.basename(process.execPath);
 
+test('ToolContext exposes folder-scoped runtime state without single-folder aliases', async () => {
+  const [typesSource, serverSource, folderRuntimeSource] = await Promise.all([
+    readFile(new URL('../src/types.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/server.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/folderRuntime.ts', import.meta.url), 'utf8')
+  ]);
+  const contextSource = typesSource.match(/export interface ToolContext \{([\s\S]*?)\n\}/)?.[1] ?? '';
+  assert.ok(contextSource);
+  for (const alias of ['sessions', 'operationsByFingerprint', 'pendingOperations', 'editProposals', 'admission']) {
+    assert.doesNotMatch(contextSource, new RegExp(`\\b${alias}\\s*:`));
+  }
+  assert.doesNotMatch(serverSource, /firstRuntime\.(?:sessions|operationsByFingerprint|pendingOperations|editProposals|admission)/);
+  assert.doesNotMatch(folderRuntimeSource, /ctx\.(?:sessions|operationsByFingerprint|pendingOperations|editProposals|admission)\s*=/);
+});
+
 function config(base, permissionMode = 'trusted') {
   return {
     host: '127.0.0.1',
@@ -121,21 +136,29 @@ test('process sessions, operations, fingerprints and locks are isolated by works
   await select(ctx, meta, 'b');
   const listedB = await callTool(ctx, 'list_sessions', { include_finalized: true }, meta);
   assert.equal(listedB.sessions.some(session => session.session_id === startedA.session_id), false);
-  expectError(await callTool(ctx, 'wait_command', {
+  const waitedAFromB = await callTool(ctx, 'wait_command', {
     session_id: startedA.session_id, timeout_ms: 0
-  }, meta), 'SESSION_NOT_FOUND');
-  expectError(await callTool(ctx, 'send_input', {
-    session_id: startedA.session_id, chars: 'hidden'
-  }, meta), 'SESSION_NOT_FOUND');
-  expectError(await callTool(ctx, 'kill_session', {
-    session_id: startedA.session_id, wait_ms: 10
-  }, meta), 'SESSION_NOT_FOUND');
+  }, meta);
+  assert.equal(waitedAFromB.ok, true, JSON.stringify(waitedAFromB));
+  assert.equal(waitedAFromB.resolved_workspace_id, 'a');
+  assert.equal(waitedAFromB.workspace_route_source, 'session_id');
+  assert.equal(waitedAFromB.workspace_route_changed, true);
+  assert.equal(waitedAFromB.conversation_selection_changed, false);
+
+  const outputAFromB = await callTool(ctx, 'read_output', {
+    output_ref: startedA.output_refs.stdout
+  }, meta);
+  assert.equal(outputAFromB.ok, true, JSON.stringify(outputAFromB));
+  assert.equal(outputAFromB.resolved_workspace_id, 'a');
+  assert.equal(outputAFromB.workspace_route_source, 'session_id');
+  assert.equal(outputAFromB.workspace_route_changed, true);
+  assert.equal(outputAFromB.conversation_selection_changed, false);
+
   expectError(await callTool(ctx, 'resolve_operation', {
     operation_id: 'shared-operation'
   }, meta), 'OPERATION_NOT_FOUND');
-  expectError(await callTool(ctx, 'read_output', {
-    output_ref: startedA.output_refs.stdout
-  }, meta), 'SESSION_NOT_FOUND');
+  const selectedAfterRouting = await callTool(ctx, 'list_workspace_folders', {}, meta);
+  assert.equal(selectedAfterRouting.selected_folder_id, 'b');
 
   const startedB = await callTool(ctx, 'exec_command', command, meta);
   assert.equal(startedB.ok, true, JSON.stringify(startedB));

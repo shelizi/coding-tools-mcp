@@ -24,7 +24,10 @@ interface TokenResponse {
 
 const allowedOrigins = new Set(['https://chatgpt.com', 'https://chat.openai.com']);
 const codeTtlMs = 5 * 60_000;
-const tokenTtlSeconds = 30 * 24 * 60 * 60;
+const tokenTtlSeconds = 7 * 24 * 60 * 60;
+const loginFailureWindowMs = 60_000;
+const loginBlockMs = 60_000;
+const maxLoginFailures = 5;
 
 function base64url(value: Buffer | string): string {
   return Buffer.from(value).toString('base64url');
@@ -191,6 +194,9 @@ export class OAuthRuntime {
   tokenSecret: string;
   readonly #pending = new Map<string, PendingCode>();
   readonly #now: () => number;
+  #loginFailures = 0;
+  #loginWindowStartedAt = 0;
+  #loginBlockedUntil = 0;
 
   constructor(config: AgentConfig['oauth'], now: () => number = Date.now) {
     this.clientId = config.clientId.trim();
@@ -208,6 +214,7 @@ export class OAuthRuntime {
     this.password = replacement.password;
     this.tokenSecret = replacement.tokenSecret;
     this.#pending.clear();
+    this.#resetLoginFailures();
   }
 
   clientIdAllowed(clientId: string): boolean {
@@ -240,9 +247,20 @@ export class OAuthRuntime {
     if (!redirectUriAllowed(redirectUri)) return htmlError('redirect_uri is not allowed');
     if (!this.clientIdAllowed(clientId)) return { status: 200, body: loginPage({ ...values, error: 'Invalid client' }) };
     if (challengeMethod !== 'S256' || !challenge) return { status: 200, body: loginPage({ ...values, error: 'Invalid PKCE parameters' }) };
-    if (!constantTimeEqual(form.get('password') ?? '', this.password)) {
-      return { status: 401, body: loginPage({ ...values, error: 'Invalid password' }) };
+    if (this.#loginRateLimited()) {
+      return { status: 429, body: loginPage({ ...values, error: 'Too many authorization attempts; try again later' }) };
     }
+    if (!constantTimeEqual(form.get('password') ?? '', this.password)) {
+      const blocked = this.#recordLoginFailure();
+      return {
+        status: blocked ? 429 : 401,
+        body: loginPage({
+          ...values,
+          error: blocked ? 'Too many authorization attempts; try again later' : 'Invalid password'
+        })
+      };
+    }
+    this.#resetLoginFailures();
 
     this.#cleanupPending();
     const code = randomBytes(16).toString('hex');
@@ -331,6 +349,31 @@ export class OAuthRuntime {
 
   dispose(): void {
     this.#pending.clear();
+  }
+
+  #loginRateLimited(): boolean {
+    const now = this.#now();
+    if (this.#loginBlockedUntil > now) return true;
+    if (this.#loginBlockedUntil) this.#resetLoginFailures();
+    return false;
+  }
+
+  #recordLoginFailure(): boolean {
+    const now = this.#now();
+    if (!this.#loginWindowStartedAt || now - this.#loginWindowStartedAt >= loginFailureWindowMs) {
+      this.#loginWindowStartedAt = now;
+      this.#loginFailures = 0;
+    }
+    this.#loginFailures += 1;
+    if (this.#loginFailures < maxLoginFailures) return false;
+    this.#loginBlockedUntil = now + loginBlockMs;
+    return true;
+  }
+
+  #resetLoginFailures(): void {
+    this.#loginFailures = 0;
+    this.#loginWindowStartedAt = 0;
+    this.#loginBlockedUntil = 0;
   }
 
   #cleanupPending(): void {

@@ -80,7 +80,13 @@ pub fn project_map(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
             continue;
         }
         let rel = relative_display(ws.root(), p);
-        if ws.is_ignored_path(p, include_hidden, include_ignored, include_generated) {
+        if ws.is_ignored_scan_path(
+            &resolved.path,
+            p,
+            include_hidden,
+            include_ignored,
+            include_generated,
+        ) {
             continue;
         }
         let depth = p

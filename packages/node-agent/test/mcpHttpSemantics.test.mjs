@@ -72,6 +72,93 @@ test('transport errors use HTTP 400 or 403 while JSON-RPC method errors remain H
   assert.equal(body.error.message, 'Method not found: unknown/method');
 });
 
+test('MCP 2026-07-28 supports stateless discovery and cacheable tool listing', async t => {
+  const state = await createMcpFixture(t);
+  const meta = {
+    'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+    'io.modelcontextprotocol/clientCapabilities': {},
+    'io.modelcontextprotocol/clientInfo': { name: 'node-agent-test', version: '1.0.0' }
+  };
+  const headers = method => ({
+    'mcp-protocol-version': '2026-07-28',
+    'mcp-method': method
+  });
+
+  const discoverResponse = await mcpRequest(state, {
+    jsonrpc: '2.0', id: 'discover', method: 'server/discover', params: { _meta: meta }
+  }, { headers: headers('server/discover') });
+  assert.equal(discoverResponse.status, 200);
+  const discover = (await responseJson(discoverResponse)).result;
+  assert.equal(discover.resultType, 'complete');
+  assert.deepEqual(discover.supportedVersions, ['2026-07-28']);
+  assert.deepEqual(discover.capabilities, {
+    tools: { listChanged: false },
+    prompts: { listChanged: false },
+    resources: { subscribe: false, listChanged: false },
+    extensions: { 'io.modelcontextprotocol/tasks': {} }
+  });
+  assert.equal(discover.ttlMs, 0);
+  assert.equal(discover.cacheScope, 'private');
+  assert.equal(discover._meta['io.modelcontextprotocol/serverInfo'].name, 'coding-tools-mcp-node');
+
+  const promptsResponse = await mcpRequest(state, {
+    jsonrpc: '2.0', id: 'prompts', method: 'prompts/list', params: { _meta: meta }
+  }, { headers: headers('prompts/list') });
+  assert.equal(promptsResponse.status, 200);
+  const prompts = (await responseJson(promptsResponse)).result;
+  assert.ok(Array.isArray(prompts.prompts));
+  assert.equal(prompts.resultType, 'complete');
+  assert.equal(prompts.ttlMs, 0);
+  assert.equal(prompts.cacheScope, 'private');
+
+  const resourcesResponse = await mcpRequest(state, {
+    jsonrpc: '2.0', id: 'resources', method: 'resources/list', params: { _meta: meta }
+  }, { headers: headers('resources/list') });
+  assert.equal(resourcesResponse.status, 200);
+  const resources = (await responseJson(resourcesResponse)).result;
+  assert.ok(Array.isArray(resources.resources));
+  assert.equal(resources.resultType, 'complete');
+  assert.equal(resources.ttlMs, 0);
+  assert.equal(resources.cacheScope, 'private');
+
+  const toolsResponse = await mcpRequest(state, {
+    jsonrpc: '2.0', id: 'tools', method: 'tools/list', params: { _meta: meta }
+  }, { headers: headers('tools/list') });
+  assert.equal(toolsResponse.status, 200);
+  const tools = (await responseJson(toolsResponse)).result;
+  assert.equal(tools.resultType, 'complete');
+  assert.ok(Array.isArray(tools.tools));
+  assert.equal(tools.ttlMs, 0);
+  assert.equal(tools.cacheScope, 'private');
+  assert.equal(tools._meta['io.modelcontextprotocol/serverInfo'].version.length > 0, true);
+
+  const legacyInitialize = await mcpRequest(state, {
+    jsonrpc: '2.0', id: 'legacy', method: 'initialize', params: { protocolVersion: '2026-07-28' }
+  });
+  assert.equal((await responseJson(legacyInitialize)).result.protocolVersion, '2025-11-25');
+
+  const modernInitialize = await mcpRequest(state, {
+    jsonrpc: '2.0', id: 'modern-init', method: 'initialize', params: { protocolVersion: '2026-07-28', _meta: meta }
+  }, { headers: headers('initialize') });
+  const modernInitializeBody = await responseJson(modernInitialize);
+  assert.equal(modernInitialize.status, 404);
+  assert.equal(modernInitializeBody.error.code, -32601);
+
+  const modernPing = await mcpRequest(state, {
+    jsonrpc: '2.0', id: 'modern-ping', method: 'ping', params: { _meta: meta }
+  }, { headers: headers('ping') });
+  const modernPingBody = await responseJson(modernPing);
+  assert.equal(modernPing.status, 404);
+  assert.equal(modernPingBody.error.code, -32601);
+
+  const legacyDiscover = await mcpRequest(state, {
+    jsonrpc: '2.0', id: 'legacy-discover', method: 'server/discover', params: {}
+  }, { headers: { 'mcp-protocol-version': '2025-11-25' } });
+  const legacyDiscoverBody = await responseJson(legacyDiscover);
+  assert.equal(legacyDiscover.status, 200);
+  assert.equal(legacyDiscoverBody.error.code, -32601);
+});
+
 test('MCP discovery reports streamable HTTP and the complete supported protocol set', async t => {
   const state = await createMcpFixture(t);
   const response = await fetch(state.infoEndpoint);
@@ -79,7 +166,7 @@ test('MCP discovery reports streamable HTTP and the complete supported protocol 
   assert.equal(response.headers.get('cache-control'), 'no-store');
   const info = await responseJson(response);
   assert.equal(info.transport, 'streamable-http');
-  assert.equal(info.protocolVersion, '2025-11-25');
-  assert.deepEqual(info.supportedProtocolVersions, ['2025-11-25', '2025-06-18', '2025-03-26']);
+  assert.equal(info.protocolVersion, '2026-07-28');
+  assert.deepEqual(info.supportedProtocolVersions, ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26']);
   assert.equal(info.name, 'coding-tools-mcp-node');
 });

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { listFrpProfiles, type FrpProfileDto } from "$lib/api/settings";
+  import { getBackend } from "$lib/backend";
   import { testTunnel as invokeTunnelTest } from "$lib/api/tunnel";
   import SecretTokenField from "$lib/components/SecretTokenField.svelte";
   import { showToast } from "$lib/stores/toast";
@@ -30,6 +31,7 @@
   }
 
   let { workspaceId, service, config, onSave }: Props = $props();
+  const capabilities = getBackend().capabilities;
 
   let draft = $state<TunnelFormConfig>({
     type: "none",
@@ -97,6 +99,7 @@
   });
 
   onMount(async () => {
+    if (!capabilities.frpManagement) return;
     frpProfiles = await listFrpProfiles();
   });
 
@@ -329,8 +332,10 @@
     >
       <option value="none">{$t("Not configured")}</option>
       <option value="builtin">{$t("Built-in WSS tunnel")}</option>
-      <option value="frp">FRP</option>
-      <option value="cloudflare">Cloudflare</option>
+      {#if capabilities.frpManagement}
+        <option value="frp">FRP</option>
+        <option value="cloudflare">Cloudflare</option>
+      {/if}
     </select>
   </label>
 

@@ -1,82 +1,58 @@
+mod connection;
+mod endpoint;
+mod identity;
+mod metrics;
+mod pool_policy;
+mod protocol_io;
+mod request_mapping;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::Duration;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use coding_tools_tunnel_protocol::{
-    auth_signing_payload, is_hop_by_hop_header, valid_client_id, ClientHello, ControlMessage,
-    DeviceAuthProof, EnrollmentRequest, EnrollmentResponse, HeaderPair, TunnelService,
-    WorkerDemand, WorkerPolicy, CLIENT_ID_HEADER, ENROLL_PATH_PREFIX, MAX_REQUEST_BODY_BYTES,
-    PROTOCOL_VERSION, SERVICE_HEADER, WS_PATH, WS_SUBPROTOCOL,
+    ControlMessage, TunnelService, WorkerDemand, WorkerPolicy, MAX_REQUEST_BODY_BYTES,
 };
-use ed25519_dalek::{Signer, SigningKey};
-use futures_util::stream::{SplitSink, SplitStream};
+use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
-use rand_core::OsRng;
-use reqwest::header::{HeaderName, HeaderValue, HOST};
-use serde::{Deserialize, Serialize};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{interval, sleep, timeout, Instant, Interval, MissedTickBehavior};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
-use crate::secret::SecretStore;
 use crate::workspace::WorkspaceProfile;
 
 use super::TunnelServiceKind;
+use connection::{connect_authenticated_worker, AuthenticatedWorkerConnection};
+use endpoint::{builtin_endpoint_for_client, parse_builtin_endpoint};
+use identity::{decode_signing_key, load_or_enroll_device_identity};
+pub use metrics::BuiltinTunnelSnapshot;
+use metrics::{BuiltinTunnelMetrics, ConnectedWorkerGuard};
+use pool_policy::{
+    configured_burst_warm_floor, configured_max_connecting, jittered_limit, join_worker_indices,
+    next_reconnect_base, pool_adjustment, reconnect_delay, scale_down_reason, scale_up_block,
+    scale_up_reason, worker_should_recycle, PoolCounts, INITIAL_RECONNECT_DELAY,
+};
+use protocol_io::{
+    close_client_websocket, decode_control, send_control, send_heartbeat, ClientSink, ClientStream,
+    HeartbeatTracker,
+};
+use request_mapping::{prepare_local_request, response_headers, IncomingRequest};
 
 const INITIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
-const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
-const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const DEMAND_HINT_TTL: Duration = Duration::from_secs(3);
-const DEVICE_IDENTITY_KEY: &str = "builtin_tunnel_device_identity";
-const ENROLLMENT_URL_KEY: &str = "builtin_tunnel_enrollment_url";
 
 pub(crate) fn behavioral_parity_fixture() -> serde_json::Value {
     serde_json::json!({
         "local_connect_timeout_ms": LOCAL_CONNECT_TIMEOUT.as_millis(),
         "demand_hint_ttl_ms": DEMAND_HINT_TTL.as_millis()
     })
-}
-
-type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type ClientSink = SplitSink<ClientWebSocket, Message>;
-type ClientStream = SplitStream<ClientWebSocket>;
-
-struct HeartbeatTracker {
-    last_activity: Instant,
-}
-
-impl HeartbeatTracker {
-    fn new_at(now: Instant) -> Self {
-        Self { last_activity: now }
-    }
-
-    fn record_activity_at(&mut self, now: Instant) {
-        self.last_activity = now;
-    }
-
-    fn record_activity(&mut self) {
-        self.record_activity_at(Instant::now());
-    }
-
-    fn expired_at(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.last_activity) >= HEARTBEAT_TIMEOUT
-    }
 }
 
 #[derive(Clone)]
@@ -92,14 +68,6 @@ pub struct BuiltinTunnelConfig {
     log_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredDeviceIdentity {
-    device_id: String,
-    client_id: String,
-    private_key: String,
-    enrolled: bool,
-}
-
 struct BuiltinTunnelBaseConfig {
     public_url: String,
     client_id: String,
@@ -112,111 +80,6 @@ pub struct BuiltinTunnelHandle {
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
     metrics: Arc<BuiltinTunnelMetrics>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuiltinTunnelSnapshot {
-    pub configured_workers: usize,
-    pub connected_workers: usize,
-    pub idle_workers: usize,
-    pub busy_workers: usize,
-    pub recycled_workers: u64,
-    pub policy_revision: u64,
-    pub last_error: Option<String>,
-}
-
-impl BuiltinTunnelSnapshot {
-    pub fn availability_state(&self, task_running: bool) -> &'static str {
-        if !task_running {
-            "stopped"
-        } else if self.connected_workers == 0 {
-            "reconnecting"
-        } else {
-            "running"
-        }
-    }
-}
-
-struct BuiltinTunnelMetrics {
-    configured_workers: AtomicUsize,
-    connected_workers: AtomicUsize,
-    idle_workers: AtomicUsize,
-    busy_workers: AtomicUsize,
-    recycled_workers: AtomicU64,
-    policy_revision: AtomicU64,
-    last_error: Mutex<Option<String>>,
-}
-
-impl BuiltinTunnelMetrics {
-    fn new(configured_workers: usize) -> Self {
-        Self {
-            configured_workers: AtomicUsize::new(configured_workers),
-            connected_workers: AtomicUsize::new(0),
-            idle_workers: AtomicUsize::new(0),
-            busy_workers: AtomicUsize::new(0),
-            recycled_workers: AtomicU64::new(0),
-            policy_revision: AtomicU64::new(0),
-            last_error: Mutex::new(None),
-        }
-    }
-
-    fn set_policy(&self, policy: &WorkerPolicy) {
-        self.configured_workers
-            .store(usize::from(policy.max_workers), Ordering::Release);
-        self.policy_revision
-            .store(policy.revision, Ordering::Release);
-    }
-
-    fn set_pool_counts(&self, idle: usize, busy: usize) {
-        self.idle_workers.store(idle, Ordering::Release);
-        self.busy_workers.store(busy, Ordering::Release);
-    }
-
-    fn record_recycle(&self) {
-        self.recycled_workers.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn set_last_error(&self, error: Option<String>) {
-        *self
-            .last_error
-            .lock()
-            .unwrap_or_else(|guard| guard.into_inner()) = error;
-    }
-
-    fn snapshot(&self) -> BuiltinTunnelSnapshot {
-        BuiltinTunnelSnapshot {
-            configured_workers: self.configured_workers.load(Ordering::Acquire),
-            connected_workers: self.connected_workers.load(Ordering::Acquire),
-            idle_workers: self.idle_workers.load(Ordering::Acquire),
-            busy_workers: self.busy_workers.load(Ordering::Acquire),
-            recycled_workers: self.recycled_workers.load(Ordering::Acquire),
-            policy_revision: self.policy_revision.load(Ordering::Acquire),
-            last_error: self
-                .last_error
-                .lock()
-                .unwrap_or_else(|guard| guard.into_inner())
-                .clone(),
-        }
-    }
-}
-
-struct ConnectedWorkerGuard {
-    metrics: Arc<BuiltinTunnelMetrics>,
-}
-
-impl ConnectedWorkerGuard {
-    fn new(metrics: Arc<BuiltinTunnelMetrics>) -> Self {
-        metrics.connected_workers.fetch_add(1, Ordering::AcqRel);
-        Self { metrics }
-    }
-}
-
-impl Drop for ConnectedWorkerGuard {
-    fn drop(&mut self) {
-        self.metrics
-            .connected_workers
-            .fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 impl BuiltinTunnelHandle {
@@ -290,7 +153,8 @@ pub async fn spawn_builtin_tunnel(
     kind: TunnelServiceKind,
 ) -> AppResult<(BuiltinTunnelHandle, String)> {
     let base = builtin_base_config(profile, kind)?;
-    let identity = load_or_enroll_device_identity(&profile.id, &base).await?;
+    let identity =
+        load_or_enroll_device_identity(&profile.id, &base.public_url, &base.client_id).await?;
     let endpoint =
         builtin_endpoint_for_client(&base.public_url, base.service, &identity.client_id)?;
     let signing_key = decode_signing_key(&identity.private_key)?;
@@ -358,165 +222,6 @@ async fn stop_startup_task(shutdown: &watch::Sender<bool>, task: &mut JoinHandle
         task.abort();
         let _ = task.await;
     }
-}
-
-async fn load_or_enroll_device_identity(
-    profile_id: &str,
-    config: &BuiltinTunnelBaseConfig,
-) -> AppResult<StoredDeviceIdentity> {
-    let stored = SecretStore::get(profile_id, DEVICE_IDENTITY_KEY)?
-        .map(|raw| {
-            serde_json::from_str::<StoredDeviceIdentity>(&raw)
-                .map_err(|error| AppError::Message(format!("內建隧道裝置身分格式損壞：{error}")))
-        })
-        .transpose()?;
-    let enrollment_url =
-        SecretStore::get(profile_id, ENROLLMENT_URL_KEY)?.filter(|value| !value.trim().is_empty());
-
-    if let Some(identity) = stored
-        .as_ref()
-        .filter(|identity| identity.enrolled && enrollment_url.is_none())
-    {
-        return Ok(identity.clone());
-    }
-
-    let mut identity = match stored {
-        Some(identity) if !identity.enrolled => identity,
-        _ => {
-            let signing_key = SigningKey::generate(&mut OsRng);
-            let identity = StoredDeviceIdentity {
-                device_id: Uuid::new_v4().simple().to_string(),
-                client_id: config.client_id.clone(),
-                private_key: URL_SAFE_NO_PAD.encode(signing_key.to_bytes()),
-                enrolled: false,
-            };
-            save_device_identity(profile_id, &identity)?;
-            identity
-        }
-    };
-
-    let enrollment_url = enrollment_url.ok_or_else(|| {
-        AppError::Message("內建 WSS 隧道尚未註冊。請貼上伺服器產生的一次性註冊連結。".into())
-    })?;
-    let enrollment_url = parse_enrollment_url(&config.public_url, &enrollment_url)?;
-    let signing_key = decode_signing_key(&identity.private_key)?;
-    let request = EnrollmentRequest {
-        device_id: identity.device_id.clone(),
-        client_id: identity.client_id.clone(),
-        device_name: local_device_name(),
-        public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
-    };
-    let response = reqwest::Client::builder()
-        .connect_timeout(WEBSOCKET_CONNECT_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| AppError::Message(format!("無法建立裝置註冊連線：{error}")))?
-        .post(enrollment_url)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|error| AppError::Message(format!("裝置註冊連線失敗：{error}")))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let detail = response.text().await.unwrap_or_default();
-        return Err(AppError::Message(format!(
-            "內建隧道裝置註冊失敗（{status}）：{}",
-            detail.trim()
-        )));
-    }
-    let enrolled = response
-        .json::<EnrollmentResponse>()
-        .await
-        .map_err(|error| AppError::Message(format!("裝置註冊回應格式無效：{error}")))?;
-    if enrolled.device_id != identity.device_id {
-        return Err(AppError::Message(
-            "內建隧道伺服器回傳了不一致的裝置 ID。".into(),
-        ));
-    }
-    let enrolled_client_id = if enrolled.client_id.trim().is_empty() {
-        identity.client_id.clone()
-    } else {
-        enrolled.client_id.trim().to_string()
-    };
-    if !valid_client_id(&enrolled_client_id) {
-        return Err(AppError::Message(
-            "內建隧道伺服器回傳了無效的 Client ID。".into(),
-        ));
-    }
-
-    identity.client_id = enrolled_client_id;
-    identity.enrolled = true;
-    save_device_identity(profile_id, &identity)?;
-    SecretStore::set(profile_id, ENROLLMENT_URL_KEY, "")?;
-    Ok(identity)
-}
-
-fn save_device_identity(profile_id: &str, identity: &StoredDeviceIdentity) -> AppResult<()> {
-    let encoded = serde_json::to_string(identity)?;
-    SecretStore::set(profile_id, DEVICE_IDENTITY_KEY, &encoded)
-}
-
-fn decode_signing_key(value: &str) -> AppResult<SigningKey> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(value.trim().as_bytes())
-        .map_err(|_| AppError::Message("內建隧道裝置私鑰格式無效。".into()))?;
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| AppError::Message("內建隧道裝置私鑰長度無效。".into()))?;
-    Ok(SigningKey::from_bytes(&bytes))
-}
-
-fn parse_enrollment_url(public_url: &str, value: &str) -> AppResult<reqwest::Url> {
-    let public = reqwest::Url::parse(public_url)
-        .map_err(|_| AppError::Message("內建隧道公開網址格式無效。".into()))?;
-    let enrollment = reqwest::Url::parse(value.trim())
-        .map_err(|_| AppError::Message("一次性註冊連結格式無效。".into()))?;
-    if enrollment.scheme() != "https"
-        || enrollment.username() != ""
-        || enrollment.password().is_some()
-        || enrollment.query().is_some()
-        || enrollment.fragment().is_some()
-        || enrollment.host_str() != public.host_str()
-        || enrollment.port_or_known_default() != public.port_or_known_default()
-    {
-        return Err(AppError::Message(
-            "一次性註冊連結必須使用與內建隧道相同的 HTTPS 網域與連接埠。".into(),
-        ));
-    }
-    let prefix = format!("{ENROLL_PATH_PREFIX}/");
-    let code = enrollment
-        .path()
-        .strip_prefix(&prefix)
-        .filter(|code| {
-            !code.is_empty()
-                && code.len() <= 128
-                && code.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        })
-        .ok_or_else(|| {
-            AppError::Message("一次性註冊連結必須使用 /_tunnel/enroll/<code> 路徑。".into())
-        })?;
-    if code.contains('/') {
-        return Err(AppError::Message("一次性註冊碼格式無效。".into()));
-    }
-    Ok(enrollment)
-}
-
-fn local_device_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "Coding Tools MCP".into())
-}
-
-fn unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 async fn run_worker_pool(
@@ -929,12 +634,6 @@ async fn worker_reconnect_loop(
     let mut attempt = 0_u64;
 
     while !*shutdown.borrow() && !*retire.borrow() {
-        let _ = event_tx
-            .send(WorkerEvent::State {
-                worker_index,
-                state: PoolWorkerState::Connecting,
-            })
-            .await;
         let mut connected = false;
         match run_connected_worker(
             &config,
@@ -959,6 +658,13 @@ async fn worker_reconnect_loop(
                 let _ = status_tx.send(Err(error)).await;
             }
         }
+
+        let _ = event_tx
+            .send(WorkerEvent::State {
+                worker_index,
+                state: PoolWorkerState::Connecting,
+            })
+            .await;
 
         if connected {
             delay = next_reconnect_base(delay, true);
@@ -991,83 +697,11 @@ async fn run_connected_worker(
     event_tx: &mpsc::Sender<WorkerEvent>,
     policy_tx: &watch::Sender<Option<WorkerPolicy>>,
 ) -> Result<WorkerConnectionExit, String> {
-    let mut request = config
-        .websocket_url
-        .clone()
-        .into_client_request()
-        .map_err(|error| error.to_string())?;
-    request.headers_mut().insert(
-        CLIENT_ID_HEADER,
-        config
-            .client_id
-            .parse()
-            .map_err(|error| format!("invalid client id header: {error}"))?,
-    );
-    request.headers_mut().insert(
-        SERVICE_HEADER,
-        config
-            .service
-            .as_str()
-            .parse()
-            .map_err(|error| format!("invalid service header: {error}"))?,
-    );
-    request.headers_mut().insert(
-        SEC_WEBSOCKET_PROTOCOL,
-        WS_SUBPROTOCOL
-            .parse()
-            .map_err(|error| format!("invalid tunnel subprotocol: {error}"))?,
-    );
-
-    let (socket, response) = timeout(WEBSOCKET_CONNECT_TIMEOUT, connect_async(request))
-        .await
-        .map_err(|_| "WSS connection timed out".to_string())?
-        .map_err(|error| error.to_string())?;
-    if response
-        .headers()
-        .get(SEC_WEBSOCKET_PROTOCOL)
-        .and_then(|value| value.to_str().ok())
-        != Some(WS_SUBPROTOCOL)
-    {
-        return Err("server did not accept coding-tools-tunnel-v3".into());
-    }
-    let (mut sink, mut stream) = socket.split();
-    let (nonce, expires_at_unix_ms) = match receive_control(&mut sink, &mut stream).await? {
-        ControlMessage::Challenge {
-            nonce,
-            expires_at_unix_ms,
-        } => (nonce, expires_at_unix_ms),
-        ControlMessage::Error { message, .. } => return Err(message),
-        _ => return Err("server did not issue a device authentication challenge".into()),
-    };
-    if unix_ms() > expires_at_unix_ms {
-        return Err("server authentication challenge already expired".into());
-    }
-    let mut proof = DeviceAuthProof {
-        hello: ClientHello {
-            protocol_version: PROTOCOL_VERSION,
-            client_id: config.client_id.clone(),
-            service: config.service,
-            worker_id: worker_id.to_string(),
-        },
-        device_id: config.device_id.clone(),
-        signature: String::new(),
-    };
-    proof.signature = URL_SAFE_NO_PAD.encode(
-        config
-            .signing_key
-            .sign(&auth_signing_payload(&nonce, &proof))
-            .to_bytes(),
-    );
-    send_control(&mut sink, &ControlMessage::Authenticate(proof)).await?;
-    let initial_policy = match receive_control(&mut sink, &mut stream).await? {
-        ControlMessage::HelloAck {
-            protocol_version,
-            worker_policy,
-        } if protocol_version == PROTOCOL_VERSION => worker_policy,
-        ControlMessage::Error { message, .. } => return Err(message),
-        _ => return Err("server did not acknowledge tunnel device authentication".into()),
-    };
-    initial_policy.validate()?;
+    let AuthenticatedWorkerConnection {
+        mut sink,
+        mut stream,
+        initial_policy,
+    } = connect_authenticated_worker(config, worker_id).await?;
     policy_tx.send_replace(Some(initial_policy.clone()));
     send_control(&mut sink, &ControlMessage::Ready).await?;
     *connected = true;
@@ -1170,240 +804,6 @@ async fn run_connected_worker(
     }
 }
 
-async fn close_client_websocket(sink: &mut ClientSink, stream: &mut ClientStream) {
-    if sink.send(Message::Close(None)).await.is_err() {
-        return;
-    }
-    // Dropping immediately after the Close frame can produce a TCP reset on
-    // Windows. Give the peer a bounded window to complete the close handshake.
-    let _ = timeout(WEBSOCKET_CLOSE_TIMEOUT, async {
-        while let Some(frame) = stream.next().await {
-            match frame {
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => {}
-            }
-        }
-    })
-    .await;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PoolCounts {
-    total: usize,
-    connecting: usize,
-    idle: usize,
-    busy: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PoolAdjustment {
-    spawn: usize,
-    retire: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ScaleUpBlock {
-    ConnectingLimitReached,
-    MaxWorkersReached,
-}
-
-impl ScaleUpBlock {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ConnectingLimitReached => "connecting_limit_reached",
-            Self::MaxWorkersReached => "max_workers_reached",
-        }
-    }
-}
-
-fn configured_max_connecting(policy: &WorkerPolicy) -> usize {
-    let maximum = usize::from(policy.max_workers).max(1);
-    if policy.max_connecting_workers == 0 {
-        maximum.min(4)
-    } else {
-        usize::from(policy.max_connecting_workers)
-            .min(maximum)
-            .max(1)
-    }
-}
-
-fn configured_burst_warm_floor(policy: &WorkerPolicy) -> usize {
-    let maximum = usize::from(policy.max_workers);
-    if policy.burst_warm_workers == 0 {
-        usize::from(policy.start_workers)
-            .max(usize::from(policy.max_idle_workers).saturating_mul(2))
-            .min(maximum)
-    } else {
-        usize::from(policy.burst_warm_workers).min(maximum)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn pool_adjustment(
-    policy: &WorkerPolicy,
-    counts: PoolCounts,
-    effective_connecting: usize,
-    max_connecting: usize,
-    desired_workers: usize,
-    idle_excess_elapsed: bool,
-    scale_down_floor: usize,
-) -> PoolAdjustment {
-    debug_assert_eq!(counts.total, counts.connecting + counts.idle + counts.busy);
-    let maximum = usize::from(policy.max_workers);
-    let startup_needed = usize::from(policy.start_workers).saturating_sub(counts.total);
-    let spare_needed = usize::from(policy.min_idle_workers)
-        .saturating_sub(counts.idle.saturating_add(effective_connecting));
-    let demand_needed = desired_workers.saturating_sub(counts.total);
-    let requested_spawn = startup_needed.max(spare_needed).max(demand_needed);
-    let connecting_budget = max_connecting.saturating_sub(effective_connecting);
-    let spawn = requested_spawn
-        .min(maximum.saturating_sub(counts.total))
-        .min(connecting_budget);
-
-    let above_maximum = counts.total.saturating_sub(maximum).min(counts.idle);
-    let staged_idle_excess = if idle_excess_elapsed && above_maximum == 0 {
-        counts
-            .total
-            .saturating_sub(scale_down_floor)
-            .min(counts.idle)
-            .min(usize::from(policy.scale_down_step))
-    } else {
-        0
-    };
-    PoolAdjustment {
-        spawn,
-        retire: above_maximum.max(staged_idle_excess),
-    }
-}
-
-fn scale_up_reason(
-    policy: &WorkerPolicy,
-    counts: PoolCounts,
-    effective_connecting: usize,
-    desired_workers: usize,
-) -> &'static str {
-    if desired_workers > counts.total {
-        return "server_demand";
-    }
-    let startup_deficit = counts.total < usize::from(policy.start_workers);
-    let idle_deficit = counts.idle + effective_connecting < usize::from(policy.min_idle_workers);
-    match (startup_deficit, idle_deficit) {
-        (true, true) => "startup_and_idle_reserve",
-        (true, false) => "startup",
-        (false, true) => "idle_reserve",
-        (false, false) => "none",
-    }
-}
-
-fn scale_down_reason(
-    policy: &WorkerPolicy,
-    counts: PoolCounts,
-    idle_excess_elapsed: bool,
-    warm_active: bool,
-) -> &'static str {
-    if counts.total > usize::from(policy.max_workers) {
-        "max_workers_reduced"
-    } else if idle_excess_elapsed && warm_active {
-        "burst_warm_staged"
-    } else if idle_excess_elapsed {
-        "idle_excess_elapsed"
-    } else {
-        "none"
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scale_up_block(
-    policy: &WorkerPolicy,
-    counts: PoolCounts,
-    effective_connecting: usize,
-    max_connecting: usize,
-    desired_workers: usize,
-    adjustment: PoolAdjustment,
-) -> Option<ScaleUpBlock> {
-    let startup_deficit = counts.total < usize::from(policy.start_workers);
-    let idle_deficit = counts.idle + effective_connecting < usize::from(policy.min_idle_workers);
-    let demand_deficit = desired_workers > counts.total;
-    if adjustment.spawn > 0 || !(startup_deficit || idle_deficit || demand_deficit) {
-        return None;
-    }
-    if counts.total >= usize::from(policy.max_workers) {
-        return Some(ScaleUpBlock::MaxWorkersReached);
-    }
-    if effective_connecting >= max_connecting {
-        return Some(ScaleUpBlock::ConnectingLimitReached);
-    }
-    None
-}
-
-fn join_worker_indices(indices: &[usize]) -> String {
-    indices
-        .iter()
-        .map(usize::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn jittered_limit(base: u64, seed: u64, percent: u8) -> u64 {
-    if base == 0 || percent == 0 {
-        return base;
-    }
-    let spread = u64::from(percent).min(50);
-    let mixed = seed
-        .wrapping_add(1)
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .rotate_left((seed % 63) as u32);
-    let offset = mixed % (spread.saturating_mul(2) + 1);
-    let factor = 100_u64.saturating_sub(spread).saturating_add(offset);
-    base.saturating_mul(factor).saturating_add(99) / 100
-}
-
-fn worker_should_recycle(
-    policy: &WorkerPolicy,
-    seed: u64,
-    completed_requests: u64,
-    connected_for: Duration,
-) -> bool {
-    let request_limit = jittered_limit(
-        policy.max_requests_per_worker,
-        seed,
-        policy.recycle_jitter_percent,
-    );
-    let lifetime_limit = jittered_limit(
-        policy.max_lifetime_seconds,
-        seed,
-        policy.recycle_jitter_percent,
-    );
-    (request_limit != 0 && completed_requests >= request_limit)
-        || (lifetime_limit != 0 && connected_for >= Duration::from_secs(lifetime_limit))
-}
-
-fn next_reconnect_base(current: Duration, connected: bool) -> Duration {
-    if connected {
-        INITIAL_RECONNECT_DELAY
-    } else {
-        (current * 2).min(MAX_RECONNECT_DELAY)
-    }
-}
-
-fn reconnect_delay(base: Duration, worker_index: usize, attempt: u64) -> Duration {
-    let mixed = (worker_index as u64 + 1)
-        .wrapping_mul(0x9E37_79B9)
-        .rotate_left((attempt % 31) as u32)
-        ^ attempt.wrapping_mul(0x85EB_CA6B);
-    let percent = 80 + mixed % 21;
-    let millis = base.as_millis().saturating_mul(u128::from(percent)) / 100;
-    Duration::from_millis(millis.max(1).min(MAX_RECONNECT_DELAY.as_millis()) as u64)
-}
-
-struct IncomingRequest {
-    request_id: String,
-    method: String,
-    path_and_query: String,
-    headers: Vec<HeaderPair>,
-    body: Vec<u8>,
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn receive_request(
     sink: &mut ClientSink,
@@ -1481,8 +881,7 @@ async fn receive_request(
                 body.extend_from_slice(&chunk);
             }
             Some(Ok(Message::Text(text))) => {
-                let control: ControlMessage =
-                    serde_json::from_str(text.as_str()).map_err(|error| error.to_string())?;
+                let control = decode_control(text.as_str())?;
                 match control {
                     ControlMessage::RequestEnd { request_id: end_id } if end_id == request_id => {
                         break
@@ -1522,27 +921,7 @@ async fn forward_request(
     heartbeat: &mut HeartbeatTracker,
     heartbeat_interval: &mut Interval,
 ) -> Result<(), String> {
-    let request_id = request.request_id.clone();
-    if !request.path_and_query.starts_with('/') || request.path_and_query.starts_with("//") {
-        return Err("server supplied an invalid relative request path".into());
-    }
-    let local_path = local_path_for_request(config, &request.path_and_query)?;
-    let url = format!("{}{}", config.local_base_url, local_path);
-    let method = reqwest::Method::from_bytes(request.method.as_bytes())
-        .map_err(|error| error.to_string())?;
-    let mut builder = http.request(method, url).body(request.body);
-    for header in request.headers {
-        if is_hop_by_hop_header(&header.name) || header.name.eq_ignore_ascii_case(HOST.as_str()) {
-            continue;
-        }
-        let Ok(name) = HeaderName::from_bytes(header.name.as_bytes()) else {
-            continue;
-        };
-        let Ok(value) = HeaderValue::from_str(&header.value) else {
-            continue;
-        };
-        builder = builder.header(name, value);
-    }
+    let (request_id, builder) = prepare_local_request(config, http, request)?;
 
     let response_future = builder.send();
     tokio::pin!(response_future);
@@ -1556,8 +935,7 @@ async fn forward_request(
             incoming = stream.next() => match incoming {
                 Some(Ok(Message::Text(text))) => {
                     heartbeat.record_activity();
-                    let control: ControlMessage = serde_json::from_str(text.as_str())
-                        .map_err(|error| error.to_string())?;
+                    let control = decode_control(text.as_str())?;
                     if matches!(control, ControlMessage::Cancel { request_id: ref id } if id == &request_id) {
                         return Ok(());
                     }
@@ -1574,19 +952,7 @@ async fn forward_request(
     };
 
     let status = response.status().as_u16();
-    let headers = response
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            if is_hop_by_hop_header(name.as_str()) {
-                return None;
-            }
-            value.to_str().ok().map(|value| HeaderPair {
-                name: name.as_str().to_string(),
-                value: value.to_string(),
-            })
-        })
-        .collect();
+    let headers = response_headers(response.headers());
     send_control(
         sink,
         &ControlMessage::ResponseHead {
@@ -1619,8 +985,7 @@ async fn forward_request(
             incoming = stream.next() => match incoming {
                 Some(Ok(Message::Text(text))) => {
                     heartbeat.record_activity();
-                    let control: ControlMessage = serde_json::from_str(text.as_str())
-                        .map_err(|error| error.to_string())?;
+                    let control = decode_control(text.as_str())?;
                     if matches!(control, ControlMessage::Cancel { request_id: ref id } if id == &request_id) {
                         return Ok(());
                     }
@@ -1700,8 +1065,7 @@ async fn receive_live_control(
         heartbeat.record_activity();
         match message {
             Some(Ok(Message::Text(text))) => {
-                let control: ControlMessage =
-                    serde_json::from_str(text.as_str()).map_err(|error| error.to_string())?;
+                let control = decode_control(text.as_str())?;
                 if let ControlMessage::PolicyUpdate { worker_policy } = control {
                     worker_policy.validate()?;
                     policy_tx.send_replace(Some(worker_policy));
@@ -1719,170 +1083,6 @@ async fn receive_live_control(
             Some(Err(error)) => return Err(error.to_string()),
         }
     }
-}
-
-async fn send_heartbeat(sink: &mut ClientSink, heartbeat: &HeartbeatTracker) -> Result<(), String> {
-    if heartbeat.expired_at(Instant::now()) {
-        return Err("WSS heartbeat timed out".into());
-    }
-    sink.send(Message::Ping(Vec::new().into()))
-        .await
-        .map_err(|error| error.to_string())
-}
-
-async fn receive_control(
-    sink: &mut ClientSink,
-    stream: &mut ClientStream,
-) -> Result<ControlMessage, String> {
-    loop {
-        match stream.next().await {
-            Some(Ok(Message::Text(text))) => {
-                return serde_json::from_str(text.as_str()).map_err(|error| error.to_string());
-            }
-            Some(Ok(Message::Ping(payload))) => sink
-                .send(Message::Pong(payload))
-                .await
-                .map_err(|error| error.to_string())?,
-            Some(Ok(Message::Close(_))) | None => return Err("websocket closed".into()),
-            Some(Ok(_)) => return Err("expected text control message".into()),
-            Some(Err(error)) => return Err(error.to_string()),
-        }
-    }
-}
-
-async fn send_control(sink: &mut ClientSink, message: &ControlMessage) -> Result<(), String> {
-    let encoded = serde_json::to_string(message).map_err(|error| error.to_string())?;
-    sink.send(Message::Text(encoded.into()))
-        .await
-        .map_err(|error| error.to_string())
-}
-
-fn local_path_for_request(
-    config: &BuiltinTunnelConfig,
-    path_and_query: &str,
-) -> Result<String, String> {
-    if config.service == TunnelService::Mcp {
-        return Ok(path_and_query.to_string());
-    }
-    let (path, query) = path_and_query
-        .split_once('?')
-        .map(|(path, query)| (path, Some(query)))
-        .unwrap_or((path_and_query, None));
-    let suffix = path
-        .strip_prefix(&config.route_prefix)
-        .ok_or_else(|| "Actions request does not match registered route".to_string())?;
-    if !suffix.is_empty() && !suffix.starts_with('/') {
-        return Err("Actions route prefix matched a partial segment".into());
-    }
-    let local = if suffix.is_empty() { "/" } else { suffix };
-    Ok(match query {
-        Some(query) => format!("{local}?{query}"),
-        None => local.to_string(),
-    })
-}
-
-struct ParsedBuiltinEndpoint {
-    public_url: String,
-    websocket_url: String,
-    client_id: String,
-    route_prefix: String,
-}
-
-fn builtin_endpoint_for_client(
-    value: &str,
-    service: TunnelService,
-    client_id: &str,
-) -> AppResult<ParsedBuiltinEndpoint> {
-    if !valid_client_id(client_id) {
-        return Err(AppError::Message(
-            "內建隧道 Client ID 只能包含英文字母、數字、- 與 _。".into(),
-        ));
-    }
-    let parsed = parse_builtin_endpoint(value, service)?;
-    let mut url = reqwest::Url::parse(&parsed.public_url)
-        .map_err(|_| AppError::Message("內建隧道公開網址格式無效。".into()))?;
-    let path = match service {
-        TunnelService::Mcp => format!("/builtin/clients/{client_id}/mcp"),
-        TunnelService::Actions => format!("/builtin/actions/{client_id}"),
-    };
-    url.set_path(&path);
-    parse_builtin_endpoint(url.as_str(), service)
-}
-
-fn parse_builtin_endpoint(value: &str, service: TunnelService) -> AppResult<ParsedBuiltinEndpoint> {
-    let mut url = reqwest::Url::parse(value.trim())
-        .map_err(|_| AppError::Message("內建隧道公開網址格式無效。".into()))?;
-    if url.scheme() != "https" {
-        return Err(AppError::Message("內建隧道公開網址必須使用 HTTPS。".into()));
-    }
-    if url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(AppError::Message(
-            "內建隧道公開網址不得包含帳號、密碼、query 或 fragment。".into(),
-        ));
-    }
-    let segments = url
-        .path_segments()
-        .map(|segments| segments.filter(|part| !part.is_empty()).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let (client_id, route_prefix) = match service {
-        TunnelService::Mcp
-            if (segments.len() == 3 || segments.len() == 4)
-                && segments[0] == "builtin"
-                && segments[1] == "clients"
-                && (segments.len() == 3 || segments[3] == "mcp") =>
-        {
-            (
-                segments[2].to_string(),
-                format!("/builtin/clients/{}", segments[2]),
-            )
-        }
-        TunnelService::Actions
-            if segments.len() == 3 && segments[0] == "builtin" && segments[1] == "actions" =>
-        {
-            (
-                segments[2].to_string(),
-                format!("/builtin/actions/{}", segments[2]),
-            )
-        }
-        TunnelService::Mcp => {
-            return Err(AppError::Message(
-                "內建 MCP 網址必須使用 /builtin/clients/<client-id>/mcp。".into(),
-            ));
-        }
-        TunnelService::Actions => {
-            return Err(AppError::Message(
-                "內建 Actions 網址必須使用 /builtin/actions/<client-id>。".into(),
-            ));
-        }
-    };
-    if !valid_client_id(&client_id) {
-        return Err(AppError::Message(
-            "內建隧道 Client ID 只能包含英文字母、數字、- 與 _。".into(),
-        ));
-    }
-
-    let public_path = match service {
-        TunnelService::Mcp => format!("{route_prefix}/mcp"),
-        TunnelService::Actions => route_prefix.clone(),
-    };
-    url.set_path(&public_path);
-    let public_url = url.as_str().trim_end_matches('/').to_string();
-    url.set_scheme("wss")
-        .map_err(|_| AppError::Message("無法建立內建 WSS 網址。".into()))?;
-    url.set_path(WS_PATH);
-    let websocket_url = url.to_string();
-
-    Ok(ParsedBuiltinEndpoint {
-        public_url,
-        websocket_url,
-        client_id,
-        route_prefix,
-    })
 }
 
 fn local_connect_host(bind_address: &str) -> String {
@@ -1912,825 +1112,4 @@ fn append_log(path: &Path, line: &str) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn single_worker_policy() -> WorkerPolicy {
-        let mut policy = WorkerPolicy::default_for(TunnelService::Mcp);
-        policy.start_workers = 1;
-        policy.min_idle_workers = 1;
-        policy.max_idle_workers = 1;
-        policy.max_workers = 1;
-        policy
-    }
-
-    #[test]
-    fn parses_namespaced_mcp_endpoint() {
-        let endpoint = parse_builtin_endpoint(
-            "https://tunnel.example.com/builtin/clients/pc-a/mcp",
-            TunnelService::Mcp,
-        )
-        .unwrap();
-        assert_eq!(endpoint.client_id, "pc-a");
-        assert_eq!(endpoint.route_prefix, "/builtin/clients/pc-a");
-        assert_eq!(
-            endpoint.websocket_url,
-            "wss://tunnel.example.com/_tunnel/v1"
-        );
-    }
-
-    #[test]
-    fn upgrades_namespaced_mcp_base_url_to_endpoint() {
-        let endpoint = parse_builtin_endpoint(
-            "https://tunnel.example.com/builtin/clients/pc-a",
-            TunnelService::Mcp,
-        )
-        .unwrap();
-        assert_eq!(
-            endpoint.public_url,
-            "https://tunnel.example.com/builtin/clients/pc-a/mcp"
-        );
-        assert_eq!(endpoint.client_id, "pc-a");
-    }
-
-    #[test]
-    fn replaces_bootstrap_client_id_with_server_assigned_id() {
-        let endpoint = builtin_endpoint_for_client(
-            "https://tunnel.example.com/builtin/clients/workspace-placeholder/mcp",
-            TunnelService::Mcp,
-            "pc-a",
-        )
-        .unwrap();
-        assert_eq!(
-            endpoint.public_url,
-            "https://tunnel.example.com/builtin/clients/pc-a/mcp"
-        );
-        assert_eq!(endpoint.client_id, "pc-a");
-    }
-
-    #[test]
-    fn actions_requests_strip_only_the_registered_prefix() {
-        let config = BuiltinTunnelConfig {
-            public_url: "https://example.com/builtin/actions/pc-a".into(),
-            websocket_url: "wss://example.com/_tunnel/v1".into(),
-            client_id: "pc-a".into(),
-            service: TunnelService::Actions,
-            route_prefix: "/builtin/actions/pc-a".into(),
-            local_base_url: "http://127.0.0.1:7001".into(),
-            device_id: "device-1".into(),
-            signing_key: Arc::new(SigningKey::from_bytes(&[7_u8; 32])),
-            log_path: PathBuf::new(),
-        };
-        assert_eq!(
-            local_path_for_request(&config, "/builtin/actions/pc-a/openapi.json?x=1").unwrap(),
-            "/openapi.json?x=1"
-        );
-        assert!(local_path_for_request(&config, "/builtin/actions/pc-ab").is_err());
-    }
-
-    #[test]
-    fn enrollment_link_must_match_the_public_origin_and_path() {
-        let url = parse_enrollment_url(
-            "https://tunnel.example.com/builtin/clients/pc-a/mcp",
-            "https://tunnel.example.com/_tunnel/enroll/abc123",
-        )
-        .unwrap();
-        assert_eq!(url.path(), "/_tunnel/enroll/abc123");
-        assert!(parse_enrollment_url(
-            "https://tunnel.example.com/builtin/clients/pc-a/mcp",
-            "https://other.example/_tunnel/enroll/abc123",
-        )
-        .is_err());
-        assert!(parse_enrollment_url(
-            "https://tunnel.example.com/builtin/clients/pc-a/mcp",
-            "https://tunnel.example.com/_tunnel/enroll/abc123?copy=1",
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn rejects_non_namespaced_builtin_urls() {
-        assert!(
-            parse_builtin_endpoint("https://example.com/clients/pc-a/mcp", TunnelService::Mcp)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn server_policy_updates_pool_metrics() {
-        let metrics = BuiltinTunnelMetrics::new(1);
-        let mut policy = WorkerPolicy::default_for(TunnelService::Mcp);
-        policy.max_workers = 24;
-        policy.revision = 7;
-        metrics.set_policy(&policy);
-        metrics.set_pool_counts(3, 2);
-
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.configured_workers, 24);
-        assert_eq!(snapshot.idle_workers, 3);
-        assert_eq!(snapshot.busy_workers, 2);
-        assert_eq!(snapshot.policy_revision, 7);
-    }
-
-    #[test]
-    fn reconnect_backoff_is_jittered_bounded_and_resets_after_connect() {
-        let base = Duration::from_secs(8);
-        let worker_zero = reconnect_delay(base, 0, 3);
-        let worker_one = reconnect_delay(base, 1, 3);
-
-        assert!(worker_zero >= Duration::from_millis(6_400));
-        assert!(worker_zero <= base);
-        assert!(worker_one >= Duration::from_millis(6_400));
-        assert!(worker_one <= base);
-        assert_ne!(worker_zero, worker_one);
-        assert_eq!(next_reconnect_base(base, true), Duration::from_secs(1));
-        assert_eq!(
-            next_reconnect_base(Duration::from_secs(10), false),
-            MAX_RECONNECT_DELAY
-        );
-    }
-
-    #[test]
-    fn connected_worker_guard_keeps_live_count_exact() {
-        let metrics = Arc::new(BuiltinTunnelMetrics::new(8));
-        assert_eq!(metrics.snapshot().connected_workers, 0);
-
-        let first = ConnectedWorkerGuard::new(metrics.clone());
-        let second = ConnectedWorkerGuard::new(metrics.clone());
-        assert_eq!(metrics.snapshot().connected_workers, 2);
-
-        drop(first);
-        assert_eq!(metrics.snapshot().connected_workers, 1);
-        drop(second);
-        assert_eq!(metrics.snapshot().connected_workers, 0);
-        assert_eq!(metrics.snapshot().configured_workers, 8);
-    }
-
-    #[test]
-    fn availability_state_distinguishes_running_from_reconnecting() {
-        let reconnecting = BuiltinTunnelSnapshot {
-            configured_workers: 8,
-            connected_workers: 0,
-            idle_workers: 0,
-            busy_workers: 0,
-            recycled_workers: 0,
-            policy_revision: 1,
-            last_error: Some("offline".into()),
-        };
-        let running = BuiltinTunnelSnapshot {
-            configured_workers: 8,
-            connected_workers: 2,
-            idle_workers: 1,
-            busy_workers: 1,
-            recycled_workers: 3,
-            policy_revision: 2,
-            last_error: None,
-        };
-
-        assert_eq!(reconnecting.availability_state(true), "reconnecting");
-        assert_eq!(running.availability_state(true), "running");
-        assert_eq!(running.availability_state(false), "stopped");
-    }
-
-    #[test]
-    fn heartbeat_deadline_moves_forward_with_server_activity() {
-        let started = Instant::now();
-        let mut heartbeat = HeartbeatTracker::new_at(started);
-
-        assert!(!heartbeat.expired_at(started + Duration::from_secs(44)));
-        assert!(heartbeat.expired_at(started + Duration::from_secs(45)));
-
-        heartbeat.record_activity_at(started + Duration::from_secs(30));
-        assert!(!heartbeat.expired_at(started + Duration::from_secs(60)));
-        assert!(heartbeat.expired_at(started + Duration::from_secs(75)));
-    }
-
-    #[test]
-    fn dynamic_pool_plan_uses_demand_connecting_limits_and_staged_shrink() {
-        let policy = coding_tools_tunnel_protocol::WorkerPolicy::default_for(TunnelService::Mcp);
-        let max_connecting = configured_max_connecting(&policy);
-        assert_eq!(max_connecting, 4);
-        assert_eq!(configured_burst_warm_floor(&policy), 8);
-
-        assert_eq!(
-            pool_adjustment(
-                &policy,
-                PoolCounts {
-                    total: 1,
-                    connecting: 1,
-                    idle: 0,
-                    busy: 0,
-                },
-                1,
-                max_connecting,
-                0,
-                false,
-                4,
-            ),
-            PoolAdjustment {
-                spawn: 3,
-                retire: 0,
-            }
-        );
-        assert_eq!(
-            pool_adjustment(
-                &policy,
-                PoolCounts {
-                    total: 4,
-                    connecting: 0,
-                    idle: 1,
-                    busy: 3,
-                },
-                0,
-                max_connecting,
-                16,
-                false,
-                8,
-            ),
-            PoolAdjustment {
-                spawn: 4,
-                retire: 0,
-            }
-        );
-        let connecting_limited = PoolCounts {
-            total: 8,
-            connecting: 4,
-            idle: 0,
-            busy: 4,
-        };
-        let connecting_adjustment =
-            pool_adjustment(&policy, connecting_limited, 4, max_connecting, 16, false, 8);
-        assert_eq!(connecting_adjustment.spawn, 0);
-        assert_eq!(
-            scale_up_block(
-                &policy,
-                connecting_limited,
-                4,
-                max_connecting,
-                16,
-                connecting_adjustment,
-            ),
-            Some(ScaleUpBlock::ConnectingLimitReached)
-        );
-
-        for (total, floor, expected_retire) in [(16, 8, 4), (12, 8, 4), (8, 8, 0), (8, 4, 4)] {
-            assert_eq!(
-                pool_adjustment(
-                    &policy,
-                    PoolCounts {
-                        total,
-                        connecting: 0,
-                        idle: total,
-                        busy: 0,
-                    },
-                    0,
-                    max_connecting,
-                    0,
-                    true,
-                    floor,
-                )
-                .retire,
-                expected_retire,
-            );
-        }
-
-        let maximum = PoolCounts {
-            total: usize::from(policy.max_workers),
-            connecting: 0,
-            idle: 0,
-            busy: usize::from(policy.max_workers),
-        };
-        assert_eq!(
-            scale_up_block(
-                &policy,
-                maximum,
-                0,
-                max_connecting,
-                usize::from(policy.max_workers).saturating_add(1),
-                PoolAdjustment {
-                    spawn: 0,
-                    retire: 0,
-                },
-            ),
-            Some(ScaleUpBlock::MaxWorkersReached)
-        );
-    }
-
-    #[test]
-    fn stale_connecting_workers_stop_counting_as_idle_reserve() {
-        let (_retire_tx, retire_rx) = watch::channel(false);
-        let (second_tx, _second_rx) = watch::channel(false);
-        let now = Instant::now();
-        let workers = HashMap::from([
-            (
-                1,
-                ManagedWorker {
-                    state: PoolWorkerState::Connecting,
-                    connecting_since: now,
-                    retire: _retire_tx,
-                },
-            ),
-            (
-                2,
-                ManagedWorker {
-                    state: PoolWorkerState::Connecting,
-                    connecting_since: now - Duration::from_secs(2),
-                    retire: second_tx,
-                },
-            ),
-        ]);
-        drop(retire_rx);
-        assert_eq!(
-            effective_connecting_workers(&workers, Duration::from_secs(1)),
-            1
-        );
-        let policy = WorkerPolicy::default_for(TunnelService::Mcp);
-        let counts = pool_counts(&workers);
-        let adjustment = pool_adjustment(
-            &policy,
-            counts,
-            1,
-            configured_max_connecting(&policy),
-            4,
-            false,
-            usize::from(policy.max_idle_workers),
-        );
-        assert_eq!(adjustment.spawn, 2);
-    }
-
-    #[test]
-    fn worker_recycle_limits_are_jittered_and_checked_only_at_idle_boundaries() {
-        let low = jittered_limit(500, 7, 10);
-        let high = jittered_limit(500, 8, 10);
-        assert!((450..=550).contains(&low));
-        assert!((450..=550).contains(&high));
-        assert_ne!(low, high);
-
-        let policy = coding_tools_tunnel_protocol::WorkerPolicy::default_for(TunnelService::Mcp);
-        assert!(!worker_should_recycle(
-            &policy,
-            7,
-            449,
-            Duration::from_secs(10)
-        ));
-        assert!(worker_should_recycle(
-            &policy,
-            7,
-            low,
-            Duration::from_secs(10)
-        ));
-        assert!(worker_should_recycle(
-            &policy,
-            7,
-            1,
-            Duration::from_secs(jittered_limit(3_600, 7, 10))
-        ));
-    }
-
-    #[tokio::test]
-    async fn worker_pool_bootstraps_grows_and_gracefully_shrinks_from_server_policy() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind websocket test server");
-        let address = listener.local_addr().expect("test server address");
-        let mut grow_policy = single_worker_policy();
-        grow_policy.start_workers = 3;
-        grow_policy.min_idle_workers = 2;
-        grow_policy.max_idle_workers = 3;
-        grow_policy.max_workers = 3;
-        let (policy_tx, policy_rx) = watch::channel(grow_policy.clone());
-        let (ready_tx, mut ready_rx) = mpsc::channel(3);
-        let (closed_tx, mut closed_rx) = mpsc::channel(3);
-        let server = tokio::spawn(async move {
-            let mut handlers = JoinSet::new();
-            for connection_index in 0..3 {
-                let (stream, _) = listener.accept().await.expect("accept worker");
-                let ready_tx = ready_tx.clone();
-                let closed_tx = closed_tx.clone();
-                let mut updates = policy_rx.clone();
-                handlers.spawn(async move {
-                    let mut socket = tokio_tungstenite::accept_hdr_async(
-                        stream,
-                        |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                         mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                            response.headers_mut().insert(
-                                SEC_WEBSOCKET_PROTOCOL,
-                                WS_SUBPROTOCOL.parse().expect("subprotocol header"),
-                            );
-                            Ok(response)
-                        },
-                    )
-                    .await
-                    .expect("accept websocket");
-                    socket
-                        .send(Message::Text(
-                            serde_json::to_string(&ControlMessage::Challenge {
-                                nonce: format!("grow-{connection_index}"),
-                                expires_at_unix_ms: unix_ms().saturating_add(10_000),
-                            })
-                            .expect("challenge json")
-                            .into(),
-                        ))
-                        .await
-                        .expect("send challenge");
-                    assert!(matches!(
-                        socket.next().await.expect("authenticate frame"),
-                        Ok(Message::Text(_))
-                    ));
-                    let initial_policy = updates.borrow().clone();
-                    socket
-                        .send(Message::Text(
-                            serde_json::to_string(&ControlMessage::HelloAck {
-                                protocol_version: PROTOCOL_VERSION,
-                                worker_policy: initial_policy,
-                            })
-                            .expect("hello ack json")
-                            .into(),
-                        ))
-                        .await
-                        .expect("send hello ack");
-                    let ready = socket.next().await.expect("ready frame").expect("ready");
-                    assert!(matches!(ready, Message::Text(_)));
-                    ready_tx.send(()).await.expect("report ready");
-
-                    updates.changed().await.expect("policy update");
-                    let updated_policy = updates.borrow().clone();
-                    socket
-                        .send(Message::Text(
-                            serde_json::to_string(&ControlMessage::PolicyUpdate {
-                                worker_policy: updated_policy,
-                            })
-                            .expect("policy update json")
-                            .into(),
-                        ))
-                        .await
-                        .expect("send policy update");
-                    while let Some(message) = socket.next().await {
-                        if matches!(message, Ok(Message::Close(_))) {
-                            break;
-                        }
-                    }
-                    let _ = closed_tx.send(()).await;
-                });
-            }
-            drop(ready_tx);
-            drop(closed_tx);
-            while handlers.join_next().await.is_some() {}
-        });
-
-        let log_dir = tempfile::tempdir().expect("log tempdir");
-        let config = BuiltinTunnelConfig {
-            public_url: format!("http://{address}/builtin/clients/pc-a/mcp"),
-            websocket_url: format!("ws://{address}{WS_PATH}"),
-            client_id: "pc-a".into(),
-            service: TunnelService::Mcp,
-            route_prefix: "/builtin/clients/pc-a".into(),
-            local_base_url: "http://127.0.0.1:1".into(),
-            device_id: "device-1".into(),
-            signing_key: Arc::new(SigningKey::from_bytes(&[29_u8; 32])),
-            log_path: log_dir.path().join("builtin-grow-test.log"),
-        };
-        let metrics = Arc::new(BuiltinTunnelMetrics::new(1));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (status_tx, _status_rx) = mpsc::channel(8);
-        let pool_log_path = config.log_path.clone();
-        let pool = tokio::spawn(run_worker_pool(
-            config,
-            shutdown_rx,
-            status_tx,
-            metrics.clone(),
-        ));
-
-        timeout(Duration::from_secs(4), async {
-            for _ in 0..3 {
-                ready_rx.recv().await.expect("worker ready");
-            }
-        })
-        .await
-        .expect("pool growth deadline");
-        assert_eq!(metrics.snapshot().configured_workers, 3);
-        assert_eq!(metrics.snapshot().connected_workers, 3);
-
-        let mut shrink_policy = single_worker_policy();
-        shrink_policy.revision = 2;
-        policy_tx
-            .send(shrink_policy)
-            .expect("publish shrink policy");
-        timeout(Duration::from_secs(4), async {
-            while metrics.snapshot().connected_workers > 1 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            for _ in 0..2 {
-                closed_rx.recv().await.expect("retired worker");
-            }
-        })
-        .await
-        .expect("pool shrink deadline");
-        assert_eq!(metrics.snapshot().configured_workers, 1);
-        assert_eq!(metrics.snapshot().connected_workers, 1);
-
-        let _ = shutdown_tx.send(true);
-        timeout(Duration::from_secs(2), pool)
-            .await
-            .expect("pool shutdown")
-            .expect("pool task");
-        timeout(Duration::from_secs(2), server)
-            .await
-            .expect("server shutdown")
-            .expect("server task");
-        let pool_log = std::fs::read_to_string(pool_log_path).expect("pool audit log");
-        assert!(pool_log.contains("event=worker_policy_applied"));
-        assert!(pool_log.contains("event=scale_up"));
-        assert!(pool_log.contains("reason=startup"));
-        assert!(pool_log.contains("event=scale_down"));
-        assert!(pool_log.contains("reason=max_workers_reduced"));
-    }
-
-    #[tokio::test]
-    async fn worker_recycles_after_request_limit_and_pool_replaces_it() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind local http server");
-        let local_address = local_listener.local_addr().expect("local http address");
-        let local_server = tokio::spawn(async move {
-            let (mut stream, _) = local_listener.accept().await.expect("accept local request");
-            let mut request = vec![0_u8; 4096];
-            let read = stream.read(&mut request).await.expect("read local request");
-            assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET "));
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-                .await
-                .expect("write local response");
-        });
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind websocket test server");
-        let address = listener.local_addr().expect("test server address");
-        let mut recycle_policy = single_worker_policy();
-        recycle_policy.max_requests_per_worker = 1;
-        recycle_policy.max_lifetime_seconds = 0;
-        recycle_policy.recycle_jitter_percent = 0;
-        let (replacement_tx, mut replacement_rx) = mpsc::channel(1);
-        let server = tokio::spawn(async move {
-            for connection_index in 0..2 {
-                let (stream, _) = listener.accept().await.expect("accept worker");
-                let mut socket = tokio_tungstenite::accept_hdr_async(
-                    stream,
-                    |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                     mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                        response.headers_mut().insert(
-                            SEC_WEBSOCKET_PROTOCOL,
-                            WS_SUBPROTOCOL.parse().expect("subprotocol header"),
-                        );
-                        Ok(response)
-                    },
-                )
-                .await
-                .expect("accept websocket");
-                socket
-                    .send(Message::Text(
-                        serde_json::to_string(&ControlMessage::Challenge {
-                            nonce: format!("recycle-{connection_index}"),
-                            expires_at_unix_ms: unix_ms().saturating_add(10_000),
-                        })
-                        .expect("challenge json")
-                        .into(),
-                    ))
-                    .await
-                    .expect("send challenge");
-                assert!(matches!(
-                    socket.next().await.expect("authenticate frame"),
-                    Ok(Message::Text(_))
-                ));
-                socket
-                    .send(Message::Text(
-                        serde_json::to_string(&ControlMessage::HelloAck {
-                            protocol_version: PROTOCOL_VERSION,
-                            worker_policy: recycle_policy.clone(),
-                        })
-                        .expect("hello ack json")
-                        .into(),
-                    ))
-                    .await
-                    .expect("send hello ack");
-                let ready = socket.next().await.expect("ready frame").expect("ready");
-                assert_eq!(
-                    serde_json::from_str::<ControlMessage>(ready.into_text().unwrap().as_ref())
-                        .expect("ready json"),
-                    ControlMessage::Ready
-                );
-
-                if connection_index == 0 {
-                    socket
-                        .send(Message::Text(
-                            serde_json::to_string(&ControlMessage::RequestHead {
-                                request_id: "request-1".into(),
-                                method: "GET".into(),
-                                path_and_query: "/builtin/clients/pc-a/mcp".into(),
-                                headers: Vec::new(),
-                                demand: None,
-                            })
-                            .expect("request head")
-                            .into(),
-                        ))
-                        .await
-                        .expect("send request head");
-                    socket
-                        .send(Message::Text(
-                            serde_json::to_string(&ControlMessage::RequestEnd {
-                                request_id: "request-1".into(),
-                            })
-                            .expect("request end")
-                            .into(),
-                        ))
-                        .await
-                        .expect("send request end");
-                    let mut response_finished = false;
-                    while let Some(message) = socket.next().await {
-                        match message.expect("response frame") {
-                            Message::Text(text) => {
-                                let control = serde_json::from_str::<ControlMessage>(&text)
-                                    .expect("response control");
-                                if matches!(control, ControlMessage::ResponseEnd { .. }) {
-                                    response_finished = true;
-                                }
-                            }
-                            Message::Close(_) => break,
-                            _ => {}
-                        }
-                    }
-                    assert!(response_finished);
-                } else {
-                    replacement_tx.send(()).await.expect("replacement ready");
-                    while socket.next().await.is_some() {}
-                }
-            }
-        });
-
-        let log_dir = tempfile::tempdir().expect("log tempdir");
-        let config = BuiltinTunnelConfig {
-            public_url: format!("http://{address}/builtin/clients/pc-a/mcp"),
-            websocket_url: format!("ws://{address}{WS_PATH}"),
-            client_id: "pc-a".into(),
-            service: TunnelService::Mcp,
-            route_prefix: "/builtin/clients/pc-a".into(),
-            local_base_url: format!("http://{local_address}"),
-            device_id: "device-1".into(),
-            signing_key: Arc::new(SigningKey::from_bytes(&[31_u8; 32])),
-            log_path: log_dir.path().join("builtin-recycle-test.log"),
-        };
-        let metrics = Arc::new(BuiltinTunnelMetrics::new(1));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (status_tx, _status_rx) = mpsc::channel(8);
-        let pool = tokio::spawn(run_worker_pool(
-            config,
-            shutdown_rx,
-            status_tx,
-            metrics.clone(),
-        ));
-
-        timeout(Duration::from_secs(4), replacement_rx.recv())
-            .await
-            .expect("replacement deadline")
-            .expect("replacement worker");
-        assert_eq!(metrics.snapshot().recycled_workers, 1);
-        assert_eq!(metrics.snapshot().connected_workers, 1);
-
-        let _ = shutdown_tx.send(true);
-        timeout(Duration::from_secs(2), pool)
-            .await
-            .expect("pool shutdown")
-            .expect("pool task");
-        timeout(Duration::from_secs(2), server)
-            .await
-            .expect("server shutdown")
-            .expect("server task");
-        timeout(Duration::from_secs(2), local_server)
-            .await
-            .expect("local server shutdown")
-            .expect("local server task");
-    }
-
-    #[tokio::test]
-    async fn worker_pool_reconnects_after_authenticated_socket_closes() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind websocket test server");
-        let address = listener.local_addr().expect("test server address");
-        let server = tokio::spawn(async move {
-            for connection_index in 0..2 {
-                let (stream, _) = listener.accept().await.expect("accept worker");
-                let mut socket = tokio_tungstenite::accept_hdr_async(
-                    stream,
-                    |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                     mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                        response.headers_mut().insert(
-                            SEC_WEBSOCKET_PROTOCOL,
-                            WS_SUBPROTOCOL.parse().expect("subprotocol header"),
-                        );
-                        Ok(response)
-                    },
-                )
-                .await
-                .expect("accept websocket");
-                socket
-                    .send(Message::Text(
-                        serde_json::to_string(&ControlMessage::Challenge {
-                            nonce: format!("nonce-{connection_index}"),
-                            expires_at_unix_ms: unix_ms().saturating_add(10_000),
-                        })
-                        .expect("challenge json")
-                        .into(),
-                    ))
-                    .await
-                    .expect("send challenge");
-                let authenticate = socket
-                    .next()
-                    .await
-                    .expect("authenticate frame")
-                    .expect("authenticate frame");
-                assert!(matches!(authenticate, Message::Text(_)));
-                socket
-                    .send(Message::Text(
-                        serde_json::to_string(&ControlMessage::HelloAck {
-                            protocol_version: PROTOCOL_VERSION,
-                            worker_policy: single_worker_policy(),
-                        })
-                        .expect("hello ack json")
-                        .into(),
-                    ))
-                    .await
-                    .expect("send hello ack");
-                let ready = socket
-                    .next()
-                    .await
-                    .expect("ready frame")
-                    .expect("ready frame");
-                let Message::Text(ready) = ready else {
-                    panic!("expected ready text");
-                };
-                assert_eq!(
-                    serde_json::from_str::<ControlMessage>(ready.as_ref()).expect("ready json"),
-                    ControlMessage::Ready
-                );
-
-                if connection_index == 0 {
-                    socket.close(None).await.expect("close first socket");
-                } else {
-                    while socket.next().await.is_some() {}
-                }
-            }
-        });
-
-        let log_dir = tempfile::tempdir().expect("log tempdir");
-        let config = BuiltinTunnelConfig {
-            public_url: format!("http://{address}/builtin/clients/pc-a/mcp"),
-            websocket_url: format!("ws://{address}{WS_PATH}"),
-            client_id: "pc-a".into(),
-            service: TunnelService::Mcp,
-            route_prefix: "/builtin/clients/pc-a".into(),
-            local_base_url: "http://127.0.0.1:1".into(),
-            device_id: "device-1".into(),
-            signing_key: Arc::new(SigningKey::from_bytes(&[23_u8; 32])),
-            log_path: log_dir.path().join("builtin-reconnect-test.log"),
-        };
-        let metrics = Arc::new(BuiltinTunnelMetrics::new(1));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (status_tx, mut status_rx) = mpsc::channel(8);
-        let pool = tokio::spawn(run_worker_pool(
-            config,
-            shutdown_rx,
-            status_tx,
-            metrics.clone(),
-        ));
-
-        assert_eq!(status_rx.recv().await.expect("first connection"), Ok(()));
-        let saw_reconnect = timeout(Duration::from_secs(3), async {
-            let mut saw_disconnect = false;
-            loop {
-                match status_rx.recv().await.expect("worker status") {
-                    Ok(()) if saw_disconnect => return true,
-                    Ok(()) => {}
-                    Err(_) => saw_disconnect = true,
-                }
-            }
-        })
-        .await
-        .expect("reconnect deadline");
-        assert!(saw_reconnect);
-        assert_eq!(metrics.snapshot().connected_workers, 1);
-
-        let _ = shutdown_tx.send(true);
-        timeout(Duration::from_secs(2), pool)
-            .await
-            .expect("pool shutdown")
-            .expect("pool task");
-        timeout(Duration::from_secs(2), server)
-            .await
-            .expect("server shutdown")
-            .expect("server task");
-    }
-}
+mod tests;

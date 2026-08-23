@@ -1,27 +1,20 @@
-import { readFile } from 'node:fs/promises';
-import type { IncomingMessage, ServerResponse } from 'node:http';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readFile, stat } from "node:fs/promises";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const uiRoot = fileURLToPath(new URL('./ui/', import.meta.url));
-const assets = new Map<string, { file: string; contentType: string; serviceWorker?: boolean }>([
-  ['/ui/app.js', { file: 'app.js', contentType: 'text/javascript; charset=utf-8' }],
-  ['/ui/app.css', { file: 'app.css', contentType: 'text/css; charset=utf-8' }],
-  ['/ui/manifest.webmanifest', { file: 'manifest.webmanifest', contentType: 'application/manifest+json; charset=utf-8' }],
-  ['/ui/icon.svg', { file: 'icon.svg', contentType: 'image/svg+xml; charset=utf-8' }],
-  ['/ui/sw.js', { file: 'sw.js', contentType: 'text/javascript; charset=utf-8', serviceWorker: true }]
-]);
+const uiRoot = fileURLToPath(new URL("./ui/", import.meta.url));
 
 function securityHeaders(contentSecurityPolicy = false): Record<string, string> {
   const headers: Record<string, string> = {
-    'cache-control': 'no-store',
-    'x-content-type-options': 'nosniff',
-    'x-frame-options': 'DENY',
-    'referrer-policy': 'no-referrer',
-    'permissions-policy': 'camera=(), microphone=(), geolocation=()'
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "no-referrer",
+    "permissions-policy": "camera=(), microphone=(), geolocation=()",
   };
   if (contentSecurityPolicy) {
-    headers['content-security-policy'] = [
+    headers["content-security-policy"] = [
       "default-src 'none'",
       "style-src 'self'",
       "script-src 'self'",
@@ -31,83 +24,186 @@ function securityHeaders(contentSecurityPolicy = false): Record<string, string> 
       "worker-src 'self'",
       "base-uri 'none'",
       "form-action 'none'",
-      "frame-ancestors 'none'"
-    ].join('; ');
+      "frame-ancestors 'none'",
+    ].join("; ");
   }
   return headers;
 }
 
-function page(adminToken: string): string {
-  if (!/^[A-Za-z0-9_-]+$/.test(adminToken)) throw new Error('Invalid management UI token.');
-  return `<!doctype html>
-<html lang="zh-Hant" data-bs-theme="light">
+function contentTypeFor(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case ".html":
+      return "text/html; charset=utf-8";
+    case ".js":
+      return "text/javascript; charset=utf-8";
+    case ".css":
+      return "text/css; charset=utf-8";
+    case ".json":
+      return "application/json; charset=utf-8";
+    case ".webmanifest":
+      return "application/manifest+json; charset=utf-8";
+    case ".svg":
+      return "image/svg+xml; charset=utf-8";
+    case ".png":
+      return "image/png";
+    case ".woff2":
+      return "font/woff2";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+function injectAdminToken(html: string, adminToken: string): string {
+  if (!/^[A-Za-z0-9_-]+$/.test(adminToken)) throw new Error("Invalid management UI token.");
+  if (html.includes('name="ctmcp-admin-token"')) {
+    return html.replace(
+      /<meta\s+name="ctmcp-admin-token"\s+content="[^"]*"\s*\/?>/i,
+      `<meta name="ctmcp-admin-token" content="${adminToken}">`,
+    );
+  }
+  return html.replace(
+    /<head([^>]*)>/i,
+    `<head$1>\n<meta name="ctmcp-admin-token" content="${adminToken}">`,
+  );
+}
+
+function resolveUiFile(pathname: string, assetRoot: string): { filePath: string; spaFallback: boolean } | null {
+  const relative = decodeURIComponent(pathname.replace(/^\/ui\/?/, ""));
+  const target = path.resolve(assetRoot, relative);
+  const root = path.resolve(assetRoot);
+  if (target !== root && !target.startsWith(root + path.sep)) return null;
+  return { filePath: target, spaFallback: !path.extname(relative) };
+}
+
+async function sendFile(res: ServerResponse, filePath: string, html = false): Promise<void> {
+  const content = await readFile(filePath);
+  const headers: Record<string, string> = {
+    "content-type": html ? "text/html; charset=utf-8" : contentTypeFor(filePath),
+    ...securityHeaders(html),
+  };
+  if (path.basename(filePath) === "sw.js") headers["service-worker-allowed"] = "/ui/";
+  res.writeHead(200, headers).end(content);
+}
+
+const FALLBACK_PAGE = `<!doctype html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#0d6efd">
-<meta name="description" content="Coding Tools MCP Headless Agent 管理介面">
-<meta name="ctmcp-admin-token" content="${adminToken}">
-<link rel="manifest" href="/ui/manifest.webmanifest">
-<link rel="icon" href="/ui/icon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/ui/app.css">
-<title>Coding Tools MCP 管理介面</title>
+<meta name="ctmcp-admin-token" content="">
+<meta name="description" content="Coding Tools MCP Headless Agent management interface">
+<title>Coding Tools MCP</title>
 </head>
-<body>
-<div id="root" data-ui-framework="react"></div>
-<noscript>此管理介面需要啟用 JavaScript。</noscript>
-<script src="/ui/app.js" defer></script>
-</body>
+<body data-ui-framework="svelte"></body>
 </html>`;
+
+async function readIndexHtml(assetRoot: string): Promise<string> {
+  try {
+    return await readFile(path.join(assetRoot, "index.html"), "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return FALLBACK_PAGE;
+    throw error;
+  }
 }
 
+async function sendPage(res: ServerResponse, adminToken: string, assetRoot: string): Promise<void> {
+  const html = injectAdminToken(await readIndexHtml(assetRoot), adminToken);
+  res.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    ...securityHeaders(true),
+  }).end(html);
+}
+
+function sendUnavailable(res: ServerResponse, code: string | undefined): void {
+  res.writeHead(code === "ENOENT" ? 503 : 500, {
+    "content-type": "application/json; charset=utf-8",
+    ...securityHeaders(),
+  }).end(JSON.stringify({
+    error: {
+      code: code === "ENOENT" ? "MANAGEMENT_UI_NOT_BUILT" : "MANAGEMENT_UI_UNAVAILABLE",
+      message: code === "ENOENT"
+        ? "Management UI assets are unavailable. Run the package build before starting the Agent."
+        : "Management UI assets could not be loaded.",
+    },
+  }));
+}
+
+const UI_CLIENT_ROUTE = /^\/(?:workspace|settings|quick-setup)(?:\/|$)/;
+
 export function isManagementUiPath(pathname: string): boolean {
-  return pathname === '/' || pathname === '/ui' || pathname.startsWith('/ui/');
+  return pathname === "/" || pathname === "/ui" || pathname.startsWith("/ui/") || UI_CLIENT_ROUTE.test(pathname);
+}
+
+function redirectToUiBase(req: IncomingMessage, res: ServerResponse, pathname: string): void {
+  const raw = req.url ?? pathname;
+  const searchIndex = raw.indexOf("?");
+  const search = searchIndex >= 0 ? raw.slice(searchIndex) : "";
+  res.writeHead(302, { location: `/ui${pathname}${search}`, ...securityHeaders() }).end();
 }
 
 export async function handleManagementUiRequest(
   req: IncomingMessage,
   res: ServerResponse,
   pathname: string,
-  adminToken: string
+  adminToken: string,
+  assetRoot = uiRoot,
 ): Promise<boolean> {
-  const pagePath = pathname === '/' || pathname === '/ui' || pathname === '/ui/';
-  const asset = assets.get(pathname);
-  if ((pagePath || asset) && req.method !== 'GET') {
+  if (!isManagementUiPath(pathname)) return false;
+  if (req.method !== "GET") {
     res.writeHead(405, {
-      allow: 'GET',
-      'content-type': 'application/json; charset=utf-8',
-      ...securityHeaders()
-    }).end(JSON.stringify({ error: { code: 'METHOD_NOT_ALLOWED', message: 'Method not allowed.' } }));
+      allow: "GET",
+      "content-type": "application/json; charset=utf-8",
+      ...securityHeaders(),
+    }).end(JSON.stringify({ error: { code: "METHOD_NOT_ALLOWED", message: "Method not allowed." } }));
     return true;
   }
-  if (pathname === '/' && req.method === 'GET') {
-    res.writeHead(302, { location: '/ui/', ...securityHeaders() }).end();
+  if (pathname === "/" ) {
+    res.writeHead(302, { location: "/ui/", ...securityHeaders() }).end();
     return true;
   }
-  if ((pathname === '/ui' || pathname === '/ui/') && req.method === 'GET') {
-    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...securityHeaders(true) }).end(page(adminToken));
+  if (UI_CLIENT_ROUTE.test(pathname)) {
+    redirectToUiBase(req, res, pathname);
     return true;
   }
-  if (!asset) return false;
+  if (pathname === "/ui" || pathname === "/ui/") {
+    try {
+      await sendPage(res, adminToken, assetRoot);
+    } catch (error) {
+      sendUnavailable(res, (error as NodeJS.ErrnoException).code);
+    }
+    return true;
+  }
+
+  const resolved = resolveUiFile(pathname, assetRoot);
+  if (!resolved) return false;
   try {
-    const content = await readFile(path.join(uiRoot, asset.file));
-    const headers: Record<string, string> = { 'content-type': asset.contentType, ...securityHeaders() };
-    if (asset.serviceWorker) headers['service-worker-allowed'] = '/ui/';
-    res.writeHead(200, headers).end(content);
+    const info = await stat(resolved.filePath);
+    if (info.isFile()) {
+      await sendFile(res, resolved.filePath, path.extname(resolved.filePath) === ".html");
+      return true;
+    }
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    res.writeHead(code === 'ENOENT' ? 503 : 500, {
-      'content-type': 'application/json; charset=utf-8',
-      ...securityHeaders()
-    }).end(JSON.stringify({
-      error: {
-        code: code === 'ENOENT' ? 'MANAGEMENT_UI_NOT_BUILT' : 'MANAGEMENT_UI_UNAVAILABLE',
-        message: code === 'ENOENT'
-          ? 'Management UI assets are unavailable. Run the package build before starting the Agent.'
-          : 'Management UI assets could not be loaded.'
-      }
-    }));
+    if (code !== "ENOENT") {
+      sendUnavailable(res, code);
+      return true;
+    }
   }
+
+  if (resolved.spaFallback) {
+    try {
+      await sendPage(res, adminToken, assetRoot);
+      return true;
+    } catch (error) {
+      sendUnavailable(res, (error as NodeJS.ErrnoException).code);
+      return true;
+    }
+  }
+
+  res.writeHead(404, {
+    "content-type": "application/json; charset=utf-8",
+    ...securityHeaders(),
+  }).end(JSON.stringify({ error: { code: "NOT_FOUND", message: "Not found." } }));
   return true;
 }

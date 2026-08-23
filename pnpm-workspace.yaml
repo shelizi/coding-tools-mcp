@@ -1,2 +1,8 @@
+packages:
+  - 'packages/*'
+
+sharedWorkspaceLockfile: true
+injectWorkspacePackages: true
+
 allowBuilds:
   esbuild: true

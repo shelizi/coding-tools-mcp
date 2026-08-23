@@ -255,6 +255,48 @@ test('ignored, hidden, and generated traversal are independent while .git is alw
   assert.equal(outside.error.code, 'PATH_OUTSIDE_WORKSPACE');
 });
 
+test('linked worktree .git pointer honors shared info exclude', async t => {
+  const { root, ctx, meta } = await fixture(t);
+  const commonGit = await mkdtemp(path.join(tmpdir(), 'ctmcp-ignore-common-git-'));
+  t.after(() => rm(commonGit, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
+  const admin = path.join(commonGit, 'worktrees', 'linked');
+  await mkdir(path.join(commonGit, 'info'), { recursive: true });
+  await mkdir(admin, { recursive: true });
+  await writeFile(path.join(root, '.git'), `gitdir: ${admin}\n`);
+  await writeFile(path.join(admin, 'gitdir'), `${path.join(root, '.git')}\n`);
+  await writeFile(path.join(admin, 'commondir'), '../..\n');
+  await writeFile(path.join(commonGit, 'info', 'exclude'), 'worktree-ignored.txt\n');
+  await put(root, 'visible.txt', 'needle visible\n');
+  await put(root, 'worktree-ignored.txt', 'needle ignored\n');
+
+  assert.deepEqual(await listedPaths(ctx, meta), ['visible.txt']);
+
+  const search = await callTool(ctx, 'search_text', { query: 'needle', max_results: 100 }, meta);
+  assert.equal(search.ok, true, JSON.stringify(search));
+  assert.deepEqual(search.matches.map(match => match.path), ['visible.txt']);
+
+  assert.deepEqual(
+    await listedPaths(ctx, meta, { include_ignored: true }),
+    ['visible.txt', 'worktree-ignored.txt']
+  );
+});
+
+test('linked worktree metadata pointer requires a reciprocal gitdir backlink', async t => {
+  const { root, ctx, meta } = await fixture(t);
+  const commonGit = await mkdtemp(path.join(tmpdir(), 'ctmcp-ignore-untrusted-git-'));
+  t.after(() => rm(commonGit, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
+  const admin = path.join(commonGit, 'worktrees', 'linked');
+  await mkdir(path.join(commonGit, 'info'), { recursive: true });
+  await mkdir(admin, { recursive: true });
+  await writeFile(path.join(root, '.git'), `gitdir: ${admin}\n`);
+  await writeFile(path.join(admin, 'gitdir'), `${path.join(root, 'not-the-dotgit-file')}\n`);
+  await writeFile(path.join(admin, 'commondir'), '../..\n');
+  await writeFile(path.join(commonGit, 'info', 'exclude'), 'must-remain-visible.txt\n');
+  await put(root, 'must-remain-visible.txt', 'needle visible\n');
+
+  assert.deepEqual(await listedPaths(ctx, meta), ['must-remain-visible.txt']);
+});
+
 test('project map, search and formatter project scope share ignore-aware traversal', async t => {
   const { root, ctx, meta } = await fixture(t);
   await put(root, '.gitignore', 'ignored/\nignored.json\n');

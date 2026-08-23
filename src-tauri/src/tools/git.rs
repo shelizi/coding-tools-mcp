@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
@@ -35,6 +36,44 @@ impl GitTarget {
             "branch": self.branch,
             "head": self.head,
             "repo_fingerprint": self.fingerprint,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct GitWorktreeEntry {
+    path: String,
+    absolute_path: PathBuf,
+    head: String,
+    branch: String,
+    detached: bool,
+    bare: bool,
+    locked: Option<String>,
+    prunable: Option<String>,
+    primary: bool,
+    inside_workspace: bool,
+    managed: bool,
+    removable: bool,
+    dirty: Option<bool>,
+    branch_merged: Option<bool>,
+}
+
+impl GitWorktreeEntry {
+    fn value(&self) -> Value {
+        json!({
+            "path": self.path,
+            "head": self.head,
+            "branch": self.branch,
+            "detached": self.detached,
+            "bare": self.bare,
+            "locked": self.locked.as_ref().map(|value| if value.is_empty() { Value::Bool(true) } else { Value::String(value.clone()) }).unwrap_or(Value::Null),
+            "prunable": self.prunable.as_ref().map(|value| if value.is_empty() { Value::Bool(true) } else { Value::String(value.clone()) }).unwrap_or(Value::Null),
+            "primary": self.primary,
+            "inside_workspace": self.inside_workspace,
+            "managed": self.managed,
+            "removable": self.removable,
+            "dirty": self.dirty,
+            "branch_merged": self.branch_merged,
         })
     }
 }
@@ -545,6 +584,496 @@ pub fn git_branch(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     })))
 }
 
+fn git_path_identity(path: &Path) -> String {
+    let value = git_cli_path(path);
+    #[cfg(windows)]
+    return value
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    #[cfg(not(windows))]
+    value.trim_end_matches('/').to_string()
+}
+
+fn git_worktree_display(ws: &Workspace, path: &Path) -> String {
+    let workspace = PathBuf::from(git_cli_path(ws.root()));
+    let candidate = PathBuf::from(git_cli_path(path));
+    candidate
+        .strip_prefix(&workspace)
+        .ok()
+        .map(|relative| {
+            if relative.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                relative.to_string_lossy().replace('\\', "/")
+            }
+        })
+        .unwrap_or_else(|| candidate.to_string_lossy().replace('\\', "/"))
+}
+
+fn list_git_worktrees(
+    ws: &Workspace,
+    root: &Path,
+) -> Result<Vec<GitWorktreeEntry>, WorkspaceError> {
+    let completed = run_git(
+        root,
+        &["worktree", "list", "--porcelain"],
+        Duration::from_secs(10),
+    )?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    let mut entries = Vec::new();
+    let mut current: Option<GitWorktreeEntry> = None;
+    let flush = |current: &mut Option<GitWorktreeEntry>, entries: &mut Vec<GitWorktreeEntry>| {
+        if let Some(entry) = current.take() {
+            entries.push(entry);
+        }
+    };
+    for line in completed.stdout.lines() {
+        if line.is_empty() {
+            flush(&mut current, &mut entries);
+            continue;
+        }
+        let (field, value) = line.split_once(' ').unwrap_or((line, ""));
+        if field == "worktree" {
+            flush(&mut current, &mut entries);
+            let absolute_path = PathBuf::from(value);
+            current = Some(GitWorktreeEntry {
+                path: git_worktree_display(ws, &absolute_path),
+                absolute_path,
+                ..Default::default()
+            });
+            continue;
+        }
+        let Some(entry) = current.as_mut() else {
+            continue;
+        };
+        match field {
+            "HEAD" => entry.head = value.to_string(),
+            "branch" => {
+                entry.branch = value
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(value)
+                    .to_string()
+            }
+            "detached" => entry.detached = true,
+            "bare" => entry.bare = true,
+            "locked" => entry.locked = Some(value.to_string()),
+            "prunable" => entry.prunable = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    flush(&mut current, &mut entries);
+
+    let merged = run_git(
+        root,
+        &["branch", "--merged", "HEAD", "--format=%(refname:short)"],
+        Duration::from_secs(10),
+    )?;
+    let merged_branches = if merged.success {
+        merged
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect::<std::collections::HashSet<_>>()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let workspace_identity = git_path_identity(ws.root());
+    let workspace_prefix = format!("{}{}", workspace_identity, std::path::MAIN_SEPARATOR);
+    for entry in &mut entries {
+        let identity = git_path_identity(&entry.absolute_path);
+        entry.primary = identity == workspace_identity;
+        entry.inside_workspace = entry.primary || identity.starts_with(&workspace_prefix);
+        entry.managed =
+            entry.inside_workspace && !entry.primary && entry.path.starts_with(".worktrees/");
+        entry.removable = entry.inside_workspace && !entry.primary;
+        entry.branch_merged = if entry.branch.is_empty() {
+            None
+        } else {
+            Some(merged_branches.contains(&entry.branch))
+        };
+        entry.dirty = if entry.inside_workspace && !entry.bare && entry.absolute_path.exists() {
+            let status = run_git(
+                &entry.absolute_path,
+                &["status", "--porcelain=v1", "--untracked-files=normal"],
+                Duration::from_secs(10),
+            )?;
+            status.success.then(|| !status.stdout.trim().is_empty())
+        } else {
+            None
+        };
+    }
+    Ok(entries)
+}
+
+fn worktree_branch_slug(branch: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in branch.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(ch);
+        } else {
+            pending_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "worktree".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn local_branch_exists(root: &Path, branch: &str) -> Result<bool, WorkspaceError> {
+    let reference = format!("refs/heads/{branch}");
+    let completed = run_git(
+        root,
+        &["show-ref", "--verify", "--quiet", reference.as_str()],
+        Duration::from_secs(10),
+    )?;
+    Ok(completed.success)
+}
+
+fn git_cli_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        return raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string();
+    }
+    #[cfg(not(windows))]
+    raw.into_owned()
+}
+
+fn worktree_tool_error(
+    code: &'static str,
+    message: impl Into<String>,
+    category: &'static str,
+) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code,
+        message: message.into(),
+        category,
+        retryable: false,
+        details: json!({}),
+    }
+}
+
+pub fn git_worktree(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
+    let target = resolve_git_target(ws, args)?;
+    verify_expected_head(&target, args)?;
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| WorkspaceError::invalid_argument("action is required"))?;
+    let dry_run = args
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+
+    if action == "list" {
+        let worktrees = list_git_worktrees(ws, &target.root)?
+            .iter()
+            .map(GitWorktreeEntry::value)
+            .collect::<Vec<_>>();
+        return Ok(tool_ok(json!({
+            "action": action,
+            "applied": false,
+            "repo": target.metadata(),
+            "worktrees": worktrees,
+        })));
+    }
+    if !matches!(action, "create" | "remove") {
+        return Err(WorkspaceError::invalid_argument(
+            "action must be list, create, or remove",
+        ));
+    }
+    if action == "create" {
+        let branch = args
+            .get("branch")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| WorkspaceError::invalid_argument("branch is required for create"))?;
+        validate_branch_name(&target.root, branch)?;
+        let default_path = format!(".worktrees/{}", worktree_branch_slug(branch));
+        let requested_path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(default_path.as_str());
+        let resolved = ws.resolve_for_write(requested_path)?;
+        if resolved.existed {
+            return Err(worktree_tool_error(
+                "GIT_WORKTREE_PATH_EXISTS",
+                format!("Worktree path already exists: {}", resolved.display),
+                "git",
+            ));
+        }
+        let start_point = validate_git_ref(
+            args.get("start_point")
+                .and_then(Value::as_str)
+                .unwrap_or("HEAD"),
+        )?;
+        let configured_mode = args
+            .get("branch_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("auto");
+        if !matches!(configured_mode, "auto" | "create" | "existing") {
+            return Err(WorkspaceError::invalid_argument(
+                "branch_mode must be auto, create, or existing",
+            ));
+        }
+        let branch_exists = local_branch_exists(&target.root, branch)?;
+        let branch_mode = match configured_mode {
+            "auto" if branch_exists => "existing",
+            "auto" => "create",
+            other => other,
+        };
+        if branch_mode == "create" && branch_exists {
+            return Err(worktree_tool_error(
+                "GIT_WORKTREE_BRANCH_EXISTS",
+                format!("Branch already exists: {branch}"),
+                "conflict",
+            ));
+        }
+        if branch_mode == "existing" && !branch_exists {
+            return Err(worktree_tool_error(
+                "GIT_WORKTREE_BRANCH_NOT_FOUND",
+                format!("Branch does not exist: {branch}"),
+                "conflict",
+            ));
+        }
+        let git_args = if branch_mode == "existing" {
+            vec![
+                "worktree".to_string(),
+                "add".to_string(),
+                git_cli_path(&resolved.path),
+                branch.to_string(),
+            ]
+        } else {
+            vec![
+                "worktree".to_string(),
+                "add".to_string(),
+                "-b".to_string(),
+                branch.to_string(),
+                git_cli_path(&resolved.path),
+                start_point.to_string(),
+            ]
+        };
+        if dry_run {
+            return Ok(tool_ok(json!({
+                "action": action,
+                "dry_run": true,
+                "applied": false,
+                "path": resolved.display,
+                "branch": branch,
+                "branch_mode": branch_mode,
+                "start_point": start_point,
+                "command": std::iter::once("git".to_string()).chain(git_args.clone()).collect::<Vec<_>>(),
+                "repo": target.metadata(),
+            })));
+        }
+        if let Some(parent) = resolved.path.parent() {
+            fs::create_dir_all(parent).map_err(|error| WorkspaceError::Tool {
+                code: "FILE_WRITE_FAILED",
+                message: format!("failed to create worktree parent directory: {error}"),
+                category: "filesystem",
+                retryable: false,
+            })?;
+        }
+        let completed = run_git_strings(&target.root, &git_args, Duration::from_secs(60))?;
+        if !completed.success {
+            return Err(git_error(&completed.stderr));
+        }
+        let worktrees = list_git_worktrees(ws, &target.root)?
+            .iter()
+            .map(GitWorktreeEntry::value)
+            .collect::<Vec<_>>();
+        return Ok(tool_ok(json!({
+            "action": action,
+            "applied": true,
+            "path": resolved.display,
+            "branch": branch,
+            "branch_mode": branch_mode,
+            "start_point": start_point,
+            "repo": target.metadata(),
+            "worktrees": worktrees,
+        })));
+    }
+
+    let requested_path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| WorkspaceError::invalid_argument("path is required for remove"))?;
+    let resolved = ws.resolve_existing(requested_path)?;
+    if resolved.path == ws.root() {
+        return Err(worktree_tool_error(
+            "GIT_WORKTREE_PRIMARY_REMOVE_DENIED",
+            "The configured workspace root cannot be removed as a linked worktree",
+            "permission",
+        ));
+    }
+    let entries = list_git_worktrees(ws, &target.root)?;
+    let entry = entries
+        .iter()
+        .find(|entry| {
+            git_path_identity(&entry.absolute_path) == git_path_identity(&resolved.path)
+                || entry.path == resolved.display
+        })
+        .cloned()
+        .ok_or_else(|| {
+            worktree_tool_error(
+                "GIT_WORKTREE_NOT_FOUND",
+                format!("Linked worktree is not registered: {}", resolved.display),
+                "git",
+            )
+        })?;
+    if entry.locked.is_some() && !force {
+        return Err(worktree_tool_error(
+            "GIT_WORKTREE_LOCKED",
+            format!("Linked worktree is locked: {}", resolved.display),
+            "git",
+        ));
+    }
+    if !force {
+        let status = run_git(
+            &resolved.path,
+            &["status", "--porcelain=v1", "--untracked-files=normal"],
+            Duration::from_secs(10),
+        )?;
+        if !status.success {
+            return Err(git_error(&status.stderr));
+        }
+        if !status.stdout.trim().is_empty() {
+            return Err(worktree_tool_error(
+                "GIT_WORKTREE_DIRTY",
+                format!(
+                    "Linked worktree has uncommitted changes: {}",
+                    resolved.display
+                ),
+                "conflict",
+            ));
+        }
+    }
+    if dry_run {
+        return Ok(tool_ok(json!({
+            "action": action,
+            "dry_run": true,
+            "applied": false,
+            "path": resolved.display,
+            "branch": if entry.branch.is_empty() { Value::Null } else { Value::String(entry.branch) },
+            "repo": target.metadata(),
+        })));
+    }
+    if !args
+        .get("confirm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(worktree_tool_error(
+            "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION",
+            "Removing a linked worktree requires confirm=true",
+            "permission",
+        ));
+    }
+    let mut remove_args = vec!["worktree".to_string(), "remove".to_string()];
+    if force {
+        remove_args.push("--force".to_string());
+    }
+    remove_args.push(git_cli_path(&resolved.path));
+    let removed = run_git_strings(&target.root, &remove_args, Duration::from_secs(60))?;
+    let mut warnings = Vec::<String>::new();
+    if !removed.success {
+        let remaining = list_git_worktrees(ws, &target.root)?;
+        let still_registered = remaining.iter().any(|candidate| {
+            git_path_identity(&candidate.absolute_path) == git_path_identity(&resolved.path)
+        });
+        if still_registered {
+            return Err(git_error(&removed.stderr));
+        }
+        warnings.push(format!(
+            "worktree registration removed but Git reported cleanup failure: {}",
+            if removed.stderr.trim().is_empty() {
+                removed.stdout.trim()
+            } else {
+                removed.stderr.trim()
+            }
+        ));
+    }
+
+    if resolved.path.exists() {
+        let mut cleanup_error = None;
+        for _ in 0..3 {
+            match fs::remove_dir_all(&resolved.path) {
+                Ok(()) => {
+                    cleanup_error = None;
+                    break;
+                }
+                Err(error) => {
+                    cleanup_error = Some(error.to_string());
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        if let Some(error) = cleanup_error {
+            warnings.push(format!("worktree directory cleanup incomplete: {error}"));
+        }
+    }
+
+    let mut branch_deleted = false;
+    if args
+        .get("delete_branch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && !entry.branch.is_empty()
+    {
+        let delete_args = vec![
+            "branch".to_string(),
+            if force {
+                "-D".to_string()
+            } else {
+                "-d".to_string()
+            },
+            entry.branch.clone(),
+        ];
+        let deleted = run_git_strings(&target.root, &delete_args, Duration::from_secs(30))?;
+        if deleted.success {
+            branch_deleted = true;
+        } else {
+            warnings.push(format!(
+                "worktree removed but branch deletion failed: {}",
+                deleted.stderr.trim()
+            ));
+        }
+    }
+    let worktrees = list_git_worktrees(ws, &target.root)?
+        .iter()
+        .map(GitWorktreeEntry::value)
+        .collect::<Vec<_>>();
+    Ok(tool_ok(json!({
+        "action": action,
+        "applied": true,
+        "path": resolved.display,
+        "branch": if entry.branch.is_empty() { Value::Null } else { Value::String(entry.branch) },
+        "branch_deleted": branch_deleted,
+        "repo": target.metadata(),
+        "worktrees": worktrees,
+        "warnings": warnings,
+    })))
+}
+
 pub fn git_stage(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError> {
     prevalidate_git_paths(ws, args)?;
     let target = resolve_git_target(ws, args)?;
@@ -618,14 +1147,27 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         .get("require_clean_index_before")
         .and_then(Value::as_bool)
         .unwrap_or(!paths.is_empty() || all);
+    let expected_head = args.get("expected_head").and_then(Value::as_str);
+    let actual_head_before =
+        git_rev_parse(&target.root, "HEAD").unwrap_or_else(|| target.head.clone());
     let index_clean = git_index_clean(&target.root)?;
+    let staged_paths_before = git_staged_paths(&target.root)?;
     if require_clean_index && !index_clean {
         return Err(WorkspaceError::ToolDetails {
             code: "GIT_INDEX_NOT_CLEAN",
             message: "git_commit requires a clean index before staging paths".into(),
             category: "conflict",
             retryable: false,
-            details: json!({"suggestion": "commit or unstage existing staged changes, or set require_clean_index_before=false"}),
+            details: json!({
+                "transaction_stage": "preflight_index",
+                "expected_head": expected_head,
+                "actual_head_before": actual_head_before,
+                "selected_path_count": paths.len(),
+                "staged_path_count_before": staged_paths_before.len(),
+                "index_clean_before": index_clean,
+                "staged_by_tool": !paths.is_empty() || all,
+                "suggestion": "commit or unstage existing staged changes, or set require_clean_index_before=false"
+            }),
         });
     }
     if args
@@ -640,12 +1182,21 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
             "paths": paths,
             "all": all,
             "index_clean": index_clean,
+            "index_clean_before": index_clean,
+            "staged_path_count_before": staged_paths_before.len(),
+            "selected_path_count": paths.len(),
+            "staged_by_tool": !paths.is_empty() || all,
+            "expected_head": expected_head,
+            "actual_head_before": actual_head_before,
+            "transaction_stage": "preflight",
+            "would_stage": !paths.is_empty() || all,
+            "would_commit": true,
             "repo": target.metadata(),
             "warnings": []
         })));
     }
 
-    let old_head = git_rev_parse(&target.root, "HEAD").unwrap_or_default();
+    let old_head = actual_head_before.clone();
     let staged_by_tool = !paths.is_empty() || all;
     if staged_by_tool {
         let mut add_args = vec!["add".to_string()];
@@ -657,8 +1208,49 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         }
         let staged = run_git_strings(&target.root, &add_args, Duration::from_secs(20))?;
         if !staged.success {
-            return Err(git_error(&staged.stderr));
+            let index_restored = restore_clean_index_after_git_transaction_failure(
+                &target.root,
+                staged_by_tool,
+                index_clean,
+            );
+            return Err(WorkspaceError::ToolDetails {
+                code: "GIT_STAGE_FAILED",
+                message: staged.stderr.trim().to_string(),
+                category: "runtime",
+                retryable: false,
+                details: json!({
+                    "transaction_stage": "stage",
+                    "expected_head": expected_head,
+                    "actual_head_before": old_head,
+                    "selected_path_count": paths.len(),
+                    "staged_path_count_before": staged_paths_before.len(),
+                    "index_clean_before": index_clean,
+                    "staged_by_tool": staged_by_tool,
+                    "index_restored": index_restored
+                }),
+            });
         }
+    }
+
+    let staged_paths = git_staged_paths(&target.root)?;
+    let actual_head_at_commit = git_rev_parse(&target.root, "HEAD").unwrap_or_default();
+    if !old_head.eq_ignore_ascii_case(&actual_head_at_commit) {
+        let index_restored = restore_clean_index_after_git_transaction_failure(
+            &target.root,
+            staged_by_tool,
+            index_clean,
+        );
+        return Err(git_transaction_head_changed(
+            expected_head,
+            &old_head,
+            &actual_head_at_commit,
+            paths.len(),
+            staged_paths_before.len(),
+            staged_paths.len(),
+            index_clean,
+            staged_by_tool,
+            index_restored,
+        ));
     }
 
     let mut commit_args = vec!["commit".to_string(), "-m".to_string(), message.to_string()];
@@ -667,22 +1259,28 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
     }
     let committed = run_git_strings(&target.root, &commit_args, Duration::from_secs(60))?;
     if !committed.success {
-        if staged_by_tool && index_clean {
-            let _ = run_git(
-                &target.root,
-                &["reset", "--quiet", "HEAD", "--"],
-                Duration::from_secs(10),
-            );
-        }
+        let index_restored = restore_clean_index_after_git_transaction_failure(
+            &target.root,
+            staged_by_tool,
+            index_clean,
+        );
         return Err(WorkspaceError::ToolDetails {
             code: "GIT_COMMIT_FAILED",
             message: committed.stderr.trim().to_string(),
             category: "runtime",
             retryable: false,
             details: json!({
+                "transaction_stage": "commit",
                 "stdout": committed.stdout,
+                "expected_head": expected_head,
+                "actual_head_before": old_head,
+                "actual_head_at_commit": actual_head_at_commit,
+                "selected_path_count": paths.len(),
+                "staged_path_count_before": staged_paths_before.len(),
+                "staged_path_count": staged_paths.len(),
+                "index_clean_before": index_clean,
                 "staged_by_tool": staged_by_tool,
-                "index_restored": staged_by_tool && index_clean
+                "index_restored": index_restored
             }),
         });
     }
@@ -693,6 +1291,17 @@ pub fn git_commit(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         "applied": true,
         "commit": new_head,
         "previous_head": old_head,
+        "expected_head": expected_head,
+        "actual_head_before": actual_head_before,
+        "actual_head_at_commit": actual_head_at_commit,
+        "actual_head_after": new_head,
+        "transaction_stage": "committed",
+        "selected_path_count": paths.len(),
+        "staged_path_count_before": staged_paths_before.len(),
+        "staged_path_count": staged_paths.len(),
+        "index_clean_before": index_clean,
+        "staged_by_tool": staged_by_tool,
+        "index_restored": false,
         "message": message,
         "paths": paths,
         "all": all,
@@ -1020,6 +1629,72 @@ fn git_index_clean(root: &Path) -> Result<bool, WorkspaceError> {
     }
 }
 
+fn git_staged_paths(root: &Path) -> Result<Vec<String>, WorkspaceError> {
+    let completed = run_git(
+        root,
+        &["diff", "--cached", "--name-only", "-z", "--"],
+        Duration::from_secs(10),
+    )?;
+    if !completed.success {
+        return Err(git_error(&completed.stderr));
+    }
+    Ok(completed
+        .stdout
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn restore_clean_index_after_git_transaction_failure(
+    root: &Path,
+    staged_by_tool: bool,
+    index_clean_before: bool,
+) -> bool {
+    if !staged_by_tool || !index_clean_before {
+        return false;
+    }
+    run_git(
+        root,
+        &["reset", "--quiet", "HEAD", "--"],
+        Duration::from_secs(10),
+    )
+    .is_ok_and(|output| output.success)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn git_transaction_head_changed(
+    expected_head: Option<&str>,
+    actual_head_before: &str,
+    actual_head_at_commit: &str,
+    selected_path_count: usize,
+    staged_path_count_before: usize,
+    staged_path_count: usize,
+    index_clean_before: bool,
+    staged_by_tool: bool,
+    index_restored: bool,
+) -> WorkspaceError {
+    WorkspaceError::ToolDetails {
+        code: "GIT_HEAD_CHANGED_DURING_TRANSACTION",
+        message: "Git HEAD changed after transaction preflight and before commit".into(),
+        category: "conflict",
+        retryable: true,
+        details: json!({
+            "transaction_stage": "pre_commit_head_check",
+            "expected_head": expected_head,
+            "actual_head_before": actual_head_before,
+            "actual_head_at_commit": actual_head_at_commit,
+            "selected_path_count": selected_path_count,
+            "staged_path_count_before": staged_path_count_before,
+            "staged_path_count": staged_path_count,
+            "index_clean_before": index_clean_before,
+            "staged_by_tool": staged_by_tool,
+            "index_restored": index_restored,
+            "suggestion": "Refresh git_status/git_diff and retry git_commit with the new expected_head."
+        }),
+    }
+}
+
 fn run_git_strings(
     cwd: &std::path::Path,
     args: &[String],
@@ -1307,9 +1982,215 @@ fn git_error(message: &str) -> WorkspaceError {
 
 #[cfg(test)]
 mod tests {
-    use super::wait_for_child_output;
+    use super::{git_transaction_head_changed, git_worktree, wait_for_child_output};
+    use crate::tools::workspace::{Workspace, WorkspaceError};
+    use serde_json::json;
+    use std::fs;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn transaction_head_change_returns_retryable_conflict_metadata() {
+        let error = git_transaction_head_changed(
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            2,
+            0,
+            2,
+            true,
+            true,
+            true,
+        );
+        match error {
+            WorkspaceError::ToolDetails {
+                code,
+                category,
+                retryable,
+                details,
+                ..
+            } => {
+                assert_eq!(code, "GIT_HEAD_CHANGED_DURING_TRANSACTION");
+                assert_eq!(category, "conflict");
+                assert!(retryable);
+                assert_eq!(details["transaction_stage"], "pre_commit_head_check");
+                assert_eq!(details["selected_path_count"], 2);
+                assert_eq!(details["staged_path_count"], 2);
+                assert_eq!(details["index_clean_before"], true);
+                assert_eq!(details["index_restored"], true);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn git_worktree_manages_linked_worktree_lifecycle() {
+        let root = tempfile::tempdir().expect("temp repo");
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init"]);
+        fs::write(root.path().join("README.md"), "fixture\n").expect("write fixture");
+        run(&["add", "README.md"]);
+        run(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "initial",
+        ]);
+
+        let ws = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let created = git_worktree(
+            &ws,
+            &json!({
+                "action": "create",
+                "path": ".worktrees/managed",
+                "branch": "feature/managed-worktree",
+                "start_point": "HEAD"
+            }),
+        )
+        .expect("create linked worktree");
+        assert_eq!(created["ok"], true);
+        assert_eq!(created["applied"], true);
+        assert!(root.path().join(".worktrees/managed").is_dir());
+
+        let denied = git_worktree(
+            &ws,
+            &json!({
+                "action": "remove",
+                "path": ".worktrees/managed",
+                "delete_branch": true
+            }),
+        )
+        .expect_err("remove must require confirmation");
+        match denied {
+            WorkspaceError::ToolDetails { code, .. } => {
+                assert_eq!(code, "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION");
+            }
+            other => panic!("unexpected worktree removal error: {other:?}"),
+        }
+
+        let removed = git_worktree(
+            &ws,
+            &json!({
+                "action": "remove",
+                "path": ".worktrees/managed",
+                "delete_branch": true,
+                "confirm": true
+            }),
+        )
+        .expect("remove linked worktree");
+        assert_eq!(removed["ok"], true);
+        assert_eq!(removed["applied"], true);
+        assert_eq!(removed["branch_deleted"], true);
+        assert!(!root.path().join(".worktrees/managed").exists());
+    }
+
+    #[test]
+    fn git_worktree_supports_existing_branch_defaults_dry_run_and_metadata() {
+        let root = tempfile::tempdir().expect("temp repo");
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init"]);
+        fs::write(root.path().join("README.md"), "fixture\n").expect("write fixture");
+        run(&["add", "README.md"]);
+        run(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "initial",
+        ]);
+        run(&["branch", "feature/existing-worktree"]);
+
+        let ws = Workspace::new(root.path().to_path_buf()).expect("workspace");
+        let planned = git_worktree(
+            &ws,
+            &json!({
+                "action": "create", "branch": "feature/existing-worktree", "dry_run": true
+            }),
+        )
+        .expect("plan existing branch worktree");
+        assert_eq!(planned["branch_mode"], "existing");
+        assert_eq!(planned["path"], ".worktrees/feature-existing-worktree");
+
+        let created = git_worktree(
+            &ws,
+            &json!({
+                "action": "create", "branch": "feature/existing-worktree"
+            }),
+        )
+        .expect("create existing branch worktree");
+        assert_eq!(created["branch_mode"], "existing");
+        let worktree_path = ".worktrees/feature-existing-worktree";
+        assert!(root.path().join(worktree_path).is_dir());
+
+        let listed = git_worktree(&ws, &json!({"action": "list"})).expect("list worktrees");
+        let entries = listed["worktrees"].as_array().expect("worktree array");
+        let primary = entries
+            .iter()
+            .find(|entry| entry["path"] == ".")
+            .expect("primary entry");
+        let managed = entries
+            .iter()
+            .find(|entry| entry["path"] == worktree_path)
+            .expect("managed entry");
+        assert_eq!(primary["primary"], true);
+        assert_eq!(primary["inside_workspace"], true);
+        assert_eq!(primary["removable"], false);
+        assert_eq!(managed["primary"], false);
+        assert_eq!(managed["inside_workspace"], true);
+        assert_eq!(managed["managed"], true);
+        assert_eq!(managed["removable"], true);
+        assert!(managed["dirty"].is_boolean());
+        assert!(managed["branch_merged"].is_boolean());
+
+        let dry_remove = git_worktree(
+            &ws,
+            &json!({
+                "action": "remove", "path": worktree_path, "dry_run": true
+            }),
+        )
+        .expect("dry-run remove without confirmation");
+        assert_eq!(dry_remove["applied"], false);
+        assert!(root.path().join(worktree_path).exists());
+
+        let removed = git_worktree(
+            &ws,
+            &json!({
+                "action": "remove", "path": worktree_path, "confirm": true
+            }),
+        )
+        .expect("remove existing branch worktree");
+        assert_eq!(removed["applied"], true);
+        assert!(!root.path().join(worktree_path).exists());
+    }
 
     #[test]
     fn child_output_timeout_is_enforced() {

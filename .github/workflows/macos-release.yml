@@ -17,10 +17,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.19.0
+          run_install: false
+
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: npm
+          node-version: "22"
+          cache: pnpm
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -31,20 +36,20 @@ jobs:
           workspaces: src-tauri
 
       - name: 安装前端依赖
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: 检查版本同步
-        run: npm run version:check
+        run: pnpm run version:check
 
       - name: 检查前端
-        run: npm run check
+        run: pnpm run check
 
       - name: 运行 Rust 测试
         working-directory: src-tauri
         run: cargo test
 
       - name: 构建通用 macOS 应用与 DMG
-        run: npm run desktop:build:macos:app
+        run: pnpm run desktop:build:macos:app
 
       - name: 上传 Actions 构建产物
         uses: actions/upload-artifact@v4

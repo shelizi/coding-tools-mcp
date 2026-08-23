@@ -77,6 +77,29 @@ test('bootstrap uses the stable runtime identity when the host session id is mis
   assert.equal(result.fallback_session_key_mismatch, false);
 });
 
+test('bootstrap defaults to compact payload and can expand full history detail on demand', async t => {
+  const { root, ctx, meta } = await fixture(t);
+  await writeHistory(root, {
+    '1.md': historyFile(1, 'old-session-1', 'first'),
+    '2.md': historyFile(2, 'old-session-2', 'second')
+  });
+  const compact = await callTool(ctx, 'history_session_bootstrap', { session_key: 'compact-chat' }, meta);
+  assert.equal(compact.ok, true);
+  assert.equal(compact.response_mode, 'compact');
+  assert.deepEqual(compact.session_summaries, []);
+  assert.equal(compact.inherited_summary, null);
+  assert.deepEqual(compact.lazy_sections, ['inherited_summary', 'session_summaries']);
+  assert.equal(compact.full_response_available, true);
+
+  const full = await callTool(ctx, 'history_session_bootstrap', {
+    session_key: 'compact-chat', response_mode: 'full'
+  }, meta);
+  assert.equal(full.ok, true);
+  assert.equal(full.response_mode, 'full');
+  assert.equal(full.session_summaries.length, 2);
+  assert.match(full.inherited_summary, /目标-first/);
+});
+
 test('bootstrap writes the shared Rust index format and resumes idempotently', async t => {
   const { root, ctx, meta } = await fixture(t);
   const dir = await writeHistory(root, {

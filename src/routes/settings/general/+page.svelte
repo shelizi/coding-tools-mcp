@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { message } from "@tauri-apps/plugin-dialog";
+  import { alert as message } from "$lib/api/native";
   import { getProxy, setProxy, type ProxyConfigDto } from "$lib/api/settings";
   import { t } from "$lib/i18n";
 

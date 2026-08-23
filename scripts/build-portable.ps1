@@ -36,7 +36,7 @@ try {
     }
 
     Write-Host 'Building frontend assets...'
-    & npm run build
+    & pnpm run build
     if ($LASTEXITCODE -ne 0) {
         throw "Frontend build failed with exit code $LASTEXITCODE."
     }
@@ -54,14 +54,15 @@ try {
         throw "Release executable was not produced: $releaseExe"
     }
 
-    $packageName = "Coding.Tools.MCP_${version}_x64_portable"
-    $expandedName = 'Coding.Tools.MCP_x64_portable'
+    $packageName = "ctmcp-${version}-win64"
+    $expandedName = 'ctmcp-win64'
     $distRoot = Join-Path $workspace 'dist-portable'
+    New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
     $expandedDir = Join-Path $distRoot $expandedName
     $zipPath = Join-Path $distRoot "$packageName.zip"
-    $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) "coding-tools-mcp-portable-$([guid]::NewGuid().ToString('N'))"
+    $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) "ctmcp-$([guid]::NewGuid().ToString('N'))"
     $stagingPackageDir = Join-Path $stagingRoot $packageName
-    $stagingExe = Join-Path $stagingPackageDir 'Coding Tools MCP.exe'
+    $stagingExe = Join-Path $stagingPackageDir 'ctmcp.exe'
     $stagingZip = Join-Path $stagingRoot "$packageName.zip"
     $expandedStagingDir = Join-Path $distRoot ".$expandedName.next-$([guid]::NewGuid().ToString('N'))"
 
@@ -85,7 +86,11 @@ try {
         }
     } finally {
         if (Test-Path -LiteralPath $expandedStagingDir) {
-            Remove-Item -LiteralPath $expandedStagingDir -Recurse -Force
+            try {
+                Remove-Item -LiteralPath $expandedStagingDir -Recurse -Force
+            } catch {
+                Write-Warning "Could not remove expanded staging folder (usually locked by a running app): $expandedStagingDir"
+            }
         }
         $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
         $resolvedStaging = [System.IO.Path]::GetFullPath($stagingRoot)

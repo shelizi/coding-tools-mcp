@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { runCapturedStdoutWithProgress } from '../../../scripts/run-streamed-child.mjs';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,21 +9,6 @@ const manifest = path.join(worktreeRoot, 'src-tauri', 'Cargo.toml');
 const outputFile = path.join(packageRoot, 'src', 'rustCatalog.generated.ts');
 const checkOnly = process.argv.includes('--check');
 
-function run(program, args, cwd) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(program, args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', chunk => { stdout += chunk.toString(); });
-    child.stderr.on('data', chunk => { stderr += chunk.toString(); });
-    child.once('error', reject);
-    child.once('exit', code => {
-      if (code === 0) resolve(stdout);
-      else reject(new Error(`Rust catalog export failed (${code})\n${stderr || stdout}`));
-    });
-  });
-}
-
 function stable(value) {
   if (Array.isArray(value)) return value.map(stable);
   if (value && typeof value === 'object') {
@@ -32,10 +17,16 @@ function stable(value) {
   return value;
 }
 
-const raw = await run('cargo', [
+process.stderr.write('[sync-rust-catalog] exporting Rust tool catalog\n');
+const raw = await runCapturedStdoutWithProgress('cargo', [
   'run', '--quiet', '--no-default-features', '--manifest-path', manifest,
   '--example', 'export_tool_catalog'
-], worktreeRoot);
+], {
+  cwd: worktreeRoot,
+  label: 'sync-rust-catalog',
+  quietHeartbeatMs: 15_000,
+  streamStderr: false
+});
 const exported = JSON.parse(raw.trim());
 const behavioralParity = stable(exported.behavioral_parity);
 if (!behavioralParity || typeof behavioralParity !== 'object' || Array.isArray(behavioralParity)) {
@@ -98,7 +89,7 @@ if (checkOnly) {
   let current = '';
   try { current = await readFile(outputFile, 'utf8'); } catch { /* missing file is drift */ }
   if (current.replaceAll('\r\n', '\n') !== content) {
-    throw new Error('generated Node tool catalog differs from the Rust registry; run npm run sync:rust-contract');
+    throw new Error('generated Node tool catalog differs from the Rust registry; run pnpm run sync:rust-contract');
   }
   console.log('Node tool catalog exactly matches the Rust registry');
 } else {

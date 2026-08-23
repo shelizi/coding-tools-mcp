@@ -16,6 +16,8 @@ pub struct CapabilityStatus {
 pub struct HarnessStatus {
     pub schema_version: u32,
     pub workspace_id: String,
+    pub scope_id: String,
+    pub scope_root: String,
     pub task_id: Option<String>,
     pub task_state: Option<TaskStatus>,
     pub task_updated_at: Option<String>,
@@ -88,6 +90,10 @@ pub struct ProjectBaseline {
 pub struct TaskSession {
     pub id: String,
     pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_root: Option<String>,
     pub objective: String,
     pub status: TaskStatus,
     pub baseline: ProjectBaseline,
@@ -187,6 +193,8 @@ pub struct ProjectFileState {
 pub struct ProjectState {
     pub schema_version: u32,
     pub workspace_id: String,
+    pub scope_id: String,
+    pub scope_root: String,
     pub branch: Option<String>,
     pub head: Option<String>,
     pub clean: bool,

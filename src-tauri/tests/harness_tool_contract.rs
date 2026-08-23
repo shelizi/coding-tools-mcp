@@ -201,6 +201,40 @@ fn harness_tools_support_task_lifecycle() {
 }
 
 #[test]
+fn finish_task_finalizes_existing_verifying_change_and_start_task_can_recover_it() {
+    let temp = tempfile::tempdir().expect("创建临时目录");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("创建工作区");
+    fs::write(workspace.join("README.md"), "初始内容\n").expect("写入文件");
+    let ctx = ToolContext::for_test(workspace, temp.path().join("harness")).expect("创建上下文");
+
+    let first = call_tool(&ctx, "start_task", &json!({"objective": "第一项"}));
+    let first_id = first["task"]["id"].as_str().expect("任务 ID");
+    let verifying = call_tool(&ctx, "finish_task", &json!({"task_id": first_id}));
+    assert_eq!(verifying["task"]["status"], "verifying");
+    let change_id = verifying["change_id"].clone();
+
+    let completed = call_tool(&ctx, "finish_task", &json!({"task_id": first_id}));
+    assert_eq!(completed["ok"], true);
+    assert_eq!(completed["task"]["status"], "completed");
+    assert_eq!(completed["change_id"], change_id);
+    assert_eq!(completed["finalized_existing_change"], true);
+
+    let stale = call_tool(&ctx, "start_task", &json!({"objective": "可恢复旧任务"}));
+    let stale_id = stale["task"]["id"].as_str().expect("任务 ID");
+    let stale_verifying = call_tool(&ctx, "finish_task", &json!({"task_id": stale_id}));
+    assert_eq!(stale_verifying["task"]["status"], "verifying");
+    let next = call_tool(
+        &ctx,
+        "start_task",
+        &json!({"objective": "下一项", "existing_task": "finish_if_complete"}),
+    );
+    assert_eq!(next["ok"], true);
+    assert_eq!(next["recovered_task_id"], stale_id);
+    assert_eq!(next["task"]["status"], "active");
+}
+
+#[test]
 fn finish_task摘要持久化且change_id选择不可变快照() {
     let temp = tempfile::tempdir().expect("创建临时目录");
     let workspace = temp.path().join("workspace");

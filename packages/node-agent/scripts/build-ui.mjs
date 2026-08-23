@@ -1,48 +1,43 @@
-import { cp, mkdir } from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import webpack from 'webpack';
-import config from '../webpack.ui.config.mjs';
+import { cp, mkdir } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+import { extractInlineAssets } from "../../../scripts/extract-sveltekit-inline.mjs";
 
-const root = path.dirname(fileURLToPath(new URL('../package.json', import.meta.url)));
-const publicDir = path.join(root, 'ui', 'public');
-const outputDir = path.join(root, 'dist', 'ui');
-const watch = process.argv.includes('--watch');
+const nodeAgentRoot = path.dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
+const repoRoot = path.resolve(nodeAgentRoot, "../..");
+const outDir = path.join(nodeAgentRoot, "dist", "ui");
+const staticDir = path.join(nodeAgentRoot, "management-static");
 
-async function copyPublicAssets() {
-  await mkdir(outputDir, { recursive: true });
-  await cp(publicDir, outputDir, { recursive: true, force: true });
-}
-
-function report(error, stats) {
-  if (error) throw error;
-  if (!stats) throw new Error('Webpack returned no build statistics.');
-  const output = stats.toString({ colors: process.stdout.isTTY, chunks: false, modules: false });
-  if (stats.hasErrors()) throw new Error(output);
-  if (output.trim()) console.log(output);
-}
-
-const compiler = webpack(config);
-if (watch) {
-  compiler.watch({}, async (error, stats) => {
-    try {
-      report(error, stats);
-      await copyPublicAssets();
-      console.log('React management UI rebuilt.');
-    } catch (buildError) {
-      console.error(buildError);
-    }
-  });
-} else {
-  await new Promise((resolve, reject) => {
-    compiler.run(async (error, stats) => {
-      try {
-        report(error, stats);
-        await copyPublicAssets();
-        compiler.close(closeError => closeError ? reject(closeError) : resolve());
-      } catch (buildError) {
-        compiler.close(() => reject(buildError));
-      }
+function run(command, args, env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: repoRoot,
+      env,
+      stdio: "inherit",
+      shell: process.platform === "win32",
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`${command} ${args.join(" ")} exited ${code}`));
     });
   });
 }
+
+const env = {
+  ...process.env,
+  CTMCP_UI_HOST: "node",
+  CTMCP_UI_BASE: "/ui",
+  CTMCP_UI_OUT: outDir,
+};
+
+await mkdir(outDir, { recursive: true });
+await run("pnpm", ["exec", "vite", "build"], env);
+await extractInlineAssets(outDir, "/ui");
+try {
+  await cp(staticDir, outDir, { recursive: true, force: true });
+} catch (error) {
+  if (error && error.code !== "ENOENT") throw error;
+}
+console.log(`Node management UI written to ${outDir}`);

@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { PNG } from 'pngjs';
 import { createAgentServer } from '../dist/server.js';
+import { discoverExtensions } from '../dist/extensions/discovery.js';
 import { CLIENT_COMPAT_VERSION } from '../dist/version.js';
 
 async function rpc(endpoint, token, request) {
@@ -32,6 +34,17 @@ test('scoped OAuth PKCE and MCP workspace flow', async t => {
   const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-http-'));
   const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-http-state-'));
   await writeFile(path.join(root, 'hello.txt'), 'hello node agent');
+  await mkdir(path.join(root, 'skills', 'release-helper'), { recursive: true });
+  await writeFile(path.join(root, 'skills', 'release-helper', 'SKILL.md'), [
+    '---',
+    'name: release-helper',
+    'description: Prepare a safe project release.',
+    '---',
+    '',
+    '# Release helper',
+    '',
+    'Run project release checks before packaging.'
+  ].join('\n'));
   const largePayload = `HTTP_LARGE_MARKER:${'x'.repeat(32 * 1024)}`;
   const httpSecret = 'sk-http-contract-secret-abcdefghijklmnopqrstuvwxyz';
   await writeFile(path.join(root, 'large.txt'), largePayload);
@@ -39,12 +52,35 @@ test('scoped OAuth PKCE and MCP workspace flow', async t => {
   const image = new PNG({ width: 2, height: 1 });
   image.data = Buffer.from([255, 0, 0, 255, 0, 0, 255, 255]);
   await writeFile(path.join(root, 'pixel.bin'), PNG.sync.write(image));
+  const externalMcpFixture = fileURLToPath(new URL('./fixtures/mcp-extension-fixture.mjs', import.meta.url));
+  const externalHookFixture = fileURLToPath(new URL('./fixtures/hook-extension-fixture.mjs', import.meta.url));
+  await writeFile(path.join(root, '.mcp.json'), JSON.stringify({
+    mcpServers: {
+      fixture: { type: 'stdio', command: process.execPath, args: [externalMcpFixture] }
+    }
+  }));
+  await mkdir(path.join(root, '.claude'), { recursive: true });
+  await writeFile(path.join(root, '.claude', 'settings.json'), JSON.stringify({
+    hooks: {
+      PreToolUse: [{
+        matcher: 'set_default_cwd',
+        hooks: [{ type: 'command', command: process.execPath, args: [externalHookFixture, 'block'] }]
+      }]
+    }
+  }));
   const prefix = '/builtin/clients/node-test';
   const publicBaseUrl = `https://public.example${prefix}`;
+  const folders = [{ id: 'repo', name: 'Repo', path: root }];
+  const extensionDiscovery = await discoverExtensions({ folders, homeDir: null });
+  const externalServer = extensionDiscovery.mcpServers.find(server => server.name === 'fixture');
+  assert.ok(externalServer);
+  const externalHook = extensionDiscovery.hooks.find(hook => hook.provider === 'claude' && hook.event === 'PreToolUse');
+  assert.ok(externalHook);
   const config = {
     host: '127.0.0.1', port: 0, publicBaseUrl, dataDir, permissionMode: 'trusted',
     oauth: { clientId: 'chatgpt', password: 'test-password', tokenSecret: 'a sufficiently long test token secret' },
-    folders: [{ id: 'repo', name: 'Repo', path: root }],
+    folders,
+    extensions: { hooks: { enabled: [externalHook.key] }, mcp: { enabled: [externalServer.key] } },
     limits: { blockingConcurrency: 4, processConcurrency: 4, activeSessionLimit: 16, maxOutputBytes: 1024 * 1024 }
   };
   const server = await createAgentServer(config);
@@ -87,9 +123,42 @@ test('scoped OAuth PKCE and MCP workspace flow', async t => {
   const endpoint = `${localBase}${prefix}/mcp`;
   const initialized = await rpc(endpoint, token, { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } });
   assert.equal(initialized.result.protocolVersion, '2025-11-25');
+  assert.match(initialized.result.instructions, /conversation_bootstrap/);
+  assert.match(initialized.result.instructions, /exec_many\(mode=auto\)/);
+  assert.equal(initialized.result.capabilities.prompts.listChanged, false);
+  assert.equal(initialized.result.capabilities.resources.subscribe, false);
+  assert.match(initialized.result.instructions, /Workspace and enabled Codex\/Claude user-level Skills/);
+  const promptList = await rpc(endpoint, token, { jsonrpc: '2.0', id: 30, method: 'prompts/list', params: {} });
+  const releasePrompt = promptList.result.prompts.find(prompt => prompt.name === 'project-skill/repo/release-helper');
+  assert.ok(releasePrompt);
+  assert.equal(releasePrompt.description, 'Prepare a safe project release.');
+  const loadedPrompt = await rpc(endpoint, token, {
+    jsonrpc: '2.0', id: 31, method: 'prompts/get', params: { name: 'project-skill/repo/release-helper' }
+  });
+  assert.match(loadedPrompt.result.messages[0].content.text, /Run project release checks before packaging\./);
+  assert.match(loadedPrompt.result.messages[0].content.text, /never grant permissions|does not grant permissions/i);
+  const resourceList = await rpc(endpoint, token, { jsonrpc: '2.0', id: 32, method: 'resources/list', params: {} });
+  const releaseResource = resourceList.result.resources.find(resource => resource.uri === 'skill://coding-tools/repo/release-helper');
+  assert.ok(releaseResource);
+  const loadedResource = await rpc(endpoint, token, {
+    jsonrpc: '2.0', id: 33, method: 'resources/read', params: { uri: 'skill://coding-tools/repo/release-helper' }
+  });
+  assert.match(loadedResource.result.contents[0].text, /^---\nname: release-helper/m);
   const listedResponse = await rpcResponse(endpoint, token, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
   const listedTools = listedResponse.body;
-  assert.equal(listedTools.result.tools.length, 50);
+  assert.equal(listedTools.result.tools.length, 60);
+  const externalTool = listedTools.result.tools.find(tool => tool.name.includes('__fixture__echo'));
+  assert.ok(externalTool);
+  const externalCall = await rpc(endpoint, token, {
+    jsonrpc: '2.0', id: 34, method: 'tools/call',
+    params: {
+      name: externalTool.name,
+      arguments: { message: 'server-proxy' },
+      _meta: { 'coding-tools/toolset-revision': listedTools.result.toolsetRevision }
+    }
+  });
+  assert.equal(externalCall.result.content[0].text, 'fixture:server-proxy');
+  assert.deepEqual(externalCall.result.structuredContent, { echoed: 'server-proxy' });
   assert.equal(listedResponse.response.headers.get('x-coding-tools-toolset-revision'), listedTools.result.toolsetRevision);
   assert.equal(listedResponse.response.headers.get('x-coding-tools-agent-version'), initialized.result.serverInfo.version);
   assert.ok(Number(listedResponse.response.headers.get('x-coding-tools-runtime-started-at')) > 0);
@@ -123,10 +192,31 @@ test('scoped OAuth PKCE and MCP workspace flow', async t => {
   assert.equal(missingMetaSwitch.result.structuredContent.error.code, 'WORKSPACE_FOLDER_NOT_SELECTED');
 
   const meta = { 'openai/session': 'integration' };
-  const list = await rpc(endpoint, token, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'list_workspace_folders', arguments: {}, _meta: meta } });
-  assert.equal(list.result.structuredContent.folders.length, 1);
-  const selected = await rpc(endpoint, token, { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'switch_workspace_folder', arguments: { folder_id: 'repo' }, _meta: meta } });
-  assert.equal(selected.result.structuredContent.ok, true);
+  const bootstrapped = await rpc(endpoint, token, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'conversation_bootstrap', arguments: {}, _meta: meta } });
+  assert.equal(bootstrapped.result.structuredContent.ok, true);
+  assert.equal(bootstrapped.result.structuredContent.selected_folder_id, 'repo');
+  assert.equal(bootstrapped.result.structuredContent.response_mode, 'compact');
+  assert.equal(bootstrapped.result.structuredContent.needs_folder_selection, false);
+  const releaseSkill = bootstrapped.result.structuredContent.project_skills.skills.find(skill => skill.name === 'release-helper');
+  assert.ok(releaseSkill);
+  assert.equal(releaseSkill.source, 'project');
+  assert.equal(releaseSkill.scope, 'workspace');
+  assert.ok(bootstrapped.result.structuredContent.project_skills.skillset_revision);
+  assert.equal(bootstrapped.result.structuredContent.startup_flow, 'workspace_and_history_bootstrapped');
+  assert.ok(bootstrapped.result.structuredContent.current_path);
+
+  const hookBlocked = await rpc(endpoint, token, {
+    jsonrpc: '2.0', id: 35, method: 'tools/call',
+    params: {
+      name: 'set_default_cwd',
+      arguments: { path: '.' },
+      _meta: { ...meta, 'coding-tools/toolset-revision': listedTools.result.toolsetRevision }
+    }
+  });
+  assert.equal(hookBlocked.error, undefined, JSON.stringify(hookBlocked));
+  assert.equal(hookBlocked.result.isError, true);
+  assert.equal(hookBlocked.result.structuredContent.error.code, 'HOOK_BLOCKED');
+  assert.match(hookBlocked.result.structuredContent.error.message, /blocked-by-extension-fixture/);
 
   const read = await rpc(endpoint, token, { jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: 'read_file', arguments: { path: 'hello.txt' }, _meta: meta } });
   assert.equal(read.result.content.length, 1);

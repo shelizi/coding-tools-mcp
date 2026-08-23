@@ -4,9 +4,10 @@ import path from 'node:path';
 import type {
   ChangeSet, JsonObject, OperationRecord, ProjectBaseline, TaskEvent, TaskRecord, TaskStatus, ToolContext
 } from './types.js';
-import { attachHarnessOperation, runBuffered } from './processes.js';
+import { attachHarnessOperation } from './processes.js';
+import { runGitBuffered } from './gitProcess.js';
 import { operationResultSummary } from './operationSummary.js';
-import { selectedFolder } from './workspace.js';
+import { rootAndCwd, selectedFolder } from './workspace.js';
 
 const BASELINE_SKIPPED_NAMES = new Set([
   '.git', '.mcp-probe-kit', 'node_modules', 'target', 'dist', 'build', '.svelte-kit'
@@ -30,6 +31,7 @@ export class HarnessError extends Error {
 export interface HarnessTracking {
   workspaceId?: string;
   taskId?: string;
+  taskRoot?: string;
   operation?: OperationRecord;
   baselineChecked?: boolean;
   baselineCaptureMs?: number;
@@ -75,7 +77,21 @@ async function workspaceContext(ctx: ToolContext, key: string) {
   const folder = selectedFolder(ctx, key);
   const workspaceId = await harnessWorkspaceId(folder.path);
   await ctx.state.migrateWorkspace(folder.id, workspaceId);
-  return { folder, workspaceId };
+  const { cwd } = rootAndCwd(ctx, key);
+  const workspaceRoot = await realpath(folder.path).catch(() => path.resolve(folder.path));
+  let taskRoot = workspaceRoot;
+  const topLevel = await git(cwd, ['rev-parse', '--show-toplevel']);
+  if (topLevel.code === 0 && topLevel.stdout.trim()) {
+    const candidate = await realpath(topLevel.stdout.trim()).catch(() => path.resolve(topLevel.stdout.trim()));
+    const relative = path.relative(workspaceRoot, candidate);
+    if (!relative || (!relative.startsWith('..') && !path.isAbsolute(relative))) taskRoot = candidate;
+  }
+  const scopeId = path.relative(workspaceRoot, taskRoot) === '' ? workspaceId : await harnessWorkspaceId(taskRoot);
+  return { folder, workspaceId, scopeId, taskRoot };
+}
+
+function taskRootFor(task: TaskRecord, fallback: string): string {
+  return task.scope_root || fallback;
 }
 
 function comparePaths(left: string, right: string): number {
@@ -104,7 +120,7 @@ function event(
 }
 
 async function git(cwd: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  return runBuffered('git', args, cwd).catch(error => ({ code: 1, stdout: '', stderr: String(error) }));
+  return runGitBuffered(cwd, args).catch(error => ({ code: 1, stdout: '', stderr: String(error) }));
 }
 
 async function gitIdentity(root: string): Promise<Pick<ProjectBaseline, 'branch' | 'head'>> {
@@ -228,9 +244,9 @@ function canTransition(from: TaskStatus, to: TaskStatus): boolean {
     || (from === 'failed' && ['active', 'rolled_back'].includes(to));
 }
 
-function taskForArgs(ctx: ToolContext, folderId: string, args: JsonObject): TaskRecord | undefined {
+function taskForArgs(ctx: ToolContext, workspaceId: string, scopeId: string, args: JsonObject): TaskRecord | undefined {
   const taskId = String(args.task_id ?? '').trim();
-  return taskId ? ctx.state.taskById(folderId, taskId) : ctx.state.task(folderId);
+  return taskId ? ctx.state.taskById(workspaceId, taskId) : ctx.state.task(scopeId);
 }
 
 function baselineMatches(task: TaskRecord, current: ProjectBaseline): boolean {
@@ -261,7 +277,7 @@ export async function refreshExpectedState(ctx: ToolContext, folderId: string, r
   task.baseline.head = current.head;
   task.expected_fingerprint = current.worktree_fingerprint;
   task.updated_at = now();
-  await ctx.state.setTask(folderId, task);
+  await ctx.state.setTask(task.scope_id ?? folderId, task);
   return task;
 }
 
@@ -270,19 +286,19 @@ async function harnessStatusValue(
   key: string,
   mode: 'full' | 'cached' = 'full'
 ): Promise<JsonObject> {
-  const { folder, workspaceId } = await workspaceContext(ctx, key);
-  const task = ctx.state.task(workspaceId);
+  const { workspaceId, scopeId, taskRoot } = await workspaceContext(ctx, key);
+  const task = ctx.state.task(scopeId);
   const baselineCheckEnabled = ctx.config.securityPolicy.enforceHarnessBaseline;
   const baselineCheckPerformed = mode === 'full' && baselineCheckEnabled && Boolean(task);
   let baselineCaptureMs = 0;
   let current: ProjectBaseline | undefined;
   if (baselineCheckPerformed) {
     const baselineStartedAt = performance.now();
-    current = await captureBaseline(folder.path);
+    current = await captureBaseline(taskRoot);
     baselineCaptureMs = elapsedPhaseMs(baselineStartedAt);
   }
   const identity = current
-    ?? (task ? { branch: task.baseline.branch, head: task.baseline.head } : mode === 'full' ? await gitIdentity(folder.path) : {});
+    ?? (task ? { branch: task.baseline.branch, head: task.baseline.head } : mode === 'full' ? await gitIdentity(taskRoot) : {});
   const matches = task && current ? baselineMatches(task, current) : undefined;
   const writable = task ? ['active', 'paused', 'verifying', 'failed'].includes(task.status) : true;
   const taskId = task?.id;
@@ -324,6 +340,8 @@ async function harnessStatusValue(
   const status: JsonObject = {
     schema_version: 1,
     workspace_id: workspaceId,
+    scope_id: scopeId,
+    scope_root: taskRoot,
     task_id: taskId ?? null,
     task_state: task?.status ?? null,
     task_updated_at: task?.updated_at ?? null,
@@ -415,12 +433,12 @@ export async function operationLog(ctx: ToolContext, key: string, args: JsonObje
 }
 
 export async function projectState(ctx: ToolContext, key: string, args: JsonObject = {}): Promise<JsonObject> {
-  const { folder, workspaceId } = await workspaceContext(ctx, key);
+  const { workspaceId, scopeId, taskRoot } = await workspaceContext(ctx, key);
   const maxFiles = Math.max(1, Math.min(10_000, Math.trunc(Number(args.max_files ?? 200)) || 200));
   const baselineStartedAt = performance.now();
-  const current = await captureBaseline(folder.path);
+  const current = await captureBaseline(taskRoot);
   const baselineCaptureMs = elapsedPhaseMs(baselineStartedAt);
-  const task = ctx.state.task(workspaceId);
+  const task = ctx.state.task(scopeId);
   const baselineMap = new Map((task?.baseline.entries ?? []).map(entry => [entry.path, entry]));
   const currentMap = new Map(current.entries.map(entry => [entry.path, entry]));
   const paths = [...new Set([...baselineMap.keys(), ...currentMap.keys()])].sort(comparePaths);
@@ -443,6 +461,8 @@ export async function projectState(ctx: ToolContext, key: string, args: JsonObje
     ok: true,
     schema_version: 1,
     workspace_id: workspaceId,
+    scope_id: scopeId,
+    scope_root: taskRoot,
     branch: current.branch ?? null,
     head: current.head ?? null,
     clean,
@@ -519,10 +539,77 @@ function changeSummaryValue(task: TaskRecord, change: ChangeSet | undefined, fil
   };
 }
 
+async function finalizeVerifyingTask(ctx: ToolContext, workspaceId: string, task: TaskRecord): Promise<JsonObject> {
+  if (task.status !== 'verifying') {
+    throw new HarnessError('INVALID_TASK_TRANSITION', `Cannot finalize task from ${task.status}`);
+  }
+  const changeId = task.latest_change_id;
+  if (!changeId) throw new HarnessError('CHANGE_NOT_FOUND', 'Verifying task has no captured change to finalize.');
+  const change = ctx.state.changeById(workspaceId, changeId);
+  if (!change || change.task_id !== task.id) {
+    throw new HarnessError('CHANGE_NOT_FOUND', `Captured change ${changeId} was not found for task ${task.id}.`);
+  }
+  if (!canTransition(task.status, 'completed')) {
+    throw new HarnessError('INVALID_TASK_TRANSITION', `Cannot transition ${task.status} to completed`);
+  }
+  task.status = 'completed';
+  task.updated_at = now();
+  const finalizedEvent = event(
+    workspaceId,
+    task.id,
+    'task_status_changed',
+    { status: 'completed', change_id: change.id },
+    { ok: true, status: 'completed', change_id: change.id }
+  );
+  await ctx.state.setTask(task.scope_id ?? workspaceId, task, finalizedEvent);
+  return {
+    ok: true,
+    task,
+    summary: change.reason.text,
+    change_id: change.id,
+    change_summary: changeSummaryValue(task, change, change.files, ctx.state.taskEvents(task.id)),
+    finalized_existing_change: true,
+    phase_durations_ms: { baseline_capture_ms: 0 }
+  };
+}
+
 export async function startTask(ctx: ToolContext, key: string, args: JsonObject): Promise<JsonObject> {
-  const { folder, workspaceId } = await workspaceContext(ctx, key);
-  const existing = ctx.state.task(workspaceId);
-  if (existing) {
+  const { workspaceId, scopeId, taskRoot } = await workspaceContext(ctx, key);
+  const objective = String(args.objective ?? '').trim();
+  if (!objective) throw new HarnessError('INVALID_ARGUMENT', 'objective is required');
+  const existingTaskMode = String(args.existing_task ?? 'error');
+  if (!['error', 'finish_if_complete'].includes(existingTaskMode)) {
+    throw new HarnessError('INVALID_ARGUMENT', 'existing_task must be error or finish_if_complete');
+  }
+  const existing = ctx.state.task(scopeId);
+  let recoveredTaskId: string | undefined;
+  if (existing && existingTaskMode === 'finish_if_complete'
+    && existing.status === 'verifying' && existing.pending_steps.length === 0 && existing.latest_change_id) {
+    await finalizeVerifyingTask(ctx, workspaceId, existing);
+    recoveredTaskId = existing.id;
+  } else if (existing) {
+    const recoveryActions: JsonObject[] = [
+      {
+        action: 'inspect_active_task',
+        tool: 'task_context',
+        required_arguments: ['task_id'],
+        arguments: { task_id: existing.id }
+      },
+      {
+        action: 'finish_active_task',
+        tool: 'finish_task',
+        required_arguments: ['task_id'],
+        arguments: { task_id: existing.id }
+      }
+    ];
+    if (existing.status === 'verifying' && existing.pending_steps.length === 0 && existing.latest_change_id) {
+      recoveryActions.push({
+        action: 'finalize_completed_verification_and_retry',
+        tool: 'start_task',
+        required_arguments: ['objective', 'existing_task'],
+        arguments: { existing_task: 'finish_if_complete' }
+      });
+    }
     throw new HarnessError(
       'TASK_ALREADY_ACTIVE',
       `Workspace already has active task ${existing.id}`,
@@ -532,32 +619,19 @@ export async function startTask(ctx: ToolContext, key: string, args: JsonObject)
         blocking_condition: 'active_task_exists',
         active_task_id: existing.id,
         suggestion: 'Continue or finish the active task before starting another task.',
-        recovery_actions: [
-          {
-            action: 'inspect_active_task',
-            tool: 'task_context',
-            required_arguments: ['task_id'],
-            arguments: { task_id: existing.id }
-          },
-          {
-            action: 'finish_active_task',
-            tool: 'finish_task',
-            required_arguments: ['task_id'],
-            arguments: { task_id: existing.id }
-          }
-        ]
+        recovery_actions: recoveryActions
       }
     );
   }
-  const objective = String(args.objective ?? '').trim();
-  if (!objective) throw new HarnessError('INVALID_ARGUMENT', 'objective is required');
   const baselineStartedAt = performance.now();
-  const baseline = await captureBaseline(folder.path);
+  const baseline = await captureBaseline(taskRoot);
   const baselineCaptureMs = elapsedPhaseMs(baselineStartedAt);
   const timestamp = now();
   const task: TaskRecord = {
     id: randomUUID().replaceAll('-', ''),
     workspace_id: workspaceId,
+    scope_id: scopeId,
+    scope_root: taskRoot,
     objective,
     status: 'active',
     baseline,
@@ -567,11 +641,12 @@ export async function startTask(ctx: ToolContext, key: string, args: JsonObject)
     created_at: timestamp,
     updated_at: timestamp
   };
-  await ctx.state.setTask(workspaceId, task, event(workspaceId, task.id, 'task_started'));
+  await ctx.state.setTask(scopeId, task, event(workspaceId, task.id, 'task_started'));
   return {
     ok: true,
     task,
     next: ['project_state', 'task_context'],
+    ...(recoveredTaskId ? { recovered_task_id: recoveredTaskId } : {}),
     phase_durations_ms: { baseline_capture_ms: baselineCaptureMs }
   };
 }
@@ -602,8 +677,11 @@ export async function setTaskStatus(ctx: ToolContext, key: string, status: TaskS
 }
 
 export async function finishTask(ctx: ToolContext, key: string, args: JsonObject): Promise<JsonObject> {
-  const { folder, workspaceId } = await workspaceContext(ctx, key);
+  const { taskRoot, workspaceId } = await workspaceContext(ctx, key);
   const task = requireTask(ctx, workspaceId, args.task_id);
+  if (task.status === 'verifying' && args.allow_unverified !== true) {
+    return finalizeVerifyingTask(ctx, workspaceId, task);
+  }
   const status: TaskStatus = args.allow_unverified === true ? 'completed_unverified' : 'verifying';
   if (!canTransition(task.status, status)) throw new HarnessError('INVALID_TASK_TRANSITION', `Cannot transition ${task.status} to ${status}`);
   const reason = finishReason(task, args);
@@ -620,7 +698,7 @@ export async function finishTask(ctx: ToolContext, key: string, args: JsonObject
   finishedEvent.reason = reason;
   finishedEvent.created_at = timestamp;
   const baselineStartedAt = performance.now();
-  const current = await captureBaseline(folder.path);
+  const current = await captureBaseline(taskRootFor(task, taskRoot));
   const baselineCaptureMs = elapsedPhaseMs(baselineStartedAt);
   const change: ChangeSet = {
     id: changeId,
@@ -716,12 +794,12 @@ function boundedTaskContext(task: TaskRecord, sourceEvents: TaskEvent[], maxByte
 }
 
 export async function taskContext(ctx: ToolContext, key: string, args: JsonObject): Promise<JsonObject> {
-  const { workspaceId } = await workspaceContext(ctx, key);
+  const { workspaceId, scopeId } = await workspaceContext(ctx, key);
   const maxBytes = Math.max(
     TASK_CONTEXT_MIN_BYTES,
     Math.min(TASK_CONTEXT_MAX_BYTES, Math.trunc(Number(args.max_bytes ?? TASK_CONTEXT_DEFAULT_BYTES)) || TASK_CONTEXT_DEFAULT_BYTES)
   );
-  const task = taskForArgs(ctx, workspaceId, args);
+  const task = taskForArgs(ctx, workspaceId, scopeId, args);
   if (!task) return { ok: true, task: null, message: '当前没有活动任务', truncated: false, max_bytes: maxBytes };
   const payloadBudget = Math.max(1, maxBytes - TASK_CONTEXT_RESULT_METADATA_BYTES);
   return boundedTaskContext(task, ctx.state.taskEvents(task.id), maxBytes, payloadBudget);
@@ -737,7 +815,7 @@ export async function listTaskEvents(ctx: ToolContext, key: string, args: JsonOb
 }
 
 export async function changeSummary(ctx: ToolContext, key: string, args: JsonObject = {}): Promise<JsonObject> {
-  const { folder, workspaceId } = await workspaceContext(ctx, key);
+  const { workspaceId, scopeId, taskRoot } = await workspaceContext(ctx, key);
   const requestedTaskId = normalizedOptionalString(args.task_id, 'task_id');
   const requestedChangeId = normalizedChangeId(args.change_id);
   if (requestedChangeId) {
@@ -749,7 +827,7 @@ export async function changeSummary(ctx: ToolContext, key: string, args: JsonObj
     const task = requireTask(ctx, workspaceId, change.task_id);
     return changeSummaryValue(task, change, change.files, ctx.state.taskEvents(task.id));
   }
-  const task = requestedTaskId ? requireTask(ctx, workspaceId, requestedTaskId) : ctx.state.task(workspaceId);
+  const task = requestedTaskId ? requireTask(ctx, workspaceId, requestedTaskId) : ctx.state.task(scopeId);
   if (!task) throw new HarnessError('TASK_STATE_REQUIRED', 'No active task is available to summarize');
   if (task.latest_change_id) {
     const change = ctx.state.changeById(workspaceId, task.latest_change_id);
@@ -757,7 +835,7 @@ export async function changeSummary(ctx: ToolContext, key: string, args: JsonObj
     return changeSummaryValue(task, change, change.files, ctx.state.taskEvents(task.id));
   }
   const baselineStartedAt = performance.now();
-  const current = await captureBaseline(folder.path);
+  const current = await captureBaseline(taskRootFor(task, taskRoot));
   const summary = changeSummaryValue(task, undefined, changeFiles(task, current), ctx.state.taskEvents(task.id));
   addPhaseDuration(summary, 'baseline_capture_ms', elapsedPhaseMs(baselineStartedAt));
   return summary;
@@ -767,21 +845,21 @@ function requiresWriteBaseline(name: string, args: JsonObject): boolean {
   if (name === 'exec_command') return true;
   if (['apply_patch', 'edit', 'edit_file', 'edit_many', 'file_ops'].includes(name)) return args.dry_run !== true;
   if (name === 'format_files') return args.mode === 'apply';
-  if (['git_branch', 'git_stage', 'git_commit', 'git_restore'].includes(name)) return args.dry_run !== true;
+  if (['git_branch', 'git_worktree', 'git_stage', 'git_commit', 'git_restore'].includes(name)) return args.dry_run !== true;
   return false;
 }
 
 function standaloneOperation(name: string): boolean {
   return [
     'patch_check', 'apply_patch', 'edit', 'edit_file', 'edit_many', 'file_ops', 'format_files',
-    'exec_command', 'git_branch', 'git_stage', 'git_commit', 'git_push', 'git_restore'
+    'exec_command', 'git_branch', 'git_worktree', 'git_stage', 'git_commit', 'git_push', 'git_restore'
   ].includes(name);
 }
 
 function shouldLogOperation(name: string): boolean {
   return standaloneOperation(name) || [
     'git_status', 'git_diff', 'git_log', 'git_show', 'git_blame',
-    'git_branch', 'git_stage', 'git_commit', 'git_push', 'git_restore'
+    'git_branch', 'git_worktree', 'git_stage', 'git_commit', 'git_push', 'git_restore'
   ].includes(name);
 }
 
@@ -799,15 +877,15 @@ export async function beginHarnessTracking(
   const needsBaseline = ctx.config.securityPolicy.enforceHarnessBaseline && tracksTask;
   const needsOperation = shouldLogOperation(name);
   if (!tracksTask && !needsOperation) return {};
-  const { folder, workspaceId } = await workspaceContext(ctx, key);
+  const { workspaceId, scopeId, taskRoot } = await workspaceContext(ctx, key);
   let taskId: string | undefined;
   let baselineCaptureMs = 0;
   if (tracksTask) {
-    const task = ctx.state.task(workspaceId);
+    const task = ctx.state.task(scopeId);
     if (task) {
       if (needsBaseline) {
         const baselineStartedAt = performance.now();
-        const baselineCheck = await checkTaskBaseline(folder.path, task);
+        const baselineCheck = await checkTaskBaseline(taskRoot, task);
         baselineCaptureMs += elapsedPhaseMs(baselineStartedAt);
         if (!baselineCheck.matches) {
           const previous = {
@@ -819,7 +897,7 @@ export async function beginHarnessTracking(
           task.baseline.head = baselineCheck.current.head;
           task.expected_fingerprint = baselineCheck.current.worktree_fingerprint;
           task.updated_at = now();
-          await ctx.state.setTask(workspaceId, task).catch(() => undefined);
+          await ctx.state.setTask(scopeId, task).catch(() => undefined);
           await ctx.state.addTaskEvent(event(
             workspaceId,
             task.id,
@@ -863,7 +941,7 @@ export async function beginHarnessTracking(
   }
   return {
     workspaceId,
-    ...(taskId ? { taskId, baselineChecked: needsBaseline, baselineCaptureMs } : {}),
+    ...(taskId ? { taskId, taskRoot, baselineChecked: needsBaseline, baselineCaptureMs } : {}),
     ...(operation ? { operation } : {})
   };
 }
@@ -911,9 +989,8 @@ export async function finishHarnessTracking(
       name
     )).catch(() => undefined);
     if (succeeded && tracking.baselineChecked && ctx.config.securityPolicy.enforceHarnessBaseline) {
-      const folder = selectedFolder(ctx, key);
       const baselineStartedAt = performance.now();
-      await refreshExpectedState(ctx, tracking.workspaceId, folder.path, tracking.taskId).catch(() => undefined);
+      await refreshExpectedState(ctx, tracking.workspaceId, tracking.taskRoot ?? selectedFolder(ctx, key).path, tracking.taskId).catch(() => undefined);
       addPhaseDuration(result, 'baseline_capture_ms', elapsedPhaseMs(baselineStartedAt));
     }
   }

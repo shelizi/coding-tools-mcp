@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { message } from "@tauri-apps/plugin-dialog";
+  import { alert as message } from "$lib/api/native";
   import type { DownloadConfig, SoftwareStatus } from "$lib/api/software";
   import {
     listSoftware,
@@ -23,6 +23,9 @@
   });
   let configChanged = $state(false);
 
+  const tunnelSoftware = $derived(software.filter((item) => (item.group ?? "tunnel") === "tunnel"));
+  const sandboxSoftware = $derived(software.filter((item) => item.group === "sandbox"));
+
   async function refresh() {
     loading = true;
     try {
@@ -37,8 +40,11 @@
   async function install(kind: string) {
     installing = kind;
     try {
-      await installSoftware(kind);
+      const status = await installSoftware(kind);
       await refresh();
+      if (status.nextSteps?.trim()) {
+        await message(status.nextSteps, { title: $t("Next steps"), kind: "info" });
+      }
     } catch (e) {
       await message(String(e), { title: $t("Installation failed"), kind: "error" });
     } finally {
@@ -77,7 +83,7 @@
     <h2 class="page-title">{$t("Software management")}</h2>
     <p class="mt-2 max-w-2xl text-sm text-[var(--color-text-muted)]">
       {$t(
-        "Install and remove the frpc and cloudflared tunnel clients. Managed binaries are stored in the application cache.",
+        "Install tunnel clients and sandbox CLIs. Cache-managed tunnel binaries can be uninstalled here; sandbox tools use the official package manager.",
       )}
     </p>
   </header>
@@ -91,44 +97,8 @@
       {:else if software.length === 0}
         <p class="mt-4 text-sm text-[var(--color-text-muted)]">{$t("No information available.")}</p>
       {:else}
-        <ul class="mt-4 space-y-2">
-          {#each software as s (s.kind)}
-            <li class="tx-panel flex items-center justify-between gap-3 px-3 py-2">
-              <div class="min-w-0">
-                <p class="text-sm font-medium">{s.name}</p>
-                <p class="font-mono text-xs text-[var(--color-text-muted)]">
-                  {s.installed ? s.path : $t("Not installed")}
-                  · {s.managed ? $t("Managed") : $t("System installation")}
-                </p>
-              </div>
-              <div class="flex shrink-0 gap-2">
-                {#if s.installed}
-                  {#if s.managed}
-                    <button
-                      type="button"
-                      class="text-xs text-red-400 hover:underline disabled:opacity-50"
-                      disabled={uninstalling === s.kind}
-                      onclick={() => uninstall(s.kind)}
-                    >
-                      {uninstalling === s.kind ? $t("Uninstalling…") : $t("Uninstall")}
-                    </button>
-                  {:else}
-                    <span class="text-xs text-[var(--color-text-muted)]">{$t("System installation")}</span>
-                  {/if}
-                {:else}
-                  <button
-                    type="button"
-                    class="text-xs text-[var(--color-accent)] hover:underline disabled:opacity-50"
-                    disabled={installing === s.kind}
-                    onclick={() => install(s.kind)}
-                  >
-                    {installing === s.kind ? $t("Installing…") : $t("Install")}
-                  </button>
-                {/if}
-              </div>
-            </li>
-          {/each}
-        </ul>
+        {@render softwareGroup($t("Tunnel clients"), tunnelSoftware)}
+        {@render softwareGroup($t("Sandbox tools"), sandboxSoftware)}
       {/if}
     </div>
 
@@ -187,3 +157,57 @@
     </div>
   </div>
 </section>
+
+{#snippet softwareGroup(title: string, items: SoftwareStatus[])}
+  {#if items.length > 0}
+    <div class="mt-4">
+      <p class="text-xs font-medium text-[var(--color-text-muted)]">{title}</p>
+      <ul class="mt-2 space-y-2">
+        {#each items as s (s.kind)}
+          <li class="tx-panel flex items-center justify-between gap-3 px-3 py-2">
+            <div class="min-w-0">
+              <p class="text-sm font-medium">{s.name}</p>
+              <p class="font-mono text-xs text-[var(--color-text-muted)]">
+                {s.installed ? s.path : $t("Not installed")}
+                · {s.managed ? $t("Managed") : $t("System installation")}
+              </p>
+              {#if s.hint}
+                <p class="mt-1 text-xs leading-5 text-[var(--color-text-muted)]">{s.hint}</p>
+              {/if}
+              {#if s.installed && s.nextSteps && s.nextSteps !== s.hint}
+                <p class="mt-1 whitespace-pre-line text-xs leading-5 text-[var(--color-text-muted)]">{s.nextSteps}</p>
+              {/if}
+            </div>
+            <div class="flex shrink-0 gap-2">
+              {#if s.installed}
+                {#if s.managed}
+                  <button
+                    type="button"
+                    class="text-xs text-red-400 hover:underline disabled:opacity-50"
+                    disabled={uninstalling === s.kind}
+                    onclick={() => uninstall(s.kind)}
+                  >
+                    {uninstalling === s.kind ? $t("Uninstalling…") : $t("Uninstall")}
+                  </button>
+                {:else}
+                  <span class="text-xs text-[var(--color-text-muted)]">{$t("System installation")}</span>
+                {/if}
+              {:else if s.installable !== false}
+                <button
+                  type="button"
+                  class="text-xs text-[var(--color-accent)] hover:underline disabled:opacity-50"
+                  disabled={installing === s.kind}
+                  onclick={() => install(s.kind)}
+                >
+                  {installing === s.kind ? $t("Installing…") : $t("Install")}
+                </button>
+              {:else}
+                <span class="text-xs text-[var(--color-text-muted)]">{$t("Not installed")}</span>
+              {/if}
+            </div>
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
+{/snippet}

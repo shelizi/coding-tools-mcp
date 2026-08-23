@@ -13,21 +13,6 @@ export function assertVersion(version) {
   return version;
 }
 
-export function syncPackageLock(text, version) {
-  const lock = JSON.parse(text);
-  if (!lock.packages?.['']) {
-    throw new Error('package-lock.json does not contain the root package entry.');
-  }
-  if (lock.version === version && lock.packages[''].version === version) {
-    return text;
-  }
-
-  lock.version = version;
-  lock.packages[''].version = version;
-  const newline = text.includes('\r\n') ? '\r\n' : '\n';
-  return `${JSON.stringify(lock, null, 2).replaceAll('\n', newline)}${newline}`;
-}
-
 function stringifyJson(document, original) {
   const newline = original.includes('\r\n') ? '\r\n' : '\n';
   return `${JSON.stringify(document, null, 2).replaceAll('\n', newline)}${newline}`;
@@ -95,10 +80,6 @@ async function main() {
 
   const targets = [
     {
-      path: join(workspace, 'package-lock.json'),
-      sync: syncPackageLock
-    },
-    {
       path: join(workspace, 'src-tauri', 'Cargo.toml'),
       sync: syncCargoManifest
     },
@@ -127,7 +108,7 @@ async function main() {
 
   if (checkOnly && stale.length > 0) {
     throw new Error(
-      `Version metadata is out of sync with package.json (${version}):\n${stale.map((path) => `- ${path}`).join('\n')}\nRun npm run version:sync.`
+      `Version metadata is out of sync with package.json (${version}):\n${stale.map((path) => `- ${path}`).join('\n')}\nRun pnpm run version:sync.`
     );
   }
 

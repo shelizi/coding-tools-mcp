@@ -17,7 +17,7 @@ cargo check --manifest-path src-tauri/Cargo.toml --no-default-features --lib
 cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --test headless_core
 ```
 
-The same headless contract is available as `npm run rust:check:headless` and
+The same headless contract is available as `pnpm run rust:check:headless` and
 runs in a separate Linux CI job without installing Tauri system packages.
 
 The desktop executable has `required-features = ["desktop"]`, so a headless

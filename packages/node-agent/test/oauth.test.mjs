@@ -104,6 +104,21 @@ test('OAuthRuntime rejects missing credentials and ignores blank optional client
   assert.equal(new OAuthRuntime(oauthConfig({ clientSecret: ' ' })).clientSecret, undefined);
 });
 
+test('OAuthRuntime rate limits repeated password failures and recovers after the block window', () => {
+  let now = 1;
+  const base = 'https://public.example/builtin/clients/oauth-test';
+  const runtime = new OAuthRuntime(oauthConfig(), () => now);
+  const invalid = authorizationForm('rate-limit');
+  invalid.set('password', 'wrong-password');
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    assert.equal(runtime.authorizeSubmit(invalid, base).status, 401);
+  }
+  assert.equal(runtime.authorizeSubmit(invalid, base).status, 429);
+  assert.equal(runtime.authorizeSubmit(authorizationForm('blocked-correct'), base).status, 429);
+  now += 60_001;
+  assert.equal(runtime.authorizeSubmit(authorizationForm('unblocked'), base).status, 303);
+});
+
 test('OAuthRuntime updates credentials and clears pending authorization codes', () => {
   const base = 'https://public.example/builtin/clients/oauth-test';
   const runtime = new OAuthRuntime(oauthConfig({ clientSecret: 'old-client-secret' }));
@@ -159,6 +174,7 @@ test('authorization codes are isolated per OAuthRuntime and single-use', () => {
 
   const exchanged = first.exchangeToken(tokenForm(code), {}, base);
   assert.equal(exchanged.status, 200);
+  assert.equal(exchanged.body.expires_in, 7 * 24 * 60 * 60);
   const accessToken = exchanged.body.access_token;
   assert.equal(first.verifyBearer({ authorization: `Bearer ${accessToken}` }, base), true);
   assert.deepEqual(first.exchangeToken(tokenForm(code), {}, base).body, {
@@ -226,7 +242,7 @@ test('closing an Agent runtime clears its pending authorization codes', async t 
   assert.equal(response.status, 303);
   const code = new URL(response.headers.get('location')).searchParams.get('code');
   assert.ok(code);
-  await new Promise(resolve => runtime.server.close(resolve));
+  await runtime.close();
 
   assert.deepEqual(runtime.oauth.exchangeToken(tokenForm(code), {}, config.publicBaseUrl).body, {
     error: 'invalid_grant',

@@ -1,0 +1,53 @@
+{
+  "id": "desktop-1",
+  "name": "Desktop Repo",
+  "path": "E:\\work\\desktop",
+  "folders": [
+    {
+      "id": "folder-1",
+      "name": "Desktop Repo",
+      "path": "E:\\work\\desktop"
+    }
+  ],
+  "active_folder_id": "folder-1",
+  "tunnel": {
+    "type": "builtin",
+    "public_url": "https://example.test/builtin/clients/desktop/mcp",
+    "frp_server": "",
+    "frp_subdomain": "",
+    "cloudflare_mode": "quick"
+  },
+  "auth": {
+    "type": "oauth",
+    "oauth_client_id": "chatgpt-desktop",
+    "use_shared_secrets": false
+  },
+  "runtime": {
+    "local_port": 18790,
+    "bind_address": "127.0.0.1",
+    "transport_mode": "streamable-http",
+    "tool_profile": "advanced",
+    "permission_mode": "trusted",
+    "allowed_commands": "pytest,cargo",
+    "workspace_local_entries": true,
+    "workspace_script_extensions": ".exe,.cmd",
+    "blocking_admission_limit": 8,
+    "process_admission_limit": 4,
+    "global_blocking_admission_limit": 16,
+    "global_process_admission_limit": 8,
+    "active_session_limit": 16,
+    "sandbox": {
+      "enabled": false,
+      "backend": "appcontainer",
+      "external_paths": [],
+      "options": {}
+    }
+  },
+  "actions": {
+    "public_url": "",
+    "tunnel_type": "none",
+    "local_port": 18791,
+    "auth_type": "oauth",
+    "oauth_client_id": "actions-desktop"
+  }
+}

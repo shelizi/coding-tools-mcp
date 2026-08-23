@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { spawn } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import {
   ProcessStartupController,
   ProcessStartupError,
@@ -18,7 +21,23 @@ import {
   isWindowsLoaderInitializationFailure,
   startupDiagnosticsJson
 } from '../dist/processStartup.js';
-import { runBuffered } from '../dist/processes.js';
+import { nativeLaunchSpec, ProcessToolError, runBuffered } from '../dist/processes.js';
+
+test('native launch policy is owned by a dedicated module behind the processes facade', async () => {
+  const launch = await import('../dist/processes/nativeLaunch.js');
+  assert.equal(launch.nativeLaunchSpec, nativeLaunchSpec);
+});
+
+test('process startup errors are owned by a dedicated module behind the processes facade', async () => {
+  const errors = await import('../dist/processes/errors.js');
+  assert.equal(errors.ProcessToolError, ProcessToolError);
+  assert.equal(typeof errors.startupToolError, 'function');
+});
+test('child stream draining is owned by a dedicated module', async () => {
+  const childStreams = await import('../dist/processes/childStreams.js');
+  assert.equal(typeof childStreams.waitForReadableEnd, 'function');
+  assert.equal(typeof childStreams.waitForChildStreams, 'function');
+});
 
 class FakeClock {
   nowMs = 0;
@@ -297,14 +316,18 @@ test('real Windows child survives startup gate and probe with output intact', {
   assert.equal(stdout, 'windows-startup-ok');
 });
 
-test('buffered startup preserves quick output and maps spawn failures', async () => {
+test('buffered startup preserves quick output, reports spawned PID, and maps spawn failures', async () => {
+  let spawnedPid;
   const quick = await runBuffered(
     process.execPath,
     ['-e', 'process.stdout.write("buffered-startup-ok")'],
     process.cwd(),
     undefined,
-    10_000
+    10_000,
+    process.env,
+    { onSpawn: pid => { spawnedPid = pid; } }
   );
+  assert.ok(Number.isSafeInteger(spawnedPid) && spawnedPid > 0);
   assert.equal(quick.code, 0);
   assert.equal(quick.stdout, 'buffered-startup-ok');
   assert.equal(quick.stderr, '');
@@ -321,4 +344,44 @@ test('buffered startup preserves quick output and maps spawn failures', async ()
       return true;
     }
   );
+});
+
+test('Windows native launcher resolves PATH .cmd shims and preserves metacharacter arguments', { skip: process.platform !== 'win32' }, async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-windows-launch-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const script = path.join(root, 'ctmcp-batch-fixture.cmd');
+  await writeFile(script, '@echo off\r\necho "%~1"\r\n');
+  const environment = {
+    ...process.env,
+    PATH: `${root}${path.delimiter}${process.env.PATH ?? ''}`,
+    PATHEXT: '.EXE;.CMD',
+    COMSPEC: process.env.ComSpec ?? process.env.COMSPEC ?? 'cmd.exe'
+  };
+
+  const launch = nativeLaunchSpec('ctmcp-batch-fixture', ['safe & echo injected'], root, environment, 'win32');
+  assert.match(path.basename(launch.program).toLowerCase(), /^cmd\.exe$/);
+  assert.equal(launch.windowsVerbatimArguments, true);
+  assert.equal(launch.args[0], '/d');
+  assert.equal(launch.args[1], '/s');
+  assert.equal(launch.args[2], '/c');
+  assert.match(launch.args[3], /ctmcp-batch-fixture\.cmd/i);
+
+  const result = await runBuffered(
+    'ctmcp-batch-fixture',
+    ['safe & echo injected'],
+    root,
+    undefined,
+    10_000,
+    environment
+  );
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(result.stdout.trim(), '"safe & echo injected"');
+  assert.equal(result.stderr, '');
+});
+
+test('Windows buffered runner launches npm through its command shim', { skip: process.platform !== 'win32' }, async () => {
+  const result = await runBuffered('npm', ['--version'], process.cwd(), undefined, 10_000, process.env);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout.trim(), /^\d+\.\d+\.\d+(?:[-+].*)?$/);
+  assert.match(result.stderr, /^(?:npm warn Unknown env config "[^"]+"[^\n]*\n)*$/);
 });

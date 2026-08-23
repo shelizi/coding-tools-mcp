@@ -14,11 +14,26 @@ fn git_output(manifest_dir: &PathBuf, args: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn git_clean(manifest_dir: &PathBuf) -> Option<bool> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .current_dir(manifest_dir)
+        .output()
+        .ok()?;
+    output.status.success().then(|| output.stdout.is_empty())
+}
+
 fn main() {
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap_or_default());
     let build_git_sha =
         git_output(&manifest_dir, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=CTMCP_BUILD_GIT_SHA={build_git_sha}");
+    let build_source_clean = git_clean(&manifest_dir)
+        .map(|clean| if clean { "true" } else { "false" })
+        .unwrap_or("unknown");
+    println!("cargo:rustc-env=CTMCP_BUILD_SOURCE_CLEAN={build_source_clean}");
 
     if let Some(git_head_path) = git_output(&manifest_dir, &["rev-parse", "--git-path", "HEAD"]) {
         println!("cargo:rerun-if-changed={git_head_path}");

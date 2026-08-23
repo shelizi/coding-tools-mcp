@@ -1,8 +1,17 @@
 import type { JsonObject, ToolContext } from './types.js';
-import { runBuffered } from './processes.js';
+import { gitRunRouting, runGitBuffered } from './gitProcess.js';
 import { createHash } from 'node:crypto';
-import { rm, stat } from 'node:fs/promises';
-import { resolveInside, resolveExistingPath, rejectProtectedWritePath, rootAndCwd, validateWorkspaceUserPath } from './workspace.js';
+import path from 'node:path';
+import { mkdir, rm, stat } from 'node:fs/promises';
+import {
+  exists,
+  relativeInside,
+  resolveInside,
+  resolveExistingPath,
+  rejectProtectedWritePath,
+  rootAndCwd,
+  validateWorkspaceUserPath
+} from './workspace.js';
 
 const ok = (value: JsonObject): JsonObject => ({ ok: true, ...value });
 const fail = (code: string, message: string): JsonObject => ({ ok: false, error: { code, message, category: 'git', retryable: false } });
@@ -19,12 +28,65 @@ type GitTarget = {
   fingerprint: string;
 };
 
+export { gitRunRouting };
+
 async function runGitAt(cwd: string, args: string[], timeoutMs = 30_000, input?: string): Promise<GitResult> {
-  return runBuffered('git', args, cwd, input, timeoutMs, { ...process.env, GIT_TERMINAL_PROMPT: '0' });
+  return runGitBuffered(cwd, args, input, timeoutMs);
 }
 
 async function runGit(ctx: ToolContext, key: string, args: string[], timeoutMs = 30_000, input?: string): Promise<GitResult> {
   return runGitAt(rootAndCwd(ctx, key).root, args, timeoutMs, input);
+}
+
+async function stagedPathsAt(root: string): Promise<string[]> {
+  const result = await runGitAt(root, ['diff', '--cached', '--name-only', '-z', '--'], 10_000);
+  if (result.code !== 0) throw new Error(result.stderr || result.stdout || 'git staged path query failed');
+  return result.stdout.split('\0').filter(Boolean);
+}
+
+async function restoreCleanIndexAfterGitTransactionFailure(
+  root: string,
+  stagedByTool: boolean,
+  indexCleanBefore: boolean
+): Promise<boolean> {
+  if (!stagedByTool || !indexCleanBefore) return false;
+  const reset = await runGitAt(root, ['reset', '--quiet', 'HEAD', '--'], 10_000);
+  return reset.code === 0;
+}
+
+function gitTransactionHeadChanged(details: {
+  expectedHead?: string;
+  actualHeadBefore: string;
+  actualHeadAtCommit: string;
+  selectedPathCount: number;
+  stagedPathCountBefore: number;
+  stagedPathCount: number;
+  indexCleanBefore: boolean;
+  stagedByTool: boolean;
+  indexRestored: boolean;
+}): JsonObject {
+  return {
+    ok: false,
+    error: {
+      code: 'GIT_HEAD_CHANGED_DURING_TRANSACTION',
+      message: 'Git HEAD changed after transaction preflight and before commit',
+      category: 'conflict',
+      retryable: true,
+      details: {
+        transaction_stage: 'pre_commit_head_check',
+        expected_head: details.expectedHead ?? null,
+        actual_head_before: details.actualHeadBefore,
+        actual_head_at_commit: details.actualHeadAtCommit,
+        selected_path_count: details.selectedPathCount,
+        staged_path_count_before: details.stagedPathCountBefore,
+        staged_path_count: details.stagedPathCount,
+        index_clean_before: details.indexCleanBefore,
+        staged_by_tool: details.stagedByTool,
+        index_restored: details.indexRestored,
+        suggestion: 'Refresh git_status/git_diff and retry git_commit with the new expected_head.'
+      }
+    }
+  };
 }
 
 function targetMetadata(target: GitTarget): JsonObject {
@@ -143,6 +205,122 @@ function parseBranchLine(line: string): { branch: string; upstream: string; ahea
     }
   }
   return { branch, upstream, ahead, behind };
+}
+
+interface GitWorktreeEntry {
+  path: string;
+  absolutePath: string;
+  head: string;
+  branch: string;
+  detached: boolean;
+  bare: boolean;
+  locked?: string | boolean;
+  prunable?: string | boolean;
+  primary?: boolean;
+  inside_workspace?: boolean;
+  managed?: boolean;
+  removable?: boolean;
+  dirty?: boolean | null;
+  branch_merged?: boolean | null;
+}
+
+function pathInside(parent: string, candidate: string): boolean {
+  const parentPath = normalizedLocalPath(parent);
+  const candidatePath = normalizedLocalPath(candidate);
+  return candidatePath === parentPath || candidatePath.startsWith(`${parentPath}${path.sep}`);
+}
+
+function displayWorktreePath(workspaceRoot: string, value: string): string {
+  try {
+    return relativeInside(workspaceRoot, value).replaceAll('\\', '/') || '.';
+  } catch {
+    return value.replaceAll('\\', '/');
+  }
+}
+
+function parseWorktreePorcelain(workspaceRoot: string, output: string): GitWorktreeEntry[] {
+  const entries: GitWorktreeEntry[] = [];
+  let current: GitWorktreeEntry | undefined;
+  const flush = (): void => {
+    if (!current) return;
+    entries.push(current);
+    current = undefined;
+  };
+  for (const raw of output.split(/\r?\n/)) {
+    if (!raw) {
+      flush();
+      continue;
+    }
+    const separator = raw.indexOf(' ');
+    const field = separator >= 0 ? raw.slice(0, separator) : raw;
+    const value = separator >= 0 ? raw.slice(separator + 1) : '';
+    if (field === 'worktree') {
+      flush();
+      current = {
+        path: displayWorktreePath(workspaceRoot, value),
+        absolutePath: value,
+        head: '',
+        branch: '',
+        detached: false,
+        bare: false
+      };
+      continue;
+    }
+    if (!current) continue;
+    if (field === 'HEAD') current.head = value;
+    else if (field === 'branch') current.branch = value.replace(/^refs\/heads\//, '');
+    else if (field === 'detached') current.detached = true;
+    else if (field === 'bare') current.bare = true;
+    else if (field === 'locked') current.locked = value || true;
+    else if (field === 'prunable') current.prunable = value || true;
+  }
+  flush();
+  return entries;
+}
+
+async function listGitWorktrees(root: string, workspaceRoot: string): Promise<GitWorktreeEntry[]> {
+  const result = await runGitAt(root, ['worktree', 'list', '--porcelain'], 10_000);
+  if (result.code !== 0) throw new Error(result.stderr || result.stdout || 'git worktree list failed');
+  const entries = parseWorktreePorcelain(workspaceRoot, result.stdout);
+  const mergedResult = await runGitAt(root, ['branch', '--merged', 'HEAD', '--format=%(refname:short)'], 10_000);
+  const mergedBranches = new Set(mergedResult.code === 0 ? mergedResult.stdout.split(/\r?\n/).map(value => value.trim()).filter(Boolean) : []);
+  for (const entry of entries) {
+    const insideWorkspace = pathInside(workspaceRoot, entry.absolutePath);
+    const primary = normalizedLocalPath(entry.absolutePath) === normalizedLocalPath(workspaceRoot);
+    entry.primary = primary;
+    entry.inside_workspace = insideWorkspace;
+    entry.managed = insideWorkspace && !primary && entry.path.startsWith('.worktrees/');
+    entry.removable = insideWorkspace && !primary;
+    entry.branch_merged = entry.branch ? mergedBranches.has(entry.branch) : null;
+    if (insideWorkspace && !entry.bare && await exists(entry.absolutePath)) {
+      const status = await runGitAt(entry.absolutePath, ['status', '--porcelain=v1', '--untracked-files=normal'], 10_000);
+      entry.dirty = status.code === 0 ? Boolean(status.stdout.trim()) : null;
+    } else {
+      entry.dirty = null;
+    }
+  }
+  return entries;
+}
+
+function worktreeBranchSlug(branch: string): string {
+  return branch.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'worktree';
+}
+
+async function localBranchExists(root: string, branch: string): Promise<boolean> {
+  const result = await runGitAt(root, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`], 10_000);
+  return result.code === 0;
+}
+
+function normalizedLocalPath(value: string): string {
+  const resolved = path.resolve(value);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function cwdInsideRemovedPath(ctx: ToolContext, key: string, workspaceRoot: string, removedPath: string): boolean {
+  const { cwd } = rootAndCwd(ctx, key);
+  const current = normalizedLocalPath(cwd);
+  const removed = normalizedLocalPath(removedPath);
+  return current === removed || current.startsWith(`${removed}${path.sep}`);
 }
 
 function parseDiffFiles(diff: string): JsonObject[] {
@@ -457,6 +635,127 @@ export async function gitBranchTool(ctx: ToolContext, key: string, args: JsonObj
   });
 }
 
+export async function gitWorktreeTool(ctx: ToolContext, key: string, args: JsonObject): Promise<JsonObject> {
+  const action = String(args.action ?? '').trim();
+  if (!['list', 'create', 'remove'].includes(action)) return fail('INVALID_ARGUMENT', 'action must be list, create, or remove');
+  const target = await resolveGitTarget(ctx, key, args);
+  const mismatch = repoTargetMismatch(target, args.expected_repo_fingerprint);
+  if (mismatch) return mismatch;
+  await ensureExpectedHead(target, args.expected_head);
+  const { folder, root: workspaceRoot } = rootAndCwd(ctx, key);
+
+  if (action === 'list') {
+    return ok({
+      action,
+      applied: false,
+      repo: targetMetadata(target),
+      worktrees: await listGitWorktrees(target.root, workspaceRoot)
+    });
+  }
+
+  if (action === 'create') {
+    const branch = String(args.branch ?? '').trim();
+    if (!branch) return fail('INVALID_ARGUMENT', 'branch is required for create');
+    await validateBranchName(ctx, key, branch);
+    const requestedPath = String(args.path ?? `.worktrees/${worktreeBranchSlug(branch)}`).trim();
+    validateWorkspaceUserPath(requestedPath, { allowDot: false });
+    const fullPath = resolveInside(workspaceRoot, requestedPath);
+    const displayPath = relativeInside(workspaceRoot, fullPath).replaceAll('\\', '/');
+    if (await exists(fullPath)) return fail('GIT_WORKTREE_PATH_EXISTS', `Worktree path already exists: ${displayPath}`);
+    const startPoint = validateGitRef(args.start_point, 'HEAD');
+    const configuredMode = String(args.branch_mode ?? 'auto');
+    if (!['auto', 'create', 'existing'].includes(configuredMode)) return fail('INVALID_ARGUMENT', 'branch_mode must be auto, create, or existing');
+    const branchExists = await localBranchExists(target.root, branch);
+    const branchMode = configuredMode === 'auto' ? (branchExists ? 'existing' : 'create') : configuredMode;
+    if (branchMode === 'create' && branchExists) return fail('GIT_WORKTREE_BRANCH_EXISTS', `Branch already exists: ${branch}`);
+    if (branchMode === 'existing' && !branchExists) return fail('GIT_WORKTREE_BRANCH_NOT_FOUND', `Branch does not exist: ${branch}`);
+    const gitArgs = branchMode === 'existing'
+      ? ['worktree', 'add', fullPath, branch]
+      : ['worktree', 'add', '-b', branch, fullPath, startPoint];
+    if (args.dry_run === true) {
+      return ok({ action, dry_run: true, applied: false, path: displayPath, branch, branch_mode: branchMode, start_point: startPoint, command: ['git', ...gitArgs], repo: targetMetadata(target) });
+    }
+    await mkdir(path.dirname(fullPath), { recursive: true });
+    const result = await runGitAt(target.root, gitArgs, 60_000);
+    if (result.code !== 0) return gitReadFailure(result);
+    return ok({
+      action,
+      applied: true,
+      path: displayPath,
+      branch,
+      branch_mode: branchMode,
+      start_point: startPoint,
+      repo: targetMetadata(target),
+      worktrees: await listGitWorktrees(target.root, workspaceRoot)
+    });
+  }
+
+  const requestedPath = String(args.path ?? '').trim();
+  if (!requestedPath) return fail('INVALID_ARGUMENT', 'path is required for remove');
+  validateWorkspaceUserPath(requestedPath, { allowDot: false });
+  const fullPath = resolveInside(workspaceRoot, requestedPath);
+  const displayPath = relativeInside(workspaceRoot, fullPath).replaceAll('\\', '/');
+  if (normalizedLocalPath(fullPath) === normalizedLocalPath(workspaceRoot)) {
+    return fail('GIT_WORKTREE_PRIMARY_REMOVE_DENIED', 'The configured workspace root cannot be removed as a linked worktree');
+  }
+  const worktrees = await listGitWorktrees(target.root, workspaceRoot);
+  const entry = worktrees.find(item => normalizedLocalPath(item.absolutePath) === normalizedLocalPath(fullPath));
+  if (!entry) return fail('GIT_WORKTREE_NOT_FOUND', `Linked worktree is not registered: ${displayPath}`);
+  if (entry.locked && args.force !== true) return fail('GIT_WORKTREE_LOCKED', `Linked worktree is locked: ${displayPath}`);
+  if (args.force !== true) {
+    const status = await runGitAt(fullPath, ['status', '--porcelain=v1', '--untracked-files=normal'], 10_000);
+    if (status.code !== 0) return gitReadFailure(status);
+    if (status.stdout.trim()) return fail('GIT_WORKTREE_DIRTY', `Linked worktree has uncommitted changes: ${displayPath}`);
+  }
+  if (args.dry_run === true) {
+    return ok({ action, dry_run: true, applied: false, path: displayPath, branch: entry.branch || null, repo: targetMetadata(target) });
+  }
+  if (args.confirm !== true) {
+    return fail('DANGEROUS_OPERATION_REQUIRES_CONFIRMATION', 'Removing a linked worktree requires confirm=true');
+  }
+  const removeArgs = ['worktree', 'remove'];
+  if (args.force === true) removeArgs.push('--force');
+  removeArgs.push(fullPath);
+  const removed = await runGitAt(target.root, removeArgs, 60_000);
+  const warnings: string[] = [];
+  if (removed.code !== 0) {
+    const remaining = await listGitWorktrees(target.root, workspaceRoot);
+    const stillRegistered = remaining.some(item => normalizedLocalPath(item.absolutePath) === normalizedLocalPath(fullPath));
+    if (stillRegistered) return gitReadFailure(removed);
+    warnings.push(`worktree registration removed but Git reported cleanup failure: ${(removed.stderr || removed.stdout).trim()}`);
+  }
+  if (await exists(fullPath)) {
+    try {
+      await rm(fullPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+    } catch (error) {
+      warnings.push(`worktree directory cleanup incomplete: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  let branchDeleted = false;
+  if (args.delete_branch === true && entry.branch) {
+    const deleted = await runGitAt(target.root, ['branch', args.force === true ? '-D' : '-d', entry.branch], 30_000);
+    if (deleted.code === 0) {
+      branchDeleted = true;
+    } else {
+      warnings.push(`worktree removed but branch deletion failed: ${(deleted.stderr || deleted.stdout).trim()}`);
+    }
+  }
+  if (cwdInsideRemovedPath(ctx, key, workspaceRoot, fullPath)) {
+    ctx.conversations.setFolderCwd(key, folder.id, '.');
+  }
+  return ok({
+    action,
+    applied: true,
+    path: displayPath,
+    branch: entry.branch || null,
+    branch_deleted: branchDeleted,
+    default_cwd: ctx.conversations.peekCwdFor(key, folder.id),
+    repo: targetMetadata(target),
+    worktrees: await listGitWorktrees(target.root, workspaceRoot),
+    warnings
+  });
+}
+
 export async function gitStageTool(ctx: ToolContext, key: string, args: JsonObject): Promise<JsonObject> {
   const preflightPaths = gitPaths(ctx, key, args, true);
   const target = await resolveGitTarget(ctx, key, args);
@@ -493,7 +792,11 @@ export async function gitCommitTool(ctx: ToolContext, key: string, args: JsonObj
   const all = args.all === true;
   const stagedByTool = paths.length > 0 || all;
   const requireCleanIndex = args.require_clean_index_before === undefined ? stagedByTool : args.require_clean_index_before === true;
+  const expectedHead = typeof args.expected_head === 'string' ? args.expected_head : undefined;
+  const actualHeadBeforeResult = await runGitAt(target.root, ['rev-parse', 'HEAD'], 10_000);
+  const actualHeadBefore = actualHeadBeforeResult.code === 0 ? actualHeadBeforeResult.stdout.trim() : target.head;
   const indexClean = (await runGitAt(target.root, ['diff', '--cached', '--quiet', '--exit-code'], 10_000)).code === 0;
+  const stagedPathsBefore = await stagedPathsAt(target.root);
   if (requireCleanIndex && !indexClean) {
     return {
       ok: false,
@@ -502,26 +805,87 @@ export async function gitCommitTool(ctx: ToolContext, key: string, args: JsonObj
         message: 'git_commit requires a clean index before staging paths',
         category: 'conflict',
         retryable: false,
-        details: { suggestion: 'commit or unstage existing staged changes, or set require_clean_index_before=false' }
+        details: {
+          transaction_stage: 'preflight_index',
+          expected_head: expectedHead ?? null,
+          actual_head_before: actualHeadBefore,
+          selected_path_count: paths.length,
+          staged_path_count_before: stagedPathsBefore.length,
+          index_clean_before: indexClean,
+          staged_by_tool: stagedByTool,
+          suggestion: 'commit or unstage existing staged changes, or set require_clean_index_before=false'
+        }
       }
     };
   }
-  if (args.dry_run === true) return ok({ dry_run: true, applied: false, message, paths, all, index_clean: indexClean, repo: targetMetadata(target), warnings: [] });
+  if (args.dry_run === true) return ok({
+    dry_run: true,
+    applied: false,
+    message,
+    paths,
+    all,
+    index_clean: indexClean,
+    index_clean_before: indexClean,
+    staged_path_count_before: stagedPathsBefore.length,
+    selected_path_count: paths.length,
+    staged_by_tool: stagedByTool,
+    expected_head: expectedHead ?? null,
+    actual_head_before: actualHeadBefore,
+    transaction_stage: 'preflight',
+    would_stage: stagedByTool,
+    would_commit: true,
+    repo: targetMetadata(target),
+    warnings: []
+  });
 
-  const oldHead = await runGitAt(target.root, ['rev-parse', 'HEAD']);
+  const oldHead = actualHeadBefore;
   if (stagedByTool) {
     const staged = await runGitAt(target.root, all ? ['add', '-A'] : ['add', '--', ...paths]);
-    if (staged.code !== 0) return fail('GIT_STAGE_FAILED', staged.stderr || staged.stdout);
+    if (staged.code !== 0) {
+      const indexRestored = await restoreCleanIndexAfterGitTransactionFailure(target.root, stagedByTool, indexClean);
+      return {
+        ok: false,
+        error: {
+          code: 'GIT_STAGE_FAILED',
+          message: (staged.stderr || staged.stdout).trim(),
+          category: 'runtime',
+          retryable: false,
+          details: {
+            transaction_stage: 'stage',
+            expected_head: expectedHead ?? null,
+            actual_head_before: oldHead,
+            selected_path_count: paths.length,
+            staged_path_count_before: stagedPathsBefore.length,
+            index_clean_before: indexClean,
+            staged_by_tool: stagedByTool,
+            index_restored: indexRestored
+          }
+        }
+      };
+    }
+  }
+  const stagedPaths = await stagedPathsAt(target.root);
+  const actualHeadAtCommitResult = await runGitAt(target.root, ['rev-parse', 'HEAD'], 10_000);
+  const actualHeadAtCommit = actualHeadAtCommitResult.code === 0 ? actualHeadAtCommitResult.stdout.trim() : '';
+  if (oldHead.toLowerCase() !== actualHeadAtCommit.toLowerCase()) {
+    const indexRestored = await restoreCleanIndexAfterGitTransactionFailure(target.root, stagedByTool, indexClean);
+    return gitTransactionHeadChanged({
+      expectedHead,
+      actualHeadBefore: oldHead,
+      actualHeadAtCommit,
+      selectedPathCount: paths.length,
+      stagedPathCountBefore: stagedPathsBefore.length,
+      stagedPathCount: stagedPaths.length,
+      indexCleanBefore: indexClean,
+      stagedByTool,
+      indexRestored
+    });
   }
   const argv = ['commit', '-m', message];
   if (args.allow_empty === true) argv.push('--allow-empty');
   const result = await runGitAt(target.root, argv, 60_000);
   if (result.code !== 0) {
-    let indexRestored = false;
-    if (stagedByTool && indexClean) {
-      const reset = await runGitAt(target.root, ['reset', '--quiet', 'HEAD', '--']);
-      indexRestored = reset.code === 0;
-    }
+    const indexRestored = await restoreCleanIndexAfterGitTransactionFailure(target.root, stagedByTool, indexClean);
     return {
       ok: false,
       error: {
@@ -529,7 +893,19 @@ export async function gitCommitTool(ctx: ToolContext, key: string, args: JsonObj
         message: (result.stderr || result.stdout).trim(),
         category: 'runtime',
         retryable: false,
-        details: { stdout: result.stdout, staged_by_tool: stagedByTool, index_restored: indexRestored }
+        details: {
+          transaction_stage: 'commit',
+          stdout: result.stdout,
+          expected_head: expectedHead ?? null,
+          actual_head_before: oldHead,
+          actual_head_at_commit: actualHeadAtCommit,
+          selected_path_count: paths.length,
+          staged_path_count_before: stagedPathsBefore.length,
+          staged_path_count: stagedPaths.length,
+          index_clean_before: indexClean,
+          staged_by_tool: stagedByTool,
+          index_restored: indexRestored
+        }
       }
     };
   }
@@ -538,7 +914,18 @@ export async function gitCommitTool(ctx: ToolContext, key: string, args: JsonObj
     dry_run: false,
     applied: true,
     commit: head.stdout.trim(),
-    previous_head: oldHead.code === 0 ? oldHead.stdout.trim() : '',
+    previous_head: oldHead,
+    expected_head: expectedHead ?? null,
+    actual_head_before: actualHeadBefore,
+    actual_head_at_commit: actualHeadAtCommit,
+    actual_head_after: head.stdout.trim(),
+    transaction_stage: 'committed',
+    selected_path_count: paths.length,
+    staged_path_count_before: stagedPathsBefore.length,
+    staged_path_count: stagedPaths.length,
+    index_clean_before: indexClean,
+    staged_by_tool: stagedByTool,
+    index_restored: false,
     message,
     paths,
     all,

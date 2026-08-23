@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { access, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { CURRENT_CONFIG_SCHEMA_VERSION, loadConfig, loadConfigBundle } from '../dist/config.js';
+import { CANONICAL_SCHEMA_VERSION, CURRENT_CONFIG_SCHEMA_VERSION, loadConfig, loadConfigBundle } from '../dist/config.js';
 
 // Never let destructive missing-key/tamper fixtures target a developer's live Agent data directory.
 delete process.env.CTMCP_DATA_DIR;
@@ -55,6 +55,62 @@ test('command timeout ceiling defaults to 30 minutes and supports a bounded envi
   } finally {
     if (previous === undefined) delete process.env.CTMCP_COMMAND_TIMEOUT_MAX_MS;
     else process.env.CTMCP_COMMAND_TIMEOUT_MAX_MS = previous;
+  }
+});
+
+test('legacy configs default sandboxing off while retaining AppContainer as the selected backend', async () => {
+  const { root, dataDir, configFile } = await fixture('ctmcp-sandbox-default');
+  await writeFile(configFile, JSON.stringify(legacyDocument(root, dataDir)));
+  const loaded = await loadConfig(configFile);
+  assert.deepEqual(loaded.sandbox, {
+    enabled: false,
+    backend: 'appcontainer',
+    externalPaths: [],
+    options: {}
+  });
+});
+
+test('sandbox environment overrides remain backend-neutral and bounded', async () => {
+  const { root, dataDir, configFile } = await fixture('ctmcp-sandbox-env');
+  await writeFile(configFile, JSON.stringify(legacyDocument(root, dataDir, {
+    sandbox: {
+      enabled: true,
+      backend: 'appcontainer',
+      externalPaths: [{ path: root, access: 'read_only' }],
+      options: { 'wslc.image': 'ubuntu:24.04' }
+    }
+  })));
+  const previous = {
+    enabled: process.env.CTMCP_SANDBOX_ENABLED,
+    backend: process.env.CTMCP_SANDBOX_BACKEND,
+    image: process.env.CTMCP_WSLC_IMAGE,
+    network: process.env.CTMCP_WSLC_NETWORK,
+    sessionStorage: process.env.CTMCP_WSLC_SESSION_STORAGE
+  };
+  process.env.CTMCP_SANDBOX_ENABLED = '0';
+  process.env.CTMCP_SANDBOX_BACKEND = 'wslc';
+  process.env.CTMCP_WSLC_IMAGE = 'alpine:3.20';
+  process.env.CTMCP_WSLC_NETWORK = 'none';
+  process.env.CTMCP_WSLC_SESSION_STORAGE = path.join(dataDir, 'wslc-session');
+  try {
+    const loaded = await loadConfig(configFile);
+    assert.equal(loaded.sandbox.enabled, false);
+    assert.equal(loaded.sandbox.backend, 'wslc');
+    assert.deepEqual(loaded.sandbox.externalPaths, [{ path: root, access: 'read_only' }]);
+    assert.equal(loaded.sandbox.options['wslc.image'], 'alpine:3.20');
+    assert.equal(loaded.sandbox.options['wslc.network'], 'none');
+    assert.equal(loaded.sandbox.options['wslc.session_storage'], path.join(dataDir, 'wslc-session'));
+  } finally {
+    for (const [key, value] of Object.entries({
+      CTMCP_SANDBOX_ENABLED: previous.enabled,
+      CTMCP_SANDBOX_BACKEND: previous.backend,
+      CTMCP_WSLC_IMAGE: previous.image,
+      CTMCP_WSLC_NETWORK: previous.network,
+      CTMCP_WSLC_SESSION_STORAGE: previous.sessionStorage
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 
@@ -123,11 +179,16 @@ test('legacy plaintext configuration migrates to schema v1 and encrypted secret 
   assert.equal(loaded.config.tunnel.enrollmentUrl, 'https://tunnel.example/_tunnel/enroll/LEGACYCODE');
 
   const migrated = JSON.parse(await readFile(configFile, 'utf8'));
-  assert.equal(migrated.schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
-  assert.deepEqual(migrated.oauth, { clientId: 'chatgpt' });
+  assert.equal(migrated.schemaVersion, CANONICAL_SCHEMA_VERSION);
+  assert.equal(migrated.schema_version, undefined);
+  assert.equal(migrated.auth.oauthClientId, 'chatgpt');
+  assert.equal(migrated.oauth, undefined);
+  assert.equal(migrated.tunnel.builtin.publicUrl, 'https://tunnel.example/builtin/clients/device_1/mcp');
   assert.equal(migrated.tunnel.enrollmentUrl, undefined);
+  assert.equal(migrated.tunnel.builtin.enrollmentUrl, undefined);
   const publicText = JSON.stringify(migrated);
   assert.doesNotMatch(publicText, /legacy-password|legacy-client-secret|legacy-token-secret|LEGACYCODE/);
+  await access(`${configFile}.bak`);
 
   const encrypted = await readFile(loaded.secretStorePath, 'utf8');
   assert.match(encrypted, /"algorithm": "aes-256-gcm"/);
@@ -239,7 +300,7 @@ test('loadConfig normalizes a string schema version to the numeric current versi
   await writeFile(configFile, JSON.stringify(document));
   const loaded = await loadConfigBundle(configFile);
   assert.equal(loaded.migrationApplied, true);
-  assert.equal(JSON.parse(await readFile(configFile, 'utf8')).schema_version, CURRENT_CONFIG_SCHEMA_VERSION);
+  assert.equal(JSON.parse(await readFile(configFile, 'utf8')).schemaVersion, CANONICAL_SCHEMA_VERSION);
 });
 
 test('loadConfig rejects non-numeric schema version values', async () => {
@@ -289,4 +350,49 @@ test('loadConfig rejects a tampered encrypted secret store', async () => {
   envelope.tag = envelope.tag.replace(/^./, envelope.tag.startsWith('A') ? 'B' : 'A');
   await writeFile(loaded.secretStorePath, JSON.stringify(envelope));
   await assert.rejects(loadConfig(configFile), /Unable to decrypt agent secret store/);
+});
+
+test('loadConfig reads canonical v2, keeps host.desktop extras, and leaves secrets out of JSON', async () => {
+  const { root, dataDir, configFile } = await fixture('ctmcp-canonical-v2');
+  await writeFile(configFile, JSON.stringify({
+    schemaVersion: CANONICAL_SCHEMA_VERSION,
+    id: 'ws-v2',
+    name: 'Repo',
+    folders: [{ id: 'repo', name: 'Repo', path: root }],
+    bind: { host: '127.0.0.1', port: 3789 },
+    auth: { type: 'oauth', oauthClientId: 'chatgpt' },
+    host: {
+      node: { dataDir, management: { enabled: true } },
+      desktop: { authType: 'bearer', actions: { localPort: 9 } }
+    }
+  }));
+  const loaded = await loadConfigBundle(configFile);
+  assert.equal(loaded.config.port, 3789);
+  assert.equal(loaded.config.host, '127.0.0.1');
+  assert.equal(loaded.canonical.id, 'ws-v2');
+  assert.equal(loaded.canonical.host.desktop.authType, 'bearer');
+  const onDisk = JSON.parse(await readFile(configFile, 'utf8'));
+  assert.equal(onDisk.schemaVersion, CANONICAL_SCHEMA_VERSION);
+  assert.equal(onDisk.host.desktop.authType, 'bearer');
+  assert.equal(onDisk.host.desktop.actions.localPort, 9);
+  assert.equal(onDisk.host.node.dataDir, dataDir);
+  const publicText = JSON.stringify(onDisk);
+  assert.doesNotMatch(publicText, /password|clientSecret|tokenSecret|enrollmentUrl/);
+  const restarted = await loadConfigBundle(configFile);
+  assert.equal(restarted.migrationApplied, false);
+  assert.equal(restarted.canonical.host.desktop.actions.localPort, 9);
+});
+
+test('loadConfig rejects a future canonical schemaVersion', async () => {
+  const { root, dataDir, configFile } = await fixture('ctmcp-future-canonical');
+  await writeFile(configFile, JSON.stringify({
+    schemaVersion: CANONICAL_SCHEMA_VERSION + 1,
+    id: 'ws-future',
+    name: 'Repo',
+    folders: [{ id: 'repo', name: 'Repo', path: root }],
+    bind: { host: '127.0.0.1', port: 3789 },
+    auth: { type: 'oauth', oauthClientId: 'chatgpt' },
+    host: { node: { dataDir } }
+  }));
+  await assert.rejects(loadConfig(configFile), /Unsupported workspace schemaVersion/);
 });

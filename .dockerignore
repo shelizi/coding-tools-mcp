@@ -1,8 +1,31 @@
 *
+
+# Tunnel server image context
 !crates/
 !crates/tunnel-protocol/
 !crates/tunnel-protocol/**
 !services/
 !services/tunnel-server/
 !services/tunnel-server/**
+
+# Node Agent image context
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!svelte.config.js
+!vite.config.js
+!tsconfig.json
+!src/
+!src/**
+!static/
+!static/**
+!scripts/
+!scripts/extract-sveltekit-inline.mjs
+!packages/
+!packages/node-agent/
+!packages/node-agent/**
+
+**/node_modules/
+**/dist/
 **/target/
+**/.git/

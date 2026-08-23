@@ -18,6 +18,7 @@
     localEndpoint: string;
     publicEndpoint?: string;
     publicLabel?: string;
+    toggleable?: boolean;
     onToggle: () => void | Promise<void>;
     onPortChange?: (port: number) => void | Promise<void>;
     onBindAddressChange?: (address: string) => void | Promise<void>;
@@ -37,6 +38,7 @@
     localEndpoint,
     publicEndpoint = "",
     publicLabel = "",
+    toggleable = true,
     onToggle,
     onPortChange,
     onBindAddressChange,
@@ -102,21 +104,23 @@
         </p>
       {/if}
     </div>
-    <button
-      type="button"
-      class="tx-btn-primary shrink-0"
-      class:tx-btn-danger={running}
-      disabled={busy || status === "starting" || status === "stopping"}
-      onclick={onToggle}
-    >
-      {#if busy}
-        {$t("Working…")}
-      {:else if running}
-        {$t("Stop")}
-      {:else}
-        {$t("Start")}
-      {/if}
-    </button>
+    {#if toggleable}
+      <button
+        type="button"
+        class="tx-btn-primary shrink-0"
+        class:tx-btn-danger={running}
+        disabled={busy || status === "starting" || status === "stopping"}
+        onclick={onToggle}
+      >
+        {#if busy}
+          {$t("Working…")}
+        {:else if running}
+          {$t("Stop")}
+        {:else}
+          {$t("Start")}
+        {/if}
+      </button>
+    {/if}
   </div>
 
   {#if showError}

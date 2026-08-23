@@ -1,6 +1,7 @@
 import { deriveWorkspaceProfileId } from './conversation.js';
 import { currentExecutionBinding } from './executionScope.js';
 import { KeyedMutex, Semaphore } from './runtime.js';
+import { SkillRegistry } from './skills/registry.js';
 import type { AgentConfig, FolderRuntime, PendingOperation, ToolContext, WorkspaceFolder } from './types.js';
 
 export function createFolderRuntime(config: AgentConfig, folder: WorkspaceFolder): FolderRuntime {
@@ -11,6 +12,11 @@ export function createFolderRuntime(config: AgentConfig, folder: WorkspaceFolder
     operationsByFingerprint: new Map(),
     pendingOperations: new Map(),
     editProposals: new Map(),
+    skillRegistry: new SkillRegistry(folder.path, {
+      workspaceKey: folder.id,
+      active: config.skills?.active ?? true,
+      disabledSkillKeys: config.skills?.disabled ?? []
+    }),
     admission: {
       blocking: new Semaphore(config.limits.blockingConcurrency),
       process: new Semaphore(config.limits.processConcurrency),
@@ -66,6 +72,11 @@ export function applyWorkspaceFolderConfiguration(
     const runtime = ctx.folderRuntimes.get(folder.id) ?? createFolderRuntime(ctx.config, folder);
     if (runtime.workspacePath !== folder.path) {
       runtime.workspacePath = folder.path;
+      runtime.skillRegistry = new SkillRegistry(folder.path, {
+        workspaceKey: folder.id,
+        active: ctx.config.skills?.active ?? true,
+        disabledSkillKeys: ctx.config.skills?.disabled ?? []
+      });
       runtime.operationsByFingerprint.clear();
     }
     nextRuntimes.set(folder.id, runtime);
@@ -74,15 +85,9 @@ export function applyWorkspaceFolderConfiguration(
   ctx.folderRuntimes.clear();
   for (const [folderId, runtime] of nextRuntimes) ctx.folderRuntimes.set(folderId, runtime);
   ctx.config.folders = folders.map(folder => ({ ...folder }));
+  ctx.extensions.setFolders(ctx.config.folders);
   if (!ctx.config.workspaceId) ctx.workspaceProfileId = deriveWorkspaceProfileId(ctx.config.folders);
-
-  const firstRuntime = ctx.folderRuntimes.values().next().value;
-  if (!firstRuntime) throw new Error('at least one workspace folder is required');
-  ctx.sessions = firstRuntime.sessions;
-  ctx.operationsByFingerprint = firstRuntime.operationsByFingerprint;
-  ctx.pendingOperations = firstRuntime.pendingOperations;
-  ctx.editProposals = firstRuntime.editProposals;
-  ctx.admission = firstRuntime.admission;
+  if (!ctx.folderRuntimes.size) throw new Error('at least one workspace folder is required');
 
   if (removedFolder) ctx.selections.clear();
   else if (pathChanged) ctx.defaultCwds.clear();

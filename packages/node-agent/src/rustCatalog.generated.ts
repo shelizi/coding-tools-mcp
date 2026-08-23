@@ -13,7 +13,25 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "description": "Return durable task, workspace, capability, and recovery status.",
     "inputSchema": {
       "additionalProperties": false,
-      "properties": {},
+      "properties": {
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
       "type": "object"
     },
     "name": "harness_status",
@@ -59,6 +77,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           ],
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "since_ts_ms": {
           "minimum": 0,
           "type": "integer"
@@ -85,7 +120,25 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "description": "Return server, workspace, auth, profile, and exposed-tool metadata.",
     "inputSchema": {
       "additionalProperties": false,
-      "properties": {},
+      "properties": {
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
       "type": "object"
     },
     "name": "server_info",
@@ -102,11 +155,91 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "description": "List folders configured in this tool hub and show the selected or default routing context.",
     "inputSchema": {
       "additionalProperties": false,
-      "properties": {},
+      "properties": {
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
       "type": "object"
     },
     "name": "list_workspace_folders",
     "title": "List tool hub folders"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Bootstrap conversation workspace"
+    },
+    "description": "Bind an existing, explicit, or unambiguous workspace folder and initialize compact session history in one call. If multiple folders are unselected, return choices without accessing project content.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "create_if_missing": {
+          "default": true,
+          "type": "boolean"
+        },
+        "folder_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "history_dir": {
+          "default": "docs/history-session",
+          "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "response_mode": {
+          "default": "compact",
+          "enum": [
+            "compact",
+            "full"
+          ],
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "session_key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "conversation_bootstrap",
+    "title": "Bootstrap conversation workspace"
   },
   {
     "annotations": {
@@ -123,6 +256,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "folder_id": {
           "minLength": 1,
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         }
       },
       "required": [
@@ -216,6 +366,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "maxItems": 20,
           "type": "array"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "scope": {
           "default": "current_runtime",
           "enum": [
@@ -271,7 +438,7 @@ export const rustCatalog: readonly ToolDefinition[] = [
       "readOnlyHint": false,
       "title": "Initialize or restore development session"
     },
-    "description": "At the start of every new ChatGPT conversation, call this exactly once before the first response, even when the user did not ask to restore. It creates the first history session when none exists, or returns ordered summaries plus the latest full handoff and resumes the current ChatGPT session without duplicates.",
+    "description": "Direct or legacy history initialization for an already-bound workspace. Used internally by conversation_bootstrap; defaults to compact summaries and can return full prior-session detail on demand. Repeated calls for the same session resume without duplicates.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -282,6 +449,31 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "history_dir": {
           "default": "docs/history-session",
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "response_mode": {
+          "default": "compact",
+          "enum": [
+            "compact",
+            "full"
+          ],
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         },
         "session_key": {
           "minLength": 1,
@@ -308,7 +500,7 @@ export const rustCatalog: readonly ToolDefinition[] = [
       "readOnlyHint": false,
       "title": "Save development checkpoint"
     },
-    "description": "Save or update one idempotent, redacted development handoff. Pass session_key and expected_path exactly as returned by history_session_bootstrap so changing host metadata cannot redirect the checkpoint. The turn_id is optional and generated deterministically when omitted.",
+    "description": "Save or update one idempotent, redacted development handoff. Pass session_key and expected_path exactly as returned by conversation_bootstrap or history_session_bootstrap so changing host metadata cannot redirect the checkpoint. The turn_id is optional and generated deterministically when omitted.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -347,11 +539,28 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "notes": {
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "remaining_issues": {
           "items": {
             "type": "string"
           },
           "type": "array"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         },
         "runtime_state": {
           "items": {
@@ -409,9 +618,26 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": "docs/history-session",
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "repair": {
           "default": false,
           "type": "boolean"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         },
         "workspace_root": {
           "minLength": 1,
@@ -440,6 +666,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "maximum": 10000,
           "minimum": 1,
           "type": "integer"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -459,9 +702,34 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "existing_task": {
+          "default": "error",
+          "enum": [
+            "error",
+            "finish_if_complete"
+          ],
+          "type": "string"
+        },
         "objective": {
           "minLength": 1,
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         }
       },
       "required": [
@@ -496,6 +764,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           },
           "type": "array"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "task_id": {
           "minLength": 1,
           "type": "string"
@@ -521,6 +806,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "task_id": {
           "minLength": 1,
           "type": "string"
@@ -546,6 +848,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "task_id": {
           "minLength": 1,
           "type": "string"
@@ -574,6 +893,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "allow_unverified": {
           "default": false,
           "type": "boolean"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         },
         "summary": {
           "type": "string"
@@ -609,6 +945,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minimum": 8192,
           "type": "integer"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "task_id": {
           "type": "string"
         }
@@ -641,6 +994,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minimum": 1,
           "type": "integer"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "task_id": {
           "minLength": 1,
           "type": "string"
@@ -669,6 +1039,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "change_id": {
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "task_id": {
           "type": "string"
         }
@@ -689,7 +1076,31 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "description": "Verify the exec worker, session creation, command execution, and stdout/stderr capture.",
     "inputSchema": {
       "additionalProperties": false,
-      "properties": {},
+      "properties": {
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
+        }
+      },
       "type": "object"
     },
     "name": "exec_health_check",
@@ -710,6 +1121,29 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "path": {
           "default": ".",
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -743,10 +1177,33 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minLength": 1,
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "start_line": {
           "default": 1,
           "minimum": 1,
           "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -863,6 +1320,29 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "merge_overlaps": {
           "default": true,
           "type": "boolean"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -916,6 +1396,29 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "path": {
           "default": ".",
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -995,9 +1498,32 @@ export const rustCatalog: readonly ToolDefinition[] = [
           },
           "type": "array"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "recursive": {
           "default": true,
           "type": "boolean"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -1017,6 +1543,11 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "calculate_total": {
+          "default": false,
+          "description": "Continue scanning after max_results to calculate an exact total match count. count_only always calculates the total.",
+          "type": "boolean"
+        },
         "case_sensitive": {
           "default": false,
           "type": "boolean"
@@ -1145,9 +1676,32 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minLength": 1,
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "regex": {
           "default": false,
           "type": "boolean"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -1190,6 +1744,29 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "reason": {
           "default": "",
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -1504,6 +2081,29 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "reason": {
           "default": "",
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -1582,6 +2182,29 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "reason": {
           "default": "",
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -1672,6 +2295,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": "",
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "scope": {
           "default": "files",
           "enum": [
@@ -1691,6 +2331,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "maximum": 600000,
           "minimum": 1,
           "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -1713,6 +2359,29 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "patch": {
           "minLength": 1,
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -1893,12 +2562,29 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": "",
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "remove_env": {
           "items": {
             "type": "string"
           },
           "maxItems": 64,
           "type": "array"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         },
         "script": {
           "description": "Structured shell script body; requires shell other than none",
@@ -1938,6 +2624,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "workdir": {
           "default": ".",
           "type": "string"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         },
         "yield_time_ms": {
           "default": 1000,
@@ -2146,6 +2838,18 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "description": "Optional reason recorded when cancelling a retained graph.",
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "result_mode": {
           "description": "Controls per-command result detail. When omitted, run/reattach preserves full results while status/cancel use compact summaries to avoid repeating large stdout/stderr payloads.",
           "enum": [
@@ -2155,9 +2859,20 @@ export const rustCatalog: readonly ToolDefinition[] = [
           ],
           "type": "string"
         },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "stop_on_error": {
           "default": true,
           "type": "boolean"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         },
         "yield_time_ms": {
           "default": 30000,
@@ -2213,6 +2928,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           ],
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "session_id": {
           "minLength": 1,
           "type": "string"
@@ -2225,8 +2957,8 @@ export const rustCatalog: readonly ToolDefinition[] = [
         },
         "timeout_ms": {
           "default": 30000,
-          "description": "Server-side event wait. Use until=finalized with a longer timeout for quiet long-running commands to reduce repeated polling.",
-          "maximum": 120000,
+          "description": "Server-side event wait, separate from the child-process timeout. The MCP transport sends a heartbeat every 10 seconds to keep long requests alive. Use output_or_exit for live incremental status; the wait window may be up to 60 minutes.",
+          "maximum": 3600000,
           "minimum": 0,
           "type": "integer"
         },
@@ -2238,6 +2970,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
             "finalized"
           ],
           "type": "string"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -2292,11 +3030,34 @@ export const rustCatalog: readonly ToolDefinition[] = [
           ],
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "tail_lines": {
           "default": 100,
           "maximum": 10000,
           "minimum": 1,
           "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -2326,6 +3087,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minimum": 1,
           "type": "integer"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "status": {
           "enum": [
             "running",
@@ -2335,6 +3113,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
             "killed"
           ],
           "type": "string"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -2362,9 +3146,32 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": false,
           "type": "boolean"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "session_id": {
           "minLength": 1,
           "type": "string"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -2393,6 +3200,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minimum": 1,
           "type": "integer"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "session_id": {
           "minLength": 1,
           "type": "string"
@@ -2411,6 +3235,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "maximum": 30000,
           "minimum": 0,
           "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -2447,6 +3277,29 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "output_ref": {
           "minLength": 1,
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -2482,6 +3335,29 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "path": {
           "default": ".",
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -2521,6 +3397,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           },
           "type": "array"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "staged": {
           "default": false,
           "type": "boolean"
@@ -2528,6 +3421,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "unstaged": {
           "default": true,
           "type": "boolean"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -2557,15 +3456,38 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": ".",
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "ref": {
           "default": "HEAD",
           "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         },
         "skip": {
           "default": 0,
           "maximum": 10000,
           "minimum": 0,
           "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -2611,9 +3533,32 @@ export const rustCatalog: readonly ToolDefinition[] = [
           },
           "type": "array"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "rev": {
           "default": "HEAD",
           "type": "string"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -2647,6 +3592,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minLength": 1,
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "rev": {
           "type": "string"
         },
@@ -2654,6 +3616,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": 1,
           "minimum": 1,
           "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -2712,10 +3680,27 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": "",
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "repo_path": {
           "default": ".",
           "description": "Workspace-relative Git repository or linked worktree root",
           "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         },
         "start_point": {
           "type": "string"
@@ -2723,6 +3708,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "switch": {
           "default": true,
           "type": "boolean"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -2733,6 +3724,112 @@ export const rustCatalog: readonly ToolDefinition[] = [
     },
     "name": "git_branch",
     "title": "Git branch"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Git worktree"
+    },
+    "description": "List, create, or remove linked Git worktrees with guarded cleanup and cwd recovery.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "list",
+            "create",
+            "remove"
+          ],
+          "type": "string"
+        },
+        "branch": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "branch_mode": {
+          "default": "auto",
+          "enum": [
+            "auto",
+            "create",
+            "existing"
+          ],
+          "type": "string"
+        },
+        "confirm": {
+          "default": false,
+          "type": "boolean"
+        },
+        "delete_branch": {
+          "default": false,
+          "type": "boolean"
+        },
+        "dry_run": {
+          "default": false,
+          "type": "boolean"
+        },
+        "expected_head": {
+          "type": "string"
+        },
+        "expected_repo_fingerprint": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "string"
+        },
+        "force": {
+          "default": false,
+          "type": "boolean"
+        },
+        "path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "repo_path": {
+          "default": ".",
+          "description": "Workspace-relative Git repository or linked worktree root",
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "start_point": {
+          "default": "HEAD",
+          "type": "string"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "name": "git_worktree",
+    "title": "Git worktree"
   },
   {
     "annotations": {
@@ -2772,10 +3869,33 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": "",
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "repo_path": {
           "default": ".",
           "description": "Workspace-relative Git repository or linked worktree root",
           "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -2830,6 +3950,18 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": "",
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "repo_path": {
           "default": ".",
           "description": "Workspace-relative Git repository or linked worktree root",
@@ -2837,6 +3969,17 @@ export const rustCatalog: readonly ToolDefinition[] = [
         },
         "require_clean_index_before": {
           "type": "boolean"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -2880,6 +4023,18 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": "",
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "remote": {
           "default": "origin",
           "minLength": 1,
@@ -2890,9 +4045,20 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "description": "Workspace-relative Git repository or linked worktree root",
           "type": "string"
         },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
         "set_upstream": {
           "default": false,
           "type": "boolean"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -2939,10 +4105,27 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": "",
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "repo_path": {
           "default": ".",
           "description": "Workspace-relative Git repository or linked worktree root",
           "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         },
         "source": {
           "type": "string"
@@ -2950,6 +4133,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "staged": {
           "default": false,
           "type": "boolean"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         },
         "worktree": {
           "type": "boolean"
@@ -3004,9 +4193,26 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minLength": 1,
           "type": "string"
         },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
         "resume_id": {
           "minLength": 1,
           "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
         },
         "scope": {
           "default": "once",
@@ -3029,6 +4235,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "maximum": 3600,
           "minimum": 1,
           "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "type": "object"
@@ -3081,6 +4293,29 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "path": {
           "minLength": 1,
           "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_folder_id": {
+          "description": "Optional one-call workspace selector. Routes only this tool call and does not change the conversation's selected folder.",
+          "minLength": 1,
+          "type": "string",
+          "x-mcp-header": "Workspace"
         }
       },
       "required": [
@@ -3090,6 +4325,395 @@ export const rustCatalog: readonly ToolDefinition[] = [
     },
     "name": "view_image",
     "title": "View image"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "List desktop displays"
+    },
+    "description": "List physical desktop displays with local sizes and global virtual-desktop origins.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "desktop_displays",
+    "title": "List desktop displays"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Capture desktop display"
+    },
+    "description": "Capture one display at native pixel dimensions with JPEG quality compression and no resizing.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "display_id": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "default": "mcp_image",
+          "enum": [
+            "mcp_image",
+            "data_url"
+          ],
+          "type": "string"
+        },
+        "quality": {
+          "default": 80,
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "desktop_screenshot",
+    "title": "Capture desktop display"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Click desktop"
+    },
+    "description": "Move to display-local physical pixel coordinates and click a mouse button.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "button": {
+          "default": "left",
+          "enum": [
+            "left",
+            "right",
+            "middle"
+          ],
+          "type": "string"
+        },
+        "clicks": {
+          "default": 1,
+          "maximum": 3,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "display_id": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "x": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "y": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "x",
+        "y"
+      ],
+      "type": "object"
+    },
+    "name": "desktop_click",
+    "title": "Click desktop"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Drag desktop"
+    },
+    "description": "Hold a mouse button and drag between display-local physical pixel coordinates, including across displays.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "button": {
+          "default": "left",
+          "enum": [
+            "left",
+            "right",
+            "middle"
+          ],
+          "type": "string"
+        },
+        "display_id": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "duration_ms": {
+          "default": 300,
+          "maximum": 5000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "steps": {
+          "default": 12,
+          "maximum": 120,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "to_display_id": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "to_x": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "to_y": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "x": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "y": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "x",
+        "y",
+        "to_x",
+        "to_y"
+      ],
+      "type": "object"
+    },
+    "name": "desktop_drag",
+    "title": "Drag desktop"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Scroll desktop"
+    },
+    "description": "Scroll the desktop, optionally at display-local physical pixel coordinates.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "delta_x": {
+          "default": 0,
+          "maximum": 12000,
+          "minimum": -12000,
+          "type": "integer"
+        },
+        "delta_y": {
+          "maximum": 12000,
+          "minimum": -12000,
+          "type": "integer"
+        },
+        "display_id": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "x": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "y": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "delta_y"
+      ],
+      "type": "object"
+    },
+    "name": "desktop_scroll",
+    "title": "Scroll desktop"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Type desktop text"
+    },
+    "description": "Type Unicode text into the currently focused desktop application.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "name": "desktop_type",
+    "title": "Type desktop text"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Press desktop keys"
+    },
+    "description": "Press a key or hotkey chord in the currently focused desktop application.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "keys": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "keys"
+      ],
+      "type": "object"
+    },
+    "name": "desktop_key",
+    "title": "Press desktop keys"
   }
 ];
 export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly string[]>> = {
@@ -3098,6 +4722,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "operation_log",
     "server_info",
     "list_workspace_folders",
+    "conversation_bootstrap",
     "switch_workspace_folder",
     "query_tool_usage",
     "history_session_bootstrap",
@@ -3138,12 +4763,20 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "git_show",
     "git_blame",
     "git_branch",
+    "git_worktree",
     "git_stage",
     "git_commit",
     "git_push",
     "git_restore",
     "request_permissions",
-    "view_image"
+    "view_image",
+    "desktop_displays",
+    "desktop_screenshot",
+    "desktop_click",
+    "desktop_drag",
+    "desktop_scroll",
+    "desktop_type",
+    "desktop_key"
   ],
   "read-only": [
     "server_info",
@@ -3170,6 +4803,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "operation_log",
     "server_info",
     "list_workspace_folders",
+    "conversation_bootstrap",
     "switch_workspace_folder",
     "query_tool_usage",
     "history_session_bootstrap",
@@ -3210,16 +4844,25 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "git_show",
     "git_blame",
     "git_branch",
+    "git_worktree",
     "git_stage",
     "git_commit",
     "git_push",
     "git_restore",
     "request_permissions",
-    "view_image"
+    "view_image",
+    "desktop_displays",
+    "desktop_screenshot",
+    "desktop_click",
+    "desktop_drag",
+    "desktop_scroll",
+    "desktop_type",
+    "desktop_key"
   ],
   "guarded-core": [
     "server_info",
     "list_workspace_folders",
+    "conversation_bootstrap",
     "switch_workspace_folder",
     "query_tool_usage",
     "history_session_bootstrap",
@@ -3248,6 +4891,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "git_show",
     "git_blame",
     "git_branch",
+    "git_worktree",
     "git_stage",
     "git_commit",
     "git_push",
@@ -3258,6 +4902,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
   "trusted-core": [
     "server_info",
     "list_workspace_folders",
+    "conversation_bootstrap",
     "switch_workspace_folder",
     "query_tool_usage",
     "history_session_bootstrap",
@@ -3286,6 +4931,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "git_show",
     "git_blame",
     "git_branch",
+    "git_worktree",
     "git_stage",
     "git_commit",
     "git_push",
@@ -3297,6 +4943,13 @@ export const rustToolAnnotationOverridesByProfile: Readonly<Record<ToolProfile, 
   "advanced": {},
   "read-only": {},
   "compat-readonly-all": {
+    "conversation_bootstrap": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Bootstrap conversation workspace"
+    },
     "switch_workspace_folder": {
       "destructiveHint": false,
       "idempotentHint": true,
@@ -3430,6 +5083,13 @@ export const rustToolAnnotationOverridesByProfile: Readonly<Record<ToolProfile, 
       "readOnlyHint": true,
       "title": "Git branch"
     },
+    "git_worktree": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Git worktree"
+    },
     "git_stage": {
       "destructiveHint": false,
       "idempotentHint": true,
@@ -3464,17 +5124,66 @@ export const rustToolAnnotationOverridesByProfile: Readonly<Record<ToolProfile, 
       "openWorldHint": false,
       "readOnlyHint": true,
       "title": "Approve and resume operation"
+    },
+    "desktop_displays": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "List desktop displays"
+    },
+    "desktop_screenshot": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Capture desktop display"
+    },
+    "desktop_click": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Click desktop"
+    },
+    "desktop_drag": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Drag desktop"
+    },
+    "desktop_scroll": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Scroll desktop"
+    },
+    "desktop_type": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Type desktop text"
+    },
+    "desktop_key": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Press desktop keys"
     }
   },
   "guarded-core": {},
   "trusted-core": {}
 };
 export const rustToolsetRevisionByProfile: Readonly<Record<ToolProfile, string>> = {
-  "advanced": "cd6a370aaabd35ab",
-  "read-only": "d3e63ccd8e6c0b19",
-  "compat-readonly-all": "a93ab448d6add11b",
-  "guarded-core": "8da48d46317ec605",
-  "trusted-core": "d105229c9e8b32d2"
+  "advanced": "7471ed64dcf9dff0",
+  "read-only": "97953fdd57a2fd2d",
+  "compat-readonly-all": "ddb51706768c0ca9",
+  "guarded-core": "ee2b091d11ad61e6",
+  "trusted-core": "7a653fa35b86129e"
 };
 export const rustBehavioralParityFixtures: Readonly<Record<string, unknown>> = {
   "execution_limits": {
@@ -3487,10 +5196,11 @@ export const rustBehavioralParityFixtures: Readonly<Record<string, unknown>> = {
     "process_admission": 64
   },
   "mcp_transport": {
-    "latest_protocol_version": "2025-11-25",
+    "latest_protocol_version": "2026-07-28",
     "stream_channel_capacity": 2,
     "stream_heartbeat_interval_ms": 10000,
     "supported_protocol_versions": [
+      "2026-07-28",
       "2025-11-25",
       "2025-06-18",
       "2025-03-26"

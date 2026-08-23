@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { statSync } from 'node:fs';
 import { access, lstat, readFile, readdir, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { ToolContext, WorkspaceFolder } from './types.js';
@@ -364,11 +365,32 @@ export function resolveFromWorkspace(root: string, cwd: string, value: string): 
   return resolveInside(root, path.resolve(cwd, value));
 }
 
+function existingDirectoryInside(root: string, value: string): string | undefined {
+  try {
+    const cwd = resolveInside(root, value || '.');
+    if (parseWslUncPath(root)) return cwd;
+    return statSync(cwd).isDirectory() ? cwd : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function validatedFolderCwd(ctx: ToolContext, key: string, folderId: string, preferred?: string): string {
+  const folder = ctx.config.folders.find(item => item.id === folderId);
+  if (!folder) return '.';
+  const root = normalizeWorkspacePath(folder.path);
+  const saved = preferred ?? ctx.conversations?.peekCwdFor(key, folderId) ?? '.';
+  if (existingDirectoryInside(root, saved)) return saved || '.';
+  ctx.conversations?.setFolderCwd(key, folderId, '.');
+  return '.';
+}
+
 export function rootAndCwd(ctx: ToolContext, key: string): { folder: WorkspaceFolder; root: string; cwd: string } {
   const binding = currentExecutionBinding(ctx, key);
   const folder = selectedFolder(ctx, key);
   const root = normalizeWorkspacePath(folder.path);
-  const cwd = resolveInside(root, binding?.defaultCwd ?? ctx.defaultCwds.get(key) ?? '.');
+  const saved = validatedFolderCwd(ctx, key, folder.id, binding?.defaultCwd ?? ctx.defaultCwds.get(key) ?? '.');
+  const cwd = existingDirectoryInside(root, saved) ?? root;
   return { folder, root, cwd };
 }
 

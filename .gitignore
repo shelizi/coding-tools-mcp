@@ -34,10 +34,20 @@ docs/history-session/
 
 dist-portable/
 /dist-node-portable/
+/dist-node-test-live/
 /dist-skills/
 
 # Local linked Git worktrees
 /.worktrees/
 
+# Local scratch, one-off scripts, and computer-use test artifacts
+.computer-use-test/
+/.computer-use-*
+.local/
+
 # Node package archives
 /packages/node-agent/*.tgz
+/packages/node-agent/.ctmcp-dist-locks/
+
+# Local host/runtime crash logs
+/debug.log

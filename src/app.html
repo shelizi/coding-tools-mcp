@@ -3,11 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <link rel="icon" href="/favicon.png" />
+    <meta name="ctmcp-admin-token" content="" />
+    <meta name="description" content="Coding Tools MCP Headless Agent management interface" />
+    <link rel="icon" href="%sveltekit.assets%/favicon.png" />
     <title>Coding Tools MCP</title>
     %sveltekit.head%
   </head>
-  <body data-sveltekit-preload-data="hover">
-    <div style="display: contents">%sveltekit.body%</div>
+  <body data-sveltekit-preload-data="hover" data-ui-framework="svelte">
+    <div class="svelte-app">%sveltekit.body%</div>
   </body>
 </html>

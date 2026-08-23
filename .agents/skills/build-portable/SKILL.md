@@ -8,7 +8,7 @@ description: Build and verify the Coding Tools MCP Windows portable release ZIP.
 Run the deterministic project script from the repository root:
 
 ```powershell
-npm run desktop:portable
+pnpm run desktop:portable
 ```
 
 The script builds the frontend, builds the Tauri release with the required `custom-protocol` feature, copies the executable, creates the versioned ZIP, and prints SHA-256 hashes.
@@ -17,7 +17,7 @@ Portable ZIP filenames and ZIP top-level directories are versioned. The expanded
 
 ## Guardrails
 
-- `package.json` is the single source of truth for the release version. For every new requested portable release build, run `npm run version:patch` exactly once before compiling. This updates the source version and synchronizes the npm/Cargo metadata; `src-tauri/tauri.conf.json` reads the version directly from `package.json`. A retry of the same failed build only reruns `npm run desktop:portable` and does not increment again.
+- `package.json` is the single source of truth for the release version. For every new requested portable release build, run `pnpm run version:patch` exactly once before compiling. This updates the source version and synchronizes the package/Cargo metadata; `src-tauri/tauri.conf.json` reads the version directly from `package.json`. A retry of the same failed build only reruns `pnpm run desktop:portable` and does not increment again.
 - Never package an executable produced by bare `cargo build --release`. Without `custom-protocol`, Tauri treats the binary as development mode and navigates to `http://localhost:1420`.
 - Never copy an older executable after a build timeout or failure. Keep the existing package unchanged and report the build error.
 - If running Cargo manually for diagnosis, include `--features custom-protocol`.

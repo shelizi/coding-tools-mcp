@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createToolContext } from '../dist/server.js';
-import { ProcessRequestLifecycle } from '../dist/processes.js';
+import { disposeProcessSessions, ProcessRequestLifecycle } from '../dist/processes.js';
 import { callTool } from '../dist/tools.js';
 
 function config(folders, dataDir) {
@@ -45,9 +45,12 @@ async function fixture(t) {
     { id: 'b', name: 'B', path: rootB }
   ], dataDir));
   t.after(async () => {
-    await rm(rootA, { recursive: true, force: true });
-    await rm(rootB, { recursive: true, force: true });
-    await rm(dataDir, { recursive: true, force: true });
+    await disposeProcessSessions(ctx);
+    await Promise.allSettled([ctx.conversations.flush(), ctx.usageStore.flush()]);
+    const remove = (target) => rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    await remove(rootA);
+    await remove(rootB);
+    await remove(dataDir);
   });
   return { ctx };
 }

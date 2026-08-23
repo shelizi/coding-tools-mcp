@@ -14,6 +14,7 @@ use crate::workspace::resources::{
     assign_free_workspace_ports, validate_workspace_resources_update,
 };
 use crate::workspace::{compare_wsl_paths, wsl_unc_path, WorkspaceFolder, WorkspaceProfile};
+use serde_json::Value;
 
 #[tauri::command]
 pub fn list_workspaces(state: State<'_, AppState>) -> AppResult<Vec<WorkspaceProfile>> {
@@ -28,6 +29,35 @@ pub fn create_workspace(
 ) -> AppResult<WorkspaceProfile> {
     validate_folder_path(&path)?;
     create_workspace_inner(&state, path, name)
+}
+
+#[tauri::command]
+pub fn export_workspace_pack(state: State<'_, AppState>, id: String) -> AppResult<Value> {
+    state.with_data(|store| store.export_workspace_pack(&id))
+}
+
+#[tauri::command]
+pub fn export_shared_workspace(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<std::path::PathBuf> {
+    state.with_data(|store| store.export_shared_workspace(&id))
+}
+
+#[tauri::command]
+pub fn open_shared_workspace(
+    state: State<'_, AppState>,
+    id: String,
+) -> AppResult<WorkspaceProfile> {
+    state.with_workspaces(|store| store.open_shared_workspace(&id))
+}
+
+#[tauri::command]
+pub fn import_workspace_pack(
+    state: State<'_, AppState>,
+    pack: Value,
+) -> AppResult<WorkspaceProfile> {
+    state.with_workspaces(|store| store.import_workspace_pack(pack))
 }
 
 fn create_workspace_inner(
@@ -144,25 +174,34 @@ fn decode_wsl_output(bytes: &[u8]) -> String {
 }
 
 #[tauri::command]
-pub fn update_workspace(
+pub async fn update_workspace(
     state: State<'_, AppState>,
     mut profile: WorkspaceProfile,
 ) -> AppResult<()> {
     profile.normalize_folders();
     profile.normalize_bind_addresses();
+    profile.normalize_sandbox();
     profile
         .validate_bind_addresses()
         .map_err(AppError::Message)?;
-    let updated = state.with_workspaces(|store| {
-        let current = store
+    let current = state.with_workspaces(|store| {
+        store
             .get(&profile.id)
             .cloned()
-            .ok_or_else(|| AppError::Message(format!("workspace not found: {}", profile.id)))?;
-        validate_workspace_resources_update(store.list(), &current, &profile)?;
+            .ok_or_else(|| AppError::Message(format!("workspace not found: {}", profile.id)))
+    })?;
+    state.with_workspaces(|store| {
+        validate_workspace_resources_update(store.list(), &current, &profile)
+    })?;
+    if crate::tunnel::public_mcp_security_error(&profile).is_some() {
+        crate::tunnel::stop_for_runtime(&current, crate::tunnel::TunnelServiceKind::Mcp).await?;
+    }
+    crate::tools::hub::preflight_live_hub(&profile).map_err(AppError::Message)?;
+    let updated = state.with_workspaces(|store| {
         store.update(profile.clone())?;
         Ok(profile.clone())
     })?;
-    crate::tools::hub::sync_live_hub(&updated).map_err(AppError::Message)?;
+    crate::tools::hub::sync_live_hub_after_preflight(&updated).map_err(AppError::Message)?;
     Ok(())
 }
 

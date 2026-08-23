@@ -12,14 +12,6 @@ pub trait Platform: Send + Sync {
     fn app_config_dir(&self) -> AppResult<PathBuf>;
 
     fn find_pid_listening_on_port(&self, port: u16) -> AppResult<Option<u32>>;
-
-    /// Best-effort reclaim of a TCP listener on the given port. Windows uses
-    /// `SetTcpEntry`; other platforms return `Ok(false)`.
-    fn reclaim_listening_port(&self, port: u16) -> AppResult<bool> {
-        let _ = port;
-        Ok(false)
-    }
-
     fn process_image_path(&self, pid: u32) -> AppResult<Option<String>>;
 
     fn is_process_alive(&self, pid: u32) -> bool;
@@ -58,7 +50,7 @@ pub use macos::MacPlatform;
 #[cfg(target_os = "windows")]
 pub use windows::WindowsPlatform;
 #[cfg(target_os = "windows")]
-pub(crate) use windows::{attach_process_tree, ProcessTreeGuard};
+pub(crate) use windows::{attach_process_tree, attach_process_tree_handle, ProcessTreeGuard};
 
 static PLATFORM: std::sync::OnceLock<Box<dyn Platform>> = std::sync::OnceLock::new();
 

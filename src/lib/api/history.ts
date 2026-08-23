@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { getBackend } from "$lib/backend";
 
 export interface HistorySessionSummary {
   number: number;
@@ -50,10 +50,7 @@ export async function listHistorySessions(
   workspaceId: string,
   folderId?: string,
 ): Promise<HistorySessionsResult> {
-  return invoke<HistorySessionsResult>("list_history_sessions", {
-    id: workspaceId,
-    folderId,
-  });
+  return getBackend().history.list(workspaceId, folderId);
 }
 
 export async function readHistorySession(
@@ -61,9 +58,5 @@ export async function readHistorySession(
   number: number,
   folderId?: string,
 ): Promise<HistorySessionDetail> {
-  return invoke<HistorySessionDetail>("read_history_session", {
-    id: workspaceId,
-    number,
-    folderId,
-  });
+  return getBackend().history.read(workspaceId, number, folderId);
 }

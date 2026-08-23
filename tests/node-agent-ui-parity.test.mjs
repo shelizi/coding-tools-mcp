@@ -21,9 +21,9 @@ test('Node Agent UI parity checklist is complete and executable', async () => {
 });
 
 test('telemetry and diagnostics keep sensitive runtime fields outside the response contract', async () => {
-  const [observability, management] = await Promise.all([
+  const [observability, managementObservabilityRoute] = await Promise.all([
     read('packages/node-agent/src/managementObservability.ts'),
-    read('packages/node-agent/src/management.ts')
+    read('packages/node-agent/src/management/routes/observability.ts')
   ]);
   const allowlist = observability.match(/const TELEMETRY_RECORD_FIELDS = \[([\s\S]*?)\] as const;/)?.[1];
   assert.ok(allowlist);
@@ -32,14 +32,14 @@ test('telemetry and diagnostics keep sensitive runtime fields outside the respon
   }
   assert.match(observability, /content\.replace\(\/\^\\\*\\\*Session key:/);
   assert.doesNotMatch(observability, /fixedProbe\([^\n]*(?:publicBaseUrl|tunnel\.publicUrl)/);
-  assert.match(management, /localListenerBaseUrl\(req\)/);
-  assert.doesNotMatch(management, /managementHealthPayload\([^\n]*req\.headers\.host/);
+  assert.match(managementObservabilityRoute, /localListenerBaseUrl\(req\)/);
+  assert.doesNotMatch(managementObservabilityRoute, /managementHealthPayload\([^\n]*req\.headers\.host/);
   assert.match(observability, /canonicalPath\(folder\.path\)/);
   assert.match(observability, /HISTORY_PATH_OUTSIDE_WORKSPACE/);
   assert.match(observability, /validateManagementHealthPayload/);
   assert.match(observability, /mcpAuthenticationProbe/);
   assert.match(observability, /resource_metadata=/);
-  assert.match(management, /action === 'logs'/);
+  assert.match(managementObservabilityRoute, /action === 'logs'/);
   assert.match(observability, /managementOperationLogPayload/);
   assert.match(observability, /harnessWorkspaceId\(folder\.path\)/);
   assert.match(observability, /redactSensitiveText/);
@@ -52,17 +52,24 @@ test('telemetry and diagnostics keep sensitive runtime fields outside the respon
 });
 
 test('workspace UI retains Rust-aligned shared observability surfaces without desktop-only services', async () => {
-  const [workspaceView, checklist] = await Promise.all([
-    read('packages/node-agent/ui/src/components/WorkspaceView.tsx'),
-    read('docs/todo/node-agent-ui-parity/CHECKLIST.md')
+  const [workspacePage, checklist, capabilities] = await Promise.all([
+    read('src/routes/workspace/[id]/+page.svelte'),
+    read('docs/todo/node-agent-ui-parity/CHECKLIST.md'),
+    read('src/lib/backend/capabilities.ts')
   ]);
-  assert.match(workspaceView, /'overview' \| 'history' \| 'telemetry' \| 'logs' \| 'health' \| 'settings'/);
-  for (const marker of ['HistoryView', 'TelemetryView', 'OperationLogView', 'HealthView', 'OperationalSummary', 'fetchWorkspaceDiagnostics']) {
-    assert.match(workspaceView, new RegExp(marker));
+  assert.match(workspacePage, /type WorkspaceTab = "overview" \| "history" \| "telemetry" \| "logs" \| "health" \| "features" \| "mcp" \| "actions" \| "settings"/);
+  for (const marker of ['HistoryViewer', 'TelemetryViewer', 'OperationLogViewer', 'HealthPanel']) {
+    assert.match(workspacePage, new RegExp(marker));
   }
-  for (const marker of ['role="tablist"', 'role="tabpanel"', "event.key === 'ArrowRight'", "event.key === 'ArrowLeft'", "event.key === 'Home'", "event.key === 'End'"]) {
-    assert.ok(workspaceView.includes(marker), `missing accessible Workspace tab marker: ${marker}`);
-  }
+  assert.match(workspacePage, /role="tabpanel"/);
+  assert.match(workspacePage, /capabilities\.operationLogs/);
+  assert.match(workspacePage, /capabilities\.workspaceFeatureControls/);
+  assert.match(workspacePage, /capabilities\.actions/);
+  assert.match(capabilities, /agentRestart: true/);
+  assert.match(capabilities, /openNativePath: true/);
+  assert.match(capabilities, /workspaceLifecycle: true/);
+  assert.match(capabilities, /workspaceFeatureControls: true/);
+  assert.match(capabilities, /rawRuntimeLogs: false/);
   assert.match(checklist, /Actions\/OpenAPI/);
   assert.match(checklist, /Live history-session running\/active\/inactive badges/);
   assert.match(checklist, /Raw Desktop per-service stdout\/stderr/);
@@ -70,38 +77,36 @@ test('workspace UI retains Rust-aligned shared observability surfaces without de
   assert.doesNotMatch(checklist, /- \[ \]/);
 });
 
-test('observability views retain complete filters, pagination, and stale-request cancellation', async () => {
-  const [telemetry, operationLog, history] = await Promise.all([
-    read('packages/node-agent/ui/src/components/TelemetryView.tsx'),
-    read('packages/node-agent/ui/src/components/OperationLogView.tsx'),
-    read('packages/node-agent/ui/src/components/HistoryView.tsx')
+test('observability views retain complete filters, pagination, and host-scoped API access', async () => {
+  const [telemetry, operationLog, history, nodeBackend] = await Promise.all([
+    read('src/lib/components/TelemetryViewer.svelte'),
+    read('src/lib/components/OperationLogViewer.svelte'),
+    read('src/lib/components/HistoryViewer.svelte'),
+    read('src/lib/backend/node.ts')
   ]);
-  assert.match(telemetry, /value="request_bytes"/);
-  assert.match(operationLog, /fetchWorkspaceOperationLogs/);
-  assert.match(operationLog, /requestRef\.current\?\.abort\(\)/);
-  assert.match(operationLog, /requestRef\.current !== controller/);
+  assert.match(telemetry, /readWorkspaceTelemetry/);
+  assert.match(operationLog, /operations\.query/);
   assert.match(operationLog, /nextCursor/);
   assert.match(operationLog, /errorsOnly/);
-  assert.match(operationLog, /workspace\.effective\.folders/);
-  assert.match(operationLog, /t\('Load older'\)/);
-  assert.match(operationLog, /t\('Command result'\)/);
-  assert.match(operationLog, /t\('Exit code'\)/);
-  assert.match(operationLog, /waitSummary\(operation\.diagnostics\)/);
-  assert.match(history, /detailRequest\.current\?\.abort\(\)/);
-  assert.match(history, /detailRequest\.current === controller/);
-  assert.match(history, /loadHistory\(selectedNumberRef\.current\)/);
-  assert.match(history, /aria-live="polite"/);
+  assert.match(operationLog, /Load older/);
+  assert.match(history, /listHistorySessions/);
+  assert.match(history, /readHistorySession/);
+  assert.match(nodeBackend, /x-ctmcp-admin-token/);
+  assert.match(nodeBackend, /credentials: "same-origin"/);
 });
 
 test('operation-log integration omits raw payloads and keeps Rust and Node debugging summaries synchronized', async () => {
-  const [managementTest, harnessTest, taskTools, operationSummary, processes, rustDispatch, rustSession] = await Promise.all([
+  const [managementTest, harnessTest, taskTools, operationSummary, processes, rustDispatch, rustDispatchTracking, rustSession, rustSessionAttachment, rustSessionLifecycle] = await Promise.all([
     read('packages/node-agent/test/management.test.mjs'),
     read('packages/node-agent/test/harnessBaseline.test.mjs'),
     read('packages/node-agent/src/taskTools.ts'),
     read('packages/node-agent/src/operationSummary.ts'),
     read('packages/node-agent/src/processes.ts'),
     read('src-tauri/src/tools/dispatch.rs'),
-    read('src-tauri/src/tools/session.rs')
+    read('src-tauri/src/tools/dispatch/tracking.rs'),
+    read('src-tauri/src/tools/session.rs'),
+    read('src-tauri/src/tools/session/attachment.rs'),
+    read('src-tauri/src/tools/session/lifecycle.rs')
   ]);
   for (const marker of [
     'completed-operation-id', 'failed-operation-id', 'incomplete-operation-id',
@@ -115,18 +120,18 @@ test('operation-log integration omits raw payloads and keeps Rust and Node debug
   assert.match(harnessTest, /OPERATION_OUTPUT_MUST_NOT_PERSIST/);
   for (const marker of ['command_ok', 'verification_ok', 'process_exit_code', 'warning_count']) {
     assert.match(operationSummary, new RegExp(marker));
-    assert.match(rustDispatch, new RegExp(marker));
+    assert.match(rustDispatchTracking, new RegExp(marker));
   }
   assert.match(operationSummary, /function operationResultSummary/);
-  assert.match(rustDispatch, /fn operation_result_summary/);
-  for (const marker of ['attach_harness_operation', 'record_harness_operation_finalization', 'harness_operation_recorded']) {
-    assert.match(rustSession, new RegExp(marker));
-  }
-  assert.match(rustDispatch, /deferred_process_operation/);
-  assert.match(rustDispatch, /session\.attach_harness_operation/);
+  assert.match(rustDispatchTracking, /fn operation_result_summary/);
+  assert.match(rustSessionAttachment, /attach_harness_operation/);
+  assert.match(rustSessionLifecycle, /record_harness_operation_finalization/);
+  assert.match(rustSession, /harness_operation_recorded/);
+  assert.match(rustDispatchTracking, /deferred_process_operation/);
+  assert.match(rustDispatchTracking, /session\.attach_harness_operation/);
   assert.match(rustDispatch, /vec!\["started", "failed"\]/);
   assert.doesNotMatch(operationSummary.match(/function operationResultSummary[\s\S]*?\n\}/)?.[0] ?? '', /\.\.\.result/);
-  assert.doesNotMatch(rustDispatch.match(/fn operation_result_summary[\s\S]*?\n\}/)?.[0] ?? '', /\.extend\(/);
+  assert.doesNotMatch(rustDispatchTracking.match(/fn operation_result_summary[\s\S]*?\n\}/)?.[0] ?? '', /\.extend\(/);
   for (const marker of ['attachHarnessOperation', 'deferredProcessOperation', 'result.command_ok === null']) {
     assert.match(taskTools, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
@@ -139,15 +144,34 @@ test('operation-log integration omits raw payloads and keeps Rust and Node debug
 });
 
 test('all settings entry points preserve fine-grained policy and global limits', async () => {
-  const [form, quickSetup, testSource] = await Promise.all([
-    read('packages/node-agent/ui/src/components/ConfigForm.tsx'),
-    read('packages/node-agent/ui/src/components/QuickSetup.tsx'),
+  const [form, nodeMap, testSource] = await Promise.all([
+    read('src/lib/components/RuntimePolicyForm.svelte'),
+    read('src/lib/backend/node-map.ts'),
     read('packages/node-agent/test/management.test.mjs')
   ]);
-  for (const marker of ['allowedCommands', 'workspaceLocalEntries', 'workspaceScriptExtensions', 'maxPatchBytes', 'globalBlockingConcurrency', 'globalProcessConcurrency']) {
+  for (const marker of ['allowedCommands', 'workspaceLocalEntries', 'workspaceScriptExtensions']) {
     assert.match(form, new RegExp(marker));
+  }
+  for (const marker of ['globalBlockingConcurrency', 'globalProcessConcurrency', 'maxPatchBytes']) {
     assert.match(testSource, new RegExp(marker));
   }
-  assert.match(quickSetup, /policy: saved\.policy/);
-  assert.match(quickSetup, /limits: saved\.limits/);
+  assert.match(nodeMap, /allowedCommands: commands/);
+  assert.match(nodeMap, /limits:/);
+});
+
+test('Node settings UI exposes sandbox configuration and preserves it in guided setup', async () => {
+  const [types, form, nodeMap, configStore] = await Promise.all([
+    read('src/lib/types.ts'),
+    read('src/lib/components/workspace/SandboxSettings.svelte'),
+    read('src/lib/backend/node-map.ts'),
+    read('packages/node-agent/src/management/configStore.ts')
+  ]);
+  for (const marker of ['export interface SandboxConfig', 'export interface SandboxBackendDescriptor', 'sandbox\\?: SandboxConfig']) {
+    assert.match(types, new RegExp(marker));
+  }
+  for (const marker of ['Enable command sandbox', 'Sandbox backend', 'Read-only external paths', 'Writable external paths']) {
+    assert.match(form, new RegExp(marker));
+  }
+  assert.match(nodeMap, /toNodeSandbox/);
+  assert.match(configStore, /sandboxBackends: sandboxBackends\(\)/);
 });

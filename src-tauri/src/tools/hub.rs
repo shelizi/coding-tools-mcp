@@ -43,6 +43,14 @@ pub struct RoutedContext {
     pub context: SharedToolContext,
 }
 
+#[derive(Clone)]
+pub struct McpRoutedContext {
+    pub folder_id: String,
+    pub selected_folder_id: Option<String>,
+    pub route_source: &'static str,
+    pub context: SharedToolContext,
+}
+
 pub struct HubRouter {
     profile_id: String,
     config: HubConfig,
@@ -103,6 +111,24 @@ pub fn sync_live_hub(profile: &WorkspaceProfile) -> Result<bool, String> {
     Ok(true)
 }
 
+pub fn preflight_live_hub(profile: &WorkspaceProfile) -> Result<bool, String> {
+    let router = lock_hubs().get(&profile.id).cloned();
+    let Some(router) = router else {
+        return Ok(false);
+    };
+    router.preflight(profile.folders.as_slice(), &profile.runtime)?;
+    Ok(true)
+}
+
+pub fn sync_live_hub_after_preflight(profile: &WorkspaceProfile) -> Result<bool, String> {
+    let router = lock_hubs().get(&profile.id).cloned();
+    let Some(router) = router else {
+        return Ok(false);
+    };
+    router.sync_preflighted(profile.folders.clone(), &profile.runtime)?;
+    Ok(true)
+}
+
 pub fn resolve_context(
     fallback: SharedToolContext,
     host_session_key: Option<&str>,
@@ -119,6 +145,32 @@ pub fn resolve_context(
         }
     };
     router.resolve(host_session_key)
+}
+
+pub fn resolve_tool_context(
+    fallback: SharedToolContext,
+    host_session_key: Option<&str>,
+    explicit_folder_id: Option<&str>,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<McpRoutedContext, String> {
+    let router = lock_hubs().get(&fallback.profile_id).cloned();
+    let Some(router) = router else {
+        #[cfg(test)]
+        {
+            return Ok(McpRoutedContext {
+                folder_id: "legacy".into(),
+                selected_folder_id: None,
+                route_source: "legacy",
+                context: fallback,
+            });
+        }
+        #[cfg(not(test))]
+        {
+            return Err("工具區 routing 尚未初始化；未明確選取資料夾前不得存取專案內容。".into());
+        }
+    };
+    router.resolve_tool_context(host_session_key, explicit_folder_id, tool_name, arguments)
 }
 
 pub fn list_workspace_folders(
@@ -203,6 +255,88 @@ impl HubRouter {
                 context_access_clock: 0,
             }),
         }))
+    }
+
+    fn resolve_tool_context(
+        &self,
+        host_session_key: Option<&str>,
+        explicit_folder_id: Option<&str>,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> Result<McpRoutedContext, String> {
+        let session_key = host_session_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "WORKSPACE_FOLDER_NOT_SELECTED: 缺少 MCP conversation/session identity；無法建立單次資料夾路由。"
+                    .to_string()
+            })?;
+        let (folder_id, selected_folder_id, route_source) = {
+            let state = lock_state(self);
+            let selected = state.session_folders.get(session_key).cloned();
+            let explicit = explicit_folder_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if let Some(folder_id) = explicit {
+                (
+                    folder_id_if_allowed(&state.folders, folder_id)?,
+                    selected,
+                    "explicit",
+                )
+            } else if let Some(session_id) = action_session_id(tool_name, arguments) {
+                let folder_id = unique_conversation_context_match(
+                    &state,
+                    session_key,
+                    |context| context.sessions.contains(session_id),
+                    "session_id",
+                )?
+                .ok_or_else(|| {
+                    format!(
+                        "WORKSPACE_FOLDER_NOT_SELECTED: 找不到目前 conversation 中 session_id 对应的资料夹上下文：{session_id}。"
+                    )
+                })?;
+                (folder_id, selected, "session_id")
+            } else if tool_name == "request_permissions" {
+                let resume_id = arguments
+                    .get("resume_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                if let Some(resume_id) = resume_id {
+                    let folder_id = unique_conversation_context_match(
+                        &state,
+                        session_key,
+                        |context| context.pending_operations.contains(resume_id),
+                        "resume_id",
+                    )?
+                    .ok_or_else(|| {
+                        format!(
+                            "WORKSPACE_FOLDER_NOT_SELECTED: 找不到目前 conversation 中 resume_id 对应的资料夹上下文：{resume_id}。"
+                        )
+                    })?;
+                    (folder_id, selected, "resume_id")
+                } else {
+                    let folder_id = selected.clone().ok_or_else(|| {
+                        "WORKSPACE_FOLDER_NOT_SELECTED: request_permissions 没有可推导的 resume_id，且 conversation 尚未绑定资料夹。"
+                            .to_string()
+                    })?;
+                    (folder_id, selected, "conversation")
+                }
+            } else {
+                let folder_id = selected.clone().ok_or_else(|| {
+                    "WORKSPACE_FOLDER_NOT_SELECTED: 此 session 尚未选取资料夹；请先呼叫 conversation_bootstrap，或为支援的工具提供 workspace_folder_id。"
+                        .to_string()
+                })?;
+                (folder_id, selected, "conversation")
+            }
+        };
+        let context = self.context_for_folder(&folder_id, Some(session_key))?;
+        Ok(McpRoutedContext {
+            folder_id,
+            selected_folder_id,
+            route_source,
+            context,
+        })
     }
 
     pub fn action_folder_listing(&self) -> Value {
@@ -337,7 +471,83 @@ impl HubRouter {
         }
     }
 
+    fn live_preflight_folders(&self, folders: &[WorkspaceFolder]) -> Vec<WorkspaceFolder> {
+        let live_paths = {
+            let state = lock_state(self);
+            state
+                .contexts
+                .iter()
+                // The bootstrap context has a cache key without a conversation suffix and
+                // must be ready before the generation is published. Conversation contexts
+                // are prewarmed only while an external owner still holds them; cache-only
+                // historical entries may prepare lazily on their next fail-closed use.
+                .filter(|(cache_key, context)| {
+                    !cache_key.contains('\u{0}') || Arc::strong_count(context) > 1
+                })
+                .map(|(_, context)| context.workspace_path())
+                .collect::<Vec<_>>()
+        };
+        folders
+            .iter()
+            .filter(|folder| live_paths.iter().any(|path| same_path(&folder.path, path)))
+            .cloned()
+            .collect()
+    }
+
+    fn preflight(
+        &self,
+        folders: &[WorkspaceFolder],
+        runtime: &RuntimeConfig,
+    ) -> Result<(), String> {
+        if folders.is_empty() {
+            return Err("工具區至少需要一個資料夾。".into());
+        }
+        validate_unique_folder_paths(folders)?;
+        let current_sandbox = self.config.runtime_config.snapshot().sandbox;
+        if !runtime.sandbox.enabled || current_sandbox == runtime.sandbox {
+            return Ok(());
+        }
+        // Prewarm only folders that already own a live ToolContext. Inactive folders
+        // remain fail-closed: their first command prepares the enabled backend on demand.
+        // An unrelated configured folder must not block a global sandbox generation swap.
+        for folder in self.live_preflight_folders(folders) {
+            let workspace = Workspace::new_with_execution(
+                PathBuf::from(&folder.path),
+                folder.execution.clone(),
+            )
+            .map_err(|error| error.message())?;
+            let context =
+                ToolContext::from_workspace_with_shared_runtime_config_and_resource_ids_and_limits(
+                    workspace,
+                    self.config.auth.clone(),
+                    self.config.runtime_config.clone(),
+                    self.profile_id.clone(),
+                    format!(
+                        "{}--{}--{}",
+                        self.profile_id, self.config.execution_resource_namespace, folder.id
+                    ),
+                    format!(
+                        "{}--{}",
+                        self.profile_id, self.config.execution_resource_namespace
+                    ),
+                    self.config.limits,
+                );
+            crate::tools::exec::prewarm_sandbox_backend(&context, &runtime.sandbox)
+                .map_err(|error| error.message())?;
+        }
+        Ok(())
+    }
+
     fn sync(&self, folders: Vec<WorkspaceFolder>, runtime: &RuntimeConfig) -> Result<(), String> {
+        self.preflight(&folders, runtime)?;
+        self.sync_preflighted(folders, runtime)
+    }
+
+    fn sync_preflighted(
+        &self,
+        folders: Vec<WorkspaceFolder>,
+        runtime: &RuntimeConfig,
+    ) -> Result<(), String> {
         if folders.is_empty() {
             return Err("工具區至少需要一個資料夾。".into());
         }
@@ -697,6 +907,30 @@ fn unique_context_match(
     }
 }
 
+fn unique_conversation_context_match(
+    state: &RoutingState,
+    session_key: &str,
+    predicate: impl Fn(&SharedToolContext) -> bool,
+    identifier_name: &str,
+) -> Result<Option<String>, String> {
+    let suffix = format!("\u{0}{session_key}");
+    let mut matches = state
+        .contexts
+        .iter()
+        .filter(|(cache_key, context)| cache_key.ends_with(&suffix) && predicate(context))
+        .map(|(cache_key, _)| context_folder_id(cache_key).to_string())
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [folder_id] => Ok(Some(folder_id.clone())),
+        _ => Err(format!(
+            "同一個 {identifier_name} 出現在目前 conversation 的多個資料夾上下文，請明確提供 workspace_folder_id。"
+        )),
+    }
+}
+
 fn same_path(left: &str, right: &str) -> bool {
     if let Some(equal) = compare_wsl_paths(left, right) {
         return equal;
@@ -776,7 +1010,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::tools::context::MutationLockGroup;
+    use crate::tools::tool_runtime::MutationLockGroup;
 
     fn test_config(namespace: &str) -> HubConfig {
         HubConfig {
@@ -936,6 +1170,8 @@ mod tests {
         runtime.allowed_commands = "node,git".into();
         runtime.workspace_local_entries = false;
         runtime.workspace_script_extensions = ".js,.ts".into();
+        runtime.sandbox.enabled = false;
+        runtime.sandbox.backend = "docker".into();
         router
             .sync(folders.clone(), &runtime)
             .expect("hot apply runtime");
@@ -947,6 +1183,8 @@ mod tests {
         assert!(!updated.policy.workspace_local_entries);
         assert!(updated.policy.allowed_commands.contains("node"));
         assert!(updated.policy.workspace_script_extensions.contains(".ts"));
+        assert!(!updated.sandbox.enabled);
+        assert_eq!(updated.sandbox.backend, "docker");
 
         let cached_again = router
             .context_for_folder("workspace", Some("cached-conversation"))
@@ -959,17 +1197,203 @@ mod tests {
             created_after_update.runtime_config().tool_profile,
             "advanced"
         );
+        assert_eq!(
+            created_after_update.runtime_config().sandbox.backend,
+            "docker"
+        );
 
         runtime.tool_profile = "read-only".into();
         runtime.permission_mode = "read-only".into();
         runtime.allowed_commands = "python".into();
+        runtime.sandbox.backend = "podman".into();
         router.sync(folders, &runtime).expect("second hot apply");
         for context in [&cached, &created_after_update] {
             let current = context.runtime_config();
             assert_eq!(current.tool_profile, "read-only");
             assert_eq!(current.permission_mode, "read-only");
             assert!(current.policy.allowed_commands.contains("python"));
+            assert_eq!(current.sandbox.backend, "podman");
         }
+    }
+
+    #[test]
+    fn sync_hot_applies_sandbox_enablement_after_preflight() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folders = vec![WorkspaceFolder {
+            id: "workspace".into(),
+            name: "Workspace".into(),
+            path: workspace.path().display().to_string(),
+            execution: Default::default(),
+        }];
+        let router = HubRouter::new(
+            "sandbox-enable-hot-apply-test".into(),
+            folders.clone(),
+            test_config("sandbox-enable-hot-apply"),
+        )
+        .expect("router");
+        let cached = router
+            .context_for_folder("workspace", Some("cached-conversation"))
+            .expect("cached context");
+        let before = cached.runtime_config().sandbox;
+        assert!(!before.enabled);
+
+        let mut runtime = crate::workspace::RuntimeConfig::default();
+        runtime.sandbox.enabled = true;
+        runtime.sandbox.backend = "appcontainer".into();
+        router
+            .sync_preflighted(folders, &runtime)
+            .expect("sync preflighted runtime");
+
+        let after = cached.runtime_config().sandbox;
+        assert!(after.enabled);
+        assert_eq!(after.backend, "appcontainer");
+        assert_ne!(after, before);
+    }
+
+    #[test]
+    fn sandbox_preflight_only_targets_folders_with_live_contexts() {
+        let first = tempfile::tempdir().expect("first workspace");
+        let second = tempfile::tempdir().expect("second workspace");
+        let folders = vec![
+            WorkspaceFolder {
+                id: "first".into(),
+                name: "First".into(),
+                path: first.path().display().to_string(),
+                execution: Default::default(),
+            },
+            WorkspaceFolder {
+                id: "second".into(),
+                name: "Second".into(),
+                path: second.path().display().to_string(),
+                execution: Default::default(),
+            },
+        ];
+        let router = HubRouter::new(
+            "sandbox-live-preflight-test".into(),
+            folders.clone(),
+            test_config("sandbox-live-preflight"),
+        )
+        .expect("router");
+
+        assert!(router.live_preflight_folders(&folders).is_empty());
+        let first_context = router
+            .context_for_folder("first", Some("first-conversation"))
+            .expect("first context");
+        assert_eq!(
+            router
+                .live_preflight_folders(&folders)
+                .into_iter()
+                .map(|folder| folder.id)
+                .collect::<Vec<_>>(),
+            vec!["first"]
+        );
+        drop(first_context);
+        assert!(
+            router.live_preflight_folders(&folders).is_empty(),
+            "a conversation context retained only by the routing cache must not block preflight"
+        );
+
+        let bootstrap = router
+            .context_for_folder("first", None)
+            .expect("bootstrap context");
+        drop(bootstrap);
+        assert_eq!(
+            router
+                .live_preflight_folders(&folders)
+                .into_iter()
+                .map(|folder| folder.id)
+                .collect::<Vec<_>>(),
+            vec!["first"],
+            "bootstrap context must be preflighted even when only the routing cache holds it"
+        );
+
+        let second_context = router
+            .context_for_folder("second", Some("second-conversation"))
+            .expect("second context");
+        let mut live_ids = router
+            .live_preflight_folders(&folders)
+            .into_iter()
+            .map(|folder| folder.id)
+            .collect::<Vec<_>>();
+        live_ids.sort();
+        assert_eq!(live_ids, vec!["first", "second"]);
+        drop(second_context);
+    }
+
+    #[test]
+    fn sandbox_preflight_does_not_touch_stale_inactive_contexts() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let live = root.path().join("live");
+        let inactive = root.path().join("inactive");
+        fs::create_dir_all(&live).expect("live workspace");
+        fs::create_dir_all(&inactive).expect("inactive workspace");
+        let folders = vec![
+            WorkspaceFolder {
+                id: "inactive".into(),
+                name: "Inactive".into(),
+                path: inactive.display().to_string(),
+                execution: Default::default(),
+            },
+            WorkspaceFolder {
+                id: "live".into(),
+                name: "Live".into(),
+                path: live.display().to_string(),
+                execution: Default::default(),
+            },
+        ];
+        let router = HubRouter::new(
+            "sandbox-inactive-preflight-test".into(),
+            folders.clone(),
+            test_config("sandbox-inactive-preflight"),
+        )
+        .expect("router");
+        let stale_context = router
+            .context_for_folder("inactive", Some("stale-conversation"))
+            .expect("stale context");
+        drop(stale_context);
+        fs::remove_dir_all(&inactive).expect("remove inactive workspace");
+
+        let _live_context = router
+            .context_for_folder("live", Some("live-conversation"))
+            .expect("live context");
+
+        let mut runtime = crate::workspace::RuntimeConfig::default();
+        runtime.sandbox.enabled = true;
+        runtime.sandbox.backend = "missing-backend".into();
+        let error = router
+            .preflight(&folders, &runtime)
+            .expect_err("live backend must still be preflighted");
+        assert!(
+            error.contains("Sandbox backend is not registered: missing-backend"),
+            "stale inactive context was touched before the live backend: {error}"
+        );
+    }
+
+    #[test]
+    fn sandbox_preflight_failure_keeps_live_generation_unchanged() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let folders = vec![WorkspaceFolder {
+            id: "workspace".into(),
+            name: "Workspace".into(),
+            path: workspace.path().display().to_string(),
+            execution: Default::default(),
+        }];
+        let router = HubRouter::new(
+            "sandbox-preflight-failure-test".into(),
+            folders.clone(),
+            test_config("sandbox-preflight-failure"),
+        )
+        .expect("router");
+        let cached = router
+            .context_for_folder("workspace", Some("cached-conversation"))
+            .expect("cached context");
+        let before = cached.runtime_config().sandbox;
+
+        let mut runtime = crate::workspace::RuntimeConfig::default();
+        runtime.sandbox.enabled = true;
+        runtime.sandbox.backend = "unknown-hot-toggle-backend".into();
+        assert!(router.preflight(&folders, &runtime).is_err());
+        assert_eq!(cached.runtime_config().sandbox, before);
     }
 
     #[test]

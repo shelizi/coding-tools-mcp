@@ -20,8 +20,8 @@ Never synchronize or bulk-bump them. Increment only the component whose behavior
 
 ## Editions
 
-- `bundled-node`: includes `runtime/node.exe` and `runtime/NODE-LICENSE.txt`; must not require system Node.js or npm after extraction.
-- `system-node`: excludes the runtime directory and Node.js license; requires Windows x64 Node.js 22 or later as `node.exe` on `PATH`; must not require npm after extraction.
+- `bundled-node`: includes `runtime/node.exe` and `runtime/NODE-LICENSE.txt`; must not require system Node.js or a package manager after extraction.
+- `system-node`: excludes the runtime directory and Node.js license; requires Windows x64 Node.js 22 or later as `node.exe` on `PATH`; must not require a package manager after extraction.
 
 Both editions contain the same compiled application and production dependencies and use the same default per-user data directory.
 
@@ -33,7 +33,7 @@ Both editions contain the same compiled application and production dependencies 
 4. Commit all release source and version changes. Require a clean worktree after the commit.
 5. Create an annotated `node-agent-v<agent>-portable-v<portable>` tag on that exact commit.
 6. Run `scripts/check-release-versions.ps1 -RepositoryRoot <repo>` from this Skill. Require the expected annotated tag to resolve to `HEAD`, a clean worktree, valid versions, and expected artifact names.
-7. Run `npm run node-agent:portable` from the repository root to build both editions from the tagged commit. Use the focused `:bundled` or `:system` commands only when explicitly requested.
+7. Run `pnpm run node-agent:portable` from the repository root to build both editions from the tagged commit. Use the focused `:bundled` or `:system` commands only when explicitly requested.
 8. Inspect both ZIP names and manifests; require Agent version, Portable version, edition, release tag, and full Git commit in each artifact identity.
 9. Confirm common application contents are present in both editions. Confirm only `bundled-node` contains `runtime/node.exe` and the Node license.
 10. Extract both ZIPs to paths containing spaces. Start each with `start-node-agent.bat --no-browser` on isolated ports and data directories, then verify `/health`, `/ui`, and static UI assets.
@@ -44,7 +44,7 @@ Both editions contain the same compiled application and production dependencies 
 
 - Require Windows x64 and Node.js 22 or later for building and for the `system-node` runtime.
 - Release packaging must run from a clean `HEAD` with an annotated `node-agent-v<agent>-portable-v<portable>` tag resolving to that exact commit. Do not use Desktop `v*` tags for Node portable releases.
-- Install staging dependencies once with `npm ci --omit=dev --ignore-scripts`, then derive both editions from the same common staging tree.
+- Deploy production staging once with `pnpm --filter @coding-tools/node-agent deploy --prod <staging>`, then derive both editions from the same common staging tree.
 - Never copy source `node_modules` into an archive.
 - Never include dev dependencies, build caches, repository history, credentials, user data, or existing configuration.
 - Default runtime data to `%LOCALAPPDATA%\CodingToolsMCPNode` unless `CTMCP_DATA_DIR` is already set.

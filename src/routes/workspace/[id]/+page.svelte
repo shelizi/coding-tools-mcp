@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
+  import { appUrl } from "$lib/app-path";
   import Tabs from "$lib/components/Tabs.svelte";
   import type { ActionsPolicyDraft } from "$lib/components/ActionsPolicyForm.svelte";
   import type { RuntimePolicyDraft } from "$lib/components/RuntimePolicyForm.svelte";
@@ -22,7 +23,8 @@
     updateWorkspace,
   } from "$lib/api/workspaces";
   import { listFrpProfiles, setLastWorkspace, type FrpProfileDto } from "$lib/api/settings";
-  import { confirm } from "@tauri-apps/plugin-dialog";
+  import { confirm } from "$lib/api/native";
+  import { getBackend } from "$lib/backend";
   import { restartTunnel, stopTunnel, testTunnel } from "$lib/api/tunnel";
   import { runServiceToggle, notifyStartFailure } from "$lib/runtime/service";
   import { showToast } from "$lib/stores/toast";
@@ -31,23 +33,32 @@
   import {
     actionsConfig,
     actionsLocalEndpoint,
+    compatibilityPermissionMode,
+    compatibilityToolProfile,
     frpPublicUrl,
     mcpLocalEndpoint,
+    sandboxConfig,
+    securityPolicyConfig,
     type ActionsAuthDraft,
     type AuthConfig,
+    type SandboxConfig,
     type RuntimeState,
     type WorkspaceProfile,
     workspaceFolders,
   } from "$lib/types";
   import { t } from "$lib/i18n";
 
-  type WorkspaceTab = "overview" | "history" | "telemetry" | "mcp" | "actions" | "settings";
+  type WorkspaceTab = "overview" | "history" | "telemetry" | "logs" | "health" | "features" | "mcp" | "actions" | "settings";
   type ServiceSection = "service" | "tunnel" | "auth" | "policy" | "logs" | "health";
 
+  const capabilities = getBackend().capabilities;
   const workspaceTabValues: WorkspaceTab[] = [
     "overview",
     "history",
     "telemetry",
+    "logs",
+    "health",
+    "features",
     "mcp",
     "actions",
     "settings",
@@ -96,18 +107,35 @@
   let telemetryViewerPromise:
     | Promise<typeof import("$lib/components/TelemetryViewer.svelte")>
     | undefined;
+  let operationLogViewerPromise:
+    | Promise<typeof import("$lib/components/OperationLogViewer.svelte")>
+    | undefined;
+  let healthPanelPromise:
+    | Promise<typeof import("$lib/components/HealthPanel.svelte")>
+    | undefined;
+  let workspaceFeatureControlsPromise:
+    | Promise<typeof import("$lib/components/workspace/WorkspaceFeatureControls.svelte")>
+    | undefined;
 
-  const workspaceTabs = $derived([
-    { value: "overview", label: $t("Overview") },
-    { value: "history", label: $t("History") },
-    { value: "telemetry", label: $t("Telemetry") },
-    { value: "mcp", label: "MCP" },
-    { value: "actions", label: "Actions" },
-    { value: "settings", label: $t("Workspace settings") },
-  ]);
+  const workspaceTabs = $derived(
+    [
+      { value: "overview", label: $t("Overview") },
+      { value: "history", label: $t("History") },
+      { value: "telemetry", label: $t("Telemetry") },
+      capabilities.operationLogs ? { value: "logs", label: $t("Operation logs") } : null,
+      { value: "health", label: $t("Health") },
+      capabilities.workspaceFeatureControls
+        ? { value: "features", label: $t("Skills / Hooks / MCP") }
+        : null,
+      { value: "mcp", label: "MCP" },
+      capabilities.actions ? { value: "actions", label: "Actions" } : null,
+      { value: "settings", label: $t("Workspace settings") },
+    ].filter((item): item is { value: string; label: string } => item != null),
+  );
 
   const workspaceId = $derived($page.params.id);
   const actions = $derived(profile ? actionsConfig(profile) : null);
+  const sandboxLocked = false;
 
   function loadOverviewPanel() {
     return (overviewPanelPromise ??= import("$lib/components/workspace/WorkspaceOverview.svelte"));
@@ -133,6 +161,18 @@
     return (telemetryViewerPromise ??= import("$lib/components/TelemetryViewer.svelte"));
   }
 
+  function loadOperationLogViewer() {
+    return (operationLogViewerPromise ??= import("$lib/components/OperationLogViewer.svelte"));
+  }
+
+  function loadHealthPanel() {
+    return (healthPanelPromise ??= import("$lib/components/HealthPanel.svelte"));
+  }
+
+  function loadWorkspaceFeatureControls() {
+    return (workspaceFeatureControlsPromise ??= import("$lib/components/workspace/WorkspaceFeatureControls.svelte"));
+  }
+
   function currentTime(): number {
     return globalThis.performance?.now() ?? Date.now();
   }
@@ -149,7 +189,11 @@
   }
 
   function validWorkspaceTab(value: string | null): WorkspaceTab {
-    return workspaceTabValues.includes(value as WorkspaceTab) ? (value as WorkspaceTab) : "overview";
+    const tab = workspaceTabValues.includes(value as WorkspaceTab) ? (value as WorkspaceTab) : "overview";
+    if (tab === "actions" && !capabilities.actions) return "overview";
+    if (tab === "logs" && !capabilities.operationLogs) return "overview";
+    if (tab === "features" && !capabilities.workspaceFeatureControls) return "overview";
+    return tab;
   }
 
   function validServiceSection(value: string | null): ServiceSection {
@@ -254,7 +298,10 @@
     if (!id) return;
     const generation = ++loadGeneration;
     const [items, profiles] = await measure("load.workspace-data", () =>
-      Promise.all([listWorkspaces(), listFrpProfiles()]),
+      Promise.all([
+        listWorkspaces(),
+        capabilities.frpManagement ? listFrpProfiles() : Promise.resolve([]),
+      ]),
     );
     if (generation !== loadGeneration || id !== workspaceId) return;
 
@@ -264,19 +311,20 @@
     profile = nextProfile;
 
     if (!nextProfile) {
-      await goto("/");
+      await goto(appUrl("/"));
       return;
     }
 
-    const [[mcpRuntime, actionsRuntime]] = await Promise.all([
-      measure("load.runtime-status", () =>
-        Promise.all([getRuntimeStatus(id), getActionsRuntimeStatus(id)]),
-      ),
+    const [mcpRuntime, actionsRuntime] = await Promise.all([
+      measure("load.runtime-status", () => getRuntimeStatus(id)),
+      capabilities.actions
+        ? measure("load.actions-status", () => getActionsRuntimeStatus(id))
+        : Promise.resolve(null),
       measure("load.last-workspace", () => setLastWorkspace(nextProfile.id)),
     ]);
     if (generation !== loadGeneration || id !== workspaceId) return;
     applyMcpRuntime(mcpRuntime, id);
-    applyActionsRuntime(actionsRuntime, id);
+    if (actionsRuntime) applyActionsRuntime(actionsRuntime, id);
   }
 
   async function refreshProfile(id = workspaceId): Promise<WorkspaceProfile | null> {
@@ -531,8 +579,10 @@
 
   async function saveMcpPolicy(draft: RuntimePolicyDraft) {
     if (!profile) return;
+    const currentSecurityPolicy = securityPolicyConfig(profile.runtime);
     const requiresRestart =
       draft.transportMode !== profile.runtime.transport_mode ||
+      JSON.stringify(draft.securityPolicy) !== JSON.stringify(currentSecurityPolicy) ||
       draft.blockingAdmissionLimit !== profile.runtime.blocking_admission_limit ||
       draft.processAdmissionLimit !== profile.runtime.process_admission_limit ||
       draft.globalBlockingAdmissionLimit !== profile.runtime.global_blocking_admission_limit ||
@@ -543,8 +593,9 @@
       runtime: {
         ...profile.runtime,
         transport_mode: draft.transportMode as "streamable-http" | "legacy-json",
-        tool_profile: draft.toolProfile,
-        permission_mode: draft.permissionMode,
+        tool_profile: compatibilityToolProfile(draft.securityPolicy),
+        permission_mode: compatibilityPermissionMode(draft.securityPolicy),
+        security_policy: draft.securityPolicy,
         allowed_commands: draft.allowedCommands,
         workspace_local_entries: draft.workspaceLocalEntries,
         workspace_script_extensions: draft.workspaceScriptExtensions,
@@ -620,6 +671,40 @@
     }
   }
 
+  async function saveSandbox(config: SandboxConfig) {
+    if (!profile || !workspaceId) return;
+    const targetWorkspaceId = workspaceId;
+    const current = sandboxConfig(profile.runtime);
+    if (JSON.stringify(current) === JSON.stringify(config)) return;
+    const disablingSandbox = current.enabled && !config.enabled;
+    const next: WorkspaceProfile = {
+      ...profile,
+      runtime: {
+        ...profile.runtime,
+        sandbox: config,
+      },
+    };
+    if (!(await persistProfile("save.workspace.sandbox", next, targetWorkspaceId))) return;
+    if (!disablingSandbox) return;
+
+    const wasRunning = mcpStatus === "running";
+    mcpBusy = true;
+    try {
+      const runtime = await measure(
+        wasRunning ? "service.mcp.restart.sandbox-disabled" : "service.mcp.start.sandbox-disabled",
+        () => (wasRunning ? restartRuntime(targetWorkspaceId) : startRuntime(targetWorkspaceId)),
+      );
+      if (targetWorkspaceId !== workspaceId) return;
+      applyMcpRuntime(runtime, targetWorkspaceId);
+      if (runtime.state === "running") await afterServiceStart("mcp", runtime, targetWorkspaceId);
+      else notifyStartFailure("MCP", runtime);
+    } catch (error) {
+      showToast(String(error), { kind: "error", title: $t("The service failed to start") });
+    } finally {
+      if (targetWorkspaceId === workspaceId) mcpBusy = false;
+    }
+  }
+
   async function saveWorkspaceName(name: string) {
     if (!profile || profile.name === name) return;
     await persistProfile("save.workspace.name", { ...profile, name });
@@ -643,7 +728,7 @@
     if (!confirmed) return;
     await measure("workspace.delete", () => deleteWorkspace(workspaceId));
     workspaces.update((items) => items.filter((item) => item.id !== workspaceId));
-    await goto("/");
+    await goto(appUrl("/"));
   }
 
   $effect(() => {
@@ -670,13 +755,15 @@
           <p class="page-kicker">{$t("Workspaces")}</p>
           <h2 class="page-title">{profile.name}</h2>
         </div>
-        <button
-          type="button"
-          class="tx-btn-ghost text-[var(--danger)]"
-          onclick={() => void removeWorkspace()}
-        >
-          {$t("Delete workspace")}
-        </button>
+        {#if capabilities.workspaceLifecycle}
+          <button
+            type="button"
+            class="tx-btn-ghost text-[var(--danger)]"
+            onclick={() => void removeWorkspace()}
+          >
+            {$t("Delete workspace")}
+          </button>
+        {/if}
       </div>
 
       <div class="mt-5">
@@ -739,6 +826,30 @@
             {@const TelemetryViewer = module.default}
             <TelemetryViewer workspaceId={workspaceId!} />
           {/await}
+        {:else if activeWorkspaceTab === "logs"}
+          {#await loadOperationLogViewer()}
+            <div class="tx-card p-5 text-sm text-[var(--color-text-muted)]">{$t("Working…")}</div>
+          {:then module}
+            {@const OperationLogViewer = module.default}
+            <OperationLogViewer
+              workspaceId={workspaceId!}
+              folders={workspaceFolders(profile)}
+            />
+          {/await}
+        {:else if activeWorkspaceTab === "health"}
+          {#await loadHealthPanel()}
+            <div class="tx-card p-5 text-sm text-[var(--color-text-muted)]">{$t("Working…")}</div>
+          {:then module}
+            {@const HealthPanel = module.default}
+            <HealthPanel workspaceId={workspaceId!} />
+          {/await}
+        {:else if activeWorkspaceTab === "features" && capabilities.workspaceFeatureControls}
+          {#await loadWorkspaceFeatureControls()}
+            <div class="tx-card p-5 text-sm text-[var(--color-text-muted)]">{$t("Working…")}</div>
+          {:then module}
+            {@const WorkspaceFeatureControls = module.default}
+            <WorkspaceFeatureControls workspaceId={workspaceId!} />
+          {/await}
         {:else if activeWorkspaceTab === "settings"}
           {#await loadSettingsPanel()}
             <div class="tx-card p-5 text-sm text-[var(--color-text-muted)]">{$t("Working…")}</div>
@@ -749,7 +860,13 @@
               onSaveName={saveWorkspaceName}
               onProfileChanged={applyWorkspaceProfile}
               onFoldersChanged={handleWorkspaceFoldersChanged}
+              onSaveSandbox={saveSandbox}
+              {sandboxLocked}
             />
+          {:catch cause}
+            <div class="tx-card p-5 text-sm text-[var(--color-danger)]">
+              {$t("Workspace settings could not be loaded.")} {String(cause)}
+            </div>
           {/await}
         {:else if activeWorkspaceTab === "mcp"}
           {#await loadMcpPanel()}
@@ -775,7 +892,7 @@
               onSaveAuth={saveMcpAuth}
             />
           {/await}
-        {:else}
+        {:else if activeWorkspaceTab === "actions" && capabilities.actions}
           {#await loadActionsPanel()}
             <div class="tx-card p-5 text-sm text-[var(--color-text-muted)]">{$t("Working…")}</div>
           {:then module}

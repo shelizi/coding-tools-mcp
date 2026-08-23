@@ -1,125 +1,30 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer, type Server } from 'node:http';
 import path from 'node:path';
-import type { AgentConfig, JsonObject, ToolContext } from './types.js';
-import {
-  resolveToolProfile, toolNamesForProfile, toolsForProfile, toolsetRevisionForProfile
-} from './catalog.js';
-import { callTool } from './tools.js';
-import {
-  authorizationMetadata, externalBase, OAuthRuntime,
-  protectedResourceMetadataUrl, resourceMetadata, sendJson
-} from './oauth.js';
+import type { AgentConfig, ToolContext } from './types.js';
+import { resolveToolProfile } from './catalog.js';
+import { externalBase, OAuthRuntime, sendJson } from './oauth.js';
 import { KeyedMutex, Semaphore } from './runtime.js';
 import { StateStore } from './state.js';
 import {
   ConfigStore, handleManagementRequest,
   type WorkspaceManagementStore, type WorkspaceRuntimeRecord
 } from './management.js';
-import { AGENT_VERSION, CLIENT_COMPAT_VERSION } from './version.js';
 import { defaultPolicy } from './policy.js';
 import { legacySecurityPolicy } from './securityPolicy.js';
-import { disposeProcessSessions, ProcessRequestLifecycle } from './processes.js';
+import { disposeProcessSessions } from './processes.js';
+import { preflightSandboxConfiguration } from './sandbox.js';
 import { ToolUsageStore } from './toolUsage.js';
 import { createFolderRuntime } from './folderRuntime.js';
+import { ExtensionRegistry } from './extensions/registry.js';
 import { canonicalizeWorkspaceFolders } from './workspace.js';
-import { ConversationStore, deriveWorkspaceProfileId, markMcpConversationMetadata } from './conversation.js';
-import { wrapMcpToolResult } from './toolContract.js';
-import {
-  LATEST_MCP_PROTOCOL_VERSION,
-  MCP_STREAM_HEARTBEAT_INTERVAL_MS,
-  SUPPORTED_MCP_PROTOCOL_VERSIONS,
-  StreamingJsonResponse,
-  sendMcpAccepted,
-  sendMcpMethodNotAllowed,
-  sendMcpTransportError,
-  validateJsonRpcMessage,
-  validateMcpConnection,
-  type McpTransportIssue
-} from './mcpTransport.js';
-
-const supportedProtocols = new Set<string>(SUPPORTED_MCP_PROTOCOL_VERSIONS);
-
-interface ToolCatalogSnapshot {
-  profile: AgentConfig['activeToolProfile'];
-  tools: ReturnType<typeof toolsForProfile>;
-  names: ReturnType<typeof toolNamesForProfile>;
-  revision: string;
-}
-
-const toolCatalogCache = new Map<AgentConfig['activeToolProfile'], ToolCatalogSnapshot>();
-
-function currentToolCatalog(context: ToolContext): ToolCatalogSnapshot {
-  const profile = context.config.activeToolProfile;
-  const cached = toolCatalogCache.get(profile);
-  if (cached) return cached;
-  const catalog = {
-    profile,
-    tools: toolsForProfile(profile),
-    names: toolNamesForProfile(profile),
-    revision: toolsetRevisionForProfile(profile)
-  };
-  toolCatalogCache.set(profile, catalog);
-  return catalog;
-}
-
-function setRuntimeRevisionHeaders(res: ServerResponse, catalog: ToolCatalogSnapshot, startedAt: number): void {
-  res.setHeader('x-coding-tools-toolset-revision', catalog.revision);
-  res.setHeader('x-coding-tools-runtime-started-at', String(startedAt));
-  res.setHeader('x-coding-tools-agent-version', AGENT_VERSION);
-}
-
-function requestedToolsetRevision(req: IncomingMessage, params: JsonObject): string {
-  const metadata = params._meta && typeof params._meta === 'object' && !Array.isArray(params._meta)
-    ? params._meta as JsonObject
-    : {};
-  const metaRevision = String(metadata['coding-tools/toolset-revision'] ?? '').trim();
-  if (metaRevision) return metaRevision;
-  const header = req.headers['x-coding-tools-toolset-revision'];
-  return String(Array.isArray(header) ? header[0] ?? '' : header ?? '').trim();
-}
-
-async function body(req: IncomingMessage, limit = 1024 * 1024): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const value = Buffer.from(chunk);
-    size += value.length;
-    if (size > limit) throw new Error('request body too large');
-    chunks.push(value);
-  }
-  return Buffer.concat(chunks);
-}
-
-function text(res: ServerResponse, status: number, value: string, type = 'text/plain; charset=utf-8'): void {
-  res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' }).end(value);
-}
-
-function routePrefix(config: AgentConfig): string {
-  if (!config.publicBaseUrl) return '';
-  try {
-    const pathname = new URL(config.publicBaseUrl).pathname.replace(/\/$/, '');
-    return pathname === '/' ? '' : pathname;
-  } catch { return ''; }
-}
-
-function localPath(pathname: string, prefix: string): string {
-  if (!prefix) return pathname;
-  if (pathname === prefix) return '/';
-  if (pathname.startsWith(`${prefix}/`)) return pathname.slice(prefix.length);
-  return pathname;
-}
-
-function isAuthorizationMetadata(pathname: string, prefix: string): boolean {
-  return pathname === '/.well-known/oauth-authorization-server'
-    || (prefix !== '' && pathname === `/.well-known/oauth-authorization-server${prefix}`);
-}
-
-function isResourceMetadata(pathname: string, prefix: string): boolean {
-  return pathname === '/.well-known/oauth-protected-resource'
-    || pathname === '/.well-known/oauth-protected-resource/mcp'
-    || (prefix !== '' && pathname === `/.well-known/oauth-protected-resource${prefix}/mcp`);
-}
+import { ConversationStore, deriveWorkspaceProfileId } from './conversation.js';
+import { currentToolCatalog, setRuntimeRevisionHeaders } from './server/catalog.js';
+import { localPath, routePrefix, sendText } from './server/http.js';
+import { rpcErrorResponse } from './server/mcp/dispatcher.js';
+import { handleMcpRoute } from './server/routes/mcp.js';
+import { handleOAuthRoute } from './server/routes/oauth.js';
+import { handleSystemRoute } from './server/routes/system.js';
 
 export async function createToolContext(config: AgentConfig): Promise<ToolContext> {
   config.policy ??= defaultPolicy();
@@ -127,14 +32,28 @@ export async function createToolContext(config: AgentConfig): Promise<ToolContex
   config.activeToolProfile ??= resolveToolProfile(config.toolProfile, config.permissionMode);
   config.securityPolicy ??= legacySecurityPolicy(config.permissionMode, config.toolProfile);
   config.securityPolicyCustomized ??= false;
+  config.skills ??= { active: true, disabled: [] };
+  config.skills.active ??= true;
+  config.extensions ??= { hooks: { active: true, enabled: [] }, mcp: { active: true, enabled: [] } };
+  config.extensions.hooks ??= { active: true, enabled: [] };
+  config.extensions.mcp ??= { active: true, enabled: [] };
+  config.extensions.hooks.active ??= true;
+  config.extensions.mcp.active ??= true;
   const folders = await canonicalizeWorkspaceFolders(config.folders);
   config = { ...config, folders };
   const state = new StateStore(config.dataDir);
   await state.load();
   const usageStore = new ToolUsageStore(config.dataDir, { redactTelemetry: config.securityPolicy.redactTelemetry });
   const folderRuntimes = new Map(config.folders.map(folder => [folder.id, createFolderRuntime(config, folder)]));
-  const firstRuntime = folderRuntimes.values().next().value;
-  if (!firstRuntime) throw new Error('at least one workspace folder is required');
+  if (!folderRuntimes.size) throw new Error('at least one workspace folder is required');
+  const extensions = new ExtensionRegistry({
+    folders: config.folders,
+    hooksActive: config.extensions.hooks.active,
+    mcpActive: config.extensions.mcp.active,
+    enabledHooks: config.extensions.hooks.enabled,
+    enabledMcpServers: config.extensions.mcp.enabled
+  });
+  await extensions.refresh(true);
   const hubAdmission = {
     blocking: new Semaphore(config.limits.globalBlockingConcurrency ?? 1_024),
     process: new Semaphore(config.limits.globalProcessConcurrency ?? 512),
@@ -154,14 +73,10 @@ export async function createToolContext(config: AgentConfig): Promise<ToolContex
     selections: conversations.selectionMap,
     defaultCwds: conversations.cwdMap,
     folderRuntimes,
+    extensions,
     hubAdmission,
-    sessions: firstRuntime.sessions,
-    operationsByFingerprint: firstRuntime.operationsByFingerprint,
-    pendingOperations: firstRuntime.pendingOperations,
-    editProposals: firstRuntime.editProposals,
     usage: [],
     usageStore,
-    admission: firstRuntime.admission,
     state,
     tunnelStatus: config.tunnel?.enabled
       ? { enabled: true, state: 'stopped', publicUrl: config.tunnel.publicUrl, workers: 1, connectedWorkers: 0, completedRequests: 0 }
@@ -173,6 +88,7 @@ export interface AgentRuntime {
   server: Server;
   context: ToolContext;
   oauth: OAuthRuntime;
+  close(): Promise<void>;
 }
 
 export interface AgentRuntimeOptions {
@@ -183,51 +99,25 @@ export interface AgentRuntimeOptions {
   runtimeRegistry?: Map<string, WorkspaceRuntimeRecord>;
 }
 
-function currentListenerPort(server: Server, fallback: number): number {
-  const address = server.address();
-  return address && typeof address === 'object' ? address.port : fallback;
-}
-
-function rpcErrorResponse(requestId: unknown, error: unknown): JsonObject {
-  const code = typeof error === 'object' && error && 'rpcCode' in error
-    ? Number((error as { rpcCode: number }).rpcCode)
-    : -32603;
-  const data = typeof error === 'object' && error && 'rpcData' in error
-    ? (error as { rpcData: JsonObject }).rpcData
-    : undefined;
-  return {
-    jsonrpc: '2.0',
-    id: requestId,
-    error: {
-      code,
-      message: error instanceof Error ? error.message : String(error),
-      ...(data ? { data } : {})
-    }
-  };
-}
-
 export async function createAgentRuntime(config: AgentConfig, options: AgentRuntimeOptions = {}): Promise<AgentRuntime> {
   const context = await createToolContext(config);
   const oauth = new OAuthRuntime(config.oauth);
   const startedAt = Date.now();
   const workspaceId = config.workspaceId ?? context.workspaceProfileId;
-  options.runtimeRegistry?.set(workspaceId, { context, oauth, startedAt });
+  options.runtimeRegistry?.set(workspaceId, {
+    context,
+    oauth,
+    startedAt,
+    preflightSandbox: sandbox => preflightSandboxConfiguration(sandbox, context.config.folders, context.config.dataDir)
+  });
   const adminToken = options.configStore ? randomBytes(32).toString('base64url') : '';
   const server = createServer(async (req, res) => {
-    let requestId: unknown = null;
-    let processLifecycle: ProcessRequestLifecycle | undefined;
-    let stream: StreamingJsonResponse | undefined;
-    let abortProcessLifecycle: (() => void) | undefined;
-    let closeProcessLifecycle: (() => void) | undefined;
-    const clearProcessLifecycleListeners = () => {
-      if (abortProcessLifecycle) req.off('aborted', abortProcessLifecycle);
-      if (closeProcessLifecycle) res.off('close', closeProcessLifecycle);
-    };
     try {
       const base = externalBase(req.headers, config);
       const prefix = routePrefix(config);
       const url = new URL(req.url ?? '/', `http://${req.headers.host ?? `${config.host}:${config.port}`}`);
       const pathname = localPath(url.pathname, prefix);
+      await context.extensions.refresh();
       const catalog = currentToolCatalog(context);
       setRuntimeRevisionHeaders(res, catalog, startedAt);
 
@@ -242,183 +132,86 @@ export async function createAgentRuntime(config: AgentConfig, options: AgentRunt
         runtimeRegistry: options.runtimeRegistry
       })) return;
 
-      if (req.method === 'GET' && isAuthorizationMetadata(url.pathname, prefix)) return sendJson(res, 200, authorizationMetadata(base, oauth));
-      if (req.method === 'GET' && isResourceMetadata(url.pathname, prefix)) return sendJson(res, 200, resourceMetadata(base));
-      if (pathname === '/health' && req.method === 'GET') return sendJson(res, 200, { ok: true, server: 'coding-tools-mcp-node', version: AGENT_VERSION, clientCompatVersion: CLIENT_COMPAT_VERSION, toolProfile: catalog.profile, toolsetRevision: catalog.revision, tools: catalog.tools.length, tunnel: context.tunnelStatus, headless: true, management: { enabled: config.management?.enabled === true } });
-
-      if (pathname === '/oauth/authorize' && req.method === 'GET') {
-        const scoped = new URL(url.toString());
-        scoped.pathname = '/oauth/authorize';
-        const output = oauth.authorizePage(scoped);
-        return text(res, output.status, output.body, 'text/html; charset=utf-8');
-      }
-      if (pathname === '/oauth/authorize' && req.method === 'POST') {
-        const form = new URLSearchParams((await body(req, 8192)).toString());
-        const output = oauth.authorizeSubmit(form, base);
-        if (output.location) { res.writeHead(output.status, { location: output.location, 'cache-control': 'no-store' }).end(); return; }
-        return text(res, output.status, output.body ?? 'Authorization failed', 'text/html; charset=utf-8');
-      }
-      if (pathname === '/oauth/token' && req.method === 'POST') {
-        const output = oauth.exchangeToken(new URLSearchParams((await body(req, 8192)).toString()), req.headers, base);
-        return sendJson(res, output.status, output.body);
-      }
-      if (pathname === '/mcp/info' && req.method === 'GET') {
-        return sendJson(res, 200, {
-          name: 'coding-tools-mcp-node',
-          version: AGENT_VERSION,
-          clientCompatVersion: CLIENT_COMPAT_VERSION,
-          protocolVersion: LATEST_MCP_PROTOCOL_VERSION,
-          supportedProtocolVersions: SUPPORTED_MCP_PROTOCOL_VERSIONS,
-          transport: 'streamable-http',
-          toolProfile: catalog.profile,
-          toolsetRevision: catalog.revision,
-          tools: catalog.names,
-          runtimeStartedAtMs: startedAt
-        });
-      }
-      if (pathname !== '/mcp') return text(res, 404, 'Not found');
-
-      const connectionIssue = validateMcpConnection(
-        req.headers,
+      if (await handleOAuthRoute(req, res, { base, localPathname: pathname, oauth, prefix, url })) return;
+      if (handleSystemRoute(req, res, { catalog, config, context, pathname, startedAt })) return;
+      if (await handleMcpRoute(req, res, {
+        base,
+        catalog,
         config,
-        currentListenerPort(server, config.port)
-      );
-      if (connectionIssue) return sendMcpTransportError(res, connectionIssue);
-      if (!oauth.verifyBearer(req.headers, base)) {
-        res.writeHead(401, {
-          'www-authenticate': `Bearer resource_metadata="${protectedResourceMetadataUrl(base)}"`,
-          'cache-control': 'no-store'
-        }).end('Unauthorized');
-        return;
-      }
-      if (req.method !== 'POST') return sendMcpMethodNotAllowed(res);
-
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse((await body(req)).toString());
-      } catch (error) {
-        const tooLarge = error instanceof Error && error.message === 'request body too large';
-        const issue: McpTransportIssue = tooLarge
-          ? { status: 400, code: -32600, message: 'request body too large' }
-          : { status: 400, code: -32700, message: 'Parse error' };
-        return sendMcpTransportError(res, issue);
-      }
-      const validated = validateJsonRpcMessage(parsed);
-      if ('status' in validated) return sendMcpTransportError(res, validated);
-      const request = validated.body;
-      requestId = validated.id;
-      const method = validated.method ?? '';
-      if (validated.kind === 'response') return sendMcpAccepted(res);
-
-      const fastPath = method === 'initialize'
-        || method === 'ping'
-        || method === 'tools/list'
-        || method.startsWith('notifications/');
-      if (validated.kind === 'request' && !fastPath) {
-        stream = new StreamingJsonResponse(
-          res,
-          options.mcpHeartbeatIntervalMs ?? MCP_STREAM_HEARTBEAT_INTERVAL_MS
-        );
-      }
-
-      let rpcResponse: JsonObject;
-      try {
-        let result: unknown;
-        if (method === 'initialize') {
-          const params = (request.params ?? {}) as JsonObject;
-          const requested = String(params.protocolVersion ?? '');
-          result = {
-            protocolVersion: supportedProtocols.has(requested)
-              ? requested
-              : LATEST_MCP_PROTOCOL_VERSION,
-            capabilities: { tools: { listChanged: false }, logging: {} },
-            serverInfo: { name: 'coding-tools-mcp-node', title: 'Coding Tools MCP Node Agent', version: AGENT_VERSION, toolsetRevision: catalog.revision, runtimeStartedAtMs: startedAt },
-            instructions: 'Call list_workspace_folders, switch_workspace_folder, then history_session_bootstrap before project tools. Hosts should refresh tools/list when x-coding-tools-toolset-revision or runtimeStartedAtMs changes. FRP and Cloudflare transports are intentionally unsupported.'
-          };
-        } else if (method === 'ping') result = {};
-        else if (method === 'tools/list') result = { tools: catalog.tools, toolsetRevision: catalog.revision };
-        else if (method === 'tools/call') {
-          const params = (request.params ?? {}) as JsonObject;
-          const name = String(params.name ?? '');
-          const clientToolsetRevision = requestedToolsetRevision(req, params);
-          if (clientToolsetRevision && clientToolsetRevision !== catalog.revision) throw Object.assign(new Error('Tool catalog revision changed; refresh tools/list before retrying the tool call.'), {
-            rpcCode: -32602,
-            rpcData: {
-              reason: 'stale_tool_catalog',
-              error_code: 'TOOLSET_REVISION_MISMATCH',
-              error_category: 'catalog',
-              retryable: true,
-              client_toolset_revision: clientToolsetRevision,
-              toolset_revision: catalog.revision,
-              runtime_started_at_ms: startedAt,
-              available_tools: catalog.names,
-              suggestion: 'Refresh tools/list and retry with the current tool catalog.'
-            }
-          });
-          if (!catalog.names.includes(name)) throw Object.assign(new Error(`Unknown tool: ${name}`), {
-            rpcCode: -32602,
-            rpcData: {
-              reason: 'unknown_tool',
-              error_code: 'UNKNOWN_TOOL',
-              error_category: 'catalog',
-              retryable: true,
-              suggestion: 'Refresh tools/list and retry with the current tool catalog.',
-              toolset_revision: catalog.revision,
-              available_tools: catalog.names
-            }
-          });
-          processLifecycle = new ProcessRequestLifecycle(context);
-          abortProcessLifecycle = () => processLifecycle?.abort();
-          closeProcessLifecycle = () => { if (!res.writableEnded) processLifecycle?.abort(); };
-          req.once('aborted', abortProcessLifecycle);
-          res.once('close', closeProcessLifecycle);
-          const structured = await callTool(
-            context,
-            name,
-            (params.arguments ?? {}) as JsonObject,
-            markMcpConversationMetadata(params._meta),
-            false,
-            processLifecycle
-          );
-          result = wrapMcpToolResult(name, (params.arguments ?? {}) as JsonObject, structured);
-        } else throw Object.assign(new Error(`Method not found: ${method}`), { rpcCode: -32601 });
-        rpcResponse = { jsonrpc: '2.0', id: requestId, result };
-        processLifecycle?.complete();
-      } catch (error) {
-        processLifecycle?.abort();
-        rpcResponse = rpcErrorResponse(requestId, error);
-      } finally {
-        clearProcessLifecycleListeners();
-      }
-
-      if (validated.kind === 'notification') return sendMcpAccepted(res);
-      if (stream) {
-        stream.finish(rpcResponse);
-        return;
-      }
-      return sendJson(res, 200, rpcResponse);
+        context,
+        heartbeatIntervalMs: options.mcpHeartbeatIntervalMs,
+        oauth,
+        pathname,
+        server,
+        startedAt
+      })) return;
+      if (pathname !== '/mcp') return sendText(res, 404, 'Not found');
     } catch (error) {
-      processLifecycle?.abort();
-      clearProcessLifecycleListeners();
-      const response = rpcErrorResponse(requestId, error);
-      if (stream) {
-        stream.finish(response);
-        return;
-      }
+      const response = rpcErrorResponse(null, error);
       if (!res.headersSent) return sendJson(res, 200, response);
       res.destroy();
     }
   });
-  server.once('close', () => {
-    if (options.runtimeRegistry?.get(workspaceId)?.context === context) options.runtimeRegistry.delete(workspaceId);
-    oauth.dispose();
-    void (async () => {
-      await disposeProcessSessions(context);
-      await context.conversations.flush();
-      await context.usageStore.flush();
+  let cleanupPromise: Promise<void> | undefined;
+  const cleanup = (): Promise<void> => {
+    if (cleanupPromise) return cleanupPromise;
+    cleanupPromise = (async () => {
+      if (options.runtimeRegistry?.get(workspaceId)?.context === context) {
+        options.runtimeRegistry.delete(workspaceId);
+      }
+      oauth.dispose();
+      const errors: unknown[] = [];
+      try {
+        await disposeProcessSessions(context);
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        await context.extensions.close();
+      } catch (error) {
+        errors.push(error);
+      }
+      const results = await Promise.allSettled([
+        context.conversations.flush(),
+        context.usageStore.flush()
+      ]);
+      errors.push(...results
+        .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+        .map(result => result.reason));
+      if (errors.length) throw new AggregateError(errors, 'Agent runtime cleanup failed.');
     })();
+    return cleanupPromise;
+  };
+  let hasListened = false;
+  let closed = false;
+  let resolveServerClosed: (() => void) | undefined;
+  const serverClosed = new Promise<void>(resolve => {
+    resolveServerClosed = resolve;
   });
-  return { server, context, oauth };
+  server.once('listening', () => {
+    hasListened = true;
+  });
+  server.once('close', () => {
+    closed = true;
+    resolveServerClosed?.();
+    void cleanup().catch(() => undefined);
+  });
+  let closePromise: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    closePromise = (async () => {
+      if (server.listening) {
+        await new Promise<void>((resolve, reject) => {
+          server.close(error => error ? reject(error) : resolve());
+        });
+      } else if (hasListened && !closed) {
+        await serverClosed;
+      }
+      await cleanup();
+    })();
+    return closePromise;
+  };
+  return { server, context, oauth, close };
 }
 
 export async function createAgentServer(config: AgentConfig, options: AgentRuntimeOptions = {}): Promise<Server> {

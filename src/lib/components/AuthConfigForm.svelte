@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { message } from "@tauri-apps/plugin-dialog";
+  import { alert as message } from "$lib/api/native";
   import SecretInput from "$lib/components/SecretInput.svelte";
   import {
     getWorkspaceSecret,
@@ -10,6 +10,7 @@
     type WorkspaceSecretKey,
     type SharedSecretKey,
   } from "$lib/api/secrets";
+  import { getBackend, readSecretIfAvailable, workspaceAuthSecretKeys } from "$lib/backend";
   import type { AuthConfig } from "$lib/types";
   import { t, translate, type MessageKey } from "$lib/i18n";
 
@@ -23,13 +24,17 @@
     onSaveProfile: (auth: AuthConfig, options?: SaveAuthOptions) => void | Promise<void>;
   }
 
-  const AUTH_OPTIONS = [
-    { value: "oauth", label: "OAuth" },
-    { value: "bearer", label: "Bearer Token" },
-    { value: "noauth", label: "No authentication" },
-  ] as const;
-
   let { workspaceId, auth, onSaveProfile }: Props = $props();
+  const capabilities = getBackend().capabilities;
+  const AUTH_OPTIONS = $derived(
+    capabilities.staticBearerAuth
+      ? [
+          { value: "oauth", label: "OAuth" },
+          { value: "bearer", label: "Bearer Token" },
+          { value: "noauth", label: "No authentication" },
+        ]
+      : [{ value: "oauth", label: "OAuth" }],
+  );
 
   let draft = $state<AuthConfig>({ type: "oauth", oauth_client_id: "", use_shared_secrets: false });
   let saving = $state(false);
@@ -59,7 +64,12 @@
   const showBearer = $derived(draft.type === "bearer");
 
   $effect(() => {
-    draft = { type: auth.type, oauth_client_id: auth.oauth_client_id, use_shared_secrets: !!auth.use_shared_secrets };
+    const type = capabilities.staticBearerAuth ? auth.type : "oauth";
+    draft = {
+      type,
+      oauth_client_id: auth.oauth_client_id,
+      use_shared_secrets: capabilities.sharedSecretStore && !!auth.use_shared_secrets,
+    };
   });
 
   $effect(() => {
@@ -73,13 +83,10 @@
   async function loadSecrets(id: string, authType: string, useShared: boolean) {
     const seq = ++secretsLoadSeq;
     const sharedClientId =
-      authType === "oauth" && useShared ? await getSharedSecret("oauth_client_id") : null;
-    const keys: WorkspaceSecretKey[] = [];
-    if (authType === "oauth") {
-      keys.push("oauth_client_secret", "oauth_password");
-    } else if (authType === "bearer") {
-      keys.push("bearer_token");
-    }
+      authType === "oauth" && useShared && capabilities.sharedSecretStore
+        ? await getSharedSecret("oauth_client_id")
+        : null;
+    const keys = workspaceAuthSecretKeys(authType, capabilities);
     if (keys.length === 0) {
       if (seq !== secretsLoadSeq) return;
       secrets = {};
@@ -88,10 +95,12 @@
     }
     const loaded = await Promise.all(
       keys.map(async (key) => {
-        const value = useShared
-          ? await getSharedSecret(key as SharedSecretKey)
-          : await getWorkspaceSecret(id, key);
-        return [key, value ?? ""] as const;
+        const value = await readSecretIfAvailable(() =>
+          useShared && capabilities.sharedSecretStore
+            ? getSharedSecret(key as SharedSecretKey)
+            : getWorkspaceSecret(id, key),
+        );
+        return [key, value] as const;
       }),
     );
     if (seq !== secretsLoadSeq) return;
@@ -178,14 +187,16 @@
     </select>
   </label>
 
-  <label class="flex items-center gap-2">
-    <input
-      type="checkbox"
-      class="h-4 w-4"
-      bind:checked={draft.use_shared_secrets}
-    />
-    <span class="text-xs text-[var(--color-text-muted)]">{$t("Use global shared secrets (managed under Settings → Shared secrets)")}</span>
-  </label>
+  {#if capabilities.sharedSecretStore}
+    <label class="flex items-center gap-2">
+      <input
+        type="checkbox"
+        class="h-4 w-4"
+        bind:checked={draft.use_shared_secrets}
+      />
+      <span class="text-xs text-[var(--color-text-muted)]">{$t("Use global shared secrets (managed under Settings → Shared secrets)")}</span>
+    </label>
+  {/if}
 
   {#if showOAuth}
     <label class="grid gap-1">
@@ -198,16 +209,18 @@
       />
     </label>
 
-    <div class="grid gap-1">
-      <span class="text-xs text-[var(--color-text-muted)]">{$t("OAuth client secret")}</span>
-      <SecretInput
-        value={secrets.oauth_client_secret ?? ""}
-        placeholder={$t("Loading…")}
-        readonly
-        onRegenerate={() => void regenerate("oauth_client_secret")}
-        regenerating={regenerating === "oauth_client_secret"}
-      />
-    </div>
+    {#if capabilities.staticBearerAuth}
+      <div class="grid gap-1">
+        <span class="text-xs text-[var(--color-text-muted)]">{$t("OAuth client secret")}</span>
+        <SecretInput
+          value={secrets.oauth_client_secret ?? ""}
+          placeholder={$t("Loading…")}
+          readonly
+          onRegenerate={() => void regenerate("oauth_client_secret")}
+          regenerating={regenerating === "oauth_client_secret"}
+        />
+      </div>
+    {/if}
 
     <div class="grid gap-1">
       <span class="text-xs text-[var(--color-text-muted)]">{$t("Authorization password")}</span>

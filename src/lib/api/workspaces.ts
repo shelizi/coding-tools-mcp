@@ -1,23 +1,27 @@
-import { invoke } from "@tauri-apps/api/core";
-import type { RuntimeStatus, WorkspaceProfile } from "$lib/types";
+import { getBackend } from "$lib/backend";
+import type { RuntimeStatus, SandboxBackendDescriptor, WorkspaceProfile } from "$lib/types";
 
 export async function listWorkspaces(): Promise<WorkspaceProfile[]> {
-  return invoke<WorkspaceProfile[]>("list_workspaces");
+  return getBackend().workspaces.list();
 }
 
 export async function createWorkspace(
   path: string,
   name?: string,
 ): Promise<WorkspaceProfile> {
-  return invoke<WorkspaceProfile>("create_workspace", { path, name });
+  return getBackend().workspaces.create(path, name);
 }
 
 export async function listWslDistributions(): Promise<string[]> {
-  return invoke<string[]>("list_wsl_distributions");
+  return getBackend().workspaces.listWslDistributions();
+}
+
+export async function listSandboxBackends(): Promise<SandboxBackendDescriptor[]> {
+  return getBackend().workspaces.listSandboxBackends();
 }
 
 export async function updateWorkspace(profile: WorkspaceProfile): Promise<void> {
-  return invoke("update_workspace", { profile });
+  return getBackend().workspaces.update(profile);
 }
 
 export async function addWorkspaceFolder(
@@ -25,7 +29,7 @@ export async function addWorkspaceFolder(
   path: string,
   name?: string,
 ): Promise<WorkspaceProfile> {
-  return invoke<WorkspaceProfile>("add_workspace_folder", { id, path, name });
+  return getBackend().workspaces.addFolder(id, path, name);
 }
 
 export async function addWslWorkspaceFolder(
@@ -34,52 +38,52 @@ export async function addWslWorkspaceFolder(
   linuxPath: string,
   name?: string,
 ): Promise<WorkspaceProfile> {
-  return invoke<WorkspaceProfile>("add_wsl_workspace_folder", { id, distro, linuxPath, name });
+  return getBackend().workspaces.addWslFolder(id, distro, linuxPath, name);
 }
 
 export async function removeWorkspaceFolder(
   id: string,
   folderId: string,
 ): Promise<WorkspaceProfile> {
-  return invoke<WorkspaceProfile>("remove_workspace_folder", { id, folderId });
+  return getBackend().workspaces.removeFolder(id, folderId);
 }
 
 export async function openWorkspaceDirectory(path: string): Promise<void> {
-  return invoke("open_workspace_directory", { path });
+  return getBackend().workspaces.openDirectory(path);
 }
 
 export async function deleteWorkspace(id: string): Promise<void> {
-  return invoke("delete_workspace", { id });
+  return getBackend().workspaces.delete(id);
 }
 
 export async function startRuntime(id: string): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("start_runtime", { id });
+  return getBackend().workspaces.startRuntime(id);
 }
 
 export async function stopRuntime(id: string): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("stop_runtime", { id });
+  return getBackend().workspaces.stopRuntime(id);
 }
 
 export async function getRuntimeStatus(id: string): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("get_runtime_status", { id });
+  return getBackend().workspaces.getRuntimeStatus(id);
 }
 
 export async function startActionsRuntime(id: string): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("start_actions_runtime", { id });
+  return getBackend().workspaces.startActionsRuntime(id);
 }
 
 export async function stopActionsRuntime(id: string): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("stop_actions_runtime", { id });
+  return getBackend().workspaces.stopActionsRuntime(id);
 }
 
 export async function getActionsRuntimeStatus(id: string): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("get_actions_runtime_status", { id });
+  return getBackend().workspaces.getActionsRuntimeStatus(id);
 }
 
 export async function restartRuntime(id: string): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("restart_runtime", { id });
+  return getBackend().workspaces.restartRuntime(id);
 }
 
 export async function restartActionsRuntime(id: string): Promise<RuntimeStatus> {
-  return invoke<RuntimeStatus>("restart_actions_runtime", { id });
+  return getBackend().workspaces.restartActionsRuntime(id);
 }

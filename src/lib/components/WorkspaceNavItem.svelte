@@ -1,6 +1,8 @@
 <script lang="ts">
   import { t } from "$lib/i18n";
+  import { getBackend } from "$lib/backend";
   import ServiceStatusPair from "$lib/components/ServiceStatusPair.svelte";
+  import StatusOrb from "$lib/components/StatusOrb.svelte";
   import { workspaceFolders, type RuntimeState, type WorkspaceProfile } from "$lib/types";
 
   interface Props {
@@ -12,12 +14,17 @@
   }
 
   let { workspace, active, mcpState, actionsState, onClick }: Props = $props();
+  const capabilities = getBackend().capabilities;
   const folderCount = $derived(workspaceFolders(workspace).length);
 </script>
 
 <div class="tx-nav-item" class:active>
   <button type="button" class="tx-nav-button" onclick={onClick}>
-    <ServiceStatusPair mcp={mcpState} actions={actionsState} />
+    {#if capabilities.actions}
+      <ServiceStatusPair mcp={mcpState} actions={actionsState} />
+    {:else}
+      <StatusOrb state={mcpState} />
+    {/if}
     <span class="min-w-0 flex-1">
       <span class="block truncate text-sm font-medium">{workspace.name}</span>
       <span class="block truncate text-[11px] text-[var(--color-text-muted)]">

@@ -19,11 +19,23 @@
   <a href="README.md">繁體中文</a> · <a href="README.en.md">English</a> · Releases
 </p>
 
-Coding Tools MCP is a Rust + Tauri 2 desktop application. Select a project directory and start the service; an AI agent can then read files, edit code, run commands and tests, inspect Git, and preserve development progress inside the project through MCP. It behaves like an AI opening an IDE workspace that remembers where the last conversation stopped.
+Coding Tools MCP now ships in two forms: a Desktop Client (Rust + Tauri 2) and a portable Node Agent. They share the same Svelte management UI and Workspace model. After selecting project folders and starting MCP, an AI agent can read and edit files, run commands and tests, operate Git, and store durable history inside the project. On Windows, Computer Use also provides display discovery, screenshots, click, drag, scroll, text input, and keyboard input.
+
+The same logical Workspace can use a protected canonical configuration and secrets store across Desktop and Node while preserving host-specific fields. Node Agent remains a headless/portable, MCP-only product; Desktop-only capabilities such as Actions and FRP/Cloudflare process management stay in the Desktop Client.
 
 ![Coding Tools MCP workspace overview](docs/images/workspace-overview.png)
 
-*One desktop app manages workspaces, MCP services, connection details, and the session-recovery prompt.*
+*Desktop and Node Agent share the same management UI. Public endpoints and local paths in this screenshot are covered with solid redaction.*
+
+## Current highlights
+
+| Capability | Current behavior |
+| --- | --- |
+| **Shared management UI** | Desktop Client and Node Agent use the same Svelte UI for Workspace, MCP, health, telemetry, operation history, and settings |
+| **Shared Workspace** | Canonical configuration and secrets use a protected shared store; host-specific fields remain separate and the same folder set can keep one logical Workspace identity |
+| **Skills / Hooks / external MCP** | Skills, Claude/Codex Hooks, and external MCP servers can be discovered and enabled individually; Node Agent can proxy stdio and Streamable HTTP MCP |
+| **Computer Use (Windows)** | `desktop_displays`, `desktop_screenshot`, `desktop_click`, `desktop_drag`, `desktop_scroll`, `desktop_type`, and `desktop_key`, using physical-pixel coordinates |
+| **Execution safety** | Workspace-first boundaries, sensitive-output redaction, Git protection, and optional command sandboxes that fail closed when enabled |
 
 ## Understand the workflow in 30 seconds
 
@@ -37,7 +49,7 @@ Install the desktop app
   → authorize it and start developing in a new conversation
 ```
 
-For a first connection, remember only this: **the desktop app turns the project into an MCP workspace, and ChatGPT connects to it through the public `/mcp` URL.**
+For a first connection, remember only this: **the Desktop Client or Node Agent turns the project into an MCP Workspace, and the AI client connects through an `/mcp` URL.** Use the Desktop Client when you need Actions, FRP/Cloudflare process management, or other Desktop-only integrations.
 
 - [See the complete desktop setup](#get-started-in-five-minutes)
 - [Quick setup wizard](#2-quick-setup-recommended-for-first-use)
@@ -156,26 +168,18 @@ If you do not have an FRPS server yet, follow this [FRPS server installation gui
 
 ### 5. Start MCP
 
-Open the workspace and click **Start** in the MCP panel. The desktop client shows:
+Open a Workspace and start MCP. The management UI brings together:
 
 - a local MCP URL such as `http://127.0.0.1:28766/mcp`;
-- the public HTTPS MCP URL;
-- authentication details for ChatGPT;
-- live logs and health-check results.
+- the public HTTPS MCP URL and ChatGPT connection settings;
+- OAuth/authentication, policy, and health entry points;
+- telemetry, operation history, and Workspace settings.
 
-![Local, public, and ChatGPT MCP connection details](docs/images/workspace-connection.png)
+![MCP service and local connection settings](docs/images/workspace-connection.png)
 
-The desktop app can verify the local and public endpoints, OAuth metadata, and the MCP protected-resource document:
+*Public MCP, OAuth, and other identifiable connection data remain available in the MCP page; the README screenshot intentionally keeps only a safe loopback example and does not expose the real endpoint.*
 
-![MCP health-check results](docs/images/health-check.png)
-
-*Each connectivity and authentication check reports its result separately.*
-
-When a connection fails, inspect recent MCP requests without leaving the desktop app:
-
-![MCP runtime logs](docs/images/runtime-logs.png)
-
-*The log quickly confirms whether tool discovery, history bootstrap, and checkpoint calls reached the server.*
+Use **Health** to validate local/public endpoints and OAuth metadata. **Telemetry** and **Operation history** help trace tool calls, latency, results, and failures. The Desktop Client also retains Desktop-specific runtime and tunnel diagnostics.
 
 ### 6. Connect an AI client
 
@@ -271,8 +275,10 @@ MCP and Actions can run together for the same workspace, with separate ports and
 - **Built for real development**: files, commands, Git, tests, and retained processes live in one Workspace.
 - **Cross-conversation continuity**: a new conversation can recover the complete history summary and the latest detailed handoff.
 - **Auditable progress**: structured checkpoints preserve decisions, changed files, test results, remaining issues, and next steps inside the project.
-- **Multiple workspaces**: one desktop client stores multiple projects and manages their MCP, Actions, and public endpoints.
+- **Multiple workspaces and runtimes**: Desktop Client and Node Agent share the management UI and Workspace model; Desktop manages MCP, Actions, and the full tunnel integration while Node Agent focuses on MCP.
 - **Direct ChatGPT connectivity**: Streamable HTTP, OAuth, Bearer tokens, OpenAPI, plus built-in WSS, FRP, and Cloudflare tunnels.
+- **Extensible agent behavior**: Skills, Hooks, and external MCP servers can be discovered, grouped, and enabled individually instead of being permanently active.
+- **Desktop interaction**: Windows Computer Use can capture the screen and drive mouse, scroll, text, and keyboard input for real GUI validation.
 - **A focused default tool surface**: stable core tools are available by default; advanced Harness capabilities are opt-in.
 
 ## Let the project remember every conversation
@@ -297,16 +303,17 @@ History uses readable Markdown that can be backed up or committed with the proje
 
 ## What an agent can do
 
-The default `core` profile provides a stable, composable development tool set:
+The available tools depend on the selected profile and runtime. Common development tools include:
 
 | Category | Main tools |
 | --- | --- |
-| File reading | `read_file`, `list_dir`, `list_files`, `search_text`, `grep_text`, `view_image` |
-| File modification | `apply_patch` |
-| Command execution | `exec_command`, `write_stdin`, `read_output`, `kill_session` |
-| Git | `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame` |
-| Environment | `server_info`, `check_exec_environment`, `get_default_cwd`, `set_default_cwd` |
+| File reading | `read_file`, `read_many`, `list_files`, `search_text`, `view_image` |
+| File modification | `apply_patch`, `edit`, `file_ops`, `format_files` |
+| Commands and sessions | `exec_command`, `exec_many`, `wait_command`, `send_input`, `kill_session` |
+| Git | `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, `git_stage`, `git_commit` |
+| Workspace routing | `list_workspace_folders`, `switch_workspace_folder`, `set_default_cwd` |
 | History sessions | `history_session_bootstrap`, `history_session_checkpoint`, `history_session_validate` |
+| Computer Use (Windows) | `desktop_displays`, `desktop_screenshot`, `desktop_click`, `desktop_drag`, `desktop_scroll`, `desktop_type`, `desktop_key` |
 
 A typical development loop is:
 
@@ -331,16 +338,16 @@ The project uses a Workspace-first permission model:
 - `.git` and `.github` cannot be damaged through ordinary file tools, Patch, or interpreter commands.
 - Patch performs preflight validation and operation-local recovery; long-term recovery uses Git instead of full Workspace snapshots.
 
-> Windows child-process execution currently uses a `policy_only` boundary. The honest runtime value is `sandbox_enforced: false`; static command policy is not a complete OS filesystem sandbox.
+> Command sandboxing is a workspace setting and is off by default. While disabled, the honest execution boundary remains `policy_only` with `sandbox_enforced: false`. When enabled, commands must use the selected OS sandbox and never fall back to policy-only execution: Windows host folders can use AppContainer (network is denied by default; set `appcontainer.network=internet` to allow it); WSL folders should use Docker, Podman, Docker Sandboxes (sbx), or WSL Containers. Native Docker / Podman run ephemeral Linux containers with network `none` by default and reject `host` networking. Install or detect `docker`, `podman`, `sbx`, and `wslc` from **Software management**; starting the engine or `podman machine` remains a user-run step. File-tool workspace read access remains a separate boundary from the command sandbox.
 
 ## Local development
 
 Requirements: Node.js 20+, Rust stable, and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform.
 
 ```bash
-npm install
-npm run hooks:install
-npm run desktop
+pnpm install --frozen-lockfile
+pnpm run hooks:install
+pnpm run desktop
 ```
 
 `hooks:install` points this clone's `core.hooksPath` at the tracked `.githooks` directory. On commit, fully staged Rust files are formatted and re-staged automatically. If a staged Rust file also has unstaged hunks, the hook stops without modifying the index so unrelated changes cannot be pulled into the commit accidentally.
@@ -348,13 +355,13 @@ npm run desktop
 Useful verification commands:
 
 ```bash
-npm run check
-npm run build
+pnpm run check
+pnpm run build
 cd src-tauri && cargo test
 cd src-tauri && cargo clippy --all-targets -- -D warnings
 ```
 
-On Windows, you can also run `dev-desktop.cmd`. Do not use `npm run dev` alone to validate the desktop application; it starts Vite without the Tauri shell.
+On Windows, you can also run `dev-desktop.cmd`. Do not use `pnpm run dev` alone to validate the desktop application; it starts Vite without the Tauri shell.
 
 ## Project layout
 
@@ -365,7 +372,8 @@ On Windows, you can also run `dev-desktop.cmd`. Do not use `npm run dev` alone t
 | `src-tauri/src/actions/` | ChatGPT Actions OpenAPI gateway |
 | `src-tauri/src/tunnel/` | Built-in WSS, FRP, and Cloudflare tunnels and process management |
 | `services/tunnel-server/` | Self-hosted built-in WSS tunnel server (Rust) |
-| `src/` | SvelteKit desktop UI |
+| `src/` | Shared Svelte management UI used by Desktop Client and Node Agent |
+| `packages/node-agent/` | Portable/headless Node Agent, management HTTP API, and shared-UI adapter |
 | `old/` | Python reference implementation and compatibility baseline |
 
 ## Source repository and attribution

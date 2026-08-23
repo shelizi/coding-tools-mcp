@@ -187,6 +187,12 @@ impl TunnelSupervisor {
     ) -> AppResult<TunnelStatus> {
         let key = (profile.id.clone(), kind);
         let tunnel_type = tunnel_type_for(profile, kind);
+        if let Err(error) = validate_public_mcp_security(profile, kind) {
+            if self.session_is_running(&key) {
+                self.stop(profile, kind, settings).await?;
+            }
+            return Err(error);
+        }
         if self.session_is_running(&key) && tunnel_type != "frp" {
             return Ok(self.status(profile, kind, settings));
         }
@@ -853,6 +859,13 @@ fn public_url_for_profile(
     }
 }
 
+pub(super) fn validate_public_mcp_security(
+    _profile: &WorkspaceProfile,
+    _kind: TunnelServiceKind,
+) -> AppResult<()> {
+    Ok(())
+}
+
 fn validate_tunnel_requirements(
     profile: &WorkspaceProfile,
     kind: TunnelServiceKind,
@@ -1151,6 +1164,21 @@ mod tests {
 
         assert!(frp_routes_conflict(&first, &same));
         assert!(!frp_routes_conflict(&first, &other));
+    }
+
+    #[test]
+    fn public_mcp_security_is_independent_of_permission_mode_and_sandbox() {
+        let mut profile = WorkspaceProfile::new("C:/workspace/security".into(), None);
+        assert!(!profile.runtime.sandbox.enabled);
+        assert!(validate_public_mcp_security(&profile, TunnelServiceKind::Mcp).is_ok());
+
+        profile.runtime.permission_mode = "trusted".into();
+        assert!(validate_public_mcp_security(&profile, TunnelServiceKind::Mcp).is_ok());
+
+        profile.runtime.sandbox.enabled = true;
+        profile.runtime.permission_mode = "dangerous".into();
+        assert!(validate_public_mcp_security(&profile, TunnelServiceKind::Mcp).is_ok());
+        assert!(validate_public_mcp_security(&profile, TunnelServiceKind::Actions).is_ok());
     }
 
     #[test]

@@ -2,7 +2,7 @@ import { access, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { AgentConfig, JsonObject, ToolContext } from './types.js';
 import { relativeInside, resolveFromWorkspace, resolveInside, rootAndCwd } from './workspace.js';
-import { parseWslUncPath, validateWslExecPaths, WslRoutingError } from './wsl.js';
+import { parseWslUncPath, validateWslExecPaths, WslRoutingError, wslUncPath } from './wsl.js';
 import { DEFAULT_COMMAND_TIMEOUT_MAX_MS } from './executionLimits.js';
 
 const BASIC_READ_ONLY_COMMANDS = ['pwd', 'ls', 'dir', 'cat', 'head', 'tail', 'grep', 'find', 'which', 'echo'];
@@ -235,6 +235,53 @@ function executableStem(executable: string): string {
   return base.replace(/\.(?:exe|cmd|bat)$/i, '');
 }
 
+function normalizeWslAbsoluteProgramPath(value: string): string | undefined {
+  if (!value.startsWith('/') || value.includes('\\') || value.includes('\0') || [...value].some(character => /[\u0000-\u001f\u007f]/.test(character))) {
+    return undefined;
+  }
+  const segments: string[] = [];
+  for (const segment of value.split('/')) {
+    if (!segment || segment === '.') continue;
+    if (segment === '..') {
+      if (!segments.length) return undefined;
+      segments.pop();
+    } else {
+      segments.push(segment);
+    }
+  }
+  return segments.length ? `/${segments.join('/')}` : '/';
+}
+
+function trustedWslSystemProgram(value: string): boolean {
+  const parent = path.posix.dirname(value);
+  const name = path.posix.basename(value);
+  return Boolean(name) && [
+    '/bin', '/sbin', '/usr/bin', '/usr/sbin',
+    '/usr/local/bin', '/usr/local/sbin', '/snap/bin'
+  ].includes(parent);
+}
+
+async function resolveWslAbsoluteProgram(raw: string, root: string, ctx: ToolContext): Promise<string> {
+  const normalized = normalizeWslAbsoluteProgramPath(raw);
+  const location = parseWslUncPath(root);
+  if (!normalized || !location) throw new PolicyError(`Workspace external executable rejected: ${raw}`, 'EXECUTABLE_OUTSIDE_WORKSPACE');
+
+  const hostCandidate = wslUncPath(location.distro, normalized);
+  if (await insideWorkspace(hostCandidate, root)) {
+    const extension = path.posix.extname(normalized).toLowerCase();
+    if (ctx.config.policy.workspaceLocalEntries
+      && (!extension || ctx.config.policy.workspaceScriptExtensions.includes(extension))) {
+      return normalized;
+    }
+    throw new PolicyError(`Workspace local entry is not allowed: ${raw}`, 'COMMAND_REJECTED');
+  }
+
+  if (ctx.config.policy.allowedCommands.includes(executableStem(normalized)) && trustedWslSystemProgram(normalized)) {
+    return normalized;
+  }
+  throw new PolicyError(`Workspace external executable rejected: ${raw}`, 'EXECUTABLE_OUTSIDE_WORKSPACE');
+}
+
 async function insideWorkspace(candidate: string, root: string): Promise<boolean> {
   try {
     const [resolved, resolvedRoot, info] = await Promise.all([realpath(candidate), realpath(root), stat(candidate)]);
@@ -286,7 +333,7 @@ async function validateCommand(ctx: ToolContext, key: string, argumentsValue: Js
   if (security.protectRepositoryMetadata && (DANGEROUS_PATTERN.test(command) || INTERPRETER_MUTATION_PATTERN.test(command)) && commandTargetsProtectedRepositoryAsset(command)) {
     throw new PolicyError('PROTECTED_REPOSITORY_ASSET: deleting or recursively clearing .git/.github is forbidden', 'PROTECTED_REPOSITORY_ASSET');
   }
-  if (security.enforceWorkspaceBoundary && INTERPRETER_MUTATION_PATTERN.test(command) && commandContainsExternalPath(command)) {
+  if (security.enforceWorkspaceBoundary && ctx.config.sandbox?.enabled !== true && INTERPRETER_MUTATION_PATTERN.test(command) && commandContainsExternalPath(command)) {
     throw new PolicyError('WORKSPACE_PATH_PROTECTED: subprocess writes outside the Workspace are forbidden', 'WORKSPACE_PATH_PROTECTED');
   }
   if (security.requireDangerousConfirmation && DANGEROUS_PATTERN.test(command) && argumentsValue.confirm !== true) {
@@ -530,6 +577,49 @@ function shellCommand(shell: string, script: string, wslWorkspace: boolean): Res
   return { program: '/bin/sh', argv: ['-lc', script], display: script, shell: false };
 }
 
+function windowsOnlySandboxProgram(program: string): boolean {
+  const normalized = program.trim().toLowerCase();
+  return /\.(?:exe|cmd|bat|ps1)$/.test(normalized);
+}
+
+export async function resolvePortableCommandSpec(ctx: ToolContext, key: string, argumentsValue: JsonObject): Promise<ResolvedCommandSpec> {
+  const security = ctx.config.securityPolicy;
+  const parts = commandParts(argumentsValue, security.requireShellConfirmation, security.enforceWorkspaceBoundary, security.enforceResourceLimits);
+  const { root, cwd } = commandCwd(ctx, key, argumentsValue);
+  if (parts.shell !== 'none') {
+    if (parts.shell !== 'sh') {
+      throw new PolicyError(`shell=${parts.shell} is unavailable inside a Linux sandbox; use shell=sh`, 'SANDBOX_COMMAND_UNSUPPORTED');
+    }
+    return { program: 'sh', argv: ['-c', parts.command], display: parts.command, shell: false };
+  }
+
+  const raw = parts.executable.trim();
+  if (windowsOnlySandboxProgram(raw)) {
+    throw new PolicyError(`Windows host executable cannot run inside a Linux sandbox: ${raw}`, 'SANDBOX_COMMAND_UNSUPPORTED');
+  }
+  if (raw.startsWith('/') && !raw.startsWith('//')) {
+    return { program: raw, argv: parts.argv, display: [raw, ...parts.argv].join(' '), shell: false };
+  }
+  const explicit = path.isAbsolute(raw) || raw.includes('/') || raw.includes('\\');
+  if (!explicit) return { program: raw, argv: parts.argv, display: [raw, ...parts.argv].join(' '), shell: false };
+
+  const candidate = resolveFromWorkspace(root, cwd, raw);
+  let resolved: string;
+  try {
+    await access(candidate);
+    resolved = await realpath(candidate);
+  } catch {
+    throw new PolicyError(`Program not found: ${raw}`, 'COMMAND_REJECTED');
+  }
+  if (!await insideWorkspace(resolved, root)) {
+    throw new PolicyError(`Workspace external executable rejected: ${raw}`, 'EXECUTABLE_OUTSIDE_WORKSPACE');
+  }
+  if (windowsOnlySandboxProgram(resolved)) {
+    throw new PolicyError(`Windows host executable cannot run inside a Linux sandbox: ${raw}`, 'SANDBOX_COMMAND_UNSUPPORTED');
+  }
+  return { program: resolved, argv: parts.argv, display: [raw, ...parts.argv].join(' '), shell: false };
+}
+
 export async function resolveCommandSpec(ctx: ToolContext, key: string, argumentsValue: JsonObject): Promise<ResolvedCommandSpec> {
   const security = ctx.config.securityPolicy;
   const parts = commandParts(argumentsValue, security.requireShellConfirmation, security.enforceWorkspaceBoundary, security.enforceResourceLimits);
@@ -542,8 +632,9 @@ export async function resolveCommandSpec(ctx: ToolContext, key: string, argument
   }
   const raw = parts.executable.trim();
   validateWslExecPaths(cwd, raw, parts.argv);
-  if (wslWorkspace && raw.startsWith('/') && ctx.config.policy.allowedCommands.includes(executableStem(raw))) {
-    return { program: raw, argv: parts.argv, display: [raw, ...parts.argv].join(' '), shell: false };
+  if (wslWorkspace && raw.startsWith('/')) {
+    const program = await resolveWslAbsoluteProgram(raw, root, ctx);
+    return { program, argv: parts.argv, display: [raw, ...parts.argv].join(' '), shell: false };
   }
   const explicit = path.isAbsolute(raw) || raw.includes('/') || raw.includes('\\');
   if (!explicit) return { program: raw, argv: parts.argv, display: [raw, ...parts.argv].join(' '), shell: false };

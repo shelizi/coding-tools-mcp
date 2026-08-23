@@ -1,6 +1,6 @@
 [package]
 name = "coding-tools-mcp-desktop"
-version = "0.1.40"
+version = "0.1.53"
 description = "Coding Tools MCP desktop client"
 authors = ["Coding Tools MCP Contributors"]
 edition = "2021"
@@ -15,6 +15,10 @@ name = "coding-tools-mcp-desktop"
 path = "src/main.rs"
 required-features = ["desktop"]
 
+[[bin]]
+name = "ctmcp-protect"
+path = "src/bin/ctmcp-protect.rs"
+
 [features]
 default = ["desktop"]
 desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-dialog"]
@@ -28,6 +32,7 @@ tauri = { version = "2", features = ["tray-icon"], optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "1.1"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 dirs = "6"
@@ -62,6 +67,10 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 tempfile = "3"
 serial_test = "3"
 
+[profile.dev]
+debug = 1
+incremental = true
+
 [profile.test]
 debug = 0
 incremental = true
@@ -73,14 +82,21 @@ windows = { version = "0.61", features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Cryptography",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Com",
     "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_Security_Isolation",
     "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
 ] }
+windows-core = "0.61.2"
 
 [target.'cfg(unix)'.dependencies]
 aes-gcm = "0.10"

@@ -7,9 +7,13 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use crate::harness::Harness;
 use crate::tools::permission::PendingOperationStore;
 use crate::tools::policy::PolicySettings;
+use crate::tools::sandbox::PreparedSandbox;
 use crate::tools::session::SessionStore;
-use crate::tools::workspace::{relative_display, Workspace};
-use crate::workspace::{AuthConfig, RuntimeConfig};
+use crate::tools::tool_runtime::{
+    descriptor as tool_runtime, MutationLockGroup, ToolExecutionLane,
+};
+use crate::tools::workspace::{relative_display, Workspace, WorkspaceError};
+use crate::workspace::{AuthConfig, RuntimeConfig, SandboxConfig, SecurityPolicy};
 
 pub const DEFAULT_COMMAND_TIMEOUT_MAX_MS: u64 = 30 * 60_000;
 pub const ABSOLUTE_COMMAND_TIMEOUT_MAX_MS: u64 = 60 * 60_000;
@@ -74,6 +78,7 @@ pub struct RuntimeToolConfig {
     pub policy: PolicySettings,
     pub tool_profile: String,
     pub permission_mode: String,
+    pub sandbox: SandboxConfig,
 }
 
 impl RuntimeToolConfig {
@@ -81,16 +86,25 @@ impl RuntimeToolConfig {
         mut policy: PolicySettings,
         tool_profile: String,
         permission_mode: String,
+        sandbox: SandboxConfig,
     ) -> Self {
+        if !policy.explicit_security_policy {
+            policy.security_policy = SecurityPolicy::legacy(&permission_mode, &tool_profile);
+        }
         policy.permission_mode = permission_mode.clone();
+        let effective_profile = if policy.explicit_security_policy {
+            crate::tools::registry::resolve_tool_profile(
+                policy.security_policy.compatibility_tool_profile(),
+                "trusted",
+            )
+        } else {
+            crate::tools::registry::resolve_tool_profile(&tool_profile, &permission_mode)
+        };
         Self {
             policy,
-            tool_profile: crate::tools::registry::resolve_tool_profile(
-                &tool_profile,
-                &permission_mode,
-            )
-            .into(),
+            tool_profile: effective_profile.into(),
             permission_mode,
+            sandbox,
         }
     }
 }
@@ -102,20 +116,36 @@ pub struct SharedRuntimeToolConfig {
 
 impl SharedRuntimeToolConfig {
     pub fn new(policy: PolicySettings, tool_profile: String, permission_mode: String) -> Self {
+        Self::new_with_sandbox(
+            policy,
+            tool_profile,
+            permission_mode,
+            SandboxConfig::default(),
+        )
+    }
+
+    pub fn new_with_sandbox(
+        policy: PolicySettings,
+        tool_profile: String,
+        permission_mode: String,
+        sandbox: SandboxConfig,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(RuntimeToolConfig::normalized(
                 policy,
                 tool_profile,
                 permission_mode,
+                sandbox,
             ))),
         }
     }
 
     pub fn from_runtime(runtime: &RuntimeConfig) -> Self {
-        Self::new(
+        Self::new_with_sandbox(
             PolicySettings::from_runtime(runtime),
             runtime.tool_profile.clone(),
             runtime.permission_mode.clone(),
+            runtime.sandbox.clone(),
         )
     }
 
@@ -127,40 +157,31 @@ impl SharedRuntimeToolConfig {
     }
 
     pub fn update(&self, policy: PolicySettings, tool_profile: String, permission_mode: String) {
+        let sandbox = self.snapshot().sandbox;
+        self.update_with_sandbox(policy, tool_profile, permission_mode, sandbox);
+    }
+
+    pub fn update_with_sandbox(
+        &self,
+        policy: PolicySettings,
+        tool_profile: String,
+        permission_mode: String,
+        sandbox: SandboxConfig,
+    ) {
         *self
             .inner
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            RuntimeToolConfig::normalized(policy, tool_profile, permission_mode);
+            RuntimeToolConfig::normalized(policy, tool_profile, permission_mode, sandbox);
     }
 
     pub fn update_from_runtime(&self, runtime: &RuntimeConfig) {
-        self.update(
+        self.update_with_sandbox(
             PolicySettings::from_runtime(runtime),
             runtime.tool_profile.clone(),
             runtime.permission_mode.clone(),
+            runtime.sandbox.clone(),
         );
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum MutationLockGroup {
-    History,
-    WorkspaceContent,
-    Git,
-    Task,
-    Cwd,
-}
-
-impl MutationLockGroup {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::History => "history",
-            Self::WorkspaceContent => "workspace_content",
-            Self::Git => "git",
-            Self::Task => "task",
-            Self::Cwd => "cwd",
-        }
     }
 }
 
@@ -195,6 +216,12 @@ impl MutationLocks {
     }
 }
 
+struct CachedPreparedSandbox {
+    workspace_root: PathBuf,
+    config: SandboxConfig,
+    prepared: Arc<dyn PreparedSandbox>,
+}
+
 struct SharedExecutionResources {
     sessions: Arc<SessionStore>,
     pending_operations: Arc<PendingOperationStore>,
@@ -202,6 +229,7 @@ struct SharedExecutionResources {
     process_admission: Arc<Semaphore>,
     mutation_locks: MutationLocks,
     resource_locks: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
+    sandbox_backend_cache: Mutex<Option<CachedPreparedSandbox>>,
     limits: ExecutionLimits,
 }
 
@@ -236,6 +264,7 @@ fn shared_execution_resources(
         process_admission: Arc::new(Semaphore::new(limits.process_admission)),
         mutation_locks: MutationLocks::new(),
         resource_locks: Arc::new(Mutex::new(HashMap::new())),
+        sandbox_backend_cache: Mutex::new(None),
         limits,
     });
     registry.insert(profile_id.to_string(), Arc::downgrade(&resources));
@@ -538,10 +567,12 @@ impl ToolContext {
 
     pub fn update_runtime_config(
         &self,
-        policy: PolicySettings,
+        mut policy: PolicySettings,
         tool_profile: String,
         permission_mode: String,
     ) {
+        policy.explicit_security_policy = false;
+        policy.security_policy = SecurityPolicy::legacy(&permission_mode, &tool_profile);
         self.runtime_config
             .update(policy, tool_profile, permission_mode);
     }
@@ -567,7 +598,12 @@ impl ToolContext {
 
     pub fn default_cwd_display(&self) -> String {
         let cwd = self.default_cwd.lock().expect("cwd lock");
-        relative_display(self.workspace.root(), &cwd)
+        let display = relative_display(self.workspace.root(), &cwd);
+        if display.is_empty() {
+            ".".into()
+        } else {
+            display
+        }
     }
 
     pub fn set_default_cwd(&self, path: PathBuf) {
@@ -593,6 +629,36 @@ impl ToolContext {
         lock
     }
 
+    pub(crate) fn cached_sandbox_backend<F>(
+        &self,
+        config: &SandboxConfig,
+        prepare: F,
+    ) -> Result<Arc<dyn PreparedSandbox>, WorkspaceError>
+    where
+        F: FnOnce() -> Result<Arc<dyn PreparedSandbox>, WorkspaceError>,
+    {
+        let workspace_root = self.workspace.root().to_path_buf();
+        let mut cache = self
+            ._execution_resources
+            .sandbox_backend_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = cache.as_ref() {
+            if cached.workspace_root == workspace_root && cached.config == *config {
+                return Ok(Arc::clone(&cached.prepared));
+            }
+        }
+        cache.take();
+
+        let prepared = prepare()?;
+        *cache = Some(CachedPreparedSandbox {
+            workspace_root,
+            config: config.clone(),
+            prepared: Arc::clone(&prepared),
+        });
+        Ok(prepared)
+    }
+
     pub fn execution_limits(&self) -> ExecutionLimits {
         self.execution_limits
     }
@@ -601,11 +667,11 @@ impl ToolContext {
         &self,
         tool_name: &str,
     ) -> Option<(&'static str, usize, Arc<Semaphore>, usize, Arc<Semaphore>)> {
-        match tool_name {
-            // Keep lightweight control and health calls responsive even when heavy
+        match tool_runtime(tool_name).lane {
+            // Keep lightweight fast/control calls responsive even when heavy
             // filesystem or process work is queued.
-            "server_info" => None,
-            "exec_command" | "exec_health_check" | "request_permissions" => Some((
+            ToolExecutionLane::Fast | ToolExecutionLane::Control => None,
+            ToolExecutionLane::Process => Some((
                 "process",
                 self.execution_limits.process_admission,
                 self.process_admission.clone(),
@@ -614,7 +680,7 @@ impl ToolContext {
                     .global_process_admission,
                 self.global_process_admission.clone(),
             )),
-            _ => Some((
+            ToolExecutionLane::Blocking => Some((
                 "blocking",
                 self.execution_limits.blocking_admission,
                 self.blocking_admission.clone(),

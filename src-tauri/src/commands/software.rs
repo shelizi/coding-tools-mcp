@@ -8,19 +8,19 @@ use crate::tunnel::{
     uninstall_software as uninstall_binary, SoftwareStatus,
 };
 
-/// List install status for frpc and cloudflared.
+/// List install status for tunnel clients and sandbox CLIs.
 #[tauri::command]
 pub fn list_software() -> AppResult<Vec<SoftwareStatus>> {
     Ok(list_binaries())
 }
 
-/// Download-install the requested binary ("frpc" | "cloudflared").
+/// Install the requested tool ("frpc" | "cloudflared" | "sbx" | "wslc").
 #[tauri::command]
 pub async fn install_software(kind: String) -> AppResult<SoftwareStatus> {
     install_binary(&kind).await
 }
 
-/// Remove a cache-managed binary ("frpc" | "cloudflared").
+/// Remove a cache-managed binary ("frpc" | "cloudflared"). Sandbox CLIs are not cache-managed.
 #[tauri::command]
 pub fn uninstall_software(kind: String) -> AppResult<SoftwareStatus> {
     uninstall_binary(&kind)
@@ -34,10 +34,7 @@ pub fn get_download_config(state: State<'_, AppState>) -> AppResult<DownloadConf
 
 /// Persist the download config (mirror + proxy).
 #[tauri::command]
-pub fn set_download_config(
-    state: State<'_, AppState>,
-    config: DownloadConfig,
-) -> AppResult<()> {
+pub fn set_download_config(state: State<'_, AppState>, config: DownloadConfig) -> AppResult<()> {
     state.with_settings(|store| {
         let mut settings = store.settings();
         settings.download = config;

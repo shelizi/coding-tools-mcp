@@ -250,7 +250,7 @@ export function wrapMcpToolResult(
   const normalized = normalizeToolResult(structured);
   const isError = normalized.ok === false;
   const suppliedImages = imageContent(normalized.content);
-  const useImage = toolName === 'view_image'
+  const useImage = (toolName === 'view_image' || toolName === 'desktop_screenshot')
     && String(args.output ?? 'mcp_image') === 'mcp_image'
     && !isError
     && suppliedImages !== undefined;

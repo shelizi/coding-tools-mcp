@@ -1,11 +1,23 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import type { EventEmitter } from 'node:events';
 import type { KeyedMutex, Semaphore } from './runtime.js';
-import type { StateStore } from './state.js';
-import type { ToolUsageStore } from './toolUsage.js';
+import type { SkillRegistry } from './skills/registry.js';
+import type { ExtensionRegistry } from './extensions/registry.js';
+import type { OperationRecord, StateStoreContract } from './state/contract.js';
+import type { ToolUsageStoreContract } from './toolUsage/contract.js';
 import type { WorkerPolicy } from './tunnelPolicy.js';
 import type { StartupDiagnostics } from './processStartup.js';
-import type { ConversationStore, MutableStringMap } from './conversation.js';
+import type { ConversationStoreContract, MutableStringMap } from './conversation/contract.js';
+
+export type {
+  ChangeSet,
+  OperationRecord,
+  PersistentState,
+  ProjectBaseline,
+  TaskEvent,
+  TaskRecord,
+  TaskStatus
+} from './state/contract.js';
 
 export type JsonObject = Record<string, unknown>;
 export type PermissionMode = 'read-only' | 'guarded' | 'trusted' | 'dangerous';
@@ -44,6 +56,20 @@ export interface WorkspaceFolderDocument {
   path: string;
 }
 
+export type SandboxPathAccess = 'read_only' | 'modify';
+
+export interface SandboxPathGrant {
+  path: string;
+  access: SandboxPathAccess;
+}
+
+export interface SandboxConfig {
+  enabled: boolean;
+  backend: string;
+  externalPaths: SandboxPathGrant[];
+  options: Record<string, string>;
+}
+
 export interface EditProposalRecord {
   path: string;
   fileSha256: string;
@@ -75,6 +101,15 @@ export interface AgentConfig {
   management: {
     enabled: boolean;
   };
+  skills: {
+    active: boolean;
+    disabled: string[];
+  };
+  extensions: {
+    hooks: { active: boolean; enabled: string[] };
+    mcp: { active: boolean; enabled: string[] };
+  };
+  sandbox: SandboxConfig;
   oauth: {
     clientId: string;
     clientSecret?: string;
@@ -115,6 +150,20 @@ export interface AgentConfigDocument {
     maxPatchBytes?: number;
   };
   management?: Partial<AgentConfig['management']>;
+  skills?: {
+    active?: boolean;
+    disabled?: string[];
+  };
+  extensions?: {
+    hooks?: { active?: boolean; enabled?: string[] };
+    mcp?: { active?: boolean; enabled?: string[] };
+  };
+  sandbox?: {
+    enabled?: boolean;
+    backend?: string;
+    externalPaths?: SandboxPathGrant[];
+    options?: Record<string, string>;
+  };
   oauth?: {
     clientId?: string;
   };
@@ -180,26 +229,22 @@ export interface FolderRuntime {
   operationsByFingerprint: Map<string, string>;
   pendingOperations: Map<string, PendingOperation>;
   editProposals: Map<string, EditProposalRecord>;
+  skillRegistry: SkillRegistry;
   admission: { blocking: Semaphore; process: Semaphore; locks: KeyedMutex };
 }
 
 export interface ToolContext {
   config: AgentConfig;
-  conversations: ConversationStore;
+  conversations: ConversationStoreContract;
   workspaceProfileId: string;
   selections: MutableStringMap;
   defaultCwds: MutableStringMap;
   folderRuntimes: Map<string, FolderRuntime>;
+  extensions: ExtensionRegistry;
   hubAdmission: { blocking: Semaphore; process: Semaphore; locks: KeyedMutex };
-  // Single-folder compatibility aliases. Runtime routing uses folderRuntimes.
-  sessions: Map<string, ProcessSession>;
-  operationsByFingerprint: Map<string, string>;
-  pendingOperations: Map<string, PendingOperation>;
-  editProposals: Map<string, EditProposalRecord>;
   usage: UsageRecord[];
-  usageStore: ToolUsageStore;
-  admission: { blocking: Semaphore; process: Semaphore; locks: KeyedMutex };
-  state: StateStore;
+  usageStore: ToolUsageStoreContract;
+  state: StateStoreContract;
   tunnelStatus?: TunnelStatus;
 }
 
@@ -242,6 +287,15 @@ export interface ProcessSession {
   stdinOpen: boolean;
   timedOut: boolean;
   killed: boolean;
+  sandboxEnforced?: boolean;
+  sandboxBackend?: string;
+  executionBoundary?: string;
+  sandboxPrepareMs?: number;
+  sandboxStartupMs?: number;
+  sandboxCleanupMs?: number;
+  processTreeContained?: boolean;
+  processTreeControl?: string;
+  backendKill?: () => Promise<void>;
   terminationReason?: string;
   telemetryCommandKind: string;
   telemetryRecorded?: boolean;
@@ -271,82 +325,6 @@ export interface UsageRecord {
   queueWaitMs: number;
   lockWaitMs: number;
   responseBytes: number;
-}
-
-export type TaskStatus = 'active' | 'paused' | 'verifying' | 'failed' | 'completed' | 'completed_unverified' | 'rolled_back';
-
-export interface ProjectBaseline {
-  branch?: string;
-  head?: string;
-  worktree_fingerprint: string;
-  entries: Array<{
-    path: string;
-    exists: boolean;
-    is_binary: boolean;
-    sha256: string;
-    bytes: number;
-  }>;
-  captured_at: string;
-}
-
-export interface TaskRecord {
-  id: string;
-  workspace_id: string;
-  objective: string;
-  status: TaskStatus;
-  baseline: ProjectBaseline;
-  expected_fingerprint: string;
-  completed_steps: string[];
-  pending_steps: string[];
-  latest_change_id?: string;
-  latest_verification_id?: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface TaskEvent {
-  id: string;
-  task_id: string;
-  operation_id: string;
-  kind: string;
-  tool_name?: string;
-  input_summary: JsonObject;
-  result_summary: JsonObject;
-  reason?: { text: string; source: string };
-  affected_files: JsonObject[];
-  created_at: string;
-}
-
-export interface ChangeSet {
-  id: string;
-  task_id: string;
-  objective: string;
-  reason: { text: string; source: string };
-  files: JsonObject[];
-  command_ids: string[];
-  verification_ids: string[];
-  risks: string[];
-  created_at: string;
-}
-
-export interface OperationRecord {
-  id: string;
-  workspace_id: string;
-  task_id?: string;
-  tool: string;
-  kind: string;
-  input_summary: JsonObject;
-  result_summary: JsonObject;
-  reason?: string;
-  affected_files: JsonObject[];
-  created_at: string;
-}
-
-export interface PersistentState {
-  tasks: Record<string, TaskRecord>;
-  currentTasks: Record<string, string>;
-  taskEvents: Record<string, TaskEvent[]>;
-  changeSets: Record<string, ChangeSet>;
 }
 
 export interface TunnelStatus {

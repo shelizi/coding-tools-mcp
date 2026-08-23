@@ -1,7 +1,8 @@
-import { lstat, readFile } from 'node:fs/promises';
+import { lstat, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
 const MAX_IGNORE_FILE_BYTES = 1024 * 1024;
+const MAX_GIT_POINTER_BYTES = 4 * 1024;
 const IGNORE_FILES = ['.gitignore', '.ignore'] as const;
 
 export interface IgnoreRule {
@@ -152,14 +153,73 @@ async function rulesFromFile(file: string, base: string): Promise<IgnoreRule[]> 
   }
 }
 
+async function smallGitMetadataFile(file: string): Promise<string | undefined> {
+  try {
+    const info = await lstat(file);
+    if (!info.isFile() || info.size > MAX_GIT_POINTER_BYTES) return undefined;
+    const value = (await readFile(file)).toString('utf8').trim();
+    return value || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function gitMetadataPath(base: string, value: string): string {
+  return path.normalize(path.isAbsolute(value) ? value : path.resolve(base, value));
+}
+
+async function samePhysicalPath(left: string, right: string): Promise<boolean> {
+  try {
+    const [leftReal, rightReal] = await Promise.all([realpath(left), realpath(right)]);
+    return process.platform === 'win32'
+      ? leftReal.toLowerCase() === rightReal.toLowerCase()
+      : leftReal === rightReal;
+  } catch {
+    return false;
+  }
+}
+
+async function commonGitDirectory(root: string): Promise<string | undefined> {
+  const dotGit = path.join(root, '.git');
+  let dotGitInfo;
+  try {
+    dotGitInfo = await lstat(dotGit);
+  } catch {
+    return undefined;
+  }
+  if (dotGitInfo.isDirectory()) return dotGit;
+  if (!dotGitInfo.isFile() || dotGitInfo.size > MAX_GIT_POINTER_BYTES) return undefined;
+
+  const pointer = await smallGitMetadataFile(dotGit);
+  const matched = pointer?.match(/^gitdir:\s*(.+)$/i);
+  if (!matched) return undefined;
+  const gitDirectory = gitMetadataPath(root, matched[1].trim());
+  try {
+    if (!(await lstat(gitDirectory)).isDirectory()) return undefined;
+  } catch {
+    return undefined;
+  }
+
+  // A linked worktree admin directory points back to the worktree's .git file.
+  // Require that reciprocal link before following metadata outside the workspace.
+  const backlink = await smallGitMetadataFile(path.join(gitDirectory, 'gitdir'));
+  if (!backlink) return undefined;
+  if (!await samePhysicalPath(gitMetadataPath(gitDirectory, backlink), dotGit)) return undefined;
+
+  const commonPointer = await smallGitMetadataFile(path.join(gitDirectory, 'commondir'));
+  if (!commonPointer) return gitDirectory;
+  const commonDirectory = gitMetadataPath(gitDirectory, commonPointer);
+  try {
+    return (await lstat(commonDirectory)).isDirectory() ? commonDirectory : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function rootIgnoreRules(root: string): Promise<IgnoreRule[]> {
   const rules: IgnoreRule[] = [];
-  const gitDirectory = path.join(root, '.git');
-  try {
-    if ((await lstat(gitDirectory)).isDirectory()) {
-      rules.push(...await rulesFromFile(path.join(gitDirectory, 'info', 'exclude'), ''));
-    }
-  } catch { /* no repository-local exclude file */ }
+  const gitDirectory = await commonGitDirectory(root);
+  if (gitDirectory) rules.push(...await rulesFromFile(path.join(gitDirectory, 'info', 'exclude'), ''));
   for (const name of IGNORE_FILES) rules.push(...await rulesFromFile(path.join(root, name), ''));
   return rules;
 }

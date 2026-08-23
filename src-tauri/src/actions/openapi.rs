@@ -1,6 +1,6 @@
 use serde_json::{json, Map, Value};
 
-use crate::tools::{is_allowed_tool, is_mcp_only_tool, MUTATING_TOOLS};
+use crate::tools::{is_allowed_tool, is_mcp_only_tool, is_mutating_tool};
 
 pub fn build_openapi(tools: &[Value], public_base_url: &str, auth_type: &str) -> Value {
     let mut paths = Map::new();
@@ -70,7 +70,7 @@ pub fn build_openapi(tools: &[Value], public_base_url: &str, auth_type: &str) ->
                 "422": { "description": "Tool execution failed" },
                 "502": { "description": "MCP backend failure" }
             },
-            "x-openai-isConsequential": MUTATING_TOOLS.contains(&name)
+            "x-openai-isConsequential": is_mutating_tool(name)
         });
 
         if use_api_key {

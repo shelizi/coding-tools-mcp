@@ -31,8 +31,8 @@ Pure Node.js/TypeScript implementation of Coding Tools MCP. It does not bundle a
 - Versioned public configuration schema with automatic migration from legacy plaintext settings
 - AES-256-GCM encrypted Agent secret store for OAuth password, client secret, token secret, and tunnel enrollment URL
 - Rust-compatible read/search/project contracts and safe `format_files` plan/check/apply flow
-- Optional loopback-only React management UI for status, workspaces, limits, OAuth, and tunnel settings
-- Bootstrap/React-Bootstrap responsive layout, TanStack Query polling/cache, light/dark/system themes, and structured workspace editing
+- Optional loopback-only management UI at `/ui/`, built from the shared Desktop Svelte app (`CTMCP_UI_HOST=node`)
+- Same Svelte screens as Desktop, with Node capabilities (OAuth, Built-in WSS, policy, history, telemetry, operation logs)
 - Installable PWA standalone window using the same locally bundled browser UI, without shipping a custom desktop EXE or loading a CDN
 - Atomic JSON configuration writes; runtime settings are applied only after an explicit Agent restart
 - Management API protected by loopback/Host checks, same-origin validation, CSP, and a per-start random token
@@ -47,20 +47,30 @@ Pure Node.js/TypeScript implementation of Coding Tools MCP. It does not bundle a
 - Windows with WSL installed when using `\\wsl.localhost`, `\\wsl$`, or extended WSL UNC workspaces
 - The command-line programs invoked by the MCP tools must already be installed
 
-The production dependencies are JavaScript-only: `ws` for WebSocket transport plus `pngjs` and `jpeg-js` for bounded image decoding and encoding. React, React-Bootstrap, Bootstrap, TanStack Query, and Webpack are development/build dependencies whose browser output is bundled into `dist/ui`. CI/package checks use an explicit production-dependency allowlist and reject `.exe`, `.dll`, `.node`, and package lifecycle install scripts.
+The production dependencies are JavaScript-only: `ws` for WebSocket transport plus `pngjs` and `jpeg-js` for bounded image decoding and encoding. The management UI is a SvelteKit static build from the repository `src/` tree, written to `dist/ui`. CI/package checks use an explicit production-dependency allowlist and reject `.exe`, `.dll`, `.node`, and package lifecycle install scripts.
+
+## Tool extension architecture
+
+The Rust registry remains the source of truth for public tool names, schemas, annotations, profiles, and toolset revisions. Rust keeps catalog/profile metadata in `src-tauri/src/tools/registry_metadata.rs`, schema routing in `src-tauri/src/tools/registry.rs`, and domain schema builders under `src-tauri/src/tools/registry_schemas/`; `scripts/sync-rust-catalog.mjs` generates those contracts for the Node Agent.
+
+Node-only execution metadata lives in `src/toolRuntime.ts`, grouped by domain. It declares each tool's admission lane, workspace locks, Harness behavior, guarded permission, inflight coalescing, telemetry family, mutation classification, and compatibility aliases. The module fails during startup and tests when an advanced-profile tool is missing metadata or when stale metadata references a tool that no longer exists.
+
+All public tool routes are composed by `src/toolDispatch.ts` from the modules under `src/toolDispatchers/` plus `src/permissionTools.ts`. `src/tools.ts` owns only the shared execution middleware pipeline: canonicalization, admission, locks, policy, Harness tracking, telemetry, and redaction. The dispatcher registry rejects duplicate, unknown, or missing handlers across the complete advanced catalog.
+
+When adding a tool, update the Rust contract, regenerate the Node catalog, register its runtime metadata, place the handler in the matching domain dispatcher, and add focused behavior tests. `src/tools.ts` should remain orchestration glue instead of accumulating domain handlers or policy lists.
 
 ## Windows portable release
 
 Build both Windows x64 portable editions from one verified build:
 
 ```powershell
-npm run portable
+pnpm run portable
 ```
 
 - `bundled-node` includes `runtime/node.exe` and needs no system Node.js after extraction.
 - `system-node` omits Node.js and requires Windows x64 Node.js 22 or later as `node.exe` on `PATH`.
 
-Build a single edition with `npm run portable:bundled` or `npm run portable:system`. Neither edition requires npm after extraction.
+Build a single edition with `pnpm run portable:bundled` or `pnpm run portable:system`. Neither edition requires pnpm after extraction.
 
 The Node Agent application version comes from `package.json`; the portable wrapper version comes from `portable-version.json`. They are intentionally independent. See `../../docs/node-agent-portable.md` for filenames, archive contracts, release checks, and Skill versioning policy.
 
@@ -74,19 +84,19 @@ $env:CTMCP_OAUTH_CLIENT_ID = "chatgpt"
 $env:CTMCP_OAUTH_PASSWORD = "replace-this"
 $env:CTMCP_OAUTH_TOKEN_SECRET = "replace-with-a-strong-random-secret"
 
-npm install
-npm run build
-npm test
-npm start
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm test
+pnpm start
 ```
 
-For UI development, keep the normal Agent running from the last successful build and rebuild the React assets on source changes:
+For UI development, keep the normal Agent running from the last successful build and rebuild the Svelte assets on source changes:
 
 ```powershell
-npm run dev:ui
+pnpm run dev:ui
 ```
 
-A normal `npm run build` compiles both the Node server and the production React bundle.
+A normal `pnpm run build` compiles both the Node server and the production Svelte UI (`CTMCP_UI_HOST=node`).
 
 `CTMCP_WORKSPACES` uses the platform path delimiter: `;` on Windows and `:` on Unix.
 
@@ -125,12 +135,12 @@ http://127.0.0.1:3789/ui
 The UI is optional and is never opened automatically. MCP, OAuth, command sessions, and Built-in WSS continue to run without a graphical environment. Disable the UI explicitly with:
 
 ```powershell
-npm start -- --no-ui
+pnpm start -- --no-ui
 ```
 
 When supported by the browser, the UI can be installed as a PWA and opened in a standalone application window. The Service Worker does not cache the management page, configuration, runtime token, or Dashboard responses. JavaScript, CSS, icons, and the manifest are served from the Agent itself; the UI does not depend on a CDN or external web asset.
 
-The React UI includes a live Dashboard for runtime health, RSS memory, blocking/process admission load, pending permissions, command-session state, tool latency/error statistics, recent durable activity, task counts, and Built-in WSS worker metrics. TanStack Query refreshes status and telemetry every five seconds, while configuration is refreshed only on initial load, explicit refresh, or save so background polling does not overwrite an in-progress form.
+The shared Svelte UI includes workspace overview, history, telemetry, health, structured operation logs, and Built-in WSS settings. It talks to `/admin/api/*` through `NodeBackend`. Configuration is loaded on workspace open and saved explicitly so a status refresh does not overwrite an in-progress form.
 
 ## Built-in WSS
 
@@ -155,10 +165,10 @@ The normal test suite runs complete local protocol integration tests, including 
 $env:CTMCP_E2E_BUILTIN_PUBLIC_URL = "https://tunnel.example/builtin/clients/my-client/mcp"
 $env:CTMCP_E2E_BUILTIN_ENROLLMENT_URL = "https://tunnel.example/_tunnel/enroll/ONE_TIME_CODE"
 $env:CTMCP_E2E_OAUTH_PASSWORD = "replace-this"
-npm run test:wss:production
+pnpm run test:wss:production
 ```
 
-The runner verifies public OAuth metadata, authorization-code PKCE, token exchange, MCP initialization, all 50 tool declarations, workspace selection, and `read_file` marker round-trip. It is intentionally excluded from `npm test` because enrollment codes are one-time production credentials. For repeat runs, set `CTMCP_E2E_DATA_DIR` and the same `CTMCP_E2E_OAUTH_TOKEN_SECRET`; the encrypted production test identity will be reused and a new enrollment URL is not required.
+The runner verifies public OAuth metadata, authorization-code PKCE, token exchange, MCP initialization, all 50 tool declarations, workspace selection, and `read_file` marker round-trip. It is intentionally excluded from `pnpm test` because enrollment codes are one-time production credentials. For repeat runs, set `CTMCP_E2E_DATA_DIR` and the same `CTMCP_E2E_OAUTH_TOKEN_SECRET`; the encrypted production test identity will be reused and a new enrollment URL is not required.
 
 ## Configuration
 
@@ -171,6 +181,7 @@ The runner verifies public OAuth metadata, authorization-code PKCE, token exchan
 | `CTMCP_PERMISSION_MODE` | `trusted` | `read-only`, `guarded`, `trusted`, or `dangerous` |
 | `CTMCP_TOOL_PROFILE` | `core` | `core`, `trusted-core`, `guarded-core`, `read-only`, `advanced`, or `compat-readonly-all` |
 | `CTMCP_UI_ENABLED` | `true` | Enables the loopback-only browser/PWA management UI |
+| `CTMCP_UI_TRUST_PRIVATE_PROXY` | `false` | Allows a private Docker bridge peer to reach the management UI while still requiring a loopback Host header; the provided Compose file enables this with a host-loopback-only port binding |
 | `CTMCP_CONFIG_FILE` | `<data-dir>/agent.json` | Persistent configuration file path |
 | `CTMCP_BLOCKING_CONCURRENCY` | `32` | File/Git blocking tool limit |
 | `CTMCP_PROCESS_CONCURRENCY` | `16` | Process tool limit |
@@ -187,7 +198,7 @@ The runner verifies public OAuth metadata, authorization-code PKCE, token exchan
 Without `--config`, the Agent reads and writes `<data-dir>/agent.json`. A different JSON file can be supplied with:
 
 ```powershell
-npm start -- --config .\node-agent.json
+pnpm start -- --config .\node-agent.json
 ```
 
 Environment variables take precedence over the JSON file and encrypted secret store. The UI edits the saved JSON values, reports the effective runtime state separately, and lists active environment overrides so an override is not accidentally persisted into the file. Password, client secret, enrollment URL, and token secret values are never returned by the management API; blank secret fields preserve the existing encrypted value.
@@ -305,7 +316,7 @@ A shared strict decoder handles UTF-8 with or without a BOM and BOM-marked UTF-1
 
 ## Ignore-aware workspace traversal
 
-`list_files`, `search_text`, `project_map`, and directory/project formatter scopes share one bounded walker. It evaluates root and nested `.gitignore` and `.ignore` files, plus repository-local `.git/info/exclude` when available. Git-style root anchoring, globstar patterns, character classes, directory rules, and negation are supported; a child can only be re-included after its ignored parent directory is also re-included.
+`list_files`, `search_text`, `project_map`, and directory/project formatter scopes share one bounded walker. It evaluates root and nested `.gitignore` and `.ignore` files, plus repository-local `info/exclude` from the effective Git common directory, including linked worktrees whose `.git` is a pointer file. Git-style root anchoring, globstar patterns, character classes, directory rules, and negation are supported; a child can only be re-included after its ignored parent directory is also re-included.
 
 `include_ignored=true` bypasses Gitignore rules and Rust-compatible default exclusions such as `node_modules`, `target`, `dist`, build caches, and virtual environments. It never exposes `.git` internals. `include_hidden` remains an independent switch, including for an explicitly selected hidden start directory.
 
@@ -349,34 +360,71 @@ Every formatter runs in an isolated `.coding-tools-format/<id>` mirror. The real
 
 `file_ops` similarly performs complete preflight before mutation, rejects protected paths and symlink traversal, stages file contents through temporary files, rechecks source/destination versions, and restores all backups if file replacement or a later directory operation fails. Git mutation tools support expected-HEAD guards and dry-run; `git_commit` requires a clean index by default when it stages paths and restores that index if commit hooks or Git reject the commit.
 
+## Server architecture
+
+The Node Agent keeps runtime composition separate from reusable HTTP routes:
+
+```text
+src/server.ts                    runtime composition and MCP request orchestration
+src/server/catalog.ts            cached tool catalog snapshots and revision headers
+src/server/http.ts               bounded request bodies, text responses, route-prefix helpers
+src/server/routes/system.ts      health and MCP discovery endpoints
+src/server/routes/oauth.ts       OAuth metadata, authorization, and token endpoints
+src/server/routes/mcp.ts         MCP HTTP validation, streaming, and response transport
+src/server/mcp/dispatcher.ts     JSON-RPC method dispatch and tool invocation contracts
+src/server/mcp/lifecycle.ts      request disconnect and process cancellation adapter
+src/mcpTransport.ts              MCP transport validation and streaming response primitives
+src/conversation/contract.ts     conversation identity, routing map and store surface
+src/state/contract.ts            task/change/operation models and durable state surface
+src/toolDispatch/contract.ts     domain handler request and callback contracts
+src/processes.ts                 process lifecycle, retained sessions and command graph orchestration
+src/processes/output.ts          UTF-8 output retention, views, redaction and response contracts
+src/toolUsage.ts                 telemetry record semantics, queueing and aggregate queries
+src/toolUsage/logStore.ts        bounded JSONL append, rotation and complete-line recovery
+src/tunnel.ts                    worker pool, WebSocket lifecycle and local request forwarding
+src/tunnel/endpoint.ts           endpoint parsing, protocol constants and signing payloads
+src/tunnel/identity.ts           encrypted device identity persistence and enrollment
+```
+
+Route handlers return whether they consumed the request. `server.ts` retains the ordering contract: management routes first, OAuth routes second, system discovery third, and MCP transport last.
+
+`createAgentRuntime()` returns an idempotent `close()` operation. Runtime owners should await it so HTTP shutdown, process finalization, OAuth disposal, registry removal, conversation persistence, and usage persistence complete before exit. `createAgentServer()` remains available for callers that only own the raw Node HTTP server.
+
+`ToolContext` owns shared services plus a `folderRuntimes` registry. It depends on the conversation, durable-state, dispatch-adjacent, and telemetry contract surfaces rather than their concrete stores or registries. Session, retained-operation, permission, edit-proposal, and workspace-admission state must be accessed through the selected `FolderRuntime`; there are no first-folder aliases on the context.
+
 ## Management UI architecture
 
 The UI build and runtime boundaries are intentionally separate:
 
 ```text
-src/management.ts          loopback, Host, token, same-origin checks; management JSON APIs
-src/managementUi.ts        minimal HTML shell and allowlisted static asset adapter
-ui/src/                    React application, components, hooks, API client, and styles
-ui/public/                 PWA manifest, icon, and non-caching Service Worker
-dist/ui/                   production Webpack output shipped with the package
+src/management.ts          compatibility exports for the management server modules
+src/management/router.ts   route ordering and management API admission
+src/management/http.ts     loopback, Host, token, same-origin and bounded-body helpers
+src/management/configStore.ts
+                           config validation, encrypted-secret persistence and hot apply
+src/management/runtime.ts  workspace runtime lookup and status aggregation
+src/management/routes/     configuration, workspace and observability endpoint handlers
+src/managementUi.ts        SPA shell under `/ui/` and allowlisted static assets
+management-static/         PWA manifest, icon, and non-caching Service Worker
+dist/ui/                   production SvelteKit static build shipped with the package
 ```
 
-`management.ts` contains no page markup, CSS, DOM code, React components, or form state. The HTML shell only carries the per-process management token in a no-store meta element and loads same-origin `app.js` and `app.css`. The compiled bundle is process-independent and does not contain that token.
+The management server modules contain no page markup, CSS, DOM code, or form state. The HTML shell injects the per-process management token into a no-store meta element and loads same-origin hashed SvelteKit assets from `/ui/_app/`. The compiled bundle is process-independent and does not contain that token.
 
-React-Bootstrap components and Bootstrap's grid/utilities provide the responsive layout. TanStack Query owns API polling, cache invalidation, and save refreshes. The settings screen uses typed, structured React state rather than parsing a free-form workspace textarea. Dynamic server values are rendered as React text nodes; the UI does not use `dangerouslySetInnerHTML`.
+The UI source lives in the repository `src/` Svelte tree. `FrontendCapabilities` hide Desktop-only surfaces. Dynamic server values are rendered as Svelte text; the UI does not inject HTML from API payloads.
 
 ## Development verification
 
 ```powershell
-npm run verify
-npm run verify:repo
+pnpm run verify
+pnpm run verify:repo
 # Validate the Rust/Node parity roadmap:
-npm run check:parity-todos
+pnpm run check:parity-todos
 # Requires explicit production credentials:
-npm run test:wss:production
+pnpm run test:wss:production
 ```
 
-`verify` is the pure Node package verification used before packing. `verify:repo` additionally runs the Rust catalog exporter, verifies the Desktop Client compatibility marker, validates the Rust/Node parity roadmap, and fails if a generated contract or roadmap reference has drifted. The Node Agent package version is an independent release version; `codingTools.clientVersion` and `src/clientVersion.generated.ts` record the Desktop Client version whose shared contracts were synchronized. Root `npm run version:sync` updates these values whenever the Desktop Client version changes. `test:wss:production` is deliberately separate and fails immediately unless production URL, OAuth, and enrollment or persisted-identity settings are supplied.
+`verify` is the pure Node package verification used before packing. `verify:repo` additionally runs the Rust catalog exporter, verifies the Desktop Client compatibility marker, validates the Rust/Node parity roadmap, and fails if a generated contract or roadmap reference has drifted. The Node Agent package version is an independent release version; `codingTools.clientVersion` and `src/clientVersion.generated.ts` record the Desktop Client version whose shared contracts were synchronized. Root `pnpm run version:sync` updates these values whenever the Desktop Client version changes. `test:wss:production` is deliberately separate and fails immediately unless production URL, OAuth, and enrollment or persisted-identity settings are supplied.
 
 ## HTTP endpoints
 
@@ -395,7 +443,7 @@ Path-scoped variants such as `/builtin/clients/<client-id>/mcp` and their RFC we
 
 ## Management security
 
-The management surface accepts only requests whose TCP peer and `Host` header are loopback addresses. API calls also require a random token generated at process start and a same-origin request. The token is injected only into the no-store HTML shell, is read by the React API client from a meta element, is absent from the static JavaScript bundle, and changes after every restart.
+The management surface normally requires both the TCP peer and `Host` header to be loopback. The provided Docker Compose profile keeps the published port bound to host loopback and explicitly permits the private Docker bridge hop; the `Host` header must still be loopback. API calls also require a random token generated at process start and a same-origin request. The token is injected only into the no-store HTML shell, is read by `NodeBackend` from a meta element, is absent from the static JavaScript bundle, and changes after every restart.
 
 Built-in WSS accepts only the configured scoped MCP, OAuth, and well-known metadata paths. It rejects management routes and other localhost paths before issuing an HTTP request. For a remote headless machine, access the UI through SSH port forwarding so the Agent still sees a loopback connection.
 
@@ -405,7 +453,7 @@ The Dashboard is designed for operational visibility rather than command inspect
 
 The API returns at most 50 session summaries, 50 durable activity records, and 100 recent usage records. Tool aggregates use the most recent 1,000 calls. Health is `degraded` when an enabled tunnel is reconnecting/in error, or when at least 10 recent calls have an error rate of 25% or higher; it is `busy` when admission queues are non-empty, otherwise `healthy`.
 
-All dynamic Dashboard values are rendered as escaped React text nodes. The UI does not use `dangerouslySetInnerHTML`, so server data is not interpreted as HTML.
+All dynamic Dashboard values are rendered as escaped Svelte text. The UI does not interpret server data as HTML.
 
 ## Intentionally unsupported
 

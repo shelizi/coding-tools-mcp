@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeConfig } from '../dist/config.js';
 import { formatterExecutableCandidates, formatterLaunchSpec } from '../dist/formatterTools.js';
+import * as gitTools from '../dist/gitTools.js';
 import { defaultPolicy, resolveCommandSpec, validateToolPolicy } from '../dist/policy.js';
 import { normalizeSecurityPolicy } from '../dist/securityPolicy.js';
 import { runBuffered } from '../dist/processes.js';
@@ -110,6 +111,47 @@ test('WSL invocation is shell-free and translates cwd, paths and environment exa
       && error.code === 'WSL_HOST_PATH_REQUIRES_TRANSLATION'
       && error.retryable === true
   );
+  assert.throws(
+    () => validateWslExecPaths(ROOT, 'cargo', [String.raw`\\server\share\Cargo.toml`]),
+    error => error instanceof WslRoutingError
+      && error.code === 'WSL_HOST_PATH_REQUIRES_TRANSLATION'
+  );
+  assert.throws(
+    () => wslInvocationForPath(ROOT, 'cargo', ['check'], [['--help', '1']], [], 'win32'),
+    error => error instanceof WslRoutingError
+      && error.code === 'WSL_ENVIRONMENT_INVALID'
+  );
+  assert.throws(
+    () => wslInvocationForPath(ROOT, 'cargo', ['check'], [], ['A=B'], 'win32'),
+    error => error instanceof WslRoutingError
+      && error.code === 'WSL_ENVIRONMENT_INVALID'
+  );
+});
+
+test('WSL clean environment wrapper preserves distro essentials and argument boundaries', () => {
+  const executable = resolveInside(ROOT, '.venv/bin/ruff');
+  const invocation = wslInvocationForPath(
+    ROOT,
+    executable,
+    ['format', 'file with spaces.py'],
+    [],
+    [],
+    'win32',
+    true
+  );
+  assert.deepEqual(invocation, {
+    program: 'wsl.exe',
+    args: [
+      '--distribution', 'Ubuntu-24.04',
+      '--cd', '/opt/src/Sample Project',
+      '--exec', '/bin/sh', '-c',
+      'exec env -i PATH="$PATH" HOME="$HOME" PWD="$PWD" USER="${USER-}" LOGNAME="${LOGNAME-}" TMPDIR="${TMPDIR-}" CARGO_HOME="${CARGO_HOME-}" RUSTUP_HOME="${RUSTUP_HOME-}" XDG_CONFIG_HOME="${XDG_CONFIG_HOME-}" XDG_CACHE_HOME="${XDG_CACHE_HOME-}" LANG="${LANG-}" LC_ALL="${LC_ALL-}" "$@"',
+      'coding-tools-clean-env',
+      '/opt/src/Sample Project/.venv/bin/ruff',
+      'format',
+      'file with spaces.py'
+    ]
+  });
 });
 
 test('WSL output decoding and workspace validation are testable without WSL', async () => {
@@ -164,6 +206,17 @@ test('WSL command policy uses distro PATH, Linux absolute programs and sh only',
   assert.deepEqual(await resolveCommandSpec(ctx, key, { program: '/usr/bin/cargo', args: ['check'] }), {
     program: '/usr/bin/cargo', argv: ['check'], display: '/usr/bin/cargo check', shell: false
   });
+  assert.deepEqual(await resolveCommandSpec(ctx, key, { program: '/usr/bin/../local/bin/cargo', args: ['check'] }), {
+    program: '/usr/local/bin/cargo', argv: ['check'], display: '/usr/bin/../local/bin/cargo check', shell: false
+  });
+  await assert.rejects(
+    resolveCommandSpec(ctx, key, { program: '/tmp/cargo', args: ['check'] }),
+    error => error?.code === 'EXECUTABLE_OUTSIDE_WORKSPACE'
+  );
+  await assert.rejects(
+    resolveCommandSpec(ctx, key, { program: '/usr/bin/../../tmp/cargo', args: ['check'] }),
+    error => error?.code === 'EXECUTABLE_OUTSIDE_WORKSPACE'
+  );
   ctx.config.policy = { ...ctx.config.policy, workspaceScriptExtensions: ['.sh'] };
   await assert.rejects(
     validateToolPolicy(ctx, key, 'exec_command', { program: '/tmp/outside.sh', args: [] }),
@@ -182,6 +235,13 @@ test('WSL command policy uses distro PATH, Linux absolute programs and sh only',
     }),
     error => error?.code === 'WSL_CROSS_DISTRIBUTION_PATH'
   );
+});
+
+test('Git commands opt into WSL routing and set non-interactive mode inside the distribution', () => {
+  assert.deepEqual(gitTools.gitRunRouting?.(), {
+    routeWsl: true,
+    environment: [['GIT_TERMINAL_PROMPT', '0']]
+  });
 });
 
 test('formatter discovery and custom JavaScript launch stay inside the selected distribution', () => {

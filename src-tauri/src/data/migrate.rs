@@ -142,9 +142,22 @@ fn load_existing_with_recovery(path: &Path) -> AppResult<AppData> {
 
 fn load_data_file(path: &Path) -> AppResult<(AppData, bool)> {
     let raw = fs::read_to_string(path)?;
-    let mut data: AppData = serde_json::from_str(&raw)?;
-    let plaintext_legacy = unprotect_secrets(&mut data, path)?;
-    Ok((data, plaintext_legacy))
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    match serde_json::from_value::<AppData>(value) {
+        Ok(mut data) => {
+            let plaintext_legacy = unprotect_secrets(&mut data, path)?;
+            Ok((data, plaintext_legacy))
+        }
+        Err(error) => {
+            let backup = backup_path(path);
+            if !backup.exists() {
+                fs::copy(path, &backup)?;
+            }
+            Err(crate::error::AppError::Message(format!(
+                "workspace profile migrate failed: {error}"
+            )))
+        }
+    }
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -309,6 +322,10 @@ fn merge_settings(data: &mut AppData, settings: AppSettings) {
 mod tests {
     use super::*;
 
+    use serde_json::json;
+
+    use crate::workspace::WorkspaceProfile;
+
     fn data_with_secret(secret: &str) -> AppData {
         let mut data = AppData::default();
         data.shared_secrets
@@ -369,5 +386,84 @@ mod tests {
             .expect("dir")
             .flatten()
             .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-")));
+    }
+
+    #[test]
+    fn save_writes_canonical_profiles_and_keeps_envelope_secrets() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("profiles.json");
+        let profile = WorkspaceProfile::new("C:/workspace/repo".into(), Some("repo".into()));
+        let id = profile.id.clone();
+        let envelope = json!({
+            "frp_profiles": [{
+                "id": "frp-1",
+                "name": "edge",
+                "server": "frp.example",
+                "server_port": 7000
+            }],
+            "last_workspace_id": id,
+            "download": { "githubMirror": "", "proxyMode": "none", "proxyUrl": "" },
+            "proxy": { "mode": "none", "url": "" },
+            "shared_secrets": { "oauth_password": "shared-oauth-password" },
+            "workspace_secrets": { (id.clone()): { "oauth_password": "envelope-oauth-password" } },
+            "app_secrets": {},
+            "mcp_enabled_workspace_ids": [id],
+            "actions_enabled_workspace_ids": [],
+            "profiles": [serde_json::to_value(&profile).expect("snake profile")]
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&envelope).expect("write")).expect("seed");
+
+        let loaded = load_existing_with_recovery(&path).expect("load snake_case envelope");
+        assert_eq!(loaded.profiles[0].name, "repo");
+        write_data(&path, &loaded).expect("save canonical");
+
+        let disk: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("disk")).expect("json");
+        let stored = &disk["profiles"][0];
+        assert_eq!(stored["schemaVersion"], 2);
+        assert!(stored.get("bind").is_some());
+        assert!(stored["host"].get("desktop").is_some());
+        assert!(stored.get("runtime").is_none());
+        assert_eq!(disk["last_workspace_id"], id);
+        assert_eq!(disk["frp_profiles"][0]["id"], "frp-1");
+        assert_eq!(disk["mcp_enabled_workspace_ids"][0], id);
+        assert!(disk["workspace_secrets"][id.as_str()].is_object());
+        assert!(disk["shared_secrets"].is_object());
+        let profile_text = stored.to_string();
+        assert!(!profile_text.contains("envelope-oauth-password"));
+        assert!(!profile_text.contains("shared-oauth-password"));
+        assert!(!profile_text.contains("oauth_password"));
+        if let Ok(dump) = std::env::var("CTMCP_PHASE4_DUMP") {
+            fs::write(
+                format!("{dump}/phase4-profiles.json"),
+                serde_json::to_vec_pretty(&disk).expect("dump"),
+            )
+            .expect("dump after");
+        }
+    }
+
+    #[test]
+    fn invalid_profile_migrate_leaves_original_and_writes_bak() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("profiles.json");
+        let original =
+            br#"{"last_workspace_id":"keep-me","profiles":[{"schemaVersion":2,"id":"broken"}]}"#;
+        fs::write(&path, original).expect("seed invalid");
+        let before = fs::read(&path).expect("before");
+
+        let error = load_data_file(&path).expect_err("migrate should fail");
+        assert!(error.to_string().contains("migrate failed"));
+        assert_eq!(fs::read(&path).expect("after"), before);
+        assert!(backup_path(&path).exists());
+        if let Ok(dump) = std::env::var("CTMCP_PHASE4_DUMP") {
+            let listing = format!(
+                "original_unchanged={}\nbak_exists={}\nbak_path={}\nerror={}\n",
+                fs::read(&path).expect("after") == before,
+                backup_path(&path).exists(),
+                backup_path(&path).display(),
+                error
+            );
+            fs::write(format!("{dump}/phase4-bak.txt"), listing).expect("dump bak");
+        }
     }
 }

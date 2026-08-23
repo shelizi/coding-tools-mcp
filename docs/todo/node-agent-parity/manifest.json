@@ -2,12 +2,12 @@
   "schema_version": 2,
   "assertion_registry": "assertions.json",
   "baseline": {
-    "audited_at": "2026-08-08",
-    "repository_head": "baab708abbd0b64761a1faa8a6a2f082399a0915",
+    "audited_at": "2026-08-20",
+    "repository_head": "a9ecac570119a38c5034845847e1aee8ac2e2a82",
     "head_policy": "ancestor",
-    "desktop_client_version": "0.1.40",
-    "node_agent_version": "0.29.8",
-    "client_compatibility_version": "0.1.40"
+    "desktop_client_version": "0.1.53",
+    "node_agent_version": "0.29.25",
+    "client_compatibility_version": "0.1.53"
   },
   "status_values": ["todo", "in_progress", "blocked", "done", "excluded"],
   "priority_values": ["P0", "P1", "P2"],
@@ -203,9 +203,9 @@
       "file": "TODO-015-wsl-routing.md",
       "depends_on": ["NP-002", "NP-009"],
       "rust_sources": ["src-tauri/src/workspace/location.rs", "src-tauri/src/platform/wsl.rs", "src-tauri/src/tools/exec.rs", "src-tauri/src/tools/file_action.rs"],
-      "node_sources": ["packages/node-agent/src/wsl.ts", "packages/node-agent/src/config.ts", "packages/node-agent/src/workspace.ts", "packages/node-agent/src/policy.ts", "packages/node-agent/src/processes.ts", "packages/node-agent/src/formatterTools.ts", "packages/node-agent/src/tools.ts", "packages/node-agent/test/wsl.test.mjs"],
+      "node_sources": ["packages/node-agent/src/wsl.ts", "packages/node-agent/src/config.ts", "packages/node-agent/src/workspace.ts", "packages/node-agent/src/policy.ts", "packages/node-agent/src/processes.ts", "packages/node-agent/src/gitProcess.ts", "packages/node-agent/src/gitTools.ts", "packages/node-agent/src/fileTools.ts", "packages/node-agent/src/formatterTools.ts", "packages/node-agent/src/taskTools.ts", "packages/node-agent/src/tools.ts", "packages/node-agent/test/wsl.test.mjs"],
       "assertion_ids": ["PA-015-WSL"],
-      "acceptance_tests": ["WSL UNC forms and case semantics", "distribution and directory validation", "case-sensitive workspace containment", "wsl.exe argv and environment translation", "host-drive and cross-distribution rejection", "WSL sh-only policy", "post-check routing", "formatter mirror and custom adapter routing", "conditional live WSL execution"]
+      "acceptance_tests": ["WSL UNC forms and case semantics", "distribution and directory validation", "case-sensitive workspace containment", "wsl.exe argv and environment translation", "host-drive host-UNC and cross-distribution rejection", "trusted absolute executable directories", "WSL Git non-interactive routing", "WSL sh-only policy", "post-check routing", "formatter mirror clean-environment routing", "conditional live WSL execution"]
     },
     {
       "id": "NP-016",

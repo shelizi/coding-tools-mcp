@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [switch]$SkipVerify,
+    [switch]$AllowUnreleasedBuild,
     [string]$OutputDirectory,
     [string]$NodeExecutable,
     [ValidateSet('all', 'bundled-node', 'system-node')]
@@ -59,6 +60,26 @@ function Write-PackageChecksums {
     Write-Utf8NoBom -Path (Join-Path $PackagePath 'SHA256SUMS.txt') -Content (($sumLines -join "`n") + "`n")
 }
 
+function Assert-PortablePathBudget {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackagePath,
+        [int]$MaxRelativeLength = 180
+    )
+
+    $packagePrefix = $PackagePath.TrimEnd('\') + '\'
+    $longest = Get-ChildItem -LiteralPath $PackagePath -Recurse -Force |
+        ForEach-Object {
+            $fullName = [System.IO.Path]::GetFullPath($_.FullName)
+            $relative = $fullName.Substring($packagePrefix.Length).Replace('\', '/')
+            [pscustomobject]@{ path = $relative; length = $relative.Length }
+        } |
+        Sort-Object length -Descending |
+        Select-Object -First 1
+    if ($null -ne $longest -and [int]$longest.length -gt $MaxRelativeLength) {
+        throw "Portable package path budget exceeded: $($longest.length) > $MaxRelativeLength characters: $($longest.path)"
+    }
+}
+
 function Publish-PortablePackage {
     param(
         [Parameter(Mandatory = $true)][string]$PackagePath,
@@ -89,7 +110,11 @@ function Publish-PortablePackage {
         Write-Warning "Expanded portable folder could not be replaced, usually because it is running. The ZIP is current: $zipPath"
     } finally {
         if (Test-Path -LiteralPath $expandedStagingPath) {
-            Remove-Item -LiteralPath $expandedStagingPath -Recurse -Force
+            try {
+                Remove-Item -LiteralPath $expandedStagingPath -Recurse -Force
+            } catch {
+                Write-Warning "Could not remove expanded staging folder (usually locked by a running Agent): $expandedStagingPath"
+            }
         }
     }
 
@@ -108,7 +133,6 @@ $ErrorActionPreference = 'Stop'
 $packageRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $repositoryRoot = (Resolve-Path (Join-Path $packageRoot '..\..')).Path
 $packageJsonPath = Join-Path $packageRoot 'package.json'
-$packageLockPath = Join-Path $packageRoot 'package-lock.json'
 $portableVersionPath = Join-Path $packageRoot 'portable-version.json'
 
 $packageJson = Get-Content -Raw -LiteralPath $packageJsonPath | ConvertFrom-Json
@@ -132,18 +156,20 @@ if ($LASTEXITCODE -ne 0) {
 if ($statusLines.Count -gt 0) {
     throw "Node portable release packaging requires a clean worktree.`n$($statusLines -join "`n")"
 }
-$gitTag = "node-agent-v${appVersion}-portable-v${portableVersion}"
-$tagType = [string](& $gitExecutable -C $repositoryRoot cat-file -t "refs/tags/$gitTag" 2>$null)
-if ($LASTEXITCODE -ne 0 -or $tagType.Trim() -ne 'tag') {
-    throw "Expected annotated Node portable release tag was not found: $gitTag"
-}
-$tagCommit = [string](& $gitExecutable -C $repositoryRoot rev-parse "$gitTag^{commit}" 2>$null)
-if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($tagCommit)) {
-    throw "Unable to resolve release tag commit: $gitTag"
-}
-$tagCommit = $tagCommit.Trim()
-if (-not $tagCommit.Equals($gitCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Release tag $gitTag resolves to $tagCommit but HEAD is $gitCommit."
+if (-not $AllowUnreleasedBuild) {
+    $gitTag = "node-agent-v${appVersion}-portable-v${portableVersion}"
+    $tagType = [string](& $gitExecutable -C $repositoryRoot cat-file -t "refs/tags/$gitTag" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $tagType.Trim() -ne 'tag') {
+        throw "Expected annotated Node portable release tag was not found: $gitTag"
+    }
+    $tagCommit = [string](& $gitExecutable -C $repositoryRoot rev-parse "$gitTag^{commit}" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($tagCommit)) {
+        throw "Unable to resolve release tag commit: $gitTag"
+    }
+    $tagCommit = $tagCommit.Trim()
+    if (-not $tagCommit.Equals($gitCommit, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Release tag $gitTag resolves to $tagCommit but HEAD is $gitCommit."
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($NodeExecutable)) {
@@ -151,7 +177,10 @@ if ([string]::IsNullOrWhiteSpace($NodeExecutable)) {
     $NodeExecutable = $nodeCommand.Source
 }
 $NodeExecutable = (Resolve-Path -LiteralPath $NodeExecutable).Path
-$npmExecutable = (Get-Command npm.cmd -ErrorAction Stop).Source
+$pnpmExecutable = (Get-Command pnpm.cmd -ErrorAction Stop).Source
+$cargoExecutable = (Get-Command cargo.exe -ErrorAction Stop).Source
+$protectManifest = Join-Path $repositoryRoot 'src-tauri\Cargo.toml'
+$protectHelper = Join-Path $repositoryRoot 'src-tauri\target\release\ctmcp-protect.exe'
 
 $nodeInfo = & $NodeExecutable -p "JSON.stringify({version:process.version,major:Number(process.versions.node.split('.')[0]),platform:process.platform,arch:process.arch})" | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) {
@@ -172,26 +201,26 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 
-$basePackageName = "Coding.Tools.Node.Agent_${appVersion}_portable-${portableVersion}"
+$basePackageName = "ctnode-${appVersion}-p${portableVersion}"
 $editionDefinitions = @()
 if ($Edition -eq 'all' -or $Edition -eq 'bundled-node') {
     $editionDefinitions += [pscustomobject]@{
         edition = 'bundled-node'
-        packageName = "${basePackageName}_bundled-node_win-x64"
-        expandedName = 'Coding.Tools.Node.Agent_portable_bundled-node_win-x64'
+        packageName = "${basePackageName}-win64"
+        expandedName = 'ctnode-win64'
         bundled = $true
     }
 }
 if ($Edition -eq 'all' -or $Edition -eq 'system-node') {
     $editionDefinitions += [pscustomobject]@{
         edition = 'system-node'
-        packageName = "${basePackageName}_system-node_win-x64"
-        expandedName = 'Coding.Tools.Node.Agent_portable_system-node_win-x64'
+        packageName = "${basePackageName}-sys-win64"
+        expandedName = 'ctnode-sys-win64'
         bundled = $false
     }
 }
 
-$stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) "coding-tools-node-agent-portable-$([guid]::NewGuid().ToString('N'))"
+$stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) "ctnode-$([guid]::NewGuid().ToString('N'))"
 $commonPackage = Join-Path $stagingRoot 'common'
 $appDirectory = Join-Path $commonPackage 'app'
 $nodeLicense = $null
@@ -207,40 +236,58 @@ if ($editionDefinitions.bundled -contains $true) {
     }
 }
 
+$previousBuildGitSha = $env:CTMCP_BUILD_GIT_SHA
+$previousBuildSourceClean = $env:CTMCP_BUILD_SOURCE_CLEAN
+$previousRequireAppContainerHelper = $env:CTMCP_REQUIRE_APPCONTAINER_HELPER
+
 Push-Location $packageRoot
 try {
+    $env:CTMCP_BUILD_GIT_SHA = $gitCommit
+    $env:CTMCP_BUILD_SOURCE_CLEAN = 'true'
+    $env:CTMCP_REQUIRE_APPCONTAINER_HELPER = '1'
     if ($SkipVerify) {
         Write-Host 'Building Node Agent (verification skipped by request)...'
-        & $npmExecutable run build
+        & $pnpmExecutable run build
     } else {
         Write-Host 'Verifying and building Node Agent...'
-        & $npmExecutable run verify
+        & $pnpmExecutable run verify
     }
     if ($LASTEXITCODE -ne 0) {
         throw "Node Agent build or verification failed with exit code $LASTEXITCODE."
     }
 
-    New-Item -ItemType Directory -Path $appDirectory -Force | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $commonPackage 'data') -Force | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $commonPackage 'logs') -Force | Out-Null
+    Write-Host 'Building Rust workspace protection helper for portable shared-store support...'
+    & $cargoExecutable build --release --manifest-path $protectManifest --bin ctmcp-protect
+    if ($LASTEXITCODE -ne 0) {
+        throw "Rust workspace protection helper build failed with exit code $LASTEXITCODE."
+    }
+    if (-not (Test-Path -LiteralPath $protectHelper -PathType Leaf)) {
+        throw "Rust workspace protection helper was not produced: $protectHelper"
+    }
 
-    Copy-Item -LiteralPath (Join-Path $packageRoot 'dist') -Destination (Join-Path $appDirectory 'dist') -Recurse
-    Copy-Item -LiteralPath $packageJsonPath -Destination (Join-Path $appDirectory 'package.json')
-    Copy-Item -LiteralPath $packageLockPath -Destination (Join-Path $appDirectory 'package-lock.json')
-    Copy-Item -LiteralPath (Join-Path $packageRoot 'README.md') -Destination (Join-Path $appDirectory 'README.md')
+    New-Item -ItemType Directory -Path $appDirectory -Force | Out-Null
+
+    Write-Host 'Deploying production-only Node Agent workspace package into portable staging...'
+    Push-Location $repositoryRoot
+    try {
+        & $pnpmExecutable --filter '@coding-tools/node-agent' deploy --prod $appDirectory
+        if ($LASTEXITCODE -ne 0) {
+            throw "Production dependency deployment failed with exit code $LASTEXITCODE."
+        }
+    } finally {
+        Pop-Location
+    }
+    foreach ($relative in @('README.md', 'pnpm-lock.yaml', 'package-lock.json', 'npm-shrinkwrap.json', 'scripts', 'test', 'tests')) {
+        $candidate = Join-Path $appDirectory $relative
+        if (Test-Path -LiteralPath $candidate) {
+            Remove-Item -LiteralPath $candidate -Recurse -Force
+        }
+    }
     Copy-Item -LiteralPath (Join-Path $repositoryRoot 'LICENSE') -Destination (Join-Path $commonPackage 'LICENSE.txt')
+    Copy-Item -LiteralPath $protectHelper -Destination (Join-Path $appDirectory 'dist\ctmcp-protect.exe') -Force
 
     Push-Location $appDirectory
     try {
-        Write-Host 'Installing production-only dependencies into portable staging...'
-        & $npmExecutable ci --omit=dev --ignore-scripts --no-audit --no-fund
-        if ($LASTEXITCODE -ne 0) {
-            throw "Production dependency installation failed with exit code $LASTEXITCODE."
-        }
-        & $npmExecutable ls --omit=dev --all
-        if ($LASTEXITCODE -ne 0) {
-            throw "Production dependency validation failed with exit code $LASTEXITCODE."
-        }
         & $NodeExecutable -e "for (const name of ['ws','pngjs','jpeg-js']) require.resolve(name); console.log('portable production dependencies resolved')"
         if ($LASTEXITCODE -ne 0) {
             throw 'Portable production dependency resolution failed.'
@@ -294,6 +341,21 @@ echo Runtime: %NODE_EXE%
 echo Data:    %CTMCP_DATA_DIR%
 echo MCP:     http://127.0.0.1:%CTMCP_PORT%/mcp
 echo UI:      http://127.0.0.1:%CTMCP_PORT%/ui
+powershell.exe -NoProfile -NonInteractive -Command "$port=$env:CTMCP_PORT; try{$r=Invoke-RestMethod -Uri ('http://127.0.0.1:'+$port+'/health') -Method Get -TimeoutSec 1; if($r.ok -eq $true -and [string]$r.server -eq 'coding-tools-mcp-node'){exit 0}}catch{}; exit 1" >nul 2>nul
+if not errorlevel 1 (
+  echo Node Agent is already running on port %CTMCP_PORT%.
+  echo Reusing the running instance.
+  if "%OPEN_BROWSER%"=="1" start "" "http://127.0.0.1:%CTMCP_PORT%/ui"
+  exit /b 0
+)
+
+powershell.exe -NoProfile -NonInteractive -Command "$port=[int]$env:CTMCP_PORT; try{$client=[System.Net.Sockets.TcpClient]::new(); $pending=$client.BeginConnect('127.0.0.1',$port,$null,$null); if($pending.AsyncWaitHandle.WaitOne(350)){try{$client.EndConnect($pending)}catch{}; $connected=$client.Connected; $client.Close(); if($connected){exit 0}}; $client.Close()}catch{}; exit 1" >nul 2>nul
+if not errorlevel 1 (
+  echo ERROR: Port %CTMCP_PORT% is already in use by another process.
+  echo Stop that process or set CTMCP_PORT to a free port, then try again.
+  goto :failed
+)
+
 echo Press Ctrl+C to stop.
 echo.
 
@@ -353,12 +415,12 @@ if errorlevel 1 goto :failed
             Copy-Item -LiteralPath $nodeLicense -Destination (Join-Path $runtimeDirectory 'NODE-LICENSE.txt')
             $runtimeSetup = $bundledRuntimeSetup
             $runtimeSummary = "Bundled Node.js: $($nodeInfo.version) win-x64"
-            $runtimeInstructions = 'This edition includes Node.js and does not require system Node.js or npm after extraction.'
+            $runtimeInstructions = 'This edition includes Node.js and does not require system Node.js or a package manager after extraction.'
             $runtimeVersion = [string]$nodeInfo.version
         } else {
             $runtimeSetup = $systemRuntimeSetup
             $runtimeSummary = "Runtime requirement: Node.js $minimumNodeMajor or later, win32 x64, available as node.exe on PATH"
-            $runtimeInstructions = 'This edition does not include Node.js. Install a supported Windows x64 Node.js runtime before launch; npm is not required after extraction.'
+            $runtimeInstructions = 'This edition does not include Node.js. Install a supported Windows x64 Node.js runtime before launch; a package manager is not required after extraction.'
             $runtimeVersion = $null
         }
 
@@ -425,6 +487,7 @@ The Node Agent version and Portable package version are independent. This releas
             }
         }
         Write-Utf8NoBom -Path (Join-Path $editionPackage 'portable-manifest.json') -Content ($manifest | ConvertTo-Json -Depth 5)
+        Assert-PortablePathBudget -PackagePath $editionPackage
         Write-PackageChecksums -PackagePath $editionPackage
         $artifacts += Publish-PortablePackage `
             -PackagePath $editionPackage `
@@ -447,6 +510,9 @@ The Node Agent version and Portable package version are independent. This releas
     }
 } finally {
     Pop-Location
+    if ($null -eq $previousBuildGitSha) { Remove-Item Env:CTMCP_BUILD_GIT_SHA -ErrorAction SilentlyContinue } else { $env:CTMCP_BUILD_GIT_SHA = $previousBuildGitSha }
+    if ($null -eq $previousBuildSourceClean) { Remove-Item Env:CTMCP_BUILD_SOURCE_CLEAN -ErrorAction SilentlyContinue } else { $env:CTMCP_BUILD_SOURCE_CLEAN = $previousBuildSourceClean }
+    if ($null -eq $previousRequireAppContainerHelper) { Remove-Item Env:CTMCP_REQUIRE_APPCONTAINER_HELPER -ErrorAction SilentlyContinue } else { $env:CTMCP_REQUIRE_APPCONTAINER_HELPER = $previousRequireAppContainerHelper }
     $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
     $resolvedStaging = [System.IO.Path]::GetFullPath($stagingRoot)
     if ($resolvedStaging.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $resolvedStaging)) {

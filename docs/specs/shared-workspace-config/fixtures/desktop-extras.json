@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 2,
+  "id": "ws-desktop",
+  "name": "desktop-extras",
+  "folders": [
+    {
+      "id": "folder-1",
+      "name": "repo",
+      "path": "E:\\work\\repo"
+    }
+  ],
+  "bind": { "host": "127.0.0.1", "port": 18790 },
+  "auth": { "type": "oauth", "oauthClientId": "chatgpt" },
+  "tunnel": {
+    "builtin": { "enabled": false, "publicUrl": "" }
+  },
+  "host": {
+    "desktop": {
+      "authType": "bearer",
+      "useSharedSecrets": true,
+      "transportMode": "legacy-json",
+      "tunnel": {
+        "type": "frp",
+        "frpServer": "frp.example",
+        "frpSubdomain": "dev",
+        "frpProfileId": "profile-1",
+        "frpServerPort": 7000
+      },
+      "actions": {
+        "localPort": 18791,
+        "authType": "oauth",
+        "oauthClientId": "actions-client"
+      }
+    }
+  }
+}

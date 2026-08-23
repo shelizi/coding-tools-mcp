@@ -23,6 +23,8 @@ const MAX_SESSION_SUMMARY_CHARS = 3_000;
 const MAX_ALL_HISTORY_SUMMARY_CHARS = 24_000;
 const MAX_LATEST_HANDOFF_CHARS = 24_000;
 const MAX_INHERITED_SUMMARY_CHARS = 16_000;
+const MAX_COMPACT_ALL_HISTORY_SUMMARY_CHARS = 8_000;
+const MAX_COMPACT_LATEST_HANDOFF_CHARS = 8_000;
 
 interface HistoryLocation {
   root: string;
@@ -324,16 +326,23 @@ export async function bootstrapHistory(ctx: ToolContext, key: string, args: Json
     }
     if (indexRebuilt && !created) await writeHistoryIndex(location.dir, index);
 
+    const responseMode = args.response_mode === 'full' ? 'full' : 'compact';
     const sessionSummaries = priorDocuments.map(document => ({
       number: document.number,
       path: document.path,
       summary: truncateChars(historySummary(document.content), MAX_SESSION_SUMMARY_CHARS)
     }));
+    const allHistorySummaryLimit = responseMode === 'full'
+      ? MAX_ALL_HISTORY_SUMMARY_CHARS : MAX_COMPACT_ALL_HISTORY_SUMMARY_CHARS;
     const allHistorySummary = truncateChars(sessionSummaries.map(summary =>
-      `会话 ${summary.number}（${summary.path}）：${summary.summary}`).join('\n'), MAX_ALL_HISTORY_SUMMARY_CHARS);
+      `会话 ${summary.number}（${summary.path}）：${summary.summary}`).join('\n'), allHistorySummaryLimit);
     const latest = priorDocuments.at(-1);
-    const latestHandoffTruncated = latest ? Array.from(latest.content).length > MAX_LATEST_HANDOFF_CHARS : false;
-    const latestHandoff = latest ? truncateChars(latest.content, MAX_LATEST_HANDOFF_CHARS) : null;
+    const latestHandoffLimit = responseMode === 'full'
+      ? MAX_LATEST_HANDOFF_CHARS : MAX_COMPACT_LATEST_HANDOFF_CHARS;
+    const latestHandoffTruncated = latest ? Array.from(latest.content).length > latestHandoffLimit : false;
+    const latestHandoff = latest ? truncateChars(latest.content, latestHandoffLimit) : null;
+    const inherited = inheritedSummary(currentContent) ?? null;
+    const compactSectionsOmitted = responseMode === 'compact' && (sessionSummaries.length > 0 || inherited !== null);
     const digest = historyDigest(priorDocuments);
 
     return {
@@ -357,12 +366,15 @@ export async function bootstrapHistory(ctx: ToolContext, key: string, args: Json
       created,
       resumed: !created,
       sequence_valid: sequenceValid,
+      response_mode: responseMode,
       all_history_summary: allHistorySummary,
-      inherited_summary: inheritedSummary(currentContent) ?? null,
-      session_summaries: sessionSummaries,
+      inherited_summary: responseMode === 'full' ? inherited : null,
+      session_summaries: responseMode === 'full' ? sessionSummaries : [],
+      lazy_sections: responseMode === 'compact' ? ['inherited_summary', 'session_summaries'] : [],
+      full_response_available: true,
       latest_handoff: latestHandoff,
       latest_handoff_truncated: latestHandoffTruncated,
-      payload_bounded: historyOmittedCount > 0 || latestHandoffTruncated,
+      payload_bounded: historyOmittedCount > 0 || latestHandoffTruncated || compactSectionsOmitted,
       history_read_mode: historyReadMode,
       history_lock_wait_ms: historyLock.waitMs,
       total_history_bytes: digest.bytes,
@@ -370,7 +382,9 @@ export async function bootstrapHistory(ctx: ToolContext, key: string, args: Json
       full_history_included: false,
       history_digest: digest.digest,
       persistence_mode: 'model_mediated_tool_calls',
-      assistant_instructions: 'Read all_history_summary, latest_handoff, and inherited_summary before continuing the project. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.',
+      assistant_instructions: responseMode === 'full'
+        ? 'Read all_history_summary, latest_handoff, and inherited_summary before continuing the project. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.'
+        : 'Use the compact all_history_summary and latest_handoff to restore context. Request history_session_bootstrap again with response_mode="full" only when deeper prior-session detail is materially needed. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.',
       required_next_actions: [
         'read_all_history_summary', 'read_latest_handoff', 'verify_workspace_state',
         'execute_user_task', 'checkpoint_after_each_completed_task'

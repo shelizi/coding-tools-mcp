@@ -1,13 +1,13 @@
 import { spawn } from "node:child_process";
 
 function commandFor(script) {
-  const npmCli = process.env.npm_execpath;
-  if (npmCli) {
-    return { command: process.execPath, args: [npmCli, "run", script] };
+  const packageManagerCli = process.env.npm_execpath;
+  if (packageManagerCli) {
+    return { command: process.execPath, args: [packageManagerCli, "run", script] };
   }
   return {
-    command: process.platform === "win32" ? "cmd.exe" : "npm",
-    args: process.platform === "win32" ? ["/d", "/s", "/c", `npm run ${script}`] : ["run", script],
+    command: process.platform === "win32" ? "cmd.exe" : "pnpm",
+    args: process.platform === "win32" ? ["/d", "/s", "/c", `pnpm run ${script}`] : ["run", script],
   };
 }
 

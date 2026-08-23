@@ -17,6 +17,86 @@ fn test_context() -> (tempfile::TempDir, tempfile::TempDir, ToolContext) {
 }
 
 #[test]
+fn bootstrap_defaults_to_compact_payload_and_allows_full_detail_on_demand() {
+    let (workspace, _harness, ctx) = test_context();
+    prepare_history(workspace.path());
+    let compact = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "compact-session"}),
+    );
+    let compact = assert_ok(&compact);
+    assert_eq!(compact["response_mode"], "compact");
+    assert_eq!(compact["session_summaries"], json!([]));
+    assert!(compact["inherited_summary"].is_null());
+    assert_eq!(compact["full_response_available"], true);
+    assert_eq!(
+        compact["lazy_sections"],
+        json!(["inherited_summary", "session_summaries"])
+    );
+
+    let full = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "compact-session", "response_mode": "full"}),
+    );
+    let full = assert_ok(&full);
+    assert_eq!(full["response_mode"], "full");
+    assert!(!full["session_summaries"].as_array().unwrap().is_empty());
+    assert!(full["inherited_summary"].as_str().is_some());
+}
+
+#[test]
+fn compact_bootstrap_uses_index_cache_and_loads_only_latest_full_handoff() {
+    let (workspace, _harness, ctx) = test_context();
+    let dir = workspace.path().join("docs/history-session");
+    fs::create_dir_all(&dir).expect("create history dir");
+    let large_notes = "Z".repeat(64_000);
+    for number in 1..=3 {
+        let mut content = history_file(number, &format!("lazy-{number}"), "cached");
+        content.push_str(&format!(
+            "\n### large-{number}\n\n```json\n{{\"notes\":\"{large_notes}\"}}\n```\n"
+        ));
+        fs::write(dir.join(format!("{number}.md")), content).expect("write large history");
+    }
+
+    assert_ok(&invoke(
+        &ctx,
+        "history_session_validate",
+        json!({"repair": true}),
+    ));
+    let boot = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({"session_key": "lazy-current"}),
+    );
+    let boot = assert_ok(&boot);
+    assert_eq!(
+        boot["history_read_mode"],
+        "indexed_summary_cache_plus_latest"
+    );
+    assert_eq!(boot["history_loaded_count"], 3);
+    let loaded = boot["loaded_history_bytes"].as_u64().expect("loaded bytes");
+    let total = boot["total_history_bytes"].as_u64().expect("total bytes");
+    assert!(loaded > 0);
+    assert!(loaded.saturating_mul(2) < total);
+
+    let index: Value = serde_json::from_str(
+        &fs::read_to_string(dir.join("index.json")).expect("read cached index"),
+    )
+    .expect("valid cached index");
+    for number in 1..=3 {
+        let entry = &index["sessions"][format!("lazy-{number}")];
+        assert!(!entry["summary"].as_str().unwrap_or_default().is_empty());
+        assert_eq!(
+            entry["content_sha256"].as_str().unwrap_or_default().len(),
+            64
+        );
+        assert!(entry["content_bytes"].as_u64().unwrap_or_default() > 64_000);
+    }
+}
+
+#[test]
 fn checkpoint_keeps_bootstrap_target_when_host_session_metadata_changes() {
     let (workspace, _harness, ctx) = test_context();
     let boot = invoke(
@@ -214,7 +294,11 @@ fn history_tools_are_exposed_with_public_schemas() {
     assert!(bootstrap["description"]
         .as_str()
         .unwrap_or("")
-        .contains("restore"));
+        .contains("compact summaries"));
+    assert_eq!(
+        bootstrap["inputSchema"]["properties"]["response_mode"]["default"],
+        "compact"
+    );
     let checkpoint_description = tools
         .iter()
         .find(|tool| tool["name"] == "history_session_checkpoint")
@@ -284,7 +368,7 @@ fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
     let first = invoke(
         &ctx,
         "history_session_bootstrap",
-        json!({"session_key": "current-chat", "title": "继续开发"}),
+        json!({"session_key": "current-chat", "title": "继续开发", "response_mode": "full"}),
     );
     let first = assert_ok(&first);
     assert_eq!(first["is_new_session"], true);

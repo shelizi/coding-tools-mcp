@@ -3,7 +3,7 @@ import { toolNamesForProfile, toolsetRevisionForProfile } from './catalog.js';
 import { allFolderRuntimes } from './folderRuntime.js';
 import { documentTitle, historySummary, metadata, parseCheckpointRecords, truncateChars } from './historyMarkdown.js';
 import { canonicalPath, DEFAULT_HISTORY_DIR, scanHistory } from './historyStorage.js';
-import { LATEST_MCP_PROTOCOL_VERSION } from './mcpTransport.js';
+import { LATEST_LEGACY_MCP_PROTOCOL_VERSION } from './mcpTransport.js';
 import { processStatus } from './processes.js';
 import { redactSensitiveText } from './redaction.js';
 import { harnessWorkspaceId } from './taskTools.js';
@@ -25,6 +25,12 @@ const TELEMETRY_RECORD_FIELDS = [
   'termination_reason', 'exit_code', 'verification_ok', 'process_timed_out',
   'request_timed_out', 'child_process_total_ms', 'first_output_ms', 'stdout_bytes',
   'stderr_bytes', 'command_kind', 'telemetry_dropped_before', 'heartbeat', 'deduplicated',
+  'returned_count', 'total_matches', 'total_matches_exact', 'calculate_total',
+  'matched_files', 'files_considered', 'scanned_files', 'scan_completed', 'early_stop_reason',
+  'transaction_stage', 'selected_path_count', 'staged_path_count_before', 'staged_path_count',
+  'index_clean_before', 'staged_by_tool', 'index_restored',
+  'error_transaction_stage', 'error_selected_path_count', 'error_staged_path_count_before',
+  'error_staged_path_count', 'error_index_clean_before', 'error_staged_by_tool', 'error_index_restored',
   'detached', 'concurrent_request'
 ] as const;
 
@@ -103,6 +109,7 @@ function telemetryView(queried: JsonObject): JsonObject {
     aggregate: queried.aggregate ?? null,
     optimization: queried.optimization ?? null,
     formatting: queried.formatting ?? null,
+    search: queried.search ?? null,
     parallelism: safeParallelism(queried.parallelism),
     performance: safePerformance(queried.performance),
     warnings: Array.isArray(queried.warnings) ? queried.warnings.map(String) : []
@@ -575,14 +582,14 @@ async function mcpAuthenticationProbe(baseUrl: string): Promise<HealthItem> {
         accept: 'application/json, text/event-stream',
         'content-type': 'application/json',
         origin: endpoint.origin,
-        'mcp-protocol-version': LATEST_MCP_PROTOCOL_VERSION
+        'mcp-protocol-version': LATEST_LEGACY_MCP_PROTOCOL_VERSION
       },
       body: JSON.stringify({
         jsonrpc: '2.0',
         id: 'management-health',
         method: 'initialize',
         params: {
-          protocolVersion: LATEST_MCP_PROTOCOL_VERSION,
+          protocolVersion: LATEST_LEGACY_MCP_PROTOCOL_VERSION,
           capabilities: {},
           clientInfo: { name: 'coding-tools-management-health', version: AGENT_VERSION }
         }

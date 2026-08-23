@@ -1,28 +1,23 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import type {
+  ConversationIdentity,
+  ConversationStoreContract,
+  MutableStringMap
+} from './conversation/contract.js';
 import type { JsonObject, WorkspaceFolder } from './types.js';
+
+export type {
+  ConversationIdentity,
+  ConversationStoreContract,
+  MutableStringMap
+} from './conversation/contract.js';
 
 export const MAX_CONVERSATION_CONTEXTS = 128;
 export const MAX_PERSISTED_CONVERSATION_CONTEXTS = MAX_CONVERSATION_CONTEXTS * 4;
 export const FALLBACK_CONVERSATION_KEY = '__ctmcp_stable_unscoped__';
 export const MCP_CONVERSATION_REQUIRED_META = 'coding-tools/require-conversation';
-
-export interface ConversationIdentity {
-  key: string;
-  isolated: boolean;
-  requiresConversation: boolean;
-  source: 'platform_conversation_id' | 'stable_fallback' | 'missing_mcp_conversation';
-}
-
-export interface MutableStringMap {
-  get(key: string): string | undefined;
-  set(key: string, value: string): this;
-  has(key: string): boolean;
-  delete(key: string): boolean;
-  clear(): void;
-  readonly size: number;
-}
 
 export class ConversationRoutingError extends Error {
   readonly category = 'workspace_routing';
@@ -127,7 +122,7 @@ function validPersistedCwd(value: unknown): value is string {
   return !value.split(/[\\/]+/).some(part => part === '..');
 }
 
-export class ConversationStore {
+export class ConversationStore implements ConversationStoreContract {
   private readonly selections = new Map<string, string>();
   private readonly activeContexts = new Map<string, ActiveConversationContext>();
   private readonly savedCwds = new Map<string, SavedConversationCwd>();

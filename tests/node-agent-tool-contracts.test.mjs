@@ -22,13 +22,13 @@ test('every Rust catalog tool has an explicit Node regression reference', async 
   const testSource = (await Promise.all(testFiles.map(name => readFile(path.join(directory, name), 'utf8')))).join('\n');
   const missing = toolNames.filter(name => !new RegExp(`\\b${escapePattern(name)}\\b`).test(testSource));
 
-  assert.equal(toolNames.length, 50);
+  assert.equal(toolNames.length, 58);
   assert.deepEqual(missing, []);
 });
 
 test('bounded harness, persisted change selection, and exec-health contracts stay synchronized across Rust and Node', async () => {
-  const [nodeTools, nodeHarness, rustHarness, rustState, nodeHealthTests, nodeHarnessTests, rustHarnessTests] = await Promise.all([
-    read('packages/node-agent/src/tools.ts'),
+  const [nodeProcessDispatcher, nodeHarness, rustHarness, rustState, nodeHealthTests, nodeHarnessTests, rustHarnessTests] = await Promise.all([
+    read('packages/node-agent/src/toolDispatchers/process.ts'),
     read('packages/node-agent/src/taskTools.ts'),
     read('src-tauri/src/harness/tools.rs'),
     read('src-tauri/src/harness/state.rs'),
@@ -38,7 +38,7 @@ test('bounded harness, persisted change selection, and exec-health contracts sta
   ]);
 
   for (const marker of ['session_create', 'command_run', 'stdout_capture', 'stderr_capture', 'exec-health-stderr']) {
-    assert.match(nodeTools, new RegExp(marker));
+    assert.match(nodeProcessDispatcher, new RegExp(marker));
   }
   assert.match(nodeHealthTests, /exec_health_check matches the Rust worker, session, and stream-capture contract/);
 
@@ -91,14 +91,16 @@ test('Rust and Node telemetry share the recoverable outcome taxonomy', async () 
 
 
 test('Rust and Node edits share replay-plan and phase-latency contracts', async () => {
-  const [rustPatch, rustUsage, nodeFiles, rustTelemetry, nodeTelemetry, nodeObservability] = await Promise.all([
-    read('src-tauri/src/tools/patch.rs'),
+  const [rustPatchSupport, rustPatchEdit, rustUsage, nodeFiles, rustTelemetry, nodeTelemetry, nodeObservability] = await Promise.all([
+    read('src-tauri/src/tools/patch/support.rs'),
+    read('src-tauri/src/tools/patch/edit_ops.rs'),
     read('src-tauri/src/tools/tool_usage.rs'),
     read('packages/node-agent/src/fileTools.ts'),
     read('src-tauri/src/mcp/telemetry.rs'),
     read('packages/node-agent/src/toolUsage.ts'),
     read('packages/node-agent/src/managementObservability.ts')
   ]);
+  const rustPatch = `${rustPatchSupport}\n${rustPatchEdit}`;
   for (const marker of [
     'schema_version',
     'plan_sha256',
@@ -113,7 +115,6 @@ test('Rust and Node edits share replay-plan and phase-latency contracts', async 
     assert.match(rustPatch, new RegExp(marker));
     assert.match(nodeFiles, new RegExp(marker));
   }
-  assert.match(nodeTelemetry, /const source = `\$\{phase\}_ms`/);
   assert.match(nodeTelemetry, /record\[`phase_\$\{source\}`\]/);
   for (const field of ['phase_preflight_ms', 'phase_plan_ms', 'phase_commit_ms', 'phase_total_ms']) {
     assert.match(rustTelemetry, new RegExp(field));

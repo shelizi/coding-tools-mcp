@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -11,6 +12,76 @@ use super::AppData;
 const SECRET_PREFIX: &str = "dpapi:v1:";
 #[cfg(unix)]
 const SECRET_PREFIX: &str = "aesgcm:v1:";
+
+pub const WRAPPED_KIND: &str = "ctmcp-wrap";
+
+pub fn wrap_json_value(
+    value: &serde_json::Value,
+    data_path: &Path,
+) -> AppResult<serde_json::Value> {
+    let text = serde_json::to_string(value)?;
+    let payload = protect_value(&text, data_path)?;
+    Ok(serde_json::json!({
+        "kind": WRAPPED_KIND,
+        "v": 1,
+        "payload": payload
+    }))
+}
+
+pub fn unwrap_json_value(
+    value: &serde_json::Value,
+    data_path: &Path,
+) -> AppResult<serde_json::Value> {
+    if value.get("kind").and_then(serde_json::Value::as_str) != Some(WRAPPED_KIND) {
+        return Ok(value.clone());
+    }
+    let payload = value
+        .get("payload")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::Message("wrapped document is missing payload".into()))?;
+    let text = unprotect_value(payload, data_path)?;
+    serde_json::from_str(&text).map_err(AppError::from)
+}
+
+pub fn write_wrapped_json(path: &Path, value: &serde_json::Value) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let wrapped = wrap_json_value(value, path)?;
+    std::fs::write(path, serde_json::to_vec_pretty(&wrapped)?)?;
+    Ok(())
+}
+
+pub fn read_maybe_wrapped_json(path: &Path) -> AppResult<serde_json::Value> {
+    let raw = std::fs::read_to_string(path)?;
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    unwrap_json_value(&value, path)
+}
+
+pub fn run_protect_cli() -> AppResult<()> {
+    let mut args = std::env::args().skip(1);
+    let command = args
+        .next()
+        .ok_or_else(|| AppError::Message("usage: ctmcp-protect wrap|unwrap <path>".into()))?;
+    let path = std::path::PathBuf::from(
+        args.next()
+            .ok_or_else(|| AppError::Message("usage: ctmcp-protect wrap|unwrap <path>".into()))?,
+    );
+    let mut stdin = String::new();
+    std::io::stdin().read_to_string(&mut stdin)?;
+    let value: serde_json::Value = serde_json::from_str(&stdin)?;
+    let output = match command.as_str() {
+        "wrap" => wrap_json_value(&value, &path)?,
+        "unwrap" => unwrap_json_value(&value, &path)?,
+        _ => {
+            return Err(AppError::Message(
+                "usage: ctmcp-protect wrap|unwrap <path>".into(),
+            ))
+        }
+    };
+    println!("{}", serde_json::to_string(&output)?);
+    Ok(())
+}
 
 pub fn protect_secrets(data: &AppData, data_path: &Path) -> AppResult<AppData> {
     let mut protected = data.clone();
@@ -127,9 +198,8 @@ fn unprotect_value(value: &str, _data_path: &Path) -> AppResult<String> {
             ))
         })?;
         let decrypted = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
-        let text = String::from_utf8(decrypted.to_vec()).map_err(|error| {
-            AppError::Message(format!("decrypted secret is not UTF-8: {error}"))
-        });
+        let text = String::from_utf8(decrypted.to_vec())
+            .map_err(|error| AppError::Message(format!("decrypted secret is not UTF-8: {error}")));
         let _ = LocalFree(Some(HLOCAL(output.pbData.cast())));
         text
     }
@@ -270,5 +340,21 @@ mod tests {
 
         assert!(unprotect_secrets(&mut data, &path).expect("read legacy"));
         assert_eq!(data.shared_secrets["bearer_token"], "legacy-secret");
+    }
+
+    #[test]
+    fn wrapped_json_round_trip_hides_plaintext() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("workspace.json");
+        let value = serde_json::json!({
+            "schemaVersion": 2,
+            "oauthPassword": "must-not-remain-plain"
+        });
+        write_wrapped_json(&path, &value).expect("wrap");
+        let disk = std::fs::read_to_string(&path).expect("disk");
+        assert!(disk.contains(WRAPPED_KIND));
+        assert!(!disk.contains("must-not-remain-plain"));
+        let restored = read_maybe_wrapped_json(&path).expect("unwrap");
+        assert_eq!(restored["oauthPassword"], "must-not-remain-plain");
     }
 }

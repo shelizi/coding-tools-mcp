@@ -4,7 +4,7 @@ use std::path::{Component, Path};
 use serde_json::Value;
 
 use crate::tools::workspace::Workspace;
-use crate::workspace::ActionsConfig;
+use crate::workspace::{ActionsConfig, SecurityPolicy};
 
 use super::registry::{is_allowed_tool, is_mcp_only_tool};
 use super::ABSOLUTE_COMMAND_TIMEOUT_MAX_MS;
@@ -62,6 +62,9 @@ pub struct PolicySettings {
     pub workspace_script_extensions: HashSet<String>,
     pub max_patch_bytes: usize,
     pub permission_mode: String,
+    pub security_policy: SecurityPolicy,
+    pub explicit_security_policy: bool,
+    pub sandbox_enabled: bool,
 }
 
 fn validate_edit_file(arguments: &Value, policy: &PolicySettings) -> Result<(), PolicyError> {
@@ -87,7 +90,7 @@ fn validate_edit_file(arguments: &Value, policy: &PolicySettings) -> Result<(), 
     let size = serde_json::to_vec(arguments)
         .map_err(|_| PolicyError("edit_file arguments could not be serialized".into()))?
         .len();
-    if size > policy.max_patch_bytes {
+    if policy.security_policy.enforce_resource_limits && size > policy.max_patch_bytes {
         return Err(PolicyError("Edit payload is too large".into()));
     }
     Ok(())
@@ -98,7 +101,7 @@ fn validate_edit(arguments: &Value, policy: &PolicySettings) -> Result<(), Polic
         .get("files")
         .and_then(Value::as_array)
         .ok_or_else(|| PolicyError("edit requires files".into()))?;
-    if files.is_empty() || files.len() > 100 {
+    if files.is_empty() || (policy.security_policy.enforce_resource_limits && files.len() > 100) {
         return Err(PolicyError("edit requires between 1 and 100 files".into()));
     }
     for (index, file) in files.iter().enumerate() {
@@ -114,10 +117,11 @@ fn validate_edit(arguments: &Value, policy: &PolicySettings) -> Result<(), Polic
                 "edit files[{index}].path must not be empty"
             )));
         }
-        if object
-            .get("edits")
-            .and_then(Value::as_array)
-            .is_some_and(|edits| edits.len() > 100)
+        if policy.security_policy.enforce_resource_limits
+            && object
+                .get("edits")
+                .and_then(Value::as_array)
+                .is_some_and(|edits| edits.len() > 100)
         {
             return Err(PolicyError(format!(
                 "edit files[{index}].edits supports at most 100 operations"
@@ -135,7 +139,9 @@ fn validate_bounded_mutation(
     let size = serde_json::to_vec(arguments)
         .map_err(|_| PolicyError(format!("{tool_name} arguments could not be serialized")))?
         .len();
-    if size > policy.max_patch_bytes.saturating_mul(4) {
+    if policy.security_policy.enforce_resource_limits
+        && size > policy.max_patch_bytes.saturating_mul(4)
+    {
         return Err(PolicyError(format!("{tool_name} payload is too large")));
     }
     Ok(())
@@ -171,7 +177,7 @@ fn validate_format_files(arguments: &Value, policy: &PolicySettings) -> Result<(
             let path = path
                 .as_str()
                 .ok_or_else(|| PolicyError("format_files paths entries must be strings".into()))?;
-            validate_format_path(path)?;
+            validate_format_path(path, policy.security_policy.enforce_workspace_boundary)?;
         }
     }
     if let Some(expected) = arguments.get("expected_sha256") {
@@ -179,7 +185,7 @@ fn validate_format_files(arguments: &Value, policy: &PolicySettings) -> Result<(
             .as_object()
             .ok_or_else(|| PolicyError("format_files expected_sha256 must be an object".into()))?;
         for path in expected.keys() {
-            validate_format_path(path)?;
+            validate_format_path(path, policy.security_policy.enforce_workspace_boundary)?;
         }
     }
     for key in ["include_patterns", "exclude_patterns"] {
@@ -191,10 +197,11 @@ fn validate_format_files(arguments: &Value, policy: &PolicySettings) -> Result<(
                 let pattern = pattern.as_str().ok_or_else(|| {
                     PolicyError(format!("format_files {key} entries must be strings"))
                 })?;
-                if Path::new(pattern).is_absolute()
-                    || Path::new(pattern)
-                        .components()
-                        .any(|component| component == Component::ParentDir)
+                if policy.security_policy.enforce_workspace_boundary
+                    && (Path::new(pattern).is_absolute()
+                        || Path::new(pattern)
+                            .components()
+                            .any(|component| component == Component::ParentDir))
                 {
                     return Err(PolicyError(format!(
                         "format_files {key} must stay inside the configured workspace"
@@ -212,13 +219,22 @@ fn validate_format_files(arguments: &Value, policy: &PolicySettings) -> Result<(
         .get("max_files")
         .and_then(Value::as_u64)
         .unwrap_or(500);
-    if mode == "apply" && scope == "project" && !confirm {
+    if policy.security_policy.require_write_confirmation
+        && mode == "apply"
+        && scope == "project"
+        && !confirm
+    {
         return Err(PolicyError(
             "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION: project-wide formatting requires confirm=true"
                 .into(),
         ));
     }
-    if mode == "apply" && max_files > 2_000 && !confirm {
+    if policy.security_policy.require_write_confirmation
+        && policy.security_policy.enforce_resource_limits
+        && mode == "apply"
+        && max_files > 2_000
+        && !confirm
+    {
         return Err(PolicyError(
             "DANGEROUS_OPERATION_REQUIRES_CONFIRMATION: formatting more than 2000 files requires confirm=true"
                 .into(),
@@ -227,15 +243,16 @@ fn validate_format_files(arguments: &Value, policy: &PolicySettings) -> Result<(
     Ok(())
 }
 
-fn validate_format_path(path: &str) -> Result<(), PolicyError> {
+fn validate_format_path(path: &str, enforce_workspace_boundary: bool) -> Result<(), PolicyError> {
     if path.trim().is_empty() {
         return Err(PolicyError("format_files paths must not be empty".into()));
     }
     let path = Path::new(path);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| component == Component::ParentDir)
+    if enforce_workspace_boundary
+        && (path.is_absolute()
+            || path
+                .components()
+                .any(|component| component == Component::ParentDir))
     {
         return Err(PolicyError(
             "format_files paths must stay inside the configured workspace".into(),
@@ -252,12 +269,19 @@ impl Default for PolicySettings {
             workspace_script_extensions: default_workspace_script_extension_set(),
             max_patch_bytes: 200_000,
             permission_mode: "trusted".into(),
+            security_policy: SecurityPolicy::default(),
+            explicit_security_policy: false,
+            sandbox_enabled: false,
         }
     }
 }
 
 impl PolicySettings {
     pub fn from_runtime(runtime: &crate::workspace::RuntimeConfig) -> Self {
+        let explicit = runtime.security_policy.is_some();
+        let security_policy = runtime.security_policy.clone().unwrap_or_else(|| {
+            SecurityPolicy::legacy(&runtime.permission_mode, &runtime.tool_profile)
+        });
         Self {
             allowed_commands: merge_default_allowed_commands(&runtime.allowed_commands),
             workspace_local_entries: runtime.workspace_local_entries,
@@ -265,26 +289,35 @@ impl PolicySettings {
                 &runtime.workspace_script_extensions,
             ),
             max_patch_bytes: 200_000,
-            permission_mode: runtime.permission_mode.clone(),
+            permission_mode: security_policy.compatibility_permission_mode().into(),
+            security_policy,
+            explicit_security_policy: explicit,
+            sandbox_enabled: runtime.sandbox.enabled,
         }
     }
 
     pub fn from_actions_config(actions: &ActionsConfig) -> Self {
+        let security_policy = SecurityPolicy::legacy(&actions.permission_mode, "core");
         Self {
             allowed_commands: merge_default_allowed_commands(&actions.allowed_commands),
             workspace_local_entries: true,
             workspace_script_extensions: default_workspace_script_extension_set(),
             max_patch_bytes: actions.max_patch_bytes as usize,
-            permission_mode: actions.permission_mode.clone(),
+            permission_mode: security_policy.compatibility_permission_mode().into(),
+            security_policy,
+            explicit_security_policy: false,
+            sandbox_enabled: false,
         }
     }
 
     pub fn network_allowed(&self) -> bool {
-        self.permission_mode == "trusted" || self.permission_mode == "dangerous"
+        !self.security_policy.block_network_commands
     }
 
     pub fn skip_permission_gates(&self) -> bool {
-        self.permission_mode == "dangerous"
+        !self.security_policy.require_dangerous_confirmation
+            && !self.security_policy.require_shell_confirmation
+            && !self.security_policy.require_write_confirmation
     }
 }
 
@@ -428,7 +461,8 @@ pub fn validate_command_for_workspace(
             "script mode requires shell=powershell, cmd, or sh".into(),
         ));
     }
-    if shell != "none"
+    if policy.security_policy.require_shell_confirmation
+        && shell != "none"
         && !arguments
             .get("confirm")
             .and_then(Value::as_bool)
@@ -461,14 +495,14 @@ pub fn validate_command_for_workspace(
             "exec_command requires a non-empty command".into(),
         ));
     }
-    if command.len() > 64_000 {
+    if policy.security_policy.enforce_resource_limits && command.len() > 64_000 {
         return Err(PolicyError("Command is too long".into()));
     }
     let filesystem_scope = arguments
         .get("filesystem_scope")
         .and_then(Value::as_str)
         .unwrap_or("workspace");
-    if filesystem_scope != "workspace" {
+    if policy.security_policy.enforce_workspace_boundary && filesystem_scope != "workspace" {
         return Err(PolicyError(
             "EXTERNAL_EXECUTION_NOT_ALLOWED: exec_command 只允许在 Workspace 内执行".into(),
         ));
@@ -476,7 +510,10 @@ pub fn validate_command_for_workspace(
     for key in ["workdir", "cwd"] {
         if let Some(workdir) = arguments.get(key).and_then(Value::as_str) {
             let path = Path::new(workdir);
-            if path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+            if policy.security_policy.enforce_workspace_boundary
+                && (path.is_absolute()
+                    || path.components().any(|part| part == Component::ParentDir))
+            {
                 return Err(PolicyError(
                     "workdir must stay inside the configured workspace".into(),
                 ));
@@ -488,22 +525,27 @@ pub fn validate_command_for_workspace(
             "Shell chaining, redirection and expansion require an explicit shell mode".into(),
         ));
     }
-    if (dangerous_command_pattern().is_match(&command)
-        || interpreter_mutation_pattern().is_match(&command))
+    if policy.security_policy.protect_repository_metadata
+        && (dangerous_command_pattern().is_match(&command)
+            || interpreter_mutation_pattern().is_match(&command))
         && command_targets_protected_repository_asset(&command)
     {
         return Err(PolicyError(
             "PROTECTED_REPOSITORY_ASSET: 禁止删除或递归清空 .git/.github".into(),
         ));
     }
-    if interpreter_mutation_pattern().is_match(&command) && command_contains_external_path(&command)
+    if policy.security_policy.enforce_workspace_boundary
+        && !policy.sandbox_enabled
+        && interpreter_mutation_pattern().is_match(&command)
+        && command_contains_external_path(&command)
     {
         return Err(PolicyError(
             "WORKSPACE_PATH_PROTECTED: workspace scope 禁止通过子进程写入 Workspace 外部路径"
                 .into(),
         ));
     }
-    if dangerous_command_pattern().is_match(&command)
+    if policy.security_policy.require_dangerous_confirmation
+        && dangerous_command_pattern().is_match(&command)
         && !arguments
             .get("confirm")
             .and_then(Value::as_bool)
@@ -514,9 +556,7 @@ pub fn validate_command_for_workspace(
                 .into(),
         ));
     }
-    if !policy.skip_permission_gates()
-        && network_command_pattern().is_match(&command)
-        && !policy.network_allowed()
+    if policy.security_policy.block_network_commands && network_command_pattern().is_match(&command)
     {
         return Err(PolicyError(
             "Network-looking commands are blocked in safe permission mode".into(),
@@ -554,23 +594,30 @@ pub fn validate_command_for_workspace(
             .workspace_script_extensions
             .iter()
             .any(|extension| base_name.to_ascii_lowercase().ends_with(extension));
-    if !(policy.allowed_commands.contains(stem)
-        || (policy.workspace_local_entries && workspace_entry_candidate))
+    if policy.security_policy.enforce_command_allowlist
+        && !(policy.allowed_commands.contains(stem)
+            || (policy.workspace_local_entries && workspace_entry_candidate))
     {
         return Err(PolicyError(format!("Command is not allowlisted: {stem}")));
     }
 
-    validate_environment_arguments(arguments)?;
-    if let Some(timeout_ms) = arguments.get("timeout_ms").and_then(Value::as_u64) {
-        if timeout_ms > ABSOLUTE_COMMAND_TIMEOUT_MAX_MS {
-            return Err(PolicyError("Command timeout exceeds 60 minutes".into()));
+    validate_environment_arguments(
+        arguments,
+        policy.security_policy.protect_environment_variables,
+        policy.security_policy.enforce_resource_limits,
+    )?;
+    if policy.security_policy.enforce_resource_limits {
+        if let Some(timeout_ms) = arguments.get("timeout_ms").and_then(Value::as_u64) {
+            if timeout_ms > ABSOLUTE_COMMAND_TIMEOUT_MAX_MS {
+                return Err(PolicyError("Command timeout exceeds 60 minutes".into()));
+            }
         }
     }
     if let Some(post_checks) = arguments.get("post_checks") {
         let post_checks = post_checks
             .as_array()
             .ok_or_else(|| PolicyError("post_checks must be an array".into()))?;
-        if post_checks.len() > 16 {
+        if policy.security_policy.enforce_resource_limits && post_checks.len() > 16 {
             return Err(PolicyError("post_checks supports at most 16 checks".into()));
         }
         for (index, check) in post_checks.iter().enumerate() {
@@ -589,7 +636,11 @@ pub fn validate_command_for_workspace(
     Ok(())
 }
 
-fn validate_environment_arguments(arguments: &Value) -> Result<(), PolicyError> {
+fn validate_environment_arguments(
+    arguments: &Value,
+    protect_environment_variables: bool,
+    enforce_resource_limits: bool,
+) -> Result<(), PolicyError> {
     let blocked = [
         "PATH",
         "PATHEXT",
@@ -603,12 +654,14 @@ fn validate_environment_arguments(arguments: &Value) -> Result<(), PolicyError> 
         let env = env
             .as_object()
             .ok_or_else(|| PolicyError("env must be an object of string values".into()))?;
-        if env.len() > 64 {
+        if enforce_resource_limits && env.len() > 64 {
             return Err(PolicyError("env contains too many entries".into()));
         }
         for (key, value) in env {
             validate_environment_key(key)?;
-            if blocked.iter().any(|item| item.eq_ignore_ascii_case(key)) {
+            if protect_environment_variables
+                && blocked.iter().any(|item| item.eq_ignore_ascii_case(key))
+            {
                 return Err(PolicyError(format!(
                     "Environment variable is protected: {key}"
                 )));
@@ -616,7 +669,7 @@ fn validate_environment_arguments(arguments: &Value) -> Result<(), PolicyError> 
             let value = value
                 .as_str()
                 .ok_or_else(|| PolicyError("env values must be strings".into()))?;
-            if value.len() > 4096 || value.contains('\0') {
+            if (enforce_resource_limits && value.len() > 4096) || value.contains('\0') {
                 return Err(PolicyError(format!("Invalid environment value for {key}")));
             }
         }
@@ -625,7 +678,7 @@ fn validate_environment_arguments(arguments: &Value) -> Result<(), PolicyError> 
         let remove_env = remove_env
             .as_array()
             .ok_or_else(|| PolicyError("remove_env must be an array".into()))?;
-        if remove_env.len() > 64 {
+        if enforce_resource_limits && remove_env.len() > 64 {
             return Err(PolicyError("remove_env contains too many entries".into()));
         }
         for key in remove_env {
@@ -968,6 +1021,31 @@ mod tests {
     }
 
     #[test]
+    fn enabled_sandbox_owns_external_mutation_enforcement() {
+        let command = json!({
+            "cmd": "node -e \"const fs=require('fs'); fs.writeFileSync('C:/outside.txt','x')\""
+        });
+        let disabled = PolicySettings::default();
+        let denied = validate_command(&command, &disabled)
+            .expect_err("policy-only mode must stay workspace-bound");
+        assert!(denied.0.contains("WORKSPACE_PATH_PROTECTED"));
+
+        let enabled = PolicySettings {
+            sandbox_enabled: true,
+            ..PolicySettings::default()
+        };
+        validate_command(&command, &enabled)
+            .expect("fail-closed sandbox backend should enforce external path grants");
+
+        let protected = json!({
+            "cmd": "node -e \"const fs=require('fs'); fs.writeFileSync('C:/repo/.git/config','x')\""
+        });
+        let denied = validate_command(&protected, &enabled)
+            .expect_err("repository metadata protection must remain policy-enforced");
+        assert!(denied.0.contains("PROTECTED_REPOSITORY_ASSET"));
+    }
+
+    #[test]
     fn quoted_python_code_is_not_treated_as_shell_chaining() {
         let policy = PolicySettings::default();
         assert!(validate_command(
@@ -981,5 +1059,30 @@ mod tests {
         )
         .is_err());
         assert!(validate_command(&json!({"cmd": "echo hello > output.txt"}), &policy).is_err());
+    }
+
+    #[test]
+    fn security_policy_gates_are_independently_configurable() {
+        let mut policy = PolicySettings::default();
+        policy.security_policy.require_shell_confirmation = false;
+        assert!(validate_command(
+            &json!({"script": "Write-Output ok", "shell": "powershell"}),
+            &policy
+        )
+        .is_ok());
+
+        policy.security_policy.require_shell_confirmation = true;
+        assert!(validate_command(
+            &json!({"script": "Write-Output ok", "shell": "powershell"}),
+            &policy
+        )
+        .is_err());
+
+        policy.security_policy.require_dangerous_confirmation = false;
+        policy.security_policy.enforce_command_allowlist = false;
+        assert!(validate_command(&json!({"cmd": "rm -rf build"}), &policy).is_ok());
+
+        policy.security_policy.block_network_commands = true;
+        assert!(validate_command(&json!({"cmd": "curl https://example.com"}), &policy).is_err());
     }
 }

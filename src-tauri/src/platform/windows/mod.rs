@@ -2,7 +2,7 @@ mod net;
 mod paths;
 mod process;
 
-pub(crate) use process::{attach_process_tree, ProcessTreeGuard};
+pub(crate) use process::{attach_process_tree, attach_process_tree_handle, ProcessTreeGuard};
 
 use std::path::{Path, PathBuf};
 
@@ -29,11 +29,6 @@ impl Platform for WindowsPlatform {
     fn find_pid_listening_on_port(&self, port: u16) -> AppResult<Option<u32>> {
         net::find_pid_listening_on_port(port)
     }
-
-    fn reclaim_listening_port(&self, port: u16) -> AppResult<bool> {
-        net::reclaim_listening_port(port)
-    }
-
     fn process_image_path(&self, pid: u32) -> AppResult<Option<String>> {
         process::process_image_path(pid)
     }

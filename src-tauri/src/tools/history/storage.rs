@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,6 +19,15 @@ const HISTORY_LOCK_OWNER_FILE: &str = "owner.json";
 const HISTORY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const HISTORY_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 const HISTORY_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
+const MAX_INDEX_SUMMARY_CHARS: usize = 3_000;
+const MAX_SUMMARY_PREFIX_BYTES: u64 = 256 * 1024;
+
+pub struct HistorySummaryRead {
+    pub summary: String,
+    pub session_key: Option<String>,
+    pub bytes_read: u64,
+    pub content_bytes: u64,
+}
 
 pub struct HistoryLock {
     path: PathBuf,
@@ -180,11 +189,11 @@ fn lock_directory_is_stale(path: &Path) -> bool {
         .is_ok_and(|elapsed| elapsed >= HISTORY_LOCK_STALE_AFTER)
 }
 
-pub fn read_document(
+fn indexed_document_path(
     workspace: &Workspace,
     history_dir: &Path,
     entry: &IndexEntry,
-) -> WorkspaceResult<HistoryDocument> {
+) -> WorkspaceResult<PathBuf> {
     ensure_safe_candidate(workspace, history_dir)?;
     let path = history_dir.join(format!("{}.md", entry.number));
     ensure_safe_candidate(workspace, &path)?;
@@ -202,6 +211,15 @@ pub fn read_document(
             }),
         });
     }
+    Ok(path)
+}
+
+pub fn read_document(
+    workspace: &Workspace,
+    history_dir: &Path,
+    entry: &IndexEntry,
+) -> WorkspaceResult<HistoryDocument> {
+    let path = indexed_document_path(workspace, history_dir, entry)?;
     let bytes = fs::read(&path).map_err(|error| io_error("HISTORY_READ_FAILED", error, true))?;
     let content = String::from_utf8(bytes).map_err(|error| WorkspaceError::ToolDetails {
         code: "HISTORY_INVALID_UTF8",
@@ -218,6 +236,70 @@ pub fn read_document(
         updated_at: markdown::metadata(&content, "Updated"),
         content,
     })
+}
+
+pub fn read_summary(
+    workspace: &Workspace,
+    history_dir: &Path,
+    entry: &IndexEntry,
+) -> WorkspaceResult<HistorySummaryRead> {
+    let path = indexed_document_path(workspace, history_dir, entry)?;
+    let content_bytes = fs::metadata(&path)
+        .map_err(|error| io_error("HISTORY_READ_FAILED", error, true))?
+        .len();
+    let file = File::open(&path).map_err(|error| io_error("HISTORY_READ_FAILED", error, true))?;
+    let mut reader = io::BufReader::new(file);
+    let mut prefix = String::new();
+    let mut bytes_read = 0_u64;
+    loop {
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| io_error("HISTORY_READ_FAILED", error, true))?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(read as u64);
+        if line.trim() == "## 本轮检查点" {
+            break;
+        }
+        prefix.push_str(&line);
+        if bytes_read >= MAX_SUMMARY_PREFIX_BYTES {
+            break;
+        }
+    }
+    Ok(HistorySummaryRead {
+        summary: bounded_summary(&prefix),
+        session_key: markdown::metadata(&prefix, "Session key"),
+        bytes_read,
+        content_bytes,
+    })
+}
+
+pub fn update_index_entry_cache(entry: &mut IndexEntry, content: &str) -> bool {
+    let summary = bounded_summary(content);
+    let content_sha256 = sha256(content.as_bytes());
+    let content_bytes = content.len() as u64;
+    let changed = entry.summary != summary
+        || entry.content_sha256 != content_sha256
+        || entry.content_bytes != content_bytes;
+    entry.summary = summary;
+    entry.content_sha256 = content_sha256;
+    entry.content_bytes = content_bytes;
+    changed
+}
+
+fn bounded_summary(content: &str) -> String {
+    let summary = markdown::summary(content);
+    if summary.chars().count() <= MAX_INDEX_SUMMARY_CHARS {
+        return summary;
+    }
+    let mut bounded = summary
+        .chars()
+        .take(MAX_INDEX_SUMMARY_CHARS)
+        .collect::<String>();
+    bounded.push_str("…（摘要已截断）");
+    bounded
 }
 
 pub fn scan(workspace: &Workspace, history_dir: &Path) -> WorkspaceResult<ScanReport> {
@@ -324,15 +406,19 @@ pub fn rebuild_index(report: &ScanReport) -> HistoryIndex {
         if duplicates.contains(session_key) {
             continue;
         }
-        index.sessions.insert(
-            session_key.clone(),
-            IndexEntry {
+        index.sessions.insert(session_key.clone(), {
+            let mut entry = IndexEntry {
                 number: document.number,
                 path: document.path.clone(),
                 created_at: document.created_at.clone().unwrap_or_default(),
                 updated_at: document.updated_at.clone().unwrap_or_default(),
-            },
-        );
+                summary: String::new(),
+                content_sha256: String::new(),
+                content_bytes: 0,
+            };
+            update_index_entry_cache(&mut entry, &document.content);
+            entry
+        });
     }
     index
 }

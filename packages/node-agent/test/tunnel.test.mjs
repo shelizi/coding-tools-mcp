@@ -8,7 +8,7 @@ import path from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createToolContext } from '../dist/server.js';
 import {
-  authSigningPayload, builtinEndpointForClient, BuiltinTunnelManager, parseBuiltinPublicUrl, tunnelPathAllowed,
+  authSigningPayload, builtinEndpointForClient, BuiltinTunnelManager, parseBuiltinPublicUrl, publicTunnelSecurityError, tunnelPathAllowed,
   BUILTIN_TUNNEL_DEMAND_TTL_MS, BUILTIN_TUNNEL_LOCAL_CONNECT_TIMEOUT_MS,
   BUILTIN_TUNNEL_LOCAL_REQUEST_TIMEOUT_MS, TUNNEL_PROTOCOL_VERSION, TUNNEL_SUBPROTOCOL
 } from '../dist/tunnel.js';
@@ -97,13 +97,31 @@ test('built-in tunnel rejects non-HTTPS and non-client MCP paths', () => {
   assert.throws(() => parseBuiltinPublicUrl('https://tunnel.example/other/path'), /builtin\/clients/);
 });
 
+test('public tunnel security is independent of permission mode and sandbox', () => {
+  const config = {
+    tunnel: { enabled: true, publicUrl: 'https://tunnel.example/builtin/clients/device/mcp' },
+    sandbox: { enabled: false },
+    permissionMode: 'guarded'
+  };
+  assert.equal(publicTunnelSecurityError(config), undefined);
+
+  delete config.sandbox;
+  config.permissionMode = 'trusted';
+  assert.equal(publicTunnelSecurityError(config), undefined);
+
+  config.sandbox = { enabled: true };
+  config.permissionMode = 'dangerous';
+  assert.equal(publicTunnelSecurityError(config), undefined);
+});
+
 test('invalid built-in tunnel configuration records a recoverable error status', async () => {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-tunnel-invalid-'));
   const config = {
     host: '127.0.0.1',
     port: 3789,
     dataDir,
-    permissionMode: 'trusted',
+    permissionMode: 'guarded',
+    sandbox: { enabled: true, backend: 'appcontainer', externalPaths: [], options: {} },
     oauth: { clientId: 'chatgpt', password: 'test-password', tokenSecret: 'a sufficiently long test token secret' },
     folders: [{ id: 'repo', name: 'Repo', path: dataDir }],
     limits: { blockingConcurrency: 4, processConcurrency: 4, activeSessionLimit: 16, maxOutputBytes: 1024 * 1024 },
@@ -129,7 +147,8 @@ test('built-in tunnel reconfigure can disable the runtime without restarting the
     host: '127.0.0.1',
     port: 3789,
     dataDir,
-    permissionMode: 'trusted',
+    permissionMode: 'guarded',
+    sandbox: { enabled: true, backend: 'appcontainer', externalPaths: [], options: {} },
     oauth: { clientId: 'chatgpt', password: 'test-password', tokenSecret: 'a sufficiently long test token secret' },
     folders: [{ id: 'repo', name: 'Repo', path: dataDir }],
     limits: { blockingConcurrency: 4, processConcurrency: 4, activeSessionLimit: 16, maxOutputBytes: 1024 * 1024 },
@@ -307,7 +326,8 @@ test('dynamic built-in tunnel performs enrollment, auth, forwarding, scale-up an
     port: address.port,
     publicBaseUrl: 'https://tunnel.example/builtin/clients/provisional_1',
     dataDir,
-    permissionMode: 'trusted',
+    permissionMode: 'guarded',
+    sandbox: { enabled: true, backend: 'appcontainer', externalPaths: [], options: {} },
     oauth: { clientId: 'chatgpt', password: 'password', tokenSecret: 'a sufficiently long test token secret' },
     folders: [{ id: 'repo', name: 'Repo', path: dataDir }],
     limits: { blockingConcurrency: 4, processConcurrency: 4, activeSessionLimit: 16, maxOutputBytes: 1024 * 1024 },
@@ -523,7 +543,8 @@ test('built-in tunnel bounds local connect and overall request phases without le
     port: localPort,
     publicBaseUrl: 'https://tunnel.example/builtin/clients/device_1',
     dataDir,
-    permissionMode: 'trusted',
+    permissionMode: 'guarded',
+    sandbox: { enabled: true, backend: 'appcontainer', externalPaths: [], options: {} },
     oauth: { clientId: 'chatgpt', password: 'test-password', tokenSecret: 'a sufficiently long test token secret' },
     folders: [{ id: 'repo', name: 'Repo', path: dataDir }],
     limits: { blockingConcurrency: 4, processConcurrency: 4, activeSessionLimit: 16, maxOutputBytes: 1024 * 1024 },
@@ -735,7 +756,8 @@ test('built-in tunnel cancels delayed local responses and keeps the worker reusa
     port: address.port,
     publicBaseUrl: 'https://tunnel.example/builtin/clients/device_1',
     dataDir,
-    permissionMode: 'trusted',
+    permissionMode: 'guarded',
+    sandbox: { enabled: true, backend: 'appcontainer', externalPaths: [], options: {} },
     oauth: { clientId: 'chatgpt', password: 'test password', tokenSecret: 'a sufficiently long test token secret' },
     folders: [{ id: 'repo', name: 'Repo', path: dataDir }],
     limits: { blockingConcurrency: 4, processConcurrency: 4, activeSessionLimit: 16, maxOutputBytes: 1024 * 1024 },

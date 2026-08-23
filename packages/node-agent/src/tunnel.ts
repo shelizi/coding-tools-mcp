@@ -1,26 +1,27 @@
-import {
-  createCipheriv, createDecipheriv, createHash, createPrivateKey, generateKeyPairSync,
-  randomBytes, randomUUID, sign, type KeyObject
-} from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { randomUUID, sign } from 'node:crypto';
 import {
   request as httpRequest, type ClientRequest, type IncomingMessage,
   type OutgoingHttpHeaders, type RequestOptions
 } from 'node:http';
-import { hostname } from 'node:os';
-import path from 'node:path';
 import WebSocket from 'ws';
 import type { AgentConfig, JsonObject, ToolContext } from './types.js';
 import { AsyncQueue } from './runtime.js';
+import {
+  authSigningPayload, builtinEndpointForClient, parseBuiltinPublicUrl,
+  TUNNEL_PROTOCOL_VERSION, TUNNEL_SUBPROTOCOL, TUNNEL_WS_PATH,
+  type TunnelEndpoint
+} from './tunnel/endpoint.js';
+import { identityPrivateKey, loadOrEnroll, type DeviceIdentity } from './tunnel/identity.js';
 import {
   configuredBurstWarmFloor, configuredMaxConnecting, normalizeWorkerPolicy,
   poolAdjustment, workerShouldRecycle, type PoolCounts, type WorkerPolicy
 } from './tunnelPolicy.js';
 
-export const TUNNEL_PROTOCOL_VERSION = 3;
-export const TUNNEL_WS_PATH = '/_tunnel/v1';
-export const TUNNEL_ENROLL_PATH = '/_tunnel/enroll';
-export const TUNNEL_SUBPROTOCOL = 'coding-tools-tunnel-v3';
+export {
+  authSigningPayload, builtinEndpointForClient, parseBuiltinPublicUrl,
+  TUNNEL_ENROLL_PATH, TUNNEL_PROTOCOL_VERSION, TUNNEL_SUBPROTOCOL, TUNNEL_WS_PATH
+} from './tunnel/endpoint.js';
+export type { TunnelEndpoint } from './tunnel/endpoint.js';
 export const MAX_TUNNEL_REQUEST_BYTES = 8 * 1024 * 1024;
 export const BUILTIN_TUNNEL_DEMAND_TTL_MS = 3_000;
 export const BUILTIN_TUNNEL_LOCAL_CONNECT_TIMEOUT_MS = 10_000;
@@ -33,28 +34,6 @@ const HOP_BY_HOP = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te',
   'trailer', 'transfer-encoding', 'upgrade', 'host', 'content-length'
 ]);
-
-export interface TunnelEndpoint {
-  publicUrl: string;
-  baseUrl: string;
-  clientId: string;
-  websocketUrl: string;
-}
-
-interface DeviceIdentity {
-  deviceId: string;
-  clientId: string;
-  privateKeyDer: string;
-  publicKeyRaw: string;
-  enrolled: boolean;
-}
-
-interface EncryptedIdentity {
-  version: 1;
-  iv: string;
-  tag: string;
-  ciphertext: string;
-}
 
 interface TunnelMessage {
   binary: boolean;
@@ -107,140 +86,6 @@ export interface BuiltinTunnelManagerOptions {
   localLookup?: RequestOptions['lookup'];
   now?: () => number;
   onEndpointResolved?: (endpoint: ResolvedBuiltinTunnelEndpoint) => Promise<void> | void;
-}
-
-export function parseBuiltinPublicUrl(value: string): TunnelEndpoint {
-  const url = new URL(value.trim());
-  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
-    throw new Error('built-in tunnel public URL must be a clean HTTPS URL');
-  }
-  const match = /^\/builtin\/clients\/([A-Za-z0-9_-]{1,64})\/mcp\/?$/.exec(url.pathname);
-  if (!match) throw new Error('built-in tunnel public URL must use /builtin/clients/<client-id>/mcp');
-  url.pathname = url.pathname.replace(/\/$/, '');
-  const publicUrl = url.toString().replace(/\/$/, '');
-  const base = new URL(publicUrl);
-  base.pathname = base.pathname.replace(/\/mcp$/, '');
-  const websocket = new URL(publicUrl);
-  websocket.protocol = 'wss:';
-  websocket.pathname = TUNNEL_WS_PATH;
-  websocket.search = '';
-  websocket.hash = '';
-  return { publicUrl, baseUrl: base.toString().replace(/\/$/, ''), clientId: match[1], websocketUrl: websocket.toString() };
-}
-
-export function builtinEndpointForClient(value: string, clientId: string): TunnelEndpoint {
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(clientId)) {
-    throw new Error('built-in tunnel client ID must contain only letters, numbers, underscores, or hyphens');
-  }
-  const configured = parseBuiltinPublicUrl(value);
-  const url = new URL(configured.publicUrl);
-  url.pathname = `/builtin/clients/${clientId}/mcp`;
-  return parseBuiltinPublicUrl(url.toString());
-}
-
-export function authSigningPayload(nonce: string, deviceId: string, clientId: string, workerId: string): Buffer {
-  return Buffer.from(JSON.stringify({
-    protocol_version: TUNNEL_PROTOCOL_VERSION,
-    nonce,
-    device_id: deviceId,
-    client_id: clientId,
-    service: 'mcp',
-    worker_id: workerId
-  }));
-}
-
-function encryptionKey(secret: string): Buffer {
-  return createHash('sha256').update(secret).digest();
-}
-
-function encryptIdentity(identity: DeviceIdentity, secret: string): EncryptedIdentity {
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', encryptionKey(secret), iv);
-  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(identity), 'utf8'), cipher.final()]);
-  return { version: 1, iv: iv.toString('base64url'), tag: cipher.getAuthTag().toString('base64url'), ciphertext: ciphertext.toString('base64url') };
-}
-
-function decryptIdentity(envelope: EncryptedIdentity, secret: string): DeviceIdentity {
-  if (envelope.version !== 1) throw new Error('unsupported tunnel identity version');
-  const decipher = createDecipheriv('aes-256-gcm', encryptionKey(secret), Buffer.from(envelope.iv, 'base64url'));
-  decipher.setAuthTag(Buffer.from(envelope.tag, 'base64url'));
-  const plaintext = Buffer.concat([decipher.update(Buffer.from(envelope.ciphertext, 'base64url')), decipher.final()]);
-  return JSON.parse(plaintext.toString('utf8')) as DeviceIdentity;
-}
-
-async function saveIdentity(file: string, identity: DeviceIdentity, secret: string): Promise<void> {
-  await mkdir(path.dirname(file), { recursive: true });
-  const temporary = `${file}.${process.pid}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(encryptIdentity(identity, secret), null, 2)}\n`, { mode: 0o600 });
-  await rename(temporary, file);
-}
-
-async function readIdentity(file: string, secret: string): Promise<DeviceIdentity | undefined> {
-  try {
-    return decryptIdentity(JSON.parse(await readFile(file, 'utf8')) as EncryptedIdentity, secret);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    throw error;
-  }
-}
-
-function newIdentity(clientId: string): DeviceIdentity {
-  const pair = generateKeyPairSync('ed25519');
-  const privateKeyDer = pair.privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64');
-  const publicDer = pair.publicKey.export({ format: 'der', type: 'spki' });
-  const publicKeyRaw = publicDer.subarray(publicDer.length - 32).toString('base64url');
-  return { deviceId: randomUUID().replaceAll('-', ''), clientId, privateKeyDer, publicKeyRaw, enrolled: false };
-}
-
-function privateKey(identity: DeviceIdentity): KeyObject {
-  return createPrivateKey({ key: Buffer.from(identity.privateKeyDer, 'base64'), format: 'der', type: 'pkcs8' });
-}
-
-function validateEnrollmentUrl(publicUrl: string, value: string): URL {
-  const publicEndpoint = new URL(publicUrl);
-  const enrollment = new URL(value.trim());
-  const sameOrigin = enrollment.protocol === 'https:'
-    && enrollment.hostname === publicEndpoint.hostname
-    && enrollment.port === publicEndpoint.port;
-  if (!sameOrigin || enrollment.username || enrollment.password || enrollment.search || enrollment.hash) {
-    throw new Error('enrollment URL must use the same HTTPS origin as the built-in tunnel');
-  }
-  if (!/^\/_tunnel\/enroll\/[A-Za-z0-9]{1,128}$/.test(enrollment.pathname)) {
-    throw new Error('enrollment URL must use /_tunnel/enroll/<code>');
-  }
-  return enrollment;
-}
-
-async function loadOrEnroll(
-  config: AgentConfig,
-  endpoint: TunnelEndpoint,
-  enrollmentFetch: typeof fetch
-): Promise<{ identity: DeviceIdentity; enrollmentCompleted: boolean }> {
-  if (!config.tunnel) throw new Error('built-in tunnel is not configured');
-  const enrollmentUrl = config.tunnel.enrollmentUrl?.trim();
-  const stored = await readIdentity(config.tunnel.stateFile, config.oauth.tokenSecret);
-  if (stored?.enrolled && !enrollmentUrl) {
-    return { identity: stored, enrollmentCompleted: false };
-  }
-
-  let identity = stored && !stored.enrolled ? stored : newIdentity(endpoint.clientId);
-  if (!enrollmentUrl) {
-    await saveIdentity(config.tunnel.stateFile, identity, config.oauth.tokenSecret);
-    throw new Error('built-in tunnel enrollment URL is required for the first connection');
-  }
-  const enrollment = validateEnrollmentUrl(endpoint.publicUrl, enrollmentUrl);
-  const response = await enrollmentFetch(enrollment, {
-    method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ device_id: identity.deviceId, client_id: identity.clientId, device_name: hostname() || 'Coding Tools MCP Node', public_key: identity.publicKeyRaw })
-  });
-  if (!response.ok) throw new Error(`built-in tunnel enrollment failed (${response.status}): ${(await response.text()).trim()}`);
-  const enrolled = await response.json() as { device_id?: string; client_id?: string };
-  if (enrolled.device_id !== identity.deviceId) throw new Error('built-in tunnel enrollment returned a different device ID');
-  const clientId = String(enrolled.client_id || identity.clientId).trim();
-  if (!/^[A-Za-z0-9_-]{1,64}$/.test(clientId)) throw new Error('built-in tunnel enrollment returned an invalid client ID');
-  identity = { ...identity, clientId, enrolled: true };
-  await saveIdentity(config.tunnel.stateFile, identity, config.oauth.tokenSecret);
-  return { identity, enrollmentCompleted: true };
 }
 
 function send(ws: WebSocket, data: string | Buffer): Promise<void> {
@@ -589,7 +434,7 @@ async function authenticate(ws: WebSocket, queue: AsyncQueue<TunnelMessage>, ide
   if (challenge.kind !== 'challenge') throw new Error('server did not issue a tunnel authentication challenge');
   if (Date.now() > Number(challenge.expires_at_unix_ms)) throw new Error('tunnel authentication challenge expired');
   const hello = { protocol_version: TUNNEL_PROTOCOL_VERSION, client_id: identity.clientId, service: 'mcp', worker_id: workerId };
-  const signature = sign(null, authSigningPayload(String(challenge.nonce), identity.deviceId, identity.clientId, workerId), privateKey(identity)).toString('base64url');
+  const signature = sign(null, authSigningPayload(String(challenge.nonce), identity.deviceId, identity.clientId, workerId), identityPrivateKey(identity)).toString('base64url');
   await sendControl(ws, { kind: 'authenticate', hello, device_id: identity.deviceId, signature });
   const acknowledgment = await nextControl(queue);
   if (acknowledgment.kind === 'error') throw new Error(String(acknowledgment.message ?? 'tunnel authentication failed'));
@@ -597,6 +442,10 @@ async function authenticate(ws: WebSocket, queue: AsyncQueue<TunnelMessage>, ide
     throw new Error('server did not acknowledge tunnel authentication');
   }
   return normalizeWorkerPolicy(acknowledgment.worker_policy);
+}
+
+export function publicTunnelSecurityError(_config: AgentConfig): string | undefined {
+  return undefined;
 }
 
 export class BuiltinTunnelManager {
@@ -625,6 +474,16 @@ export class BuiltinTunnelManager {
 
   async start(): Promise<void> {
     if (!this.config.tunnel?.enabled || !this.config.tunnel.publicUrl || !this.#stopped) return;
+    const securityError = publicTunnelSecurityError(this.config);
+    if (securityError) {
+      this.context.tunnelStatus = {
+        enabled: true, state: 'error', publicUrl: this.config.tunnel.publicUrl,
+        workers: 0, connectedWorkers: 0, connectingWorkers: 0, idleWorkers: 0,
+        busyWorkers: 0, recycledWorkers: 0, completedRequests: 0,
+        startedAt: this.#now(), lastError: securityError
+      };
+      throw new Error(securityError);
+    }
     this.#stopped = false;
     this.#abort = new AbortController();
     this.context.tunnelStatus = {
@@ -687,6 +546,16 @@ export class BuiltinTunnelManager {
         state: 'stopped', workers: 0, connectedWorkers: 0,
         connectingWorkers: 0, idleWorkers: 0, busyWorkers: 0
       });
+    }
+  }
+
+  async enforceSecurity(): Promise<void> {
+    const securityError = publicTunnelSecurityError(this.config);
+    if (!securityError) return;
+    await this.stop();
+    if (this.context.tunnelStatus) {
+      this.context.tunnelStatus.state = 'error';
+      this.context.tunnelStatus.lastError = securityError;
     }
   }
 

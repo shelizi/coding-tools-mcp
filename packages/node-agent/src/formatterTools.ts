@@ -3,6 +3,7 @@ import { access, copyFile, lstat, mkdir, readFile, readdir, rename, rm, rmdir, s
 import path from 'node:path';
 import type { JsonObject, ToolContext } from './types.js';
 import { runBuffered } from './processes.js';
+import { runGitBuffered } from './gitProcess.js';
 import { parseWslUncPath } from './wsl.js';
 import {
   exists, globRegex, relativeInside, resolveExistingPath, resolveInside,
@@ -346,7 +347,7 @@ async function collectFormatCandidates(root: string, args: JsonObject): Promise<
       ? [['diff', '--cached', '--name-only', '-z']]
       : [['diff', '--name-only', '-z'], ['diff', '--cached', '--name-only', '-z'], ['ls-files', '--others', '--exclude-standard', '-z']];
     for (const command of commands) {
-      const result = await runBuffered('git', command, root, undefined, 30_000, undefined, { routeWsl: true });
+      const result = await runGitBuffered(root, command, undefined, 30_000);
       if (result.code !== 0) throw new FormatterError('FORMAT_SCOPE_GIT_FAILED', result.stderr || `git ${command.join(' ')} failed`, 'runtime', true);
       for (const value of result.stdout.split('\0').filter(Boolean)) {
         try {
@@ -594,7 +595,7 @@ async function runFormatter(root: string, mirrorRoot: string, group: FormatGroup
   try {
     result = await runBuffered(
       launch.program, launch.args, mirrorRoot, undefined, timeoutMs, formatterEnvironment(),
-      { routeWsl: true, environment: wslWorkspace ? [['NO_COLOR', '1']] : [] }
+      { routeWsl: true, cleanEnvironment: wslWorkspace }
     );
   }
   catch (error) {

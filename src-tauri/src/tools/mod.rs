@@ -1,4 +1,5 @@
 pub mod context;
+mod desktop;
 pub mod dispatch;
 pub mod exec;
 pub mod file;
@@ -11,11 +12,17 @@ pub(crate) mod parallel_stats;
 pub mod patch;
 pub mod permission;
 pub mod policy;
+mod process_child;
+mod process_spec;
 mod process_start;
 pub mod project;
 pub mod redaction;
 pub mod registry;
+mod registry_metadata;
+mod registry_schemas;
+pub mod sandbox;
 pub mod session;
+pub(crate) mod tool_runtime;
 pub mod tool_usage;
 pub mod workspace;
 
@@ -28,8 +35,8 @@ pub use dispatch::{call_tool, call_tool_async};
 pub use policy::{validate_actions_exposure, PolicySettings};
 pub use registry::{
     exposed_tool_names, is_allowed_tool, is_mcp_only_tool, list_tools, list_tools_for_profile,
-    MUTATING_TOOLS,
 };
+pub(crate) use tool_runtime::is_mutating_tool;
 pub use workspace::{wrap_mcp_tool_result, wrap_tool_result, Workspace};
 
 pub(crate) use process_start::behavioral_parity_fixture as process_start_behavioral_parity_fixture;

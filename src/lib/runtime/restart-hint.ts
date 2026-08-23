@@ -1,4 +1,4 @@
-import { message } from "@tauri-apps/plugin-dialog";
+import { alert } from "$lib/api/native";
 import { translate } from "$lib/i18n";
 
 export async function promptServiceRestart(
@@ -6,7 +6,7 @@ export async function promptServiceRestart(
   serviceLabel: string,
 ): Promise<void> {
   if (!serviceRunning) return;
-  await message(translate("Configuration saved. Stop and restart {service} for the changes to take effect.", {
+  await alert(translate("Configuration saved. Stop and restart {service} for the changes to take effect.", {
     service: serviceLabel,
   }), {
     title: translate("Service restart required"),

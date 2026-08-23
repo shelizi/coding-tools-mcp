@@ -34,6 +34,15 @@ impl Drop for ProcessTreeGuard {
 
 pub(crate) fn attach_process_tree(pid: u32) -> Option<ProcessTreeGuard> {
     unsafe {
+        let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid).ok()?;
+        let guard = attach_process_tree_handle(process);
+        let _ = CloseHandle(process);
+        guard
+    }
+}
+
+pub(crate) fn attach_process_tree_handle(process: HANDLE) -> Option<ProcessTreeGuard> {
+    unsafe {
         let job = CreateJobObjectW(None, None).ok()?;
         let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -48,16 +57,7 @@ pub(crate) fn attach_process_tree(pid: u32) -> Option<ProcessTreeGuard> {
             let _ = CloseHandle(job);
             return None;
         }
-        let process = match OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) {
-            Ok(process) => process,
-            Err(_) => {
-                let _ = CloseHandle(job);
-                return None;
-            }
-        };
-        let assigned = AssignProcessToJobObject(job, process).is_ok();
-        let _ = CloseHandle(process);
-        if !assigned {
+        if AssignProcessToJobObject(job, process).is_err() {
             let _ = CloseHandle(job);
             return None;
         }

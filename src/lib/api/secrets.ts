@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { getBackend, isUnavailableBackendError } from "$lib/backend";
 
 export type WorkspaceSecretKey =
   | "oauth_client_secret"
@@ -19,7 +19,7 @@ export async function getWorkspaceSecret(
   id: string,
   key: WorkspaceSecretKey,
 ): Promise<string | null> {
-  return invoke<string | null>("get_workspace_secret", { id, key });
+  return getBackend().secrets.getWorkspaceSecret(id, key);
 }
 
 export async function setWorkspaceSecret(
@@ -27,14 +27,14 @@ export async function setWorkspaceSecret(
   key: WorkspaceSecretKey,
   value: string,
 ): Promise<void> {
-  return invoke("set_workspace_secret", { id, key, value });
+  return getBackend().secrets.setWorkspaceSecret(id, key, value);
 }
 
 export async function regenerateWorkspaceSecret(
   id: string,
   key: WorkspaceSecretKey,
 ): Promise<string> {
-  return invoke<string>("regenerate_workspace_secret", { id, key });
+  return getBackend().secrets.regenerateWorkspaceSecret(id, key);
 }
 
 /** @deprecated use WorkspaceSecretKey */
@@ -49,8 +49,6 @@ export const setSecret = setWorkspaceSecret;
 /** @deprecated use regenerateWorkspaceSecret */
 export const regenerateSecret = regenerateWorkspaceSecret;
 
-// ── Shared secrets ───────────────────────────────────────────────────────
-
 export type SharedSecretKey =
   | "oauth_client_id"
   | "bearer_token"
@@ -63,18 +61,23 @@ export type SharedSecretKey =
   | "actions_oauth_token_secret";
 
 export async function getSharedSecret(key: SharedSecretKey): Promise<string | null> {
-  return invoke<string | null>("get_shared_secret", { key });
+  return getBackend().secrets.getSharedSecret(key);
 }
 
 export async function setSharedSecret(key: SharedSecretKey, value: string): Promise<void> {
-  return invoke("set_shared_secret", { key, value });
+  return getBackend().secrets.setSharedSecret(key, value);
 }
 
 export async function regenerateSharedSecret(key: SharedSecretKey): Promise<string> {
-  return invoke<string>("regenerate_shared_secret", { key });
+  return getBackend().secrets.regenerateSharedSecret(key);
 }
 
 export async function secretIsSet(id: string, key: WorkspaceSecretKey): Promise<boolean> {
-  const value = await getWorkspaceSecret(id, key);
-  return Boolean(value);
+  try {
+    const value = await getWorkspaceSecret(id, key);
+    return Boolean(value);
+  } catch (error) {
+    if (isUnavailableBackendError(error)) return false;
+    throw error;
+  }
 }

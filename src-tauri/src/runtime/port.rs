@@ -102,28 +102,6 @@ fn wait_until_port_is_free_blocking(port: u16, timeout: Duration) -> bool {
         .is_none()
 }
 
-pub fn try_reclaim_own_port(port: u16) -> bool {
-    let Ok(Some(pid)) = platform().find_pid_listening_on_port(port) else {
-        return false;
-    };
-    if !is_own_process(pid) {
-        return false;
-    }
-
-    match platform().reclaim_listening_port(port) {
-        Ok(true) => platform()
-            .find_pid_listening_on_port(port)
-            .ok()
-            .flatten()
-            .is_none(),
-        Ok(false) => false,
-        Err(error) => {
-            eprintln!("reclaim_listening_port({port}) failed: {error}");
-            false
-        }
-    }
-}
-
 pub async fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -135,10 +113,6 @@ pub async fn wait_for_port_free(port: u16, timeout: Duration) -> bool {
             Ok(Some(_)) => return false,
             Err(_) => return false,
         }
-    }
-
-    if try_reclaim_own_port(port) {
-        return true;
     }
 
     platform()
@@ -161,10 +135,6 @@ pub fn wait_for_port_free_blocking(port: u16, timeout: Duration) -> bool {
         }
     }
 
-    if try_reclaim_own_port(port) {
-        return true;
-    }
-
     platform()
         .find_pid_listening_on_port(port)
         .ok()
@@ -184,15 +154,19 @@ pub async fn await_listener_shutdown(handle: Option<JoinHandle<()>>, port: u16) 
         }
     }
 
-    if !wait_for_port_free(port, Duration::from_secs(2)).await {
-        let _ = try_reclaim_own_port(port);
-    }
+    // Never force-close a listener owned by this process with an OS TCP-table
+    // mutation. After graceful shutdown (or task abort), let dropping the
+    // listener future release the socket; callers can report a busy port if it
+    // still has not drained.
+    let _ = wait_for_port_free(port, Duration::from_secs(2)).await;
 }
 
 pub fn await_listener_shutdown_blocking(handle: Option<JoinHandle<()>>, port: u16) {
     if let Some(handle) = handle {
-        // begin_stop 已经发送了优雅退出信号。这里必须等待监听端口真正释放，
-        // 不能只把等待任务丢到异步运行时后立即返回，否则 restart 会与旧监听器并发启动。
+        // begin_stop already sent graceful shutdown. Give the listener time to
+        // drain; if it does not, abort the task and then wait for the dropped
+        // listener future to release the socket. Do not mutate the Windows TCP
+        // table to tear down a socket owned by this process.
         let port_free = wait_for_port_free_blocking(port, Duration::from_secs(3));
         if !port_free {
             handle.abort();
@@ -200,8 +174,11 @@ pub fn await_listener_shutdown_blocking(handle: Option<JoinHandle<()>>, port: u1
         crate::task_runtime::spawn(async move {
             let _ = handle.await;
         });
-    } else if !wait_for_port_free_blocking(port, Duration::from_secs(5)) {
-        let _ = try_reclaim_own_port(port);
+        if !port_free {
+            let _ = wait_for_port_free_blocking(port, Duration::from_secs(2));
+        }
+    } else {
+        let _ = wait_for_port_free_blocking(port, Duration::from_secs(5));
     }
 }
 

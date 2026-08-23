@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { ApplicationConfigStore, loadApplication } from './application.js';
 import { restartSupervisedFromArgv } from './cliOptions.js';
-import { CURRENT_CONFIG_SCHEMA_VERSION } from './config.js';
+import { CANONICAL_SCHEMA_VERSION } from './config.js';
 import type { WorkspaceRuntimeRecord } from './management.js';
 import { createAgentRuntime, type AgentRuntime } from './server.js';
 import { AGENT_VERSION, CLIENT_COMPAT_VERSION } from './version.js';
@@ -30,10 +30,7 @@ let exitRequested = false;
 
 async function closeRuntime(item: RunningWorkspace): Promise<void> {
   await item.tunnel.stop();
-  if (!item.runtime.server.listening) return;
-  await new Promise<void>((resolve, reject) => {
-    item.runtime.server.close(error => error ? reject(error) : resolve());
-  });
+  await item.runtime.close();
 }
 
 async function stop(): Promise<void> {
@@ -111,7 +108,7 @@ for (const item of running) {
   console.log(`MCP: http://${config.host}:${config.port}/mcp`);
   console.log(`OAuth metadata: http://${config.host}:${config.port}/.well-known/oauth-authorization-server`);
   console.log(`Configuration file: ${workspace.store.configPath}`);
-  console.log(`Config schema: v${CURRENT_CONFIG_SCHEMA_VERSION}`);
+  console.log(`Config schema: v${CANONICAL_SCHEMA_VERSION}`);
   console.log(`Folders: ${config.folders.map(folder => `${folder.name}=${folder.path}`).join(', ')}`);
   console.log(`Tool profile: ${config.activeToolProfile} (configured: ${config.toolProfile})`);
   if (item.primary && config.management.enabled) {

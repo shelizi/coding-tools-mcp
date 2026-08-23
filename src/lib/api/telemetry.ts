@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { getBackend } from "$lib/backend";
 
 export interface TelemetryRecord {
   event?: string;
@@ -61,12 +61,5 @@ export async function readWorkspaceTelemetry(
   workspaceId: string,
   options: { limit?: number; errorsOnly?: boolean; minDurationMs?: number; sinceTsMs?: number } = {},
 ): Promise<TelemetryResult> {
-  return invoke<TelemetryResult>("read_workspace_telemetry", {
-    id: workspaceId,
-    limit: options.limit,
-    errorsOnly: options.errorsOnly,
-    minDurationMs: options.minDurationMs,
-    sinceTsMs: options.sinceTsMs,
-  });
+  return getBackend().telemetry.query(workspaceId, options);
 }
-

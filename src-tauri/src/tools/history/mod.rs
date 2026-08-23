@@ -21,6 +21,17 @@ const HISTORY_NUMBER_WINDOW: usize = 256;
 const MAX_SESSION_SUMMARY_CHARS: usize = 3_000;
 const MAX_ALL_HISTORY_SUMMARY_CHARS: usize = 24_000;
 const MAX_LATEST_HANDOFF_CHARS: usize = 24_000;
+const MAX_COMPACT_ALL_HISTORY_SUMMARY_CHARS: usize = 8_000;
+const MAX_COMPACT_LATEST_HANDOFF_CHARS: usize = 8_000;
+
+#[derive(Clone)]
+struct HistorySummaryEntry {
+    number: u64,
+    path: String,
+    summary: String,
+    content_sha256: String,
+    content_bytes: u64,
+}
 
 pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     let (session_key, source) = resolve_session_key(args)?;
@@ -56,12 +67,7 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     let (mut index, sequence_valid, index_rebuilt, history_read_mode) = match storage::read_index(
         &history_dir,
     ) {
-        Ok(Some(index)) => (
-            index,
-            true,
-            false,
-            "indexed_recent_summaries_plus_latest_bounded",
-        ),
+        Ok(Some(index)) => (index, true, false, "indexed_summary_cache_plus_latest"),
         Ok(None) => {
             warnings.push("历史索引缺失，已根据 Markdown 重建。".into());
             let report = storage::scan(&ctx.workspace, &history_dir)?;
@@ -106,6 +112,12 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         }
     };
 
+    let response_mode = if args.get("response_mode").and_then(Value::as_str) == Some("full") {
+        "full"
+    } else {
+        "compact"
+    };
+
     let mut indexed_prior = index
         .sessions
         .iter()
@@ -122,23 +134,87 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         .collect::<Vec<_>>();
     let history_omitted_count = history_count.saturating_sub(HISTORY_SUMMARY_WINDOW);
     let recent_start = indexed_prior.len().saturating_sub(HISTORY_SUMMARY_WINDOW);
-    let prior_documents = indexed_prior[recent_start..]
+    let recent_prior = &indexed_prior[recent_start..];
+    let latest_prior_key = recent_prior.last().map(|(key, _)| key.clone());
+    let mut loaded_history_bytes = 0_u64;
+    let mut index_cache_updated = false;
+    let latest_document = if let Some((key, entry)) = recent_prior.last() {
+        let document = load_indexed_document(ctx, &history_dir, key, entry)?;
+        loaded_history_bytes = loaded_history_bytes.saturating_add(document.content.len() as u64);
+        if let Some(index_entry) = index.sessions.get_mut(key) {
+            index_cache_updated |=
+                storage::update_index_entry_cache(index_entry, &document.content);
+        }
+        Some(document)
+    } else {
+        None
+    };
+    let mut summary_entries = Vec::with_capacity(recent_prior.len());
+    for (key, fallback_entry) in recent_prior {
+        let entry = index
+            .sessions
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| fallback_entry.clone());
+        if latest_prior_key.as_deref() == Some(key.as_str()) || !entry.summary.is_empty() {
+            let cached = index.sessions.get(key).unwrap_or(&entry);
+            summary_entries.push(HistorySummaryEntry {
+                number: cached.number,
+                path: cached.path.clone(),
+                summary: cached.summary.clone(),
+                content_sha256: cached.content_sha256.clone(),
+                content_bytes: cached.content_bytes,
+            });
+            continue;
+        }
+        let summary = storage::read_summary(&ctx.workspace, &history_dir, &entry)?;
+        if summary.session_key.as_deref() != Some(key.as_str()) {
+            return Err(history_error(
+                "HISTORY_INDEX_STALE",
+                "History index session_key does not match the indexed Markdown file.",
+                "validation",
+                true,
+                json!({
+                    "session_key": key,
+                    "path": entry.path,
+                    "document_session_key": summary.session_key
+                }),
+            ));
+        }
+        loaded_history_bytes = loaded_history_bytes.saturating_add(summary.bytes_read);
+        if let Some(index_entry) = index.sessions.get_mut(key) {
+            index_entry.summary = summary.summary.clone();
+            index_entry.content_bytes = summary.content_bytes;
+            index_cache_updated = true;
+        }
+        summary_entries.push(HistorySummaryEntry {
+            number: entry.number,
+            path: entry.path,
+            summary: summary.summary,
+            content_sha256: entry.content_sha256,
+            content_bytes: summary.content_bytes,
+        });
+    }
+    let total_history_bytes = summary_entries
         .iter()
-        .map(|(key, entry)| load_indexed_document(ctx, &history_dir, key, entry))
-        .collect::<WorkspaceResult<Vec<_>>>()?;
+        .map(|entry| entry.content_bytes)
+        .sum::<u64>();
 
     let existing_entry = index.sessions.get(&session_key).cloned();
     let (current_number, current_path, current_content, created, resumed) = if let Some(entry) =
         existing_entry
     {
-        let document = load_indexed_document(ctx, &history_dir, &session_key, &entry)?;
-        (
-            document.number,
-            document.path,
-            document.content,
-            false,
-            true,
-        )
+        let current_content = if response_mode == "full" {
+            let document = load_indexed_document(ctx, &history_dir, &session_key, &entry)?;
+            if let Some(index_entry) = index.sessions.get_mut(&session_key) {
+                index_cache_updated |=
+                    storage::update_index_entry_cache(index_entry, &document.content);
+            }
+            Some(document.content)
+        } else {
+            None
+        };
+        (entry.number, entry.path, current_content, false, true)
     } else {
         if !args
             .get("create_if_missing")
@@ -160,7 +236,7 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             .get("title")
             .and_then(Value::as_str)
             .unwrap_or("开发会话");
-        let inherited_summary = build_inherited_summary(&prior_documents, history_omitted_count);
+        let inherited_summary = build_inherited_summary(&summary_entries, history_omitted_count);
         let content = markdown::attach_inherited_summary(
             markdown::render_document(
                 number,
@@ -175,32 +251,34 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         );
         storage::write_markdown(&history_dir.join(format!("{number}.md")), &content)?;
         index.latest_number = number;
-        index.sessions.insert(
-            session_key.clone(),
-            IndexEntry {
-                number,
-                path: relative_path.clone(),
-                created_at: timestamp.clone(),
-                updated_at: timestamp,
-            },
-        );
+        let mut entry = IndexEntry {
+            number,
+            path: relative_path.clone(),
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+            summary: String::new(),
+            content_sha256: String::new(),
+            content_bytes: 0,
+        };
+        storage::update_index_entry_cache(&mut entry, &content);
+        index.sessions.insert(session_key.clone(), entry);
         storage::write_index(&history_dir, &index)?;
-        (number, relative_path, content, true, false)
+        (number, relative_path, Some(content), true, false)
     };
-    if index_rebuilt && !created {
+    let mut history_read_mode = history_read_mode;
+    if !index_rebuilt && index_cache_updated {
+        history_read_mode = "indexed_summary_cache_backfill_plus_latest";
+    }
+    if (index_rebuilt || index_cache_updated) && !created {
         storage::write_index(&history_dir, &index)?;
     }
-
-    let session_summaries = prior_documents
+    let session_summaries = summary_entries
         .iter()
-        .map(|document| {
+        .map(|entry| {
             json!({
-                "number": document.number,
-                "path": document.path,
-                "summary": truncate_chars(
-                    &markdown::summary(&document.content),
-                    MAX_SESSION_SUMMARY_CHARS,
-                )
+                "number": entry.number,
+                "path": entry.path,
+                "summary": truncate_chars(&entry.summary, MAX_SESSION_SUMMARY_CHARS)
             })
         })
         .collect::<Vec<_>>();
@@ -217,24 +295,59 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             })
             .collect::<Vec<_>>()
             .join("\n"),
-        MAX_ALL_HISTORY_SUMMARY_CHARS,
+        if response_mode == "full" {
+            MAX_ALL_HISTORY_SUMMARY_CHARS
+        } else {
+            MAX_COMPACT_ALL_HISTORY_SUMMARY_CHARS
+        },
     );
-    let latest = prior_documents
-        .iter()
-        .max_by_key(|document| document.number);
-    let latest_handoff_was_truncated =
-        latest.is_some_and(|document| document.content.chars().count() > MAX_LATEST_HANDOFF_CHARS);
-    let latest_handoff =
-        latest.map(|document| truncate_chars(&document.content, MAX_LATEST_HANDOFF_CHARS));
+    let latest = summary_entries.last();
+    let latest_handoff_limit = if response_mode == "full" {
+        MAX_LATEST_HANDOFF_CHARS
+    } else {
+        MAX_COMPACT_LATEST_HANDOFF_CHARS
+    };
+    let latest_handoff_was_truncated = latest_document
+        .as_ref()
+        .is_some_and(|document| document.content.chars().count() > latest_handoff_limit);
+    let latest_handoff = latest_document
+        .as_ref()
+        .map(|document| truncate_chars(&document.content, latest_handoff_limit));
+    let inherited_summary = current_content
+        .as_deref()
+        .and_then(markdown::inherited_summary);
+    let compact_sections_omitted = response_mode == "compact"
+        && (!session_summaries.is_empty() || inherited_summary.is_some());
+    let inherited_summary_response = if response_mode == "full" {
+        inherited_summary
+    } else {
+        None
+    };
+    let session_summaries_response = if response_mode == "full" {
+        session_summaries
+    } else {
+        Vec::new()
+    };
+    let lazy_sections = if response_mode == "compact" {
+        vec!["inherited_summary", "session_summaries"]
+    } else {
+        Vec::<&str>::new()
+    };
+    let assistant_instructions = if response_mode == "full" {
+        "Read all_history_summary, latest_handoff, and inherited_summary before continuing the project. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path."
+    } else {
+        "Use the compact all_history_summary and latest_handoff to restore context. Request history_session_bootstrap again with response_mode=\"full\" only when deeper prior-session detail is materially needed. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path."
+    };
     let mut digest = Sha256::new();
-    let mut loaded_history_bytes = 0_u64;
-    for document in &prior_documents {
-        digest.update(document.number.to_le_bytes());
-        digest.update(document.content.as_bytes());
-        loaded_history_bytes += document.content.len() as u64;
+    for entry in &summary_entries {
+        digest.update(entry.number.to_le_bytes());
+        digest.update(entry.path.as_bytes());
+        digest.update(entry.summary.as_bytes());
+        digest.update(entry.content_sha256.as_bytes());
+        digest.update(entry.content_bytes.to_le_bytes());
     }
 
-    Ok(tool_ok(json!({
+    let mut payload = json!({
         "is_new_session": created,
         "session_key": session_key.clone(),
         "session_key_source": source,
@@ -243,7 +356,7 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "history_numbers_omitted_count": history_numbers_omitted_count,
         "history_number_window": HISTORY_NUMBER_WINDOW,
         "history_count": history_count,
-        "history_loaded_count": prior_documents.len(),
+        "history_loaded_count": summary_entries.len(),
         "history_omitted_count": history_omitted_count,
         "history_summary_window": HISTORY_SUMMARY_WINDOW,
         "latest_completed_number": latest.map(|document| document.number),
@@ -253,20 +366,25 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "created": created,
         "resumed": resumed,
         "sequence_valid": sequence_valid,
-        "all_history_summary": all_history_summary,
-        "inherited_summary": markdown::inherited_summary(&current_content),
-        "session_summaries": session_summaries,
+        "response_mode": response_mode,
+        "all_history_summary": all_history_summary
+    });
+    let remainder = json!({
+        "inherited_summary": inherited_summary_response,
+        "session_summaries": session_summaries_response,
+        "lazy_sections": lazy_sections,
+        "full_response_available": true,
         "latest_handoff": latest_handoff,
         "latest_handoff_truncated": latest_handoff_was_truncated,
-        "payload_bounded": history_omitted_count > 0 || latest_handoff_was_truncated,
+        "payload_bounded": history_omitted_count > 0 || latest_handoff_was_truncated || compact_sections_omitted,
         "history_read_mode": history_read_mode,
         "history_lock_wait_ms": history_lock_wait_ms,
-        "total_history_bytes": loaded_history_bytes,
+        "total_history_bytes": total_history_bytes,
         "loaded_history_bytes": loaded_history_bytes,
         "full_history_included": false,
         "history_digest": format!("{:x}", digest.finalize()),
         "persistence_mode": "model_mediated_tool_calls",
-        "assistant_instructions": "Read all_history_summary, latest_handoff, and inherited_summary before continuing the project. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.",
+        "assistant_instructions": assistant_instructions,
         "required_next_actions": [
             "read_all_history_summary",
             "read_latest_handoff",
@@ -284,7 +402,11 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             "automatic_background_persistence": false
         },
         "warnings": warnings
-    })))
+    });
+    if let (Some(payload), Some(remainder)) = (payload.as_object_mut(), remainder.as_object()) {
+        payload.extend(remainder.clone());
+    }
+    Ok(tool_ok(payload))
 }
 fn host_session_key(args: &Value) -> Option<&str> {
     args.get("_host_session_key")
@@ -364,7 +486,11 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         .is_some_and(|value| !value.is_empty());
     let mut record = markdown::checkpoint_from_args(args, &timestamp)
         .map_err(WorkspaceError::invalid_argument)?;
-    let redacted = markdown::redact_record(&mut record);
+    let redacted = if ctx.runtime_config().policy.security_policy.redact_history {
+        markdown::redact_record(&mut record)
+    } else {
+        false
+    };
     let mut records = markdown::parse_checkpoint_records(&document.content);
     let mut duplicate_ignored = false;
     let mut updated = false;
@@ -425,6 +551,9 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
                 .clone()
                 .unwrap_or_else(|| timestamp.clone()),
             updated_at: record.timestamp.clone(),
+            summary: String::new(),
+            content_sha256: String::new(),
+            content_bytes: 0,
         });
     entry.number = document.number;
     entry.path = document.path.clone();
@@ -435,6 +564,8 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             .unwrap_or_else(|| timestamp.clone());
     }
     entry.updated_at = record.timestamp.clone();
+    storage::update_index_entry_cache(entry, &final_content);
+    let content_hash = entry.content_sha256.clone();
     storage::write_index(&history_dir, &index)?;
 
     let mut warnings = Vec::new();
@@ -454,7 +585,7 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "created": false,
         "updated": updated,
         "duplicate_ignored": duplicate_ignored,
-        "content_hash": storage::sha256(final_content.as_bytes()),
+        "content_hash": content_hash,
         "history_read_mode": history_read_mode,
         "history_lock_wait_ms": history_lock_wait_ms,
         "warnings": warnings
@@ -650,10 +781,7 @@ fn now_timestamp() -> String {
     format!("unix:{seconds}")
 }
 
-fn build_inherited_summary(
-    documents: &[model::HistoryDocument],
-    externally_omitted: usize,
-) -> String {
+fn build_inherited_summary(documents: &[HistorySummaryEntry], externally_omitted: usize) -> String {
     const MAX_TOTAL_CHARS: usize = 16_000;
     const MAX_SESSION_CHARS: usize = 3_000;
 
@@ -661,7 +789,7 @@ fn build_inherited_summary(
     let mut used = 0_usize;
     let mut omitted = externally_omitted;
     for document in documents.iter().rev() {
-        let compact = truncate_chars(&markdown::summary(&document.content), MAX_SESSION_CHARS);
+        let compact = truncate_chars(&document.summary, MAX_SESSION_CHARS);
         let entry = format!(
             "### 会话 {}（{}）\n\n{}",
             document.number, document.path, compact

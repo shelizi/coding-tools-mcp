@@ -13,7 +13,8 @@ import { captureGitRestoreSnapshot, restoreGitSnapshot } from '../dist/gitTools.
 import { createToolContext } from '../dist/server.js';
 import { callTool } from '../dist/tools.js';
 import { MAX_RETAINED_COMMAND_GRAPHS, pruneRetainedCommandGraphs } from '../dist/processes.js';
-import { AGENT_VERSION, CLIENT_COMPAT_VERSION } from '../dist/version.js';
+import { fastWorkspaceGitHead } from '../dist/runtimeRevision.js';
+import { AGENT_VERSION, BUILD_GIT_SHA, BUILD_SOURCE_CLEAN, CLIENT_COMPAT_VERSION } from '../dist/version.js';
 
 const execFile = promisify(execFileCallback);
 const nodeProgram = path.basename(process.execPath);
@@ -81,11 +82,11 @@ async function gitContext(permissionMode = 'trusted') {
 }
 
 test('catalog exactly matches the Rust P0 tool names', async () => {
-  const registryPath = fileURLToPath(new URL('../../../src-tauri/src/tools/registry.rs', import.meta.url));
-  const registry = await readFile(registryPath, 'utf8');
-  const block = registry.split('pub const P0_TOOLS')[1].split('];')[0];
+  const registryMetadataPath = fileURLToPath(new URL('../../../src-tauri/src/tools/registry_metadata.rs', import.meta.url));
+  const registryMetadata = await readFile(registryMetadataPath, 'utf8');
+  const block = registryMetadata.split('pub const P0_TOOLS')[1].split('];')[0];
   const rustNames = [...block.matchAll(/^\s*"([a-z_]+)",\s*$/gm)].map(match => match[1]);
-  assert.equal(tools.length, 50);
+  assert.equal(tools.length, rustNames.length);
   assert.deepEqual(toolNames, rustNames);
 });
 
@@ -99,6 +100,7 @@ test('command execution schemas expose the timeout ceilings and deprecate applic
   assert.equal(exec.inputSchema.properties.timeout_ms.maximum, 60 * 60_000);
   assert.equal(exec.inputSchema.properties.post_checks.items.properties.timeout_ms.maximum, 60 * 60_000);
   assert.equal(execMany.inputSchema.properties.commands.items.properties.timeout_ms.maximum, 60 * 60_000);
+  assert.equal(wait.inputSchema.properties.timeout_ms.maximum, 60 * 60_000);
   assert.match(wait.inputSchema.properties.heartbeat_ms.description, /deprecated.*ignored.*transport/i);
 });
 
@@ -110,8 +112,13 @@ test('portable restart supervision requires the explicit launcher flag', async (
   const portableScript = await readFile(portableScriptPath, 'utf8');
   assert.doesNotMatch(portableScript, /CTMCP_RESTART_SUPERVISED/);
   assert.match(portableScript, /"%NODE_EXE%" "%AGENT_ENTRY%" --restart-supervised %\*/);
+  assert.match(portableScript, /Node Agent is already running on port %CTMCP_PORT%/);
+  assert.match(portableScript, /coding-tools-mcp-node/);
+  assert.match(portableScript, /Port %CTMCP_PORT% is already in use by another process/);
   assert.match(portableScript, /catch \[System\.UnauthorizedAccessException\]/);
   assert.match(portableScript, /The ZIP is current/);
+  assert.match(portableScript, /\[switch\]\$AllowUnreleasedBuild/);
+  assert.match(portableScript, /if \(-not \$AllowUnreleasedBuild\) \{/);
 
   const repoLauncherPath = fileURLToPath(new URL('../../../start-node-agent.bat', import.meta.url));
   const repoLauncher = await readFile(repoLauncherPath, 'utf8');
@@ -129,11 +136,53 @@ test('server_info reports the package Agent version', async () => {
   assert.equal(info.version, packageMetadata.version);
   assert.equal(info.client_compat_version, CLIENT_COMPAT_VERSION);
   assert.equal(typeof info.runtime_revision.process_started_at_ms, 'number');
+  assert.equal(info.runtime_revision.build_git_sha, BUILD_GIT_SHA);
+  assert.ok(BUILD_GIT_SHA === 'unknown' || /^[0-9a-f]{40}$/.test(BUILD_GIT_SHA));
+  assert.ok(['revision_match_unverified', 'mismatch', 'dirty_build', 'unknown', 'not_applicable'].includes(info.runtime_revision.trust_state));
+  assert.equal(info.runtime_revision.source_workspace, false);
+  assert.equal(info.runtime_revision.source_clean, BUILD_SOURCE_CLEAN);
+  assert.equal(info.runtime_revision.workspace_clean_verified, false);
+  assert.equal(info.runtime_revision.workspace_clean_verification_tool, 'git_status');
+  assert.ok(info.runtime_revision.trusted === null || info.runtime_revision.trusted === false);
+  assert.ok(Object.hasOwn(info.runtime_revision, 'matches_workspace'));
   assert.ok(Object.hasOwn(info.runtime_revision, 'workspace_git_head'));
   assert.ok(Object.hasOwn(info.runtime_revision, 'runtime_predates_workspace_head'));
   assert.equal(info.limits.commandTimeoutAbsoluteMaxMs, 60 * 60_000);
   assert.ok(Number(info.phase_durations_ms.dispatch_ms) >= 0);
   assert.ok(Number(info.phase_durations_ms.serialization_ms) >= 0);
+});
+
+test('fastWorkspaceGitHead reads repo-local refs and rejects external pointers without spawning git', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-node-git-head-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const gitDir = path.join(root, '.git');
+  const refDir = path.join(gitDir, 'refs', 'heads');
+  await mkdir(refDir, { recursive: true });
+  await writeFile(path.join(gitDir, 'HEAD'), 'ref: refs/heads/main\n');
+  await writeFile(path.join(refDir, 'main'), '0123456789abcdef0123456789abcdef01234567\n');
+  assert.equal(await fastWorkspaceGitHead(root), '0123456789abcdef0123456789abcdef01234567');
+
+  const repository = await mkdtemp(path.join(tmpdir(), 'ctmcp-node-git-worktree-'));
+  t.after(() => rm(repository, { recursive: true, force: true }));
+  const common = path.join(repository, '.git');
+  const linked = path.join(repository, '.worktrees', 'linked');
+  const worktreeGit = path.join(common, 'worktrees', 'linked');
+  await mkdir(linked, { recursive: true });
+  await mkdir(path.join(common, 'refs', 'heads'), { recursive: true });
+  await mkdir(worktreeGit, { recursive: true });
+  await writeFile(path.join(linked, '.git'), `gitdir: ${worktreeGit}\n`);
+  await writeFile(path.join(worktreeGit, 'HEAD'), 'ref: refs/heads/linked\n');
+  await writeFile(path.join(worktreeGit, 'commondir'), '../..\n');
+  await writeFile(path.join(common, 'refs', 'heads', 'linked'), 'fedcba9876543210fedcba9876543210fedcba98\n');
+  assert.equal(await fastWorkspaceGitHead(linked), 'fedcba9876543210fedcba9876543210fedcba98');
+
+  const malicious = await mkdtemp(path.join(tmpdir(), 'ctmcp-node-git-malicious-'));
+  const external = await mkdtemp(path.join(tmpdir(), 'ctmcp-node-git-external-'));
+  t.after(() => rm(malicious, { recursive: true, force: true }));
+  t.after(() => rm(external, { recursive: true, force: true }));
+  await writeFile(path.join(external, 'HEAD'), '0123456789abcdef0123456789abcdef01234567\n');
+  await writeFile(path.join(malicious, '.git'), `gitdir: ${external}\n`);
+  assert.equal(await fastWorkspaceGitHead(malicious), null);
 });
 
 test('workspace selection gates access and read_file returns a bounded slice', async () => {
@@ -183,6 +232,10 @@ test('read_many, search_text, list_files and project_map follow the Rust read co
   assert.equal(firstPage.next_cursor, 1);
   assert.equal(firstPage.matches[0].line, 2);
   assert.deepEqual(firstPage.matches[0].before, ['alpha']);
+  assert.equal(firstPage.calculate_total, false);
+  assert.equal(firstPage.scan_completed, false);
+  assert.equal(firstPage.total_matches_exact, false);
+  assert.equal(firstPage.early_stop_reason, 'result_limit');
 
   const secondPage = await callTool(ctx, 'search_text', {
     query: 'needle',
@@ -194,6 +247,21 @@ test('read_many, search_text, list_files and project_map follow the Rust read co
   assert.equal(secondPage.matches[0].line, 3);
   assert.equal(secondPage.next_cursor, null);
 
+  const exactTotal = await callTool(ctx, 'search_text', {
+    query: 'needle',
+    path: '.',
+    max_results: 1,
+    calculate_total: true
+  }, meta);
+  assert.equal(exactTotal.returned_count, 1);
+  assert.equal(exactTotal.truncated, true);
+  assert.equal(exactTotal.calculate_total, true);
+  assert.equal(exactTotal.scan_completed, true);
+  assert.equal(exactTotal.total_matches_exact, true);
+  assert.equal(exactTotal.total_matches, 3);
+  assert.ok(exactTotal.files_considered >= exactTotal.scanned_files);
+  assert.equal(exactTotal.early_stop_reason, null);
+
   const filenameOnly = await callTool(ctx, 'search_text', {
     filename_query: 'nested',
     files_only: true
@@ -202,6 +270,8 @@ test('read_many, search_text, list_files and project_map follow the Rust read co
 
   const counted = await callTool(ctx, 'search_text', { query: 'needle', count_only: true }, meta);
   assert.equal(counted.total_matches, 3);
+  assert.equal(counted.calculate_total, true);
+  assert.equal(counted.total_matches_exact, true);
   assert.deepEqual(counted.matches, []);
 
   const listed = await callTool(ctx, 'list_files', { path: '.', recursive: false }, meta);
@@ -547,6 +617,123 @@ test('Git branch and stage support dry-run, expected HEAD and structured status'
   assert.equal(await git(root, 'branch', '--list', 'feature/no-switch'), '');
 });
 
+test('git_worktree manages linked worktree lifecycle and resets removed cwd', async () => {
+  const { root, ctx, meta } = await gitContext();
+  const worktreePath = '.worktrees/managed';
+  const branch = 'feature/managed-worktree';
+
+  const listed = await callTool(ctx, 'git_worktree', { action: 'list' }, meta);
+  assert.equal(listed.ok, true);
+  assert.equal(listed.worktrees.length, 1);
+
+  const created = await callTool(ctx, 'git_worktree', {
+    action: 'create',
+    path: worktreePath,
+    branch,
+    start_point: 'HEAD'
+  }, meta);
+  assert.equal(created.ok, true, JSON.stringify(created));
+  assert.equal(created.applied, true);
+  assert.equal(await pathExists(path.join(root, worktreePath)), true);
+  assert.ok(created.worktrees.some(entry => entry.path === worktreePath && entry.branch === branch));
+
+  const selectedCwd = await callTool(ctx, 'set_default_cwd', { path: worktreePath }, meta);
+  assert.equal(selectedCwd.ok, true);
+  assert.equal(selectedCwd.default_cwd.replaceAll('\\', '/'), worktreePath);
+
+  const denied = await callTool(ctx, 'git_worktree', {
+    action: 'remove',
+    path: worktreePath,
+    delete_branch: true
+  }, meta);
+  assert.equal(denied.ok, false);
+  assert.equal(denied.error.code, 'DANGEROUS_OPERATION_REQUIRES_CONFIRMATION');
+
+  const removed = await callTool(ctx, 'git_worktree', {
+    action: 'remove',
+    path: worktreePath,
+    delete_branch: true,
+    confirm: true
+  }, meta);
+  assert.equal(removed.ok, true, JSON.stringify(removed));
+  assert.equal(removed.applied, true);
+  assert.equal(await pathExists(path.join(root, worktreePath)), false);
+  assert.equal(await git(root, 'branch', '--list', branch), '');
+
+  const workspace = await callTool(ctx, 'list_workspace_folders', {}, meta);
+  assert.equal(workspace.default_cwd, '.');
+});
+
+test('git_worktree reuses an existing branch and derives a managed default path', async () => {
+  const { root, ctx, meta } = await gitContext();
+  const branch = 'feature/existing-worktree';
+  await git(root, 'branch', branch);
+
+  const dryRun = await callTool(ctx, 'git_worktree', {
+    action: 'create', branch, dry_run: true
+  }, meta);
+  assert.equal(dryRun.ok, true, JSON.stringify(dryRun));
+  assert.equal(dryRun.applied, false);
+  assert.equal(dryRun.branch_mode, 'existing');
+  assert.equal(dryRun.path, '.worktrees/feature-existing-worktree');
+
+  const created = await callTool(ctx, 'git_worktree', { action: 'create', branch }, meta);
+  assert.equal(created.ok, true, JSON.stringify(created));
+  assert.equal(created.applied, true);
+  assert.equal(created.branch_mode, 'existing');
+  assert.equal(await git(path.join(root, created.path), 'branch', '--show-current'), branch);
+
+  const removed = await callTool(ctx, 'git_worktree', {
+    action: 'remove', path: created.path, confirm: true
+  }, meta);
+  assert.equal(removed.ok, true, JSON.stringify(removed));
+});
+
+test('git_worktree remove dry-run is non-destructive and does not require confirmation', async () => {
+  const { root, ctx, meta } = await gitContext();
+  const worktreePath = '.worktrees/dry-remove';
+  const created = await callTool(ctx, 'git_worktree', {
+    action: 'create', path: worktreePath, branch: 'feature/dry-remove'
+  }, meta);
+  assert.equal(created.ok, true, JSON.stringify(created));
+
+  const dryRun = await callTool(ctx, 'git_worktree', {
+    action: 'remove', path: worktreePath, dry_run: true
+  }, meta);
+  assert.equal(dryRun.ok, true, JSON.stringify(dryRun));
+  assert.equal(dryRun.applied, false);
+  assert.equal(await pathExists(path.join(root, worktreePath)), true);
+
+  await callTool(ctx, 'git_worktree', {
+    action: 'remove', path: worktreePath, delete_branch: true, confirm: true
+  }, meta);
+});
+
+test('git_worktree list reports workspace management and removability metadata', async () => {
+  const { ctx, meta } = await gitContext();
+  const worktreePath = '.worktrees/metadata';
+  await callTool(ctx, 'git_worktree', {
+    action: 'create', path: worktreePath, branch: 'feature/metadata-worktree'
+  }, meta);
+
+  const listed = await callTool(ctx, 'git_worktree', { action: 'list' }, meta);
+  const primary = listed.worktrees.find(entry => entry.path === '.');
+  const managed = listed.worktrees.find(entry => entry.path === worktreePath);
+  assert.equal(primary.primary, true);
+  assert.equal(primary.inside_workspace, true);
+  assert.equal(primary.removable, false);
+  assert.equal(managed.primary, false);
+  assert.equal(managed.inside_workspace, true);
+  assert.equal(managed.managed, true);
+  assert.equal(managed.removable, true);
+  assert.equal(typeof managed.dirty, 'boolean');
+  assert.equal(typeof managed.branch_merged, 'boolean');
+
+  await callTool(ctx, 'git_worktree', {
+    action: 'remove', path: worktreePath, delete_branch: true, confirm: true
+  }, meta);
+});
+
 test('Git mutators route to a selected nested repository and guard its fingerprint', async () => {
   const { root, ctx, meta } = await gitContext();
   const nested = path.join(root, 'nested-repo');
@@ -597,6 +784,15 @@ test('git_commit enforces a clean index and returns previous/new HEAD metadata',
   assert.equal(dryRun.ok, true);
   assert.equal(dryRun.applied, false);
   assert.equal(dryRun.index_clean, true);
+  assert.equal(dryRun.index_clean_before, true);
+  assert.equal(dryRun.staged_path_count_before, 0);
+  assert.equal(dryRun.selected_path_count, 1);
+  assert.equal(dryRun.staged_by_tool, true);
+  assert.equal(dryRun.expected_head, oldHead);
+  assert.equal(dryRun.actual_head_before, oldHead);
+  assert.equal(dryRun.transaction_stage, 'preflight');
+  assert.equal(dryRun.would_stage, true);
+  assert.equal(dryRun.would_commit, true);
   assert.equal(await git(root, 'diff', '--cached', '--name-only'), '');
 
   const committed = await callTool(ctx, 'git_commit', {
@@ -607,6 +803,17 @@ test('git_commit enforces a clean index and returns previous/new HEAD metadata',
   assert.equal(committed.ok, true);
   assert.equal(committed.applied, true);
   assert.equal(committed.previous_head, oldHead);
+  assert.equal(committed.expected_head, oldHead);
+  assert.equal(committed.actual_head_before, oldHead);
+  assert.equal(committed.actual_head_at_commit, oldHead);
+  assert.equal(committed.actual_head_after, committed.commit);
+  assert.equal(committed.transaction_stage, 'committed');
+  assert.equal(committed.selected_path_count, 1);
+  assert.equal(committed.staged_path_count_before, 0);
+  assert.equal(committed.staged_path_count, 1);
+  assert.equal(committed.index_clean_before, true);
+  assert.equal(committed.staged_by_tool, true);
+  assert.equal(committed.index_restored, false);
   assert.notEqual(committed.commit, oldHead);
   assert.equal(await git(root, 'rev-parse', 'HEAD'), committed.commit);
 
@@ -620,6 +827,10 @@ test('git_commit enforces a clean index and returns previous/new HEAD metadata',
   }, meta);
   assert.equal(blocked.ok, false);
   assert.equal(blocked.error.code, 'GIT_INDEX_NOT_CLEAN');
+  assert.equal(blocked.error.details.transaction_stage, 'preflight_index');
+  assert.equal(blocked.error.details.selected_path_count, 1);
+  assert.equal(blocked.error.details.staged_path_count_before, 1);
+  assert.equal(blocked.error.details.index_clean_before, false);
   assert.equal(await git(root, 'diff', '--cached', '--name-only'), 'pre-staged.txt');
 });
 
@@ -640,6 +851,13 @@ test('git_commit restores a clean index after a commit hook failure', async () =
   assert.equal(failed.error.code, 'GIT_COMMIT_FAILED');
   assert.equal(failed.error.details.staged_by_tool, true);
   assert.equal(failed.error.details.index_restored, true);
+  assert.equal(failed.error.details.transaction_stage, 'commit');
+  assert.equal(failed.error.details.actual_head_before, head);
+  assert.equal(failed.error.details.actual_head_at_commit, head);
+  assert.equal(failed.error.details.selected_path_count, 1);
+  assert.equal(failed.error.details.staged_path_count_before, 0);
+  assert.equal(failed.error.details.staged_path_count, 1);
+  assert.equal(failed.error.details.index_clean_before, true);
   assert.equal(await git(root, 'diff', '--cached', '--name-only'), '');
   assert.equal(await git(root, 'diff', '--name-only'), 'tracked.txt');
   assert.equal(await readFile(path.join(root, 'tracked.txt'), 'utf8'), 'hook failure\n');
@@ -1238,6 +1456,18 @@ test('exec_many retained graph control actions require an operation id and rejec
   }, meta);
   assert.equal(withCommands.ok, false);
   assert.equal(withCommands.error.code, 'INVALID_ARGUMENT');
+});
+
+test('command graph retention is owned by a dedicated module behind the processes facade', async () => {
+  const commandGraph = await import('../dist/processes/commandGraph.js');
+  assert.equal(commandGraph.MAX_RETAINED_COMMAND_GRAPHS, MAX_RETAINED_COMMAND_GRAPHS);
+  assert.equal(commandGraph.pruneRetainedCommandGraphs, pruneRetainedCommandGraphs);
+});
+
+test('command graph runtime orchestration is owned by the dedicated module', async () => {
+  const commandGraph = await import('../dist/processes/commandGraph.js');
+  assert.equal(typeof commandGraph.runCommandGraph, 'function');
+  assert.equal(typeof commandGraph.abortRetainedCommandGraphs, 'function');
 });
 
 test('retained exec_many capacity eviction removes oldest completed graphs but never active graphs', () => {

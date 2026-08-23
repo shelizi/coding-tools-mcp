@@ -119,8 +119,10 @@ test('application initialization persists a Rust-style random OAuth client ID an
   assert.notEqual(first.workspaces[0].loaded.config.oauth.password, 'change-me');
 
   const saved = JSON.parse(await readFile(configPath, 'utf8'));
-  assert.equal(saved.oauth.clientId, first.workspaces[0].loaded.config.oauth.clientId);
-  assert.equal(saved.oauth.password, undefined);
+  assert.equal(saved.schemaVersion, 2);
+  assert.equal(saved.auth.oauthClientId, first.workspaces[0].loaded.config.oauth.clientId);
+  assert.equal(saved.auth.password, undefined);
+  assert.equal(saved.oauth, undefined);
   const registry = JSON.parse(await readFile(first.registryPath, 'utf8'));
   assert.equal(registry.workspaces[0].id, first.workspaces[0].id);
 
@@ -204,7 +206,9 @@ test('workspace management API scopes settings, dashboards and authorization pas
   await writeFile(primary.configPath, `${JSON.stringify(configDocument(primary.root, primary.dataDir, 43151), null, 2)}\n`);
   await writeFile(secondary.configPath, `${JSON.stringify(configDocument(secondary.root, secondary.dataDir, 43152, {
     permissionMode: 'guarded',
-    folders: [{ id: 'secondary-root', name: 'Secondary Root', path: secondary.root }]
+    oauth: { clientId: 'secondary-client' },
+    folders: [{ id: 'secondary-root', name: 'Secondary Root', path: secondary.root }],
+    tunnel: { enabled: true, publicUrl: 'https://secondary.example.test/builtin/clients/secondary-client/mcp' }
   }), null, 2)}\n`);
   await writeFile(path.join(primary.dataDir, 'workspace-profiles.json'), `${JSON.stringify({
     schema_version: 1,
@@ -229,6 +233,18 @@ test('workspace management API scopes settings, dashboards and authorization pas
     runtimeRegistry: runtimes
   });
   const secondaryRuntime = await createAgentRuntime(secondaryProfile.loaded.config, { runtimeRegistry: runtimes });
+  const secondaryTunnelReconfigurations = [];
+  const secondaryRuntimeRecord = runtimes.get('secondary');
+  assert.ok(secondaryRuntimeRecord);
+  secondaryRuntimeRecord.tunnel = {
+    async reconfigure(tunnel, publicBaseUrl) {
+      secondaryTunnelReconfigurations.push({
+        tunnel: tunnel ? structuredClone(tunnel) : undefined,
+        publicBaseUrl
+      });
+    },
+    async enforceSecurity() {}
+  };
   const port = await listen(primaryRuntime.server);
   t.after(() => new Promise(resolve => primaryRuntime.server.close(resolve)));
   const base = `http://127.0.0.1:${port}`;
@@ -264,18 +280,62 @@ test('workspace management API scopes settings, dashboards and authorization pas
   assert.equal(secondaryRuntime.oauth.password, regenerated.value);
   assert.equal(secondaryRuntime.context.config.oauth.password, regenerated.value);
 
+  const enrollmentUrl = 'https://secondary.example.test/enroll/once';
+  const enrollmentResponse = await fetch(`${base}/admin/api/workspaces/secondary/secrets/builtin-tunnel-enrollment-url`, {
+    method: 'PUT',
+    headers: { ...headers, 'content-type': 'application/json', origin: base },
+    body: JSON.stringify({ value: enrollmentUrl })
+  });
+  assert.equal(enrollmentResponse.status, 200);
+  const enrollmentResult = await enrollmentResponse.json();
+  assert.equal(enrollmentResult.restartRequired, false);
+  assert.deepEqual(enrollmentResult.appliedImmediately, ['tunnel']);
+  assert.equal(secondaryTunnelReconfigurations.length, 1);
+  assert.equal(secondaryTunnelReconfigurations[0].tunnel.enrollmentUrl, enrollmentUrl);
+  assert.equal(secondaryRuntime.context.config.tunnel.enrollmentUrl, enrollmentUrl);
+  const persistedSecondary = await loadConfigBundle(secondary.configPath);
+  assert.equal(persistedSecondary.config.tunnel.enrollmentUrl, enrollmentUrl);
+  assert.doesNotMatch(await readFile(secondary.configPath, 'utf8'), /enroll\/once/);
+
   const secondarySnapshot = snapshot.workspaces.find(workspace => workspace.id === 'secondary');
   const saveResponse = await fetch(`${base}/admin/api/workspaces/secondary/config`, {
     method: 'PUT',
     headers: { ...headers, 'content-type': 'application/json', origin: base },
     body: JSON.stringify(updatePayload(secondarySnapshot, { name: 'Secondary API Renamed' }))
   });
-  assert.equal(saveResponse.status, 200);
-  assert.equal((await saveResponse.json()).name, 'Secondary API Renamed');
+  const saveResult = await saveResponse.json();
+  assert.equal(saveResponse.status, 200, JSON.stringify(saveResult));
+  assert.equal(saveResult.name, 'Secondary API Renamed');
 
   const refreshed = await fetch(`${base}/admin/api/config`, { headers }).then(response => response.json());
   assert.equal(refreshed.workspaces.find(workspace => workspace.id === 'secondary').name, 'Secondary API Renamed');
   assert.equal(refreshed.workspaces.find(workspace => workspace.id === 'primary').name, 'Primary Workspace');
+
+  const extraFolder = path.join(secondary.base, 'linux-extra');
+  await import('node:fs/promises').then(({ mkdir }) => mkdir(extraFolder, { recursive: true }));
+  const refreshedSecondary = refreshed.workspaces.find(workspace => workspace.id === 'secondary');
+  const folderResponse = await fetch(`${base}/admin/api/workspaces/secondary/config`, {
+    method: 'PUT',
+    headers: { ...headers, 'content-type': 'application/json', origin: base },
+    body: JSON.stringify(updatePayload(refreshedSecondary, {
+      folders: [
+        ...refreshedSecondary.saved.folders,
+        { name: 'Linux Extra', path: extraFolder }
+      ]
+    }))
+  });
+  const folderResult = await folderResponse.json();
+  assert.equal(folderResponse.status, 200, JSON.stringify(folderResult));
+  assert.ok(folderResult.appliedImmediately.includes('folders'));
+  assert.equal(folderResult.hotApplyDeferredReason, null);
+  assert.equal(secondaryRuntime.context.config.folders.length, 2);
+  const canonicalExtraFolder = await import('node:fs/promises').then(({ realpath }) => realpath(extraFolder));
+  assert.equal(secondaryRuntime.context.config.folders[1].path, canonicalExtraFolder);
+
+  const foldersSnapshot = await fetch(`${base}/admin/api/config`, { headers }).then(response => response.json());
+  const foldersWorkspace = foldersSnapshot.workspaces.find(workspace => workspace.id === 'secondary');
+  assert.equal(foldersWorkspace.saved.folders.length, 2);
+  assert.equal(foldersWorkspace.effective.folders.length, 2);
 });
 
 test('workspace registry rejects duplicate runtime ports before servers start', async () => {
@@ -292,4 +352,82 @@ test('workspace registry rejects duplicate runtime ports before servers start', 
   }, null, 2)}\n`);
 
   await assert.rejects(loadApplication(primary.configPath), /Workspace ports conflict/);
+});
+
+test('workspace pack export strips secrets and import allocates a local port and dataDir', async () => {
+  const source = await fixture('ctmcp-pack-source');
+  const dest = await fixture('ctmcp-pack-dest');
+  await writeFile(source.configPath, `${JSON.stringify(configDocument(source.root, source.dataDir, 43201), null, 2)}\n`);
+  await writeFile(dest.configPath, `${JSON.stringify(configDocument(dest.root, dest.dataDir, 43202), null, 2)}\n`);
+  const sourceApp = await loadApplication(source.configPath);
+  const sourceStore = new ApplicationConfigStore(sourceApp);
+  const sourceId = sourceApp.workspaces[0].id;
+  const pack = sourceStore.exportWorkspacePack(sourceId);
+  const packText = JSON.stringify(pack);
+  assert.equal(pack.schemaVersion, 2);
+  assert.equal(pack.secretPresence.oauthPassword, true);
+  assert.equal(pack.host?.node?.dataDir, undefined);
+  assert.doesNotMatch(packText, /"password"|"tokenSecret"|"clientSecret"|"enrollmentUrl"/);
+  assert.doesNotMatch(packText, new RegExp(source.dataDir.replace(/[\\/]/g, '[\\\\/]')));
+
+  const destApp = await loadApplication(dest.configPath);
+  const destStore = new ApplicationConfigStore(destApp);
+  const imported = await destStore.importWorkspacePack(pack);
+  assert.equal(imported.ok, true);
+  assert.notEqual(imported.saved.port, 43202);
+  assert.match(imported.saved.dataDir, /workspaces/);
+  assert.notEqual(imported.saved.dataDir, source.dataDir);
+  const destFile = JSON.parse(await readFile(destStore.workspace(imported.id).store.configPath, 'utf8'));
+  assert.equal(destFile.schemaVersion, 2);
+  assert.doesNotMatch(JSON.stringify(destFile), /oauthPassword|password/);
+  if (process.env.CTMCP_PHASE5_DUMP) {
+    const dump = process.env.CTMCP_PHASE5_DUMP;
+    await writeFile(`${dump}/export.ctmcp-workspace.json`, `${JSON.stringify(pack, null, 2)}\n`);
+    await writeFile(`${dump}/import-node.json`, `${JSON.stringify(destFile, null, 2)}\n`);
+  }
+});
+
+test('shared drop workspace.json opens without replacing the Node data dir', async () => {
+  const { mkdir } = await import('node:fs/promises');
+  const { sharedWorkspaceFile, sharedWorkspacesRoot } = await import('../dist/application.js');
+  const dest = await fixture('ctmcp-drop-dest');
+  await writeFile(dest.configPath, `${JSON.stringify(configDocument(dest.root, dest.dataDir, 43301), null, 2)}\n`);
+  const destApp = await loadApplication(dest.configPath);
+  const destStore = new ApplicationConfigStore(destApp);
+
+  const dropRoot = path.join(dest.base, 'CodingToolsMCP', 'workspaces');
+  process.env.CTMCP_SHARED_WORKSPACES_ROOT = dropRoot;
+  const source = await fixture('ctmcp-drop-source');
+  await writeFile(source.configPath, `${JSON.stringify(configDocument(source.root, source.dataDir, 43302, {
+    securityPolicy: { restrictToolCatalog: true }
+  }), null, 2)}\n`);
+  const sourceApp = await loadApplication(source.configPath);
+  const sourceStore = new ApplicationConfigStore(sourceApp);
+  const pack = sourceStore.exportWorkspacePack(sourceApp.workspaces[0].id);
+  pack.host = { ...pack.host, desktop: { authType: 'bearer', actions: { localPort: 9 } }, node: { dataDir: 'C:/should-not-import' } };
+  const dropFile = sharedWorkspaceFile('ws-drop');
+  await mkdir(path.dirname(dropFile), { recursive: true });
+  await writeFile(dropFile, `${JSON.stringify(pack, null, 2)}\n`);
+  assert.match(dropFile.replaceAll('\\', '/'), /CodingToolsMCP\/workspaces\/ws-drop\/workspace.json/);
+
+  const imported = await destStore.importSharedWorkspace('ws-drop');
+  assert.equal(imported.ok, true);
+  assert.notEqual(imported.saved.dataDir, dest.dataDir);
+  assert.notEqual(imported.saved.dataDir, 'C:/should-not-import');
+  assert.match(imported.saved.dataDir, /workspaces/);
+  const saved = JSON.parse(await readFile(destStore.workspace(imported.id).store.configPath, 'utf8'));
+  assert.equal(saved.auth?.type ?? 'oauth', 'oauth');
+  assert.equal(saved.host?.desktop?.authType, 'bearer');
+  if (process.env.CTMCP_PHASE6_DUMP) {
+    await writeFile(`${process.env.CTMCP_PHASE6_DUMP}/phase6-open.txt`, [
+      `shared_root=${sharedWorkspacesRoot()}`,
+      `drop_file=${dropFile}`,
+      `imported_id=${imported.id}`,
+      `imported_dataDir=${imported.saved.dataDir}`,
+      `primary_dataDir=${dest.dataDir}`,
+      `desktop_authType=${saved.host?.desktop?.authType}`,
+      `runtime_auth=${saved.auth?.type}`
+    ].join('\n'));
+  }
+  delete process.env.CTMCP_SHARED_WORKSPACES_ROOT;
 });

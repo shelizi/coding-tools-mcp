@@ -2,7 +2,7 @@
 
 This directory tracks behavior implemented in the Rust Client that is missing or materially incomplete in the pure Node.js Agent.
 
-The verified re-audit baseline is commit `a9ecac570119a38c5034845847e1aee8ac2e2a82` using the ancestor-anchor policy, Desktop Client `0.1.40`, Node Agent `0.29.8`, and client compatibility `0.1.40`.
+The verified re-audit baseline is commit `a9ecac570119a38c5034845847e1aee8ac2e2a82` using the ancestor-anchor policy, Desktop Client `0.1.43`, Node Agent `0.29.13`, and client compatibility `0.1.43`.
 
 ## Commands
 

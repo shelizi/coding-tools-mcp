@@ -25,6 +25,12 @@ pub struct IndexEntry {
     pub path: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub content_sha256: String,
+    #[serde(default)]
+    pub content_bytes: u64,
 }
 
 #[derive(Debug, Clone)]

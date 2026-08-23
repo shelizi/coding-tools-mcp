@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, realpath, rm, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -9,6 +9,19 @@ import {
 import { createToolContext } from '../dist/server.js';
 import { callTool } from '../dist/tools.js';
 import { sameWorkspacePath, workspacePathIdentity } from '../dist/wsl.js';
+
+test('conversation context depends on a pure contract instead of the store implementation', async () => {
+  const [typesSource, conversationSource, contractSource] = await Promise.all([
+    readFile(new URL('../src/types.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/conversation.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/conversation/contract.ts', import.meta.url), 'utf8')
+  ]);
+  assert.match(typesSource, /from ['"]\.\/conversation\/contract\.js['"]/);
+  assert.doesNotMatch(typesSource, /from ['"]\.\/conversation\.js['"]/);
+  assert.match(conversationSource, /implements ConversationStoreContract/);
+  assert.match(conversationSource, /export type \{[^}]*ConversationIdentity[^}]*MutableStringMap[^}]*\} from ['"]\.\/conversation\/contract\.js['"]/s);
+  assert.doesNotMatch(contractSource, /from\s+['"]/);
+});
 
 function config(folders, dataDir) {
   return {
@@ -42,6 +55,10 @@ async function fixture(t) {
     mkdir(path.join(first, 'src'), { recursive: true }),
     mkdir(path.join(second, 'packages'), { recursive: true }),
     mkdir(dataDir, { recursive: true })
+  ]);
+  await Promise.all([
+    writeFile(path.join(first, 'marker.txt'), 'first workspace', 'utf8'),
+    writeFile(path.join(second, 'marker.txt'), 'second workspace', 'utf8')
   ]);
   const folders = [
     { id: 'first', name: 'First', path: first },
@@ -112,6 +129,136 @@ test('workspace listing and switching expose conversation-isolated Rust metadata
   assert.deepEqual(listedB.folders.map(folder => folder.selected), [false, true]);
 });
 
+test('workspace_folder_id routes one call without changing conversation selection', async t => {
+  const state = await fixture(t);
+  const meta = { 'openai/session': 'one-call-routing' };
+
+  const unselectedRead = await callTool(state.ctx, 'read_file', {
+    path: 'marker.txt',
+    workspace_folder_id: 'second'
+  }, meta);
+  assert.equal(unselectedRead.ok, true, JSON.stringify(unselectedRead));
+  assert.equal(unselectedRead.content, 'second workspace');
+  assert.equal(unselectedRead.requested_workspace_id, 'second');
+  assert.equal(unselectedRead.resolved_workspace_id, 'second');
+  assert.equal(unselectedRead.workspace_route_source, 'explicit');
+  assert.equal(unselectedRead.workspace_route_changed, true);
+  assert.equal(unselectedRead.conversation_selection_changed, false);
+
+  const stillUnselected = await callTool(state.ctx, 'list_workspace_folders', {}, meta);
+  assert.equal(stillUnselected.selected_folder_id, null);
+  assert.deepEqual(stillUnselected.folders.map(folder => folder.selected), [false, false]);
+
+  await callTool(state.ctx, 'switch_workspace_folder', { folder_id: 'first' }, meta);
+  const crossRead = await callTool(state.ctx, 'read_file', {
+    path: 'marker.txt',
+    workspace_folder_id: 'second'
+  }, meta);
+  assert.equal(crossRead.content, 'second workspace');
+  assert.equal(crossRead.workspace_route_changed, true);
+
+  const selected = await callTool(state.ctx, 'list_workspace_folders', {}, meta);
+  assert.equal(selected.selected_folder_id, 'first');
+  assert.deepEqual(selected.folders.map(folder => folder.selected), [true, false]);
+});
+
+test('recovery metadata is stripped from execution and yields stable failure ids', async t => {
+  const state = await fixture(t);
+  const meta = { 'openai/session': 'recovery-routing' };
+  await callTool(state.ctx, 'switch_workspace_folder', { folder_id: 'first' }, meta);
+
+  const first = await callTool(state.ctx, 'read_file', {
+    path: 'missing.txt',
+    retry_of_call_sequence: 41,
+    recovery_of_operation_id: 'operation-41',
+    recovery_action_id: 'read_current_file'
+  }, meta);
+  assert.equal(first.ok, false, JSON.stringify(first));
+  assert.match(first.failure_id, /^[0-9a-f]{64}$/);
+  assert.equal(first.retry_of_call_sequence, 41);
+  assert.match(first.recovery_of_operation_id_hash, /^[0-9a-f]{64}$/);
+  assert.equal(first.recovery_action_id, 'read_current_file');
+  assert.equal(first.recovery_attempt, true);
+  assert.equal(first.recovery_succeeded, false);
+
+  const second = await callTool(state.ctx, 'read_file', {
+    path: 'missing.txt',
+    retry_of_call_sequence: 42,
+    recovery_action_id: 'refresh_target'
+  }, meta);
+  assert.equal(second.failure_id, first.failure_id);
+
+  const recovered = await callTool(state.ctx, 'read_file', {
+    path: 'marker.txt',
+    retry_of_call_sequence: 41,
+    recovery_of_operation_id: 'operation-41',
+    recovery_action_id: 'read_current_file'
+  }, meta);
+  assert.equal(recovered.ok, true, JSON.stringify(recovered));
+  assert.equal(recovered.recovery_attempt, true);
+  assert.equal(recovered.recovery_succeeded, true);
+  assert.equal(recovered.failure_id, undefined);
+});
+
+test('process control recovers the workspace of an explicitly routed session', async t => {
+  const state = await fixture(t);
+  const meta = { 'openai/session': 'one-call-process-routing' };
+  await callTool(state.ctx, 'switch_workspace_folder', { folder_id: 'first' }, meta);
+
+  const started = await callTool(state.ctx, 'exec_command', {
+    program: path.basename(process.execPath),
+    args: ['-e', 'setTimeout(() => process.stdout.write("done"), 100)'],
+    yield_time_ms: 0,
+    timeout_ms: 10_000,
+    workspace_folder_id: 'second'
+  }, meta);
+  assert.equal(started.ok, true, JSON.stringify(started));
+  assert.equal(started.resolved_workspace_id, 'second');
+  assert.equal(started.workspace_route_source, 'explicit');
+  assert.equal(started.process_still_running, true);
+
+  const waited = await callTool(state.ctx, 'wait_command', {
+    session_id: started.session_id,
+    cursor: started.next_cursor,
+    timeout_ms: 10_000,
+    until: 'finalized',
+    output_mode: 'tail'
+  }, meta);
+  assert.equal(waited.ok, true, JSON.stringify(waited));
+  assert.equal(waited.resolved_workspace_id, 'second');
+  assert.equal(waited.workspace_route_source, 'session_id');
+  assert.equal(waited.workspace_route_changed, true);
+  assert.equal(waited.conversation_selection_changed, false);
+
+  const selected = await callTool(state.ctx, 'list_workspace_folders', {}, meta);
+  assert.equal(selected.selected_folder_id, 'first');
+});
+
+test('conversation_bootstrap returns choices when ambiguous then binds and bootstraps in one call', async t => {
+  const state = await fixture(t);
+  const meta = { 'openai/session': 'bootstrap-conversation' };
+
+  const ambiguous = await callTool(state.ctx, 'conversation_bootstrap', {}, meta);
+  assert.equal(ambiguous.ok, true);
+  assert.equal(ambiguous.needs_folder_selection, true);
+  assert.equal(ambiguous.selected_folder_id, null);
+  assert.equal(ambiguous.next_action.tool, 'conversation_bootstrap');
+  assert.deepEqual(ambiguous.folders.map(folder => folder.selected), [false, false]);
+
+  const bootstrapped = await callTool(state.ctx, 'conversation_bootstrap', { folder_id: 'first' }, meta);
+  assert.equal(bootstrapped.ok, true);
+  assert.equal(bootstrapped.selected_folder_id, 'first');
+  assert.equal(bootstrapped.needs_folder_selection, false);
+  assert.equal(bootstrapped.response_mode, 'compact');
+  assert.equal(bootstrapped.startup_flow, 'workspace_and_history_bootstrapped');
+  assert.equal(bootstrapped.current_path.replaceAll('\\', '/'), 'docs/history-session/1.md');
+
+  const resumed = await callTool(state.ctx, 'conversation_bootstrap', {}, meta);
+  assert.equal(resumed.selected_folder_id, 'first');
+  assert.equal(resumed.current_path, bootstrapped.current_path);
+  assert.equal(resumed.resumed, true);
+});
+
 test('switching back to a folder restores that conversation folder cwd', async t => {
   const state = await fixture(t);
   const meta = { 'openai/session': 'cwd-conversation' };
@@ -132,6 +279,34 @@ test('switching back to a folder restores that conversation folder cwd', async t
   assert.equal(listing.default_cwd, 'src');
   assert.equal(listing.folders.find(folder => folder.id === 'first').default_cwd, 'src');
   assert.equal(listing.folders.find(folder => folder.id === 'second').default_cwd, 'packages');
+});
+
+test('relative workspace tools honor default cwd and stale cwd falls back to workspace root', async t => {
+  const state = await fixture(t);
+  const meta = { 'openai/session': 'cwd-relative-tools' };
+  await writeFile(path.join(state.first, 'src', 'marker.txt'), 'nested marker', 'utf8');
+
+  await callTool(state.ctx, 'switch_workspace_folder', { folder_id: 'first' }, meta);
+  const selected = await callTool(state.ctx, 'set_default_cwd', { path: 'src' }, meta);
+  assert.equal(selected.ok, true);
+
+  const read = await callTool(state.ctx, 'read_file', { path: 'marker.txt' }, meta);
+  assert.equal(read.ok, true, JSON.stringify(read));
+  assert.equal(read.content, 'nested marker');
+  assert.equal(read.path.replaceAll('\\', '/'), 'src/marker.txt');
+
+  const search = await callTool(state.ctx, 'search_text', { path: '.', query: 'nested marker' }, meta);
+  assert.equal(search.ok, true);
+  assert.equal(search.returned_count, 1);
+  assert.equal(search.matches[0].path.replaceAll('\\', '/'), 'src/marker.txt');
+
+  await rm(path.join(state.first, 'src'), { recursive: true, force: true });
+  const listing = await callTool(state.ctx, 'list_workspace_folders', {}, meta);
+  assert.equal(listing.default_cwd, '.');
+
+  const rootRead = await callTool(state.ctx, 'read_file', { path: 'marker.txt' }, meta);
+  assert.equal(rootRead.ok, true, JSON.stringify(rootRead));
+  assert.equal(rootRead.content, 'first workspace');
 });
 
 test('workspace selection, per-folder cwd, and fallback identity survive Agent restart', async t => {

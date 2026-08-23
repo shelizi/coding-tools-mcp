@@ -1,6 +1,9 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { goto } from "$app/navigation";
-  import { open } from "@tauri-apps/plugin-dialog";
+  import { page } from "$app/stores";
+  import { appUrl } from "$lib/app-path";
+  import { pickDirectory } from "$lib/api/native";
   import ArrowLeft from "@lucide/svelte/icons/arrow-left";
   import Check from "@lucide/svelte/icons/check";
   import CircleCheck from "@lucide/svelte/icons/circle-check";
@@ -11,15 +14,17 @@
   import ShieldCheck from "@lucide/svelte/icons/shield-check";
   import Workflow from "@lucide/svelte/icons/workflow";
   import { setWorkspaceSecret, type WorkspaceSecretKey } from "$lib/api/secrets";
-  import { testTunnel } from "$lib/api/tunnel";
+  import { startTunnel, testTunnel } from "$lib/api/tunnel";
   import {
     addWorkspaceFolder,
     createWorkspace,
+    getRuntimeStatus,
     listWorkspaces,
     startActionsRuntime,
     startRuntime,
     updateWorkspace,
   } from "$lib/api/workspaces";
+  import { getBackend } from "$lib/backend";
   import GptQuickCopy from "$lib/components/GptQuickCopy.svelte";
   import QuickTunnelSetup from "$lib/components/quick-setup/QuickTunnelSetup.svelte";
   import { t } from "$lib/i18n";
@@ -42,6 +47,11 @@
     cloudflarePublicUrl: string;
     useProxy: boolean;
   }
+
+  const capabilities = getBackend().capabilities;
+  const isNodeHost = capabilities.host === "node";
+  const frpAvailable = capabilities.frpManagement && capabilities.softwareManagement;
+  const cloudflareAvailable = capabilities.softwareManagement;
 
   const steps: Array<{ value: WizardStep; label: "Tunnel" | "Project" | "Connection" | "Enable" | "Finish" }> = [
     { value: "provider", label: "Tunnel" },
@@ -70,6 +80,15 @@
     return items.find((item) => item.id === workspaceId) ?? null;
   }
 
+  async function loadNodeWorkspace() {
+    if (!isNodeHost) return;
+    const items = await listWorkspaces();
+    workspaces.set(items);
+    const requestedId = $page.url.searchParams.get("workspace");
+    profile = items.find((item) => item.id === requestedId) ?? items[0] ?? null;
+    workspaceName = profile?.name ?? "";
+  }
+
   function chooseProvider(nextProvider: TunnelProvider) {
     provider = nextProvider;
     errorMessage = "";
@@ -79,7 +98,7 @@
     if (busy) return;
     errorMessage = "";
     try {
-      const selected = await open({ directory: true, multiple: true });
+      const selected = await pickDirectory({ multiple: true });
       if (!selected) return;
       const selectedPaths = (Array.isArray(selected) ? selected : [selected]).map((path) => path.trim()).filter(
         (path, index, paths) => path.length > 0 && paths.findIndex((item) => item.toLocaleLowerCase() === path.toLocaleLowerCase()) === index,
@@ -223,9 +242,15 @@
       const nextProfile = configuredProfile(profile, targetService, input, publicUrlFor(input, targetService, workspaceId));
       await updateWorkspace(nextProfile);
       await saveProviderSecret(workspaceId, targetService, input);
-      const status = targetService === "mcp"
-        ? await startRuntime(workspaceId)
-        : await startActionsRuntime(workspaceId);
+      let status: RuntimeStatus;
+      if (isNodeHost) {
+        await startTunnel(workspaceId, targetService);
+        status = await getRuntimeStatus(workspaceId);
+      } else {
+        status = targetService === "mcp"
+          ? await startRuntime(workspaceId)
+          : await startActionsRuntime(workspaceId);
+      }
       if (status.state !== "running") {
         throw new Error(status.localMessage || status.publicMessage || $t("The service failed to start"));
       }
@@ -255,18 +280,26 @@
   }
 
   function openWorkspace() {
-    if (profile) void goto(`/workspace/${profile.id}`);
+    if (profile) void goto(appUrl(`/workspace/${profile.id}`));
   }
 
   function resetWizard() {
     step = "provider";
     provider = null;
-    profile = null;
     service = null;
-    workspaceName = "";
     runtimeStatus = null;
     errorMessage = "";
+    if (isNodeHost) {
+      void loadNodeWorkspace();
+    } else {
+      profile = null;
+      workspaceName = "";
+    }
   }
+
+  onMount(() => {
+    if (isNodeHost) void loadNodeWorkspace();
+  });
 </script>
 
 <section class="page-scroll">
@@ -335,6 +368,7 @@
               class:bg-[var(--primary-soft)]={provider === "frp"}
               class:border-[var(--color-border)]={provider !== "frp"}
               aria-pressed={provider === "frp"}
+              disabled={!frpAvailable}
               onclick={() => chooseProvider("frp")}
             >
               <Server size={23} class="text-[var(--primary)]" />
@@ -350,6 +384,7 @@
               class:bg-[var(--primary-soft)]={provider === "cloudflare"}
               class:border-[var(--color-border)]={provider !== "cloudflare"}
               aria-pressed={provider === "cloudflare"}
+              disabled={!cloudflareAvailable}
               onclick={() => chooseProvider("cloudflare")}
             >
               <Cloud size={23} class="text-[var(--primary)]" />
@@ -375,13 +410,15 @@
             </div>
             <button type="button" class="tx-btn-ghost" disabled={busy} onclick={goBack}><ArrowLeft size={16} /> {$t("Back")}</button>
           </div>
-          <label class="tx-field mt-6 max-w-xl">
-            <span class="tx-label">{$t("Workspace name")}</span>
-            <input class="tx-input" type="text" placeholder={$t("For example: Client projects")} bind:value={workspaceName} disabled={busy || Boolean(profile)} />
-            <span class="text-[11px] text-[var(--color-text-muted)]">
-              {$t("Leave blank to use the first selected folder name.")}
-            </span>
-          </label>
+          {#if !isNodeHost}
+            <label class="tx-field mt-6 max-w-xl">
+              <span class="tx-label">{$t("Workspace name")}</span>
+              <input class="tx-input" type="text" placeholder={$t("For example: Client projects")} bind:value={workspaceName} disabled={busy || Boolean(profile)} />
+              <span class="text-[11px] text-[var(--color-text-muted)]">
+                {$t("Leave blank to use the first selected folder name.")}
+              </span>
+            </label>
+          {/if}
           {#if profile}
             <div class="tx-info-block mt-5">
               <p class="text-sm font-semibold">{profile.name}</p>
@@ -393,8 +430,12 @@
             </div>
             <div class="mt-6 flex flex-wrap gap-2">
               <button type="button" class="tx-btn-primary" onclick={() => (step = "service")}>{$t("Continue with this workspace")}</button>
-              <button type="button" class="tx-btn-ghost" disabled={busy} onclick={() => void selectProjectFolders()}>{$t("Choose different folders")}</button>
+              {#if !isNodeHost}
+                <button type="button" class="tx-btn-ghost" disabled={busy} onclick={() => void selectProjectFolders()}>{$t("Choose different folders")}</button>
+              {/if}
             </div>
+          {:else if isNodeHost}
+            <button type="button" class="tx-btn-primary mt-6" disabled>{$t("Continue with this workspace")}</button>
           {:else}
             <button type="button" class="tx-btn-primary mt-6" disabled={busy} onclick={() => void selectProjectFolders()}>
               {busy ? $t("Creating workspace…") : $t("Select project folders")}
@@ -432,6 +473,7 @@
               class:bg-[var(--primary-soft)]={service === "actions"}
               class:border-[var(--color-border)]={service !== "actions"}
               aria-pressed={service === "actions"}
+              disabled={!capabilities.actions}
               onclick={() => (service = "actions")}
             >
               <Workflow size={22} class="text-[var(--primary)]" />

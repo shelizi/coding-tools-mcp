@@ -3,7 +3,6 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createAgentRuntime } from '../dist/server.js';
-import { disposeProcessSessions } from '../dist/processes.js';
 
 function base64url(value) {
   return Buffer.from(value).toString('base64url');
@@ -24,10 +23,33 @@ export function bearerToken(baseUrl, secret) {
   return `${header}.${body}.${signature}`;
 }
 
-async function closeServer(server) {
-  if (!server.listening) return;
-  server.closeAllConnections?.();
-  await new Promise(resolve => server.close(() => resolve()));
+let mcpPortSequence = 0;
+
+async function listenOnFetchSafePort(server, host) {
+  let lastError;
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const port = 48_000 + ((process.pid + mcpPortSequence++) % 8_000);
+    try {
+      await new Promise((resolve, reject) => {
+        const onError = error => {
+          server.off('listening', onListening);
+          reject(error);
+        };
+        const onListening = () => {
+          server.off('error', onError);
+          resolve();
+        };
+        server.once('error', onError);
+        server.once('listening', onListening);
+        server.listen(port, host);
+      });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (error?.code !== 'EADDRINUSE') throw error;
+    }
+  }
+  throw lastError ?? new Error('unable to allocate a fetch-safe MCP test port');
 }
 
 export async function createMcpFixture(t, options = {}) {
@@ -40,7 +62,7 @@ export async function createMcpFixture(t, options = {}) {
     port: 0,
     publicBaseUrl,
     dataDir,
-    permissionMode: 'trusted',
+    permissionMode: options.permissionMode ?? 'trusted',
     management: { enabled: false },
     oauth: { clientId: 'chatgpt', password: 'test-password', tokenSecret },
     folders: [{ id: 'repo', name: 'Repo', path: root }],
@@ -54,7 +76,7 @@ export async function createMcpFixture(t, options = {}) {
   const runtime = await createAgentRuntime(config, {
     mcpHeartbeatIntervalMs: options.mcpHeartbeatIntervalMs
   });
-  await new Promise(resolve => runtime.server.listen(0, config.host, resolve));
+  await listenOnFetchSafePort(runtime.server, config.host);
   const address = runtime.server.address();
   if (!address || typeof address === 'string') throw new Error('Node Agent test listener has no TCP address');
   const routePrefix = new URL(publicBaseUrl).pathname.replace(/\/$/, '');
@@ -74,9 +96,8 @@ export async function createMcpFixture(t, options = {}) {
     authorization: `Bearer ${token}`
   };
   t.after(async () => {
-    await closeServer(runtime.server);
-    await disposeProcessSessions(runtime.context);
-    await runtime.context.usageStore.flush();
+    runtime.server.closeAllConnections?.();
+    await runtime.close();
     await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     await rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });

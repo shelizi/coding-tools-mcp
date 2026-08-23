@@ -4,4 +4,5 @@ mod protection;
 mod store;
 
 pub use model::AppData;
+pub use protection::run_protect_cli as protection_cli;
 pub use store::DataStore;

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "host": "127.0.0.1",
+  "port": 3789,
+  "publicBaseUrl": "https://example.test/builtin/clients/v1",
+  "dataDir": "C:\\data\\node-v1",
+  "permissionMode": "trusted",
+  "toolProfile": "core",
+  "management": { "enabled": true },
+  "oauth": {
+    "clientId": "chatgpt-v1",
+    "password": "must-not-survive-migrate",
+    "clientSecret": "must-not-survive-migrate"
+  },
+  "policy": {
+    "allowedCommands": ["pytest"],
+    "workspaceLocalEntries": true,
+    "workspaceScriptExtensions": [".exe"],
+    "maxPatchBytes": 2048
+  },
+  "folders": [
+    { "id": "repo", "name": "Repo", "path": "E:\\work\\v1" }
+  ],
+  "limits": {
+    "blockingConcurrency": 8,
+    "processConcurrency": 4,
+    "globalBlockingConcurrency": 16,
+    "globalProcessConcurrency": 8,
+    "activeSessionLimit": 16,
+    "maxOutputBytes": 4096,
+    "commandTimeoutMaxMs": 30000
+  },
+  "sandbox": {
+    "enabled": false,
+    "backend": "appcontainer",
+    "externalPaths": [],
+    "options": {}
+  },
+  "tunnel": {
+    "enabled": true,
+    "publicUrl": "https://example.test/builtin/clients/v1/mcp",
+    "enrollmentUrl": "https://example.test/_tunnel/enroll/SECRET"
+  }
+}

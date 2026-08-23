@@ -1,6 +1,7 @@
 mod listener;
 mod server;
 mod session_activity;
+mod tasks;
 mod telemetry;
 
 pub(crate) use listener::behavioral_parity_fixture;

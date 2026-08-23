@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { request as httpRequest } from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   AUTO_DEDUPE_COMPLETED_GRACE_MS,
+  attachHarnessOperation,
+  cargoTargetLock,
   DETACHED_SESSION_GRACE_MS,
   disposeProcessSessions,
   FINALIZED_SESSION_RETENTION_MS,
@@ -18,10 +20,60 @@ import {
   startAndYield,
   waitForSession
 } from '../dist/processes.js';
+import { runtimeForFolderId } from '../dist/folderRuntime.js';
 import { createAgentRuntime, createToolContext } from '../dist/server.js';
 import { callTool } from '../dist/tools.js';
+import {
+  managedWslcSessionStorage,
+  wslcHostAvailable
+} from '../dist/sandboxWslcProvisioner.js';
+
+test('process execution identity is owned by a dedicated module behind the processes facade', async () => {
+  const identity = await import('../dist/processes/identity.js');
+  assert.equal(identity.cargoTargetLock, cargoTargetLock);
+  assert.equal(typeof identity.commandFingerprint, 'function');
+  assert.equal(typeof identity.safeAutomaticDedup, 'function');
+});
+
+test('process timeout policy is owned by a dedicated module behind the processes facade', async () => {
+  const timeoutPolicy = await import('../dist/processes/timeoutPolicy.js');
+  assert.equal(timeoutPolicy.resolvedCommandTimeoutMs, resolvedCommandTimeoutMs);
+  assert.equal(typeof timeoutPolicy.boundedInteger, 'function');
+  assert.equal(typeof timeoutPolicy.commandTimeoutMaxMs, 'function');
+});
+test('process environment policy is owned by a dedicated module', async () => {
+  const environment = await import('../dist/processes/environment.js');
+  assert.equal(typeof environment.commandEnvironment, 'function');
+  assert.equal(typeof environment.explicitEnvironment, 'function');
+  assert.equal(typeof environment.removedEnvironment, 'function');
+});
+test('retained process session registry is owned by a dedicated module behind the processes facade', async () => {
+  const registry = await import('../dist/processes/sessionRegistry.js');
+  assert.equal(registry.pruneProcessSessions, pruneProcessSessions);
+  assert.equal(registry.MAX_RETAINED_FINALIZED_SESSIONS, MAX_RETAINED_FINALIZED_SESSIONS);
+  assert.equal(registry.FINALIZED_SESSION_RETENTION_MS, FINALIZED_SESSION_RETENTION_MS);
+  assert.equal(typeof registry.requireProcessSession, 'function');
+  assert.equal(typeof registry.findProcessOperation, 'function');
+});
+test('process harness operation tracking is owned by a dedicated module behind the processes facade', async () => {
+  const tracking = await import('../dist/processes/harnessTracking.js');
+  assert.equal(tracking.attachHarnessOperation, attachHarnessOperation);
+  assert.equal(typeof tracking.recordHarnessOperationFinalization, 'function');
+});
+test('process output module owns retained recovery action projection', async () => {
+  const output = await import('../dist/processes/output.js');
+  assert.equal(typeof output.retainedNextActions, 'function');
+});
+test('process post-check orchestration is owned by a dedicated module', async () => {
+  const postChecks = await import('../dist/processes/postChecks.js');
+  assert.equal(typeof postChecks.runProcessPostChecks, 'function');
+});
 
 const nodeProgram = path.basename(process.execPath);
+
+function repoRuntime(ctx) {
+  return runtimeForFolderId(ctx, 'repo');
+}
 
 test('known build and packaging commands inherit the configured long timeout when omitted', () => {
   const max = 30 * 60_000;
@@ -29,10 +81,39 @@ test('known build and packaging commands inherit the configured long timeout whe
   assert.equal(resolvedCommandTimeoutMs({}, 'npm --prefix packages/node-agent run build:server', max), max);
   assert.equal(resolvedCommandTimeoutMs({}, 'npm run node-agent:parity:check', max), max);
   assert.equal(resolvedCommandTimeoutMs({}, 'npm --prefix packages/node-agent run sync:rust-contract', max), max);
+  assert.equal(resolvedCommandTimeoutMs({}, 'pnpm desktop:portable', max), max);
+  assert.equal(resolvedCommandTimeoutMs({}, 'pnpm node-agent:build', max), max);
   assert.equal(resolvedCommandTimeoutMs({}, 'cargo test --manifest-path src-tauri/Cargo.toml', max), max);
   assert.equal(resolvedCommandTimeoutMs({}, 'cargo clippy --manifest-path src-tauri/Cargo.toml', max), max);
   assert.equal(resolvedCommandTimeoutMs({}, 'node scripts/check.mjs', max), 30_000);
   assert.equal(resolvedCommandTimeoutMs({ timeout_ms: 600_000 }, 'npm run desktop:portable', max), 600_000);
+});
+
+test('Cargo resource locks follow resolved target directories across worktrees', () => {
+  const cargo = { program: 'cargo', argv: ['check'], display: 'cargo check', shell: false };
+  const main = path.resolve('C:/repo/main');
+  const linked = path.resolve('C:/repo/main/.worktrees/feature');
+  const mainLock = cargoTargetLock(main, cargo, {});
+  const linkedLock = cargoTargetLock(linked, cargo, {});
+  assert.equal(mainLock?.target, path.resolve(main, 'target'));
+  assert.equal(linkedLock?.target, path.resolve(linked, 'target'));
+  assert.notEqual(mainLock?.group, linkedLock?.group);
+
+  const sharedTarget = path.resolve('C:/cargo/shared-target');
+  const sharedMain = cargoTargetLock(main, cargo, { env: { CARGO_TARGET_DIR: sharedTarget } });
+  const sharedLinked = cargoTargetLock(linked, cargo, { env: { cargo_target_dir: sharedTarget } });
+  assert.equal(sharedMain?.target, sharedTarget);
+  assert.equal(sharedLinked?.target, sharedTarget);
+  assert.equal(sharedMain?.group, sharedLinked?.group);
+
+  const manifest = cargoTargetLock(main, {
+    program: 'cargo',
+    argv: ['check', '--manifest-path', 'src-tauri/Cargo.toml'],
+    display: 'cargo check --manifest-path src-tauri/Cargo.toml',
+    shell: false
+  }, {});
+  assert.equal(manifest?.target, path.resolve(main, 'src-tauri', 'target'));
+  assert.equal(cargoTargetLock(main, { program: nodeProgram, argv: [], display: nodeProgram, shell: false }, {}), undefined);
 });
 
 function config(root, dataDir, maxOutputBytes = 1024 * 1024) {
@@ -61,14 +142,21 @@ async function fixture(t, maxOutputBytes) {
 }
 
 async function waitFinal(state, sessionId, cursor = 0, outputMode = 'tail') {
-  return callTool(state.ctx, 'wait_command', {
-    session_id: sessionId,
-    cursor,
-    timeout_ms: 10_000,
-    until: 'finalized',
-    output_mode: outputMode,
-    max_output_bytes: 1024 * 1024
-  }, state.meta);
+  let nextCursor = cursor;
+  let result;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    result = await callTool(state.ctx, 'wait_command', {
+      session_id: sessionId,
+      cursor: nextCursor,
+      timeout_ms: 10_000,
+      until: 'finalized',
+      output_mode: outputMode,
+      max_output_bytes: 1024 * 1024
+    }, state.meta);
+    if (result.process_completed) return result;
+    nextCursor = Number(result.latest_cursor ?? nextCursor);
+  }
+  return result;
 }
 
 async function waitForValue(read, timeoutMs = 5_000) {
@@ -87,6 +175,241 @@ process.stdin.on('data', chunk => process.stdout.write(chunk));
 process.stdin.on('end', () => process.exit(0));
 setInterval(() => {}, 1000);
 `;
+
+test('Docker Linux sandbox rejects a Windows host executable before any host process session is created', async t => {
+  const state = await fixture(t);
+  state.ctx.config.sandbox = {
+    enabled: true,
+    backend: 'docker_sbx',
+    externalPaths: [],
+    options: {}
+  };
+  const result = await callTool(state.ctx, 'exec_command', {
+    program: nodeProgram,
+    args: ['-e', 'process.stdout.write("must-not-run")'],
+    timeout_ms: 5_000
+  }, state.meta);
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(result.error.code, 'SANDBOX_COMMAND_UNSUPPORTED');
+  assert.equal(result.error.category, 'policy');
+  assert.equal(result.error.retryable, false);
+  assert.equal(repoRuntime(state.ctx).sessions.size, 0);
+});
+
+test('Node WSLC reports host availability without an explicit storage option', async t => {
+  const state = await fixture(t);
+  state.ctx.config.sandbox = {
+    enabled: true,
+    backend: 'wslc',
+    externalPaths: [],
+    options: { 'wslc.image': 'alpine:3.20', 'wslc.network': 'none' }
+  };
+  const info = await callTool(state.ctx, 'server_info', {}, state.meta);
+  const available = wslcHostAvailable();
+  assert.equal(info.environment.filesystem_sandbox.available, available);
+  assert.equal(info.environment.filesystem_sandbox.enforced, available);
+  assert.equal(info.environment.filesystem_sandbox.enforcement_ready, true);
+  assert.equal(info.environment.filesystem_sandbox.verification_tool, 'exec_health_check');
+  assert.equal(info.environment.filesystem_sandbox.live_verification_required, true);
+  assert.equal(info.environment.workspace_exec.available, available);
+  assert.equal(info.environment.workspace_exec.sandbox_enforced, available);
+  assert.equal(info.environment.workspace_exec.boundary, available ? 'wslc' : 'sandbox_unavailable');
+  assert.equal(repoRuntime(state.ctx).sessions.size, 0);
+});
+
+test('server_info reports backend readiness separately from live sandbox availability', async t => {
+  const state = await fixture(t);
+  state.ctx.config.sandbox = {
+    enabled: true,
+    backend: 'docker_sbx',
+    externalPaths: [],
+    options: {}
+  };
+  const result = await callTool(state.ctx, 'server_info', {}, state.meta);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.environment.filesystem_sandbox.enabled, true);
+  const backend = result.environment.filesystem_sandbox.backends.find(value => value.id === 'docker_sbx');
+  assert.equal(result.environment.filesystem_sandbox.available, backend?.hostSupported ?? false);
+  assert.equal(result.environment.filesystem_sandbox.enforced, result.environment.filesystem_sandbox.available);
+  assert.equal(result.environment.filesystem_sandbox.backend, 'docker_sbx');
+  assert.equal(result.environment.filesystem_sandbox.enforcement_ready, true);
+  assert.equal(result.environment.filesystem_sandbox.verification_tool, 'exec_health_check');
+  assert.equal(result.environment.filesystem_sandbox.live_verification_required, true);
+  assert.equal(result.environment.workspace_exec.available, result.environment.filesystem_sandbox.available);
+  assert.equal(result.environment.workspace_exec.sandbox_enforced, result.environment.filesystem_sandbox.available);
+  assert.equal(result.environment.workspace_exec.boundary, result.environment.filesystem_sandbox.available ? 'docker_sbx' : 'sandbox_unavailable');
+  assert.ok(result.environment.filesystem_sandbox.backends.some(backend => backend.id === 'wslc'));
+  assert.ok(result.environment.filesystem_sandbox.backends.some(backend => backend.id === 'docker'));
+  assert.ok(result.environment.filesystem_sandbox.backends.some(backend => backend.id === 'podman'));
+});
+
+test('live WSLC sandbox enforces Node Agent process, post-check, health and cancellation boundaries', {
+  skip: process.platform !== 'win32'
+    || process.env.CTMCP_TEST_WSLC !== '1'
+}, async t => {
+  const state = await fixture(t);
+  const readonly = await mkdtemp(path.join(tmpdir(), 'ctmcp-node-wslc-ro-'));
+  const writable = await mkdtemp(path.join(tmpdir(), 'ctmcp-node-wslc-rw-'));
+  const hidden = await mkdtemp(path.join(tmpdir(), 'ctmcp-node-wslc-hidden-'));
+  t.after(async () => {
+    await rm(readonly, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    await rm(writable, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    await rm(hidden, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  });
+  await writeFile(path.join(readonly, 'readonly-marker.txt'), 'readonly');
+  await writeFile(path.join(writable, 'writable-marker.txt'), 'writable');
+  await writeFile(path.join(hidden, 'hidden-marker.txt'), 'hidden');
+
+  state.ctx.config.sandbox = {
+    enabled: true,
+    backend: 'wslc',
+    externalPaths: [
+      { path: readonly, access: 'read_only' },
+      { path: writable, access: 'modify' }
+    ],
+    options: {
+      'wslc.image': process.env.CTMCP_TEST_WSLC_IMAGE ?? 'alpine:3.20',
+      'wslc.network': 'none'
+    }
+  };
+
+  const started = await callTool(state.ctx, 'exec_command', {
+    program: 'sh',
+    args: ['-c', [
+      'set -e',
+      'printf "%s|" "$CTMCP_NODE_WSLC"',
+      'cat',
+      'printf workspace-write > live.txt',
+      'ro=$(find /ctmcp/grants -name readonly-marker.txt -print -quit)',
+      'rw=$(find /ctmcp/grants -name writable-marker.txt -print -quit)',
+      'test -n "$ro"',
+      'test -n "$rw"',
+      'if printf blocked > "$(dirname "$ro")/blocked.txt"; then exit 41; fi',
+      'printf allowed > "$(dirname "$rw")/allowed.txt"',
+      'test ! -e /ctmcp/grants/2'
+    ].join('; ')],
+    env: { CTMCP_NODE_WSLC: 'node-wslc' },
+    stdin: 'stdin-ok',
+    timeout_ms: 30_000,
+    yield_time_ms: 30_000,
+    output_mode: 'all',
+    post_checks: [{
+      name: 'inside-alpine',
+      program: 'sh',
+      args: ['-c', 'test -f /etc/alpine-release'],
+      timeout_ms: 10_000
+    }]
+  }, state.meta);
+  let completed = started;
+  if (started.session_id && !started.process_completed) completed = await waitFinal(state, started.session_id, 0, 'all');
+  assert.equal(completed.ok, true, JSON.stringify(completed));
+  assert.equal(completed.command_ok, true, JSON.stringify(completed));
+  assert.equal(completed.sandbox_enforced, true);
+  assert.equal(completed.sandbox_backend, 'wslc');
+  assert.equal(completed.execution_boundary, 'wslc');
+  assert.ok(Number.isFinite(completed.sandbox_phase_durations_ms?.prepare_ms), JSON.stringify(completed.sandbox_phase_durations_ms));
+  assert.ok(Number.isFinite(completed.sandbox_phase_durations_ms?.startup_ms), JSON.stringify(completed.sandbox_phase_durations_ms));
+  assert.ok(Number.isFinite(completed.sandbox_phase_durations_ms?.cleanup_ms), JSON.stringify(completed.sandbox_phase_durations_ms));
+  assert.equal(completed.process_tree_contained, true);
+  assert.equal(completed.process_tree_control, 'wslc_container');
+  assert.match(completed.stdout, /node-wslc\|stdin-ok/);
+  assert.equal(completed.post_checks?.[0]?.ok, true, JSON.stringify(completed.post_checks));
+  const managedStorage = await managedWslcSessionStorage(state.dataDir, state.root);
+  assert.ok((await stat(path.join(managedStorage, 'storage.vhdx'))).size > 0);
+  assert.equal(await readFile(path.join(state.root, 'live.txt'), 'utf8'), 'workspace-write');
+  assert.equal(await readFile(path.join(writable, 'allowed.txt'), 'utf8'), 'allowed');
+  await assert.rejects(readFile(path.join(readonly, 'blocked.txt'), 'utf8'));
+  assert.equal(await readFile(path.join(hidden, 'hidden-marker.txt'), 'utf8'), 'hidden');
+
+  const health = await callTool(state.ctx, 'exec_health_check', {}, state.meta);
+  assert.equal(health.status, 'success', JSON.stringify(health));
+  assert.equal(health.probe.sandbox_enforced, true);
+  assert.equal(health.probe.sandbox_backend, 'wslc');
+  assert.equal(health.probe.execution_boundary, 'wslc');
+  assert.ok(Number.isFinite(health.probe.sandbox_phase_durations_ms?.prepare_ms), JSON.stringify(health.probe));
+  assert.ok(Number.isFinite(health.probe.sandbox_phase_durations_ms?.startup_ms), JSON.stringify(health.probe));
+  assert.ok(Number.isFinite(health.probe.sandbox_phase_durations_ms?.cleanup_ms), JSON.stringify(health.probe));
+  assert.deepEqual(health.sandbox_verification, {
+    required: true,
+    verified: true,
+    backend: 'wslc',
+    execution_boundary: 'wslc'
+  });
+
+  const info = await callTool(state.ctx, 'server_info', {}, state.meta);
+  assert.equal(info.environment.filesystem_sandbox.available, true);
+  assert.equal(info.environment.filesystem_sandbox.enforced, true);
+  assert.equal(info.environment.workspace_exec.boundary, 'wslc');
+
+  const parallelStartedAt = Date.now();
+  const [parallelA, parallelB] = await Promise.all([
+    callTool(state.ctx, 'exec_command', {
+      program: 'sh',
+      args: ['-c', 'sleep 2; printf parallel-a'],
+      timeout_ms: 30_000,
+      yield_time_ms: 0,
+      deduplicate: false
+    }, state.meta),
+    callTool(state.ctx, 'exec_command', {
+      program: 'sh',
+      args: ['-c', 'sleep 2; printf parallel-b'],
+      timeout_ms: 30_000,
+      yield_time_ms: 0,
+      deduplicate: false
+    }, state.meta)
+  ]);
+  assert.equal(parallelA.ok, true, JSON.stringify(parallelA));
+  assert.equal(parallelB.ok, true, JSON.stringify(parallelB));
+  assert.ok(Date.now() - parallelStartedAt >= 1_500, 'second command should wait for the first storage lease');
+  const [parallelAFinal, parallelBFinal] = await Promise.all([
+    waitFinal(state, parallelA.session_id, 0, 'all'),
+    waitFinal(state, parallelB.session_id, 0, 'all')
+  ]);
+  assert.equal(parallelAFinal.command_ok, true, JSON.stringify(parallelAFinal));
+  assert.equal(parallelBFinal.command_ok, true, JSON.stringify(parallelBFinal));
+  assert.equal(parallelAFinal.sandbox_enforced, true);
+  assert.equal(parallelBFinal.sandbox_enforced, true);
+  assert.match(parallelAFinal.stdout, /parallel-a/);
+  assert.match(parallelBFinal.stdout, /parallel-b/);
+
+  const queueHolder = await startAndYield(state.ctx, state.meta['openai/session'], {
+    program: 'sh',
+    args: ['-c', 'sleep 3; printf queue-holder'],
+    timeout_ms: 30_000,
+    yield_time_ms: 0,
+    deduplicate: false
+  });
+  const queuedLifecycle = new ProcessRequestLifecycle(state.ctx);
+  const queued = startAndYield(state.ctx, state.meta['openai/session'], {
+    program: 'sh',
+    args: ['-c', 'printf leaked > queued-cancel-leak.txt'],
+    timeout_ms: 30_000,
+    yield_time_ms: 0,
+    deduplicate: false
+  }, queuedLifecycle);
+  await new Promise(resolve => setTimeout(resolve, 200));
+  queuedLifecycle.abort();
+  await assert.rejects(queued, error => error?.code === 'SANDBOX_WSLC_QUEUE_CANCELLED');
+  await waitFinal(state, queueHolder.session_id, 0, 'all');
+  await new Promise(resolve => setTimeout(resolve, 250));
+  await assert.rejects(readFile(path.join(state.root, 'queued-cancel-leak.txt'), 'utf8'));
+
+  const longRunning = await callTool(state.ctx, 'exec_command', {
+    program: 'sh',
+    args: ['-c', 'sleep 5; printf leaked > cancel-leak.txt'],
+    timeout_ms: 30_000,
+    yield_time_ms: 0
+  }, state.meta);
+  assert.equal(longRunning.process_still_running, true, JSON.stringify(longRunning));
+  const killed = await callTool(state.ctx, 'kill_session', {
+    session_id: longRunning.session_id,
+    signal: 'KILL',
+    wait_ms: 5_000
+  }, state.meta);
+  assert.equal(killed.ok, true, JSON.stringify(killed));
+  await new Promise(resolve => setTimeout(resolve, 6_000));
+  await assert.rejects(readFile(path.join(state.root, 'cancel-leak.txt'), 'utf8'));
+});
 
 test('interactive sessions expose stdin state, byte counts, timing and closed-input errors', async t => {
   const state = await fixture(t);
@@ -158,6 +481,8 @@ test('wait_command ignores the legacy heartbeat interval and uses the full serve
     timeout_ms: 10_000
   }, state.meta);
   assert.equal(started.operation_id, null);
+  assert.equal(started.next_actions[0].arguments.timeout_ms, 60 * 60_000);
+  assert.equal(started.next_actions[0].arguments.until, 'output_or_exit');
 
   const waited = await callTool(state.ctx, 'wait_command', {
     session_id: started.session_id,
@@ -194,6 +519,46 @@ test('wait_command ignores the legacy heartbeat interval and uses the full serve
     wait_ms: 5_000
   }, state.meta);
   assert.equal(killed.evicted, true, JSON.stringify(killed));
+});
+
+test('kill_session retains an exited session until post-check finalization completes', async t => {
+  const state = await fixture(t);
+  const started = await callTool(state.ctx, 'exec_command', {
+    program: nodeProgram,
+    args: ['-e', 'setTimeout(() => process.exit(0), 50)'],
+    tty: true,
+    yield_time_ms: 0,
+    timeout_ms: 5_000,
+    post_checks: [{
+      name: 'slow-verify',
+      program: nodeProgram,
+      args: ['-e', 'setTimeout(() => process.exit(0), 750)'],
+      timeout_ms: 2_000
+    }]
+  }, state.meta);
+  const session = repoRuntime(state.ctx).sessions.get(started.session_id);
+  assert.ok(session);
+  await waitForSession(session, session.sequence, 5_000, 'exit');
+  assert.ok(session.endedAt);
+  assert.equal(session.finalizedAt, undefined);
+
+  const verifying = await callTool(state.ctx, 'kill_session', {
+    session_id: started.session_id,
+    wait_ms: 0
+  }, state.meta);
+  assert.equal(verifying.killed, false, JSON.stringify(verifying));
+  assert.equal(verifying.status, 'verifying', JSON.stringify(verifying));
+  assert.equal(verifying.evicted, false, JSON.stringify(verifying));
+  assert.equal(repoRuntime(state.ctx).sessions.has(started.session_id), true);
+
+  await waitForSession(session, session.sequence, 5_000, 'finalized');
+  assert.ok(session.finalizedAt);
+  const evicted = await callTool(state.ctx, 'kill_session', {
+    session_id: started.session_id,
+    wait_ms: 0
+  }, state.meta);
+  assert.equal(evicted.evicted, true, JSON.stringify(evicted));
+  assert.equal(repoRuntime(state.ctx).sessions.has(started.session_id), false);
 });
 
 test('Windows TERM kill_session forcefully terminates the managed tree like Rust', { skip: process.platform !== 'win32' }, async t => {
@@ -278,7 +643,7 @@ test('operation reattachment, conflict and automatic dedupe grace match Rust', a
   assert.equal(automaticSecond.session_id, automaticFirst.session_id);
   assert.equal(automaticSecond.deduplicated, true);
 
-  const retained = state.ctx.sessions.get(automaticFirst.session_id);
+  const retained = repoRuntime(state.ctx).sessions.get(automaticFirst.session_id);
   assert.ok(retained?.finalizedAt);
   retained.finalizedAt = Date.now() - AUTO_DEDUPE_COMPLETED_GRACE_MS - 1;
   const automaticThird = await callTool(state.ctx, 'exec_command', automaticArgs, state.meta);
@@ -339,9 +704,10 @@ test('timeout and detached grace expose Rust recovery contracts and reattachment
     operation_id: 'detached-operation'
   }, lifecycle);
   lifecycle.abort();
-  const detachedSession = state.ctx.sessions.get(detachedStart.session_id);
+  const detachedSession = repoRuntime(state.ctx).sessions.get(detachedStart.session_id);
   assert.ok(detachedSession);
   await waitForSession(detachedSession, detachedSession.sequence, 5_000, 'finalized');
+  assert.ok(detachedSession.finalizedAt, 'detached timeout must finalize through the normal lifecycle');
   const detachedFinal = await callTool(state.ctx, 'resolve_operation', {
     operation_id: 'detached-operation',
     output_mode: 'none'
@@ -367,7 +733,7 @@ test('timeout and detached grace expose Rust recovery contracts and reattachment
   }, state.meta);
   assert.equal(reattached.detached, false);
   await new Promise(resolve => setTimeout(resolve, 300));
-  const stillRunning = state.ctx.sessions.get(cancelStart.session_id);
+  const stillRunning = repoRuntime(state.ctx).sessions.get(cancelStart.session_id);
   assert.ok(stillRunning && !stillRunning.endedAt);
 
   const killed = await callTool(state.ctx, 'kill_session', {
@@ -378,7 +744,7 @@ test('timeout and detached grace expose Rust recovery contracts and reattachment
   assert.equal(killed.killed, true);
   assert.equal(killed.evicted, true);
   assert.equal(killed.status, 'killed');
-  assert.equal(state.ctx.sessions.has(cancelStart.session_id), false);
+  assert.equal(repoRuntime(state.ctx).sessions.has(cancelStart.session_id), false);
 });
 
 test('retained output pagination reports expiry, UTF-8 alignment and delta continuation', async t => {
@@ -489,8 +855,7 @@ test('closing the Agent finalizes running sessions with server_restart recovery 
     runtime.server.listen(0, '127.0.0.1', resolve);
   });
   t.after(async () => {
-    if (runtime.server.listening) await new Promise(resolve => runtime.server.close(() => resolve()));
-    await disposeProcessSessions(runtime.context);
+    await runtime.close();
     await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     await rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
@@ -503,11 +868,12 @@ test('closing the Agent finalizes running sessions with server_restart recovery 
     timeout_ms: 10_000,
     operation_id: 'server-close-operation'
   }, meta);
-  const session = runtime.context.sessions.get(started.session_id);
+  const session = repoRuntime(runtime.context).sessions.get(started.session_id);
   assert.ok(session && !session.endedAt);
 
-  await new Promise((resolve, reject) => runtime.server.close(error => error ? reject(error) : resolve()));
-  await waitForSession(session, session.sequence, 5_000, 'finalized');
+  await runtime.close();
+  assert.ok(session.endedAt);
+  assert.ok(session.finalizedAt, 'server close must wait for lifecycle finalization');
   const resolved = await callTool(runtime.context, 'resolve_operation', {
     operation_id: 'server-close-operation',
     output_mode: 'none'
@@ -599,7 +965,7 @@ test('aborting a real MCP request starts detached grace and resolve_operation re
     clientRequest.end(payload);
   });
 
-  const session = await waitForValue(() => [...runtime.context.sessions.values()]
+  const session = await waitForValue(() => [...repoRuntime(runtime.context).sessions.values()]
     .find(candidate => candidate.operationId === 'http-abort-operation'));
   assert.ok(clientResponse, 'streaming response headers should arrive before process completion');
   clientResponse.destroy();
@@ -632,7 +998,7 @@ test('finalized session retention expires old records and caps retained summarie
     yield_time_ms: 10_000,
     operation_id: 'retention-base'
   }, state.meta);
-  const base = state.ctx.sessions.get(baseResult.session_id);
+  const base = repoRuntime(state.ctx).sessions.get(baseResult.session_id);
   assert.ok(base?.finalizedAt);
 
   const expired = {
@@ -649,11 +1015,11 @@ test('finalized session retention expires old records and caps retained summarie
     detachedTimer: undefined,
     lockRelease: undefined
   };
-  state.ctx.sessions.set(expired.id, expired);
-  state.ctx.operationsByFingerprint.set(expired.fingerprint, expired.id);
+  repoRuntime(state.ctx).sessions.set(expired.id, expired);
+  repoRuntime(state.ctx).operationsByFingerprint.set(expired.fingerprint, expired.id);
   pruneProcessSessions(state.ctx);
-  assert.equal(state.ctx.sessions.has(expired.id), false);
-  assert.equal(state.ctx.operationsByFingerprint.has(expired.fingerprint), false);
+  assert.equal(repoRuntime(state.ctx).sessions.has(expired.id), false);
+  assert.equal(repoRuntime(state.ctx).operationsByFingerprint.has(expired.fingerprint), false);
 
   for (let index = 0; index < MAX_RETAINED_FINALIZED_SESSIONS + 5; index += 1) {
     const session = {
@@ -670,11 +1036,12 @@ test('finalized session retention expires old records and caps retained summarie
       detachedTimer: undefined,
       lockRelease: undefined
     };
-    state.ctx.sessions.set(session.id, session);
-    state.ctx.operationsByFingerprint.set(session.fingerprint, session.id);
+    repoRuntime(state.ctx).sessions.set(session.id, session);
+    repoRuntime(state.ctx).operationsByFingerprint.set(session.fingerprint, session.id);
   }
   pruneProcessSessions(state.ctx);
-  const finalizedCount = [...state.ctx.sessions.values()].filter(session => session.finalizedAt).length;
+  const finalizedCount = [...repoRuntime(state.ctx).sessions.values()]
+    .filter(session => session.finalizedAt).length;
   assert.equal(finalizedCount, MAX_RETAINED_FINALIZED_SESSIONS);
 
   const listed = await callTool(state.ctx, 'list_sessions', { include_finalized: true, limit: 1000 }, state.meta);
@@ -692,12 +1059,23 @@ test('exec_health_check matches the Rust worker, session, and stream-capture con
   assert.equal(result.command_run, true, JSON.stringify(result));
   assert.equal(result.stdout_capture, true, JSON.stringify(result));
   assert.equal(result.stderr_capture, true, JSON.stringify(result));
+  assert.deepEqual(result.sandbox_verification, {
+    required: false,
+    verified: null,
+    backend: null,
+    execution_boundary: 'policy_only'
+  });
   assert.equal(result.status, 'success');
   assert.deepEqual(result.next_actions, []);
   assert.ok(result.duration_ms >= 0);
   assert.equal(typeof result.probe.session_id, 'string');
   assert.equal(result.probe.status, 'exited');
   assert.equal(result.probe.process_still_running, false);
+  assert.deepEqual(result.probe.sandbox_phase_durations_ms, {
+    prepare_ms: null,
+    startup_ms: null,
+    cleanup_ms: null
+  });
   assert.equal(Number(result.probe.process_exit_code ?? result.probe.exit_code), 0);
   assert.match(result.probe.stdout, /exec-health/);
   assert.match(result.probe.stderr, /exec-health-stderr/);

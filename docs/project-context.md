@@ -1,69 +1,69 @@
-# Coding Tools MCP Rust - 项目上下文
+# Coding Tools MCP 專案上下文
 
-> 本文档是项目上下文的索引文件，提供项目概览和文档导航。
+> 本文件是目前專案架構、開發流程與圖譜文件的入口。
 
-## 项目概览
+## 專案概覽
 
-| 属性 | 值 |
-|------|-----|
-| 项目名称 | Coding Tools MCP Rust |
-| 版本 | 0.0.0（重构中） |
-| 语言 | Rust + TypeScript |
-| 框架 | Tauri 2 + Svelte |
-| 类型 | 桌面客户端 + 内嵌 MCP 运行时 |
-| 描述 | 用 Rust/Tauri 重构 Coding Tools MCP 桌面客户端，内嵌 MCP 核心，单二进制分发 |
+| 屬性 | 目前狀態 |
+| --- | --- |
+| 專案名稱 | Coding Tools MCP |
+| Desktop Client | `0.1.43` |
+| Node Agent | `0.29.12`，相容 Desktop Client `0.1.43` |
+| Node Portable 格式 | `1.1.1` |
+| Tunnel protocol/server | `0.2.0` |
+| 主要語言 | Rust、TypeScript |
+| 桌面技術 | Tauri 2、Svelte 5 |
+| Node Web UI | 與 Desktop 共用 Svelte 5（`CTMCP_UI_HOST=node`） |
+| 產品形態 | 桌面用戶端、Headless Node Agent、內建 WSS Tunnel Server |
 
-## 文档导航
+Coding Tools MCP 將本機專案暴露成可持續工作的 MCP Workspace。Desktop 與 Node Agent 共用工具契約、權限、歷史、遙測與 Built-in WSS 行為；Tauri 桌面另外提供 Actions、FRP、Cloudflare、Tray 與原生程序管理。
 
-### [技术栈](./project-context/tech-stack.md)
-项目使用的语言、框架、工具
+## 文件導航
 
-### [架构设计](./project-context/architecture.md)
-项目结构、目录说明、设计模式
+- [技術棧](./project-context/tech-stack.md)：目前使用的語言、框架、儲存與建置工具。
+- [架構設計](./project-context/architecture.md)：Desktop、Node Agent、Tunnel Server 與共用契約邊界。
+- [如何開發](./project-context/how-to-develop.md)：專案工作流、版本與 parity 規則。
+- [如何測試](./project-context/how-to-test.md)：分層驗證指令與提交門禁。
+- [最新圖譜洞察](./graph-insights/latest.md)：GitNexus 索引狀態、核心呼叫鏈與結構風險。
+- [設計系統](./design-system.md)：桌面 UI 視覺與互動規範。
+- [Node Agent parity manifest](./todo/node-agent-parity/manifest.json)：Rust／Node 行為對齊與刻意差異。
+- [Shared workspace config（規劃）](./todo/shared-workspace-config/README.md)：canonical schema 與遷移；規格在 [docs/specs/shared-workspace-config](./specs/shared-workspace-config/requirements.md)。
 
-### [如何开发](./project-context/how-to-develop.md)
-开发新功能的基本步骤
+## 主要程式入口
 
-### [如何编写测试](./project-context/how-to-test.md)
-测试框架和测试编写规范
+| 執行面 | 入口 |
+| --- | --- |
+| Tauri Desktop | `src-tauri/src/main.rs`、`src-tauri/src/lib.rs` |
+| Desktop Web UI | `src/routes/+layout.svelte`、`src/routes/workspace/[id]/+page.svelte` |
+| Node Agent | `packages/node-agent/src/cli.ts`、`packages/node-agent/src/server.ts` |
+| Node Agent Web UI | Shared Svelte UI in `src/` built with `CTMCP_UI_HOST=node` to `packages/node-agent/dist/ui/` |
+| Tunnel Server | `services/tunnel-server/src/main.rs` |
+| Shared Rust contracts | `crates/command-policy/`、`crates/tunnel-protocol/` |
 
-### [代码图谱洞察](./graph-insights/latest.md)
-模块依赖、调用链和影响面摘要
+## 開發快速開始
 
-### [设计系统](./design-system.md)
-2026 开发者工具 UI 审美、色彩、字体、交互规范
+```powershell
+pnpm install --frozen-lockfile
+pnpm run hooks:install
+pnpm run desktop
+```
 
-## 参考实现
+最小驗證：
 
-旧版 Python 实现完整归档在 `old/` 目录：
+```powershell
+pnpm run verify:fast
+pnpm run rust:check
+pnpm run version:check
+pnpm run node-agent:parity:check
+```
 
-- `old/coding_tools_mcp/server.py` — MCP 核心（~5400 行）
-- `old/apps/desktop-client/` — PySide6 桌面客户端
-- `old/docs/profile-v0.1.md` — MCP 协议契约
-- `old/tests/compliance/` — 71 项合规测试
+Client 或共用契約改動還必須執行 `pnpm run node-agent:verify-repo`。Portable 發佈必須使用專案的 `build-portable` skill／腳本，不能以裸 `cargo build --release` 取代。
 
-## 快速开始
+## 歷史參考
 
-1. 阅读 [技术栈](./project-context/tech-stack.md) 了解项目使用的技术
-2. 阅读 [架构设计](./project-context/architecture.md) 了解项目结构
-3. 阅读 [代码图谱洞察](./graph-insights/latest.md) 理解模块边界
-4. 查看 `docs/specs/rust-desktop-client/` 了解当前功能规格
-
-## 开发时查看对应文档
-
-### 新功能开发
-- 先调用 `start_feature` MCP 工具
-- 规格文档：`docs/specs/<feature>/`
-- 通过 `check_spec` 后再写实现代码
-
-### 理解 MCP 协议行为
-- `old/docs/profile-v0.1.md` — 协议规范
-- `old/docs/tools-and-schemas.md` — 工具 schema
-
-### 编写测试
-- [how-to-test.md](./project-context/how-to-test.md)
-- `old/tests/compliance/` — 行为参考
+`old/` 保存舊版 Python／PySide6 實作與相容性資料，只作行為參考，不是目前執行路徑。新功能應以現行 Rust catalog、Node parity manifest、可執行測試與規格文件為準。
 
 ---
-*生成时间: 2026-07-10*
-*生成工具: MCP Probe Kit - init_project_context*
+*更新時間：2026-08-11*
+*本文件索引資料快照：2026-08-11 18:52:42（UTC+08:00）*
+*依據：GitNexus 1.6.9 graph + PDG 索引、目前原始碼與版本來源。*

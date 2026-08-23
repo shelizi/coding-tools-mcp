@@ -124,6 +124,9 @@ impl RuntimeSupervisor {
 
     pub fn finish_stop(&mut self, workspace_id: &str, kind: ServiceKind) {
         self.entries.remove(&(workspace_id.to_string(), kind));
+        if kind == ServiceKind::Mcp {
+            crate::workspace_features::unregister_runtime(workspace_id);
+        }
     }
 
     fn status(&self, profile: &WorkspaceProfile, kind: ServiceKind) -> RuntimeStatusDto {
@@ -343,6 +346,7 @@ impl RuntimeSupervisor {
                     oauth_password,
                     oauth_token_secret,
                     policy,
+                    profile.runtime.sandbox.clone(),
                     crate::tools::ExecutionLimits::new_with_global(
                         profile.runtime.blocking_admission_limit as usize,
                         profile.runtime.process_admission_limit as usize,

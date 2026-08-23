@@ -99,6 +99,12 @@ pub fn parse_wsl_path(path: &Path) -> Option<WslLocation> {
     parse_wsl_unc_path(path.to_string_lossy())
 }
 
+/// True for `\\wsl$` / `\\wsl.localhost` (and their verbatim UNC forms).
+/// Ordinary SMB/UNC shares are not WSL filesystems.
+pub fn is_wsl_unc_path(path: impl AsRef<Path>) -> bool {
+    parse_wsl_path(path.as_ref()).is_some()
+}
+
 /// Compare WSL workspace paths using Windows semantics for the share and
 /// distribution name, while preserving Linux case sensitivity below it.
 /// Returns `None` when neither path is a WSL path so callers can retain their
@@ -145,7 +151,9 @@ fn normalize_linux_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_wsl_paths, parse_wsl_unc_path, wsl_unc_path, ExecutionTarget};
+    use super::{
+        compare_wsl_paths, is_wsl_unc_path, parse_wsl_unc_path, wsl_unc_path, ExecutionTarget,
+    };
 
     #[test]
     fn parses_supported_wsl_unc_forms() {
@@ -184,6 +192,15 @@ mod tests {
             ),
             Some(true)
         );
+    }
+
+    #[test]
+    fn classifies_wsl_unc_separately_from_ordinary_network_shares() {
+        assert!(is_wsl_unc_path(r"\\wsl.localhost\Ubuntu\home\dev"));
+        assert!(is_wsl_unc_path(r"\\wsl$\Ubuntu\home\dev"));
+        assert!(is_wsl_unc_path(r"\\?\UNC\wsl.localhost\Ubuntu\home\dev"));
+        assert!(!is_wsl_unc_path(r"\\server\share\folder"));
+        assert!(!is_wsl_unc_path(r"C:\src\project"));
     }
 
     #[test]

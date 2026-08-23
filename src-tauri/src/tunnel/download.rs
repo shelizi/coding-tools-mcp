@@ -3,6 +3,8 @@ use std::time::Duration;
 use crate::error::{AppError, AppResult};
 use crate::settings::AppSettings;
 
+const MAX_RELEASE_ASSET_BYTES: u64 = 128 * 1024 * 1024;
+
 /// The official GitHub URL plus an optional user-configured mirror fallback.
 /// Callers always try `primary` first, then `fallback`.
 pub struct DownloadPlan {
@@ -89,15 +91,35 @@ pub async fn download_release_asset(
 }
 
 async fn fetch_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .await
         .map_err(|err| err.to_string())?
         .error_for_status()
         .map_err(|err| err.to_string())?;
-    let bytes = response.bytes().await.map_err(|err| err.to_string())?;
-    Ok(bytes.to_vec())
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RELEASE_ASSET_BYTES)
+    {
+        return Err(format!(
+            "release asset exceeds {} MiB limit",
+            MAX_RELEASE_ASSET_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|err| err.to_string())? {
+        let next_len = bytes.len().saturating_add(chunk.len()) as u64;
+        if next_len > MAX_RELEASE_ASSET_BYTES {
+            return Err(format!(
+                "release asset exceeds {} MiB limit",
+                MAX_RELEASE_ASSET_BYTES / (1024 * 1024)
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

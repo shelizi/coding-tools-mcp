@@ -1,19 +1,32 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { ensureAgentSecrets } from './secrets.js';
 import { defaultPolicy, mergeAllowedCommands, normalizeScriptExtensions } from './policy.js';
 import { configuredToolProfile, resolveToolProfile } from './catalog.js';
 import { compatibilityToolProfile, normalizeSecurityPolicy } from './securityPolicy.js';
 import type {
-  AgentConfig, AgentConfigDocument, AgentSecrets, PermissionMode, WorkspaceFolder, WorkspaceFolderDocument
+  AgentConfig, AgentConfigDocument, AgentSecrets, PermissionMode, SandboxConfig, SandboxPathGrant, WorkspaceFolder, WorkspaceFolderDocument
 } from './types.js';
 import { normalizeWorkspacePath, workspaceBasename } from './wsl.js';
 import { canonicalizeWorkspaceFolders, validateUniqueWorkspaceFolders } from './workspace.js';
 import { ABSOLUTE_COMMAND_TIMEOUT_MAX_MS, DEFAULT_COMMAND_TIMEOUT_MAX_MS } from './executionLimits.js';
+import {
+  CANONICAL_SCHEMA_VERSION,
+  canonicalToAgentConfigDocument,
+  extractPlaintextSecrets,
+  looksLikeCanonicalWorkspace,
+  overlayAgentDocumentOnCanonical,
+  parseCanonicalWorkspace,
+  resolveWorkspaceIdentity,
+  serializeCanonicalWorkspace,
+  type CanonicalWorkspace,
+  type WorkspaceIdentity
+} from './workspaceDocument.js';
 
 export const CURRENT_CONFIG_SCHEMA_VERSION = 1 as const;
+export { CANONICAL_SCHEMA_VERSION };
 
 export function createOAuthClientId(): string {
   return `chatgpt-client-${randomUUID().slice(0, 12)}`;
@@ -46,6 +59,7 @@ export interface LoadedConfig {
   config: AgentConfig;
   configPath: string;
   document: AgentConfigDocument;
+  canonical: CanonicalWorkspace;
   secrets: AgentSecrets;
   secretStorePath: string;
   secretKeyPath: string;
@@ -53,8 +67,14 @@ export interface LoadedConfig {
   migratedFromSchema?: number;
 }
 
+export interface WriteConfigDocumentOptions {
+  identity?: WorkspaceIdentity;
+  canonical?: CanonicalWorkspace;
+}
+
 interface MigrationResult {
   document: AgentConfigDocument;
+  canonical?: CanonicalWorkspace;
   secrets: AgentSecrets;
   changed: boolean;
   fromSchema: number;
@@ -85,6 +105,75 @@ function enabled(value: unknown, fallback: boolean): boolean {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'string') return !['0', 'false', 'no', 'off'].includes(value.toLowerCase());
   return fallback;
+}
+
+function disabledSkillKeys(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 1024) {
+    throw new Error('skills.disabled must contain at most 1024 entries');
+  }
+  const unique = new Set<string>();
+  for (const [index, raw] of value.entries()) {
+    if (typeof raw !== 'string') throw new Error(`skills.disabled[${index}] must be a string`);
+    const key = raw.trim();
+    if (!key || key.length > 4096) {
+      throw new Error(`skills.disabled[${index}] must contain 1 to 4096 characters`);
+    }
+    unique.add(key);
+  }
+  return [...unique].sort();
+}
+
+function enabledExtensionKeys(value: unknown, name: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 1024) {
+    throw new Error(`${name} must contain at most 1024 entries`);
+  }
+  const unique = new Set<string>();
+  for (const [index, raw] of value.entries()) {
+    if (typeof raw !== 'string') throw new Error(`${name}[${index}] must be a string`);
+    const key = raw.trim();
+    if (!key || key.length > 4096) throw new Error(`${name}[${index}] must contain 1 to 4096 characters`);
+    unique.add(key);
+  }
+  return [...unique].sort();
+}
+
+function sandboxConfig(input: AgentConfigDocument['sandbox'], environment: NodeJS.ProcessEnv): SandboxConfig {
+  const externalPaths: SandboxPathGrant[] = (input?.externalPaths ?? []).map((grant, index) => {
+    if (!grant || typeof grant !== 'object') throw new Error(`sandbox.externalPaths[${index}] must be an object`);
+    const grantPath = String(grant.path ?? '').trim();
+    if (!grantPath) throw new Error(`sandbox.externalPaths[${index}].path is required`);
+    const access = String(grant.access ?? 'read_only');
+    if (access !== 'read_only' && access !== 'modify') {
+      throw new Error(`sandbox.externalPaths[${index}].access must be read_only or modify`);
+    }
+    return { path: grantPath, access };
+  });
+  const options: Record<string, string> = {};
+  for (const [key, value] of Object.entries(input?.options ?? {})) {
+    const normalizedKey = key.trim();
+    if (!normalizedKey || normalizedKey.length > 128) throw new Error('sandbox option keys must contain 1 to 128 characters');
+    const normalizedValue = String(value);
+    if (normalizedValue.length > 4096) throw new Error(`sandbox option ${normalizedKey} exceeds 4096 characters`);
+    options[normalizedKey] = normalizedValue;
+  }
+  if (environment.CTMCP_WSLC_IMAGE !== undefined) options['wslc.image'] = environment.CTMCP_WSLC_IMAGE;
+  if (environment.CTMCP_WSLC_NETWORK !== undefined) options['wslc.network'] = environment.CTMCP_WSLC_NETWORK;
+  if (environment.CTMCP_WSLC_SESSION_STORAGE !== undefined) {
+    options['wslc.session_storage'] = environment.CTMCP_WSLC_SESSION_STORAGE;
+  }
+  if (environment.CTMCP_DOCKER_IMAGE !== undefined) options['docker.image'] = environment.CTMCP_DOCKER_IMAGE;
+  if (environment.CTMCP_DOCKER_NETWORK !== undefined) options['docker.network'] = environment.CTMCP_DOCKER_NETWORK;
+  if (environment.CTMCP_PODMAN_IMAGE !== undefined) options['podman.image'] = environment.CTMCP_PODMAN_IMAGE;
+  if (environment.CTMCP_PODMAN_NETWORK !== undefined) options['podman.network'] = environment.CTMCP_PODMAN_NETWORK;
+  const requestedEnabled = enabled(environment.CTMCP_SANDBOX_ENABLED ?? input?.enabled, false);
+  return {
+    enabled: requestedEnabled,
+    backend: String(environment.CTMCP_SANDBOX_BACKEND ?? input?.backend ?? 'appcontainer').trim() || 'appcontainer',
+    externalPaths,
+    options
+  };
 }
 
 function record(value: unknown, name: string): Record<string, unknown> {
@@ -147,6 +236,21 @@ export function normalizeConfig(
     management: {
       enabled: enabled(environment.CTMCP_UI_ENABLED ?? input.management?.enabled, true)
     },
+    skills: {
+      active: enabled(input.skills?.active, true),
+      disabled: disabledSkillKeys(input.skills?.disabled)
+    },
+    extensions: {
+      hooks: {
+        active: enabled(input.extensions?.hooks?.active, true),
+        enabled: enabledExtensionKeys(input.extensions?.hooks?.enabled, 'extensions.hooks.enabled')
+      },
+      mcp: {
+        active: enabled(input.extensions?.mcp?.active, true),
+        enabled: enabledExtensionKeys(input.extensions?.mcp?.enabled, 'extensions.mcp.enabled')
+      }
+    },
+    sandbox: sandboxConfig(input.sandbox, environment),
     oauth: {
       clientId: environment.CTMCP_OAUTH_CLIENT_ID ?? input.oauth?.clientId ?? createOAuthClientId(),
       clientSecret: environment.CTMCP_OAUTH_CLIENT_SECRET ?? secrets.oauthClientSecret,
@@ -191,8 +295,30 @@ function derivePublicBase(publicUrl: string): string | undefined {
   } catch { return undefined; }
 }
 
-function migrateConfigDocument(value: unknown): MigrationResult {
+function migrateConfigDocument(value: unknown, identity?: WorkspaceIdentity): MigrationResult {
   const source = record(value, 'config');
+  if (source.schemaVersion !== undefined) {
+    const parsed = Number(source.schemaVersion);
+    if (!Number.isInteger(parsed) || parsed < 0) throw new Error('schemaVersion must be a non-negative integer');
+    if (parsed !== CANONICAL_SCHEMA_VERSION) {
+      throw new Error(`Unsupported workspace schemaVersion ${parsed}; this Agent supports ${CANONICAL_SCHEMA_VERSION}`);
+    }
+  }
+
+  if (looksLikeCanonicalWorkspace(source)) {
+    const extracted = extractPlaintextSecrets(source);
+    const parsed = parseCanonicalWorkspace(source);
+    const canonical = resolveWorkspaceIdentity(parsed, identity);
+    const identityChanged = canonical.id !== parsed.id || canonical.name !== parsed.name;
+    return {
+      document: canonicalToAgentConfigDocument(canonical),
+      canonical,
+      secrets: extracted.secrets,
+      changed: extracted.found || identityChanged,
+      fromSchema: CANONICAL_SCHEMA_VERSION
+    };
+  }
+
   const rawVersion = source.schema_version;
   if (rawVersion !== undefined
     && typeof rawVersion !== 'number'
@@ -226,12 +352,10 @@ function migrateConfigDocument(value: unknown): MigrationResult {
   }
   if (document.tunnel) delete (document.tunnel as Record<string, unknown>).enrollmentUrl;
 
-  const containsPlaintextSecrets = ['password', 'clientSecret', 'tokenSecret'].some(key => key in oauth)
-    || 'enrollmentUrl' in tunnel;
   return {
     document,
     secrets,
-    changed: rawVersion !== CURRENT_CONFIG_SCHEMA_VERSION || containsPlaintextSecrets,
+    changed: true,
     fromSchema
   };
 }
@@ -273,6 +397,11 @@ export function validateConfig(config: AgentConfig): void {
   if (!config.oauth.password.trim()) throw new Error('OAuth password is required');
   if (!config.oauth.tokenSecret.trim()) throw new Error('OAuth token secret is not configured');
   if (!config.toolProfile.trim() || !config.activeToolProfile.trim()) throw new Error('tool profile is required');
+  if (!config.sandbox.backend.trim()) throw new Error('sandbox backend is required');
+  for (const [index, grant] of config.sandbox.externalPaths.entries()) {
+    if (!grant.path.trim()) throw new Error(`sandbox.externalPaths[${index}].path is required`);
+    if (grant.access !== 'read_only' && grant.access !== 'modify') throw new Error(`sandbox.externalPaths[${index}].access is invalid`);
+  }
   if (!config.policy.allowedCommands.length) throw new Error('at least one allowed command is required');
   if (!config.policy.workspaceScriptExtensions.length) throw new Error('at least one workspace script extension is required');
   if (config.policy.maxPatchBytes < 1) throw new Error('maxPatchBytes must be positive');
@@ -290,11 +419,22 @@ export function validateConfigDocument(document: AgentConfigDocument): AgentConf
   return normalized;
 }
 
-export async function writeConfigDocument(configPath: string, document: AgentConfigDocument): Promise<void> {
-  validateConfigDocument(document);
+export async function writeConfigDocument(
+  configPath: string,
+  document: AgentConfigDocument,
+  options: WriteConfigDocumentOptions = {}
+): Promise<CanonicalWorkspace> {
+  const normalized = validateConfigDocument(document);
+  const withFolders = document.folders?.length
+    ? document
+    : { ...document, folders: normalized.folders };
+  const canonical = overlayAgentDocumentOnCanonical(withFolders, {
+    id: options.identity?.id || options.canonical?.id || '',
+    name: options.identity?.name || options.canonical?.name
+  }, options.canonical);
   await mkdir(path.dirname(configPath), { recursive: true, mode: 0o700 });
   const temporary = `${configPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
-  const content = `${JSON.stringify(document, null, 2)}\n`;
+  const content = `${JSON.stringify(serializeCanonicalWorkspace(canonical), null, 2)}\n`;
   await writeFile(temporary, content, { flag: 'wx', mode: 0o600 });
   try {
     await rename(temporary, configPath);
@@ -303,12 +443,16 @@ export async function writeConfigDocument(configPath: string, document: AgentCon
     throw error;
   }
   await chmod(configPath, 0o600).catch(() => undefined);
+  return canonical;
 }
 
-export async function loadConfigBundle(file?: string): Promise<LoadedConfig> {
+export async function loadConfigBundle(
+  file?: string,
+  options?: { identity?: WorkspaceIdentity }
+): Promise<LoadedConfig> {
   const configPath = resolveConfigPath(file);
   const input = await readConfigInput(configPath);
-  const migration = migrateConfigDocument(input.value);
+  const migration = migrateConfigDocument(input.value, options?.identity);
   if (!migration.document.oauth?.clientId?.trim()) {
     migration.document.oauth = { ...migration.document.oauth, clientId: createOAuthClientId() };
     migration.changed = true;
@@ -320,6 +464,10 @@ export async function loadConfigBundle(file?: string): Promise<LoadedConfig> {
       migration.changed = true;
     }
   }
+  let canonical = overlayAgentDocumentOnCanonical(migration.document, {
+    id: options?.identity?.id || migration.canonical?.id || '',
+    name: options?.identity?.name || migration.canonical?.name
+  }, migration.canonical);
   const dataDir = resolveDataDir(migration.document);
   const legacyToken = await readLegacyTokenSecret(dataDir);
   const seed: AgentSecrets = {
@@ -337,7 +485,13 @@ export async function loadConfigBundle(file?: string): Promise<LoadedConfig> {
   validateConfig(config);
   config = { ...config, folders: await canonicalizeWorkspaceFolders(config.folders) };
 
-  if (!input.exists || migration.changed) await writeConfigDocument(configPath, migration.document);
+  if (!input.exists || migration.changed) {
+    if (input.exists) await copyFile(configPath, `${configPath}.bak`);
+    canonical = await writeConfigDocument(configPath, migration.document, {
+      identity: { id: canonical.id, name: canonical.name },
+      canonical
+    });
+  }
   if (legacyToken.value && secretState.secrets.oauthTokenSecret) {
     await rm(legacyToken.filePath, { force: true });
   }
@@ -346,6 +500,7 @@ export async function loadConfigBundle(file?: string): Promise<LoadedConfig> {
     config,
     configPath,
     document: migration.document,
+    canonical,
     secrets: secretState.secrets,
     secretStorePath: secretState.storePath,
     secretKeyPath: secretState.keyPath,

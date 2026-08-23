@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
 import path from 'node:path';
+import { runtimeForFolderId } from '../dist/folderRuntime.js';
 import {
   BoundedMcpStreamQueue,
   MCP_STREAM_CHANNEL_CAPACITY,
@@ -27,7 +28,7 @@ async function selectWorkspace(state, session) {
   assert.equal(body.result.structuredContent.ok, true, JSON.stringify(body));
 }
 
-function openStreamingRequest(state, payload) {
+function openStreamingRequest(state, payload, extraHeaders = {}) {
   const url = new URL(state.endpoint);
   const serialized = JSON.stringify(payload);
   let request;
@@ -41,7 +42,8 @@ function openStreamingRequest(state, payload) {
       headers: {
         authorization: state.authorization,
         'content-type': 'application/json',
-        'content-length': Buffer.byteLength(serialized)
+        'content-length': Buffer.byteLength(serialized),
+        ...extraHeaders
       }
     }, resolve);
     request.once('error', reject);
@@ -134,6 +136,57 @@ test('slow MCP tool calls flush headers, stream JSON whitespace heartbeats and f
   assert.equal((body.match(/\{/g) ?? []).length > 0, true);
 });
 
+test('modern subscriptions/listen opens SSE, acknowledges the honored filter, and stays alive with comments', async t => {
+  const state = await createMcpFixture(t, { mcpHeartbeatIntervalMs: 40 });
+  const subscriptionId = 41;
+  const opened = openStreamingRequest(state, {
+    jsonrpc: '2.0',
+    id: subscriptionId,
+    method: 'subscriptions/listen',
+    params: {
+      notifications: {
+        toolsListChanged: true,
+        promptsListChanged: true,
+        resourcesListChanged: true,
+        resourceSubscriptions: ['file:///unsupported.txt']
+      },
+      _meta: {
+        'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+        'io.modelcontextprotocol/clientCapabilities': {}
+      }
+    }
+  }, {
+    'mcp-protocol-version': '2026-07-28',
+    'mcp-method': 'subscriptions/listen'
+  });
+  const response = await opened.response;
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.headers['content-type'], 'text/event-stream');
+  assert.equal(response.headers['cache-control'], 'no-store');
+  assert.equal(response.headers['x-accel-buffering'], 'no');
+
+  let received = '';
+  response.on('data', chunk => { received += Buffer.from(chunk).toString('utf8'); });
+  await waitFor(
+    () => received.includes('\n\n') && received.includes('notifications/subscriptions/acknowledged'),
+    'subscription acknowledgement was not streamed'
+  );
+  const dataLine = received.split('\n').find(line => line.startsWith('data: '));
+  assert.ok(dataLine);
+  const acknowledged = JSON.parse(dataLine.slice('data: '.length));
+  assert.equal(acknowledged.jsonrpc, '2.0');
+  assert.equal(acknowledged.method, 'notifications/subscriptions/acknowledged');
+  assert.deepEqual(acknowledged.params.notifications, {});
+  assert.equal(
+    acknowledged.params._meta['io.modelcontextprotocol/subscriptionId'],
+    subscriptionId
+  );
+
+  await waitFor(() => received.includes(':\n\n'), 'subscription keepalive comment was not streamed');
+  response.destroy();
+  opened.request.destroy();
+});
+
 test('disconnecting a streaming MCP response aborts and detaches the retained process request', async t => {
   const state = await createMcpFixture(t, { mcpHeartbeatIntervalMs: 30 });
   const session = `disconnect-${Date.now()}`;
@@ -155,7 +208,7 @@ test('disconnecting a streaming MCP response aborts and detaches the retained pr
   });
   const response = await opened.response;
   await waitFor(
-    () => [...state.runtime.context.sessions.values()][0],
+    () => [...runtimeForFolderId(state.runtime.context, 'repo').sessions.values()][0],
     'streaming request did not retain a process session'
   );
   await new Promise(resolve => response.once('data', resolve));
@@ -163,7 +216,8 @@ test('disconnecting a streaming MCP response aborts and detaches the retained pr
   opened.request.destroy();
 
   const detached = await waitFor(
-    () => [...state.runtime.context.sessions.values()].find(value => value.detachedGeneration !== 0),
+    () => [...runtimeForFolderId(state.runtime.context, 'repo').sessions.values()]
+      .find(value => value.detachedGeneration !== 0),
     'streaming disconnect did not detach the retained process session'
   );
   assert.ok(detached.detachedGeneration > 0);

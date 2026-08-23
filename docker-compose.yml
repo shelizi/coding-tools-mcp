@@ -1,0 +1,20 @@
+services:
+  node-agent:
+    build:
+      context: .
+      dockerfile: packages/node-agent/Dockerfile
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${CTMCP_PORT:-3789}:3789"
+    environment:
+      CTMCP_HOST: 0.0.0.0
+      CTMCP_PORT: 3789
+      CTMCP_UI_ENABLED: "true"
+      CTMCP_UI_TRUST_PRIVATE_PROXY: "true"
+      CTMCP_OAUTH_PASSWORD: ${CTMCP_OAUTH_PASSWORD:?Set CTMCP_OAUTH_PASSWORD before starting the stack}
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - .data:/data
+      - "${CTMCP_WORKSPACE:-.}:/workspace"
+      - /var/run/docker.sock:/var/run/docker.sock

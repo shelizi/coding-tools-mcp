@@ -29,10 +29,10 @@ if errorlevel 1 (
   goto :failed
 )
 
-where npm >nul 2>nul
+where pnpm >nul 2>nul
 if errorlevel 1 (
-  echo ERROR: npm was not found in PATH.
-  echo Reinstall Node.js with npm enabled, then run this file again.
+  echo ERROR: pnpm was not found in PATH.
+  echo Enable Corepack or install pnpm 10.19.0, then run this file again.
   goto :failed
 )
 
@@ -48,17 +48,17 @@ if %NODE_MAJOR% LSS 22 (
   goto :failed
 )
 
-cd /d "%AGENT_DIR%"
+cd /d "%REPO_ROOT%"
 if errorlevel 1 (
-  echo ERROR: Unable to enter the Node Agent directory.
+  echo ERROR: Unable to enter the repository root.
   goto :failed
 )
 
-if not exist "node_modules\typescript\bin\tsc" (
-  echo Installing Node Agent dependencies...
-  call npm ci
+if not exist "%AGENT_DIR%\node_modules\@typescript\native\bin\tsc" (
+  echo Installing pnpm workspace dependencies...
+  call pnpm install --frozen-lockfile
   if errorlevel 1 (
-    echo ERROR: npm ci failed.
+    echo ERROR: pnpm install failed.
     goto :failed
   )
 )
@@ -68,7 +68,7 @@ if not exist "dist\ui\app.js" set "FORCE_BUILD=1"
 
 if "%FORCE_BUILD%"=="1" (
   echo Building Node Agent...
-  call npm run build
+  call pnpm --filter @coding-tools/node-agent run build
   if errorlevel 1 (
     echo ERROR: Node Agent build failed.
     goto :failed

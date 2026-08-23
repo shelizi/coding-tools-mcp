@@ -5,7 +5,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
+
+use crate::tools::process_child::ProcessChild;
 
 #[cfg(windows)]
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -73,7 +75,7 @@ pub(crate) struct StartupSlotGuard {
 }
 
 pub(crate) struct StartedChild {
-    pub child: Child,
+    pub child: ProcessChild,
     pub diagnostics: StartupDiagnostics,
     pub startup_guard: StartupSlotGuard,
 }
@@ -273,14 +275,23 @@ pub(crate) async fn acquire_start_permission() -> StartupPermission {
     }
 }
 
-pub(crate) fn spawn_with_permission<F>(
+#[derive(Debug)]
+pub(crate) enum ControlledProcessStartError<E> {
+    Start(E),
+    LoaderInitialization {
+        exit_code: i32,
+        diagnostics: StartupDiagnostics,
+    },
+}
+
+pub(crate) fn start_process_with_permission<F, E>(
     permission: StartupPermission,
-    mut build: F,
-) -> Result<StartedChild, ProcessStartError>
+    mut start: F,
+) -> Result<StartedChild, E>
 where
-    F: FnMut() -> Command,
+    F: FnMut() -> Result<ProcessChild, E>,
 {
-    let child = build().spawn().map_err(ProcessStartError::Spawn)?;
+    let child = start()?;
     Ok(StartedChild {
         child,
         diagnostics: permission.diagnostics,
@@ -288,44 +299,17 @@ where
     })
 }
 
-pub(crate) async fn spawn_once_with_control<F>(build: F) -> Result<StartedChild, ProcessStartError>
+pub(crate) async fn start_process_with_control<F, E>(
+    mut start: F,
+) -> Result<StartedChild, ControlledProcessStartError<E>>
 where
-    F: FnMut() -> Command,
-{
-    let permission = acquire_start_permission().await;
-    spawn_with_permission(permission, build)
-}
-
-pub(crate) async fn loader_failure_retry_delay(retry_index: usize) -> Option<Duration> {
-    #[cfg(not(windows))]
-    {
-        let _ = retry_index;
-        None
-    }
-
-    #[cfg(windows)]
-    {
-        let controller = controller();
-        controller.record_loader_failure().await;
-        (retry_index < RETRY_DELAYS.len()).then(|| controller.retry_delay(retry_index))
-    }
-}
-
-pub(crate) async fn spawn_with_control<F>(mut build: F) -> Result<StartedChild, ProcessStartError>
-where
-    F: FnMut() -> Command,
+    F: FnMut() -> Result<ProcessChild, E>,
 {
     #[cfg(not(windows))]
     {
-        let child = build().spawn().map_err(ProcessStartError::Spawn)?;
-        return Ok(StartedChild {
-            child,
-            diagnostics: StartupDiagnostics {
-                attempts: 1,
-                ..StartupDiagnostics::default()
-            },
-            startup_guard: StartupSlotGuard::default(),
-        });
+        let permission = acquire_start_permission().await;
+        return start_process_with_permission(permission, &mut start)
+            .map_err(ControlledProcessStartError::Start);
     }
 
     #[cfg(windows)]
@@ -333,7 +317,9 @@ where
         let mut diagnostics = StartupDiagnostics::default();
 
         loop {
-            let started = spawn_once_with_control(&mut build).await?;
+            let permission = acquire_start_permission().await;
+            let started = start_process_with_permission(permission, &mut start)
+                .map_err(ControlledProcessStartError::Start)?;
             diagnostics.absorb(&started.diagnostics);
             let mut child = started.child;
             let startup_guard = started.startup_guard;
@@ -356,7 +342,7 @@ where
 
             let retry_index = diagnostics.attempts - 1;
             let Some(delay) = loader_failure_retry_delay(retry_index).await else {
-                return Err(ProcessStartError::LoaderInitialization {
+                return Err(ControlledProcessStartError::LoaderInitialization {
                     exit_code: STATUS_DLL_INIT_FAILED,
                     diagnostics,
                 });
@@ -373,9 +359,105 @@ where
     }
 }
 
+pub(crate) async fn loader_failure_retry_delay(retry_index: usize) -> Option<Duration> {
+    #[cfg(not(windows))]
+    {
+        let _ = retry_index;
+        None
+    }
+
+    #[cfg(windows)]
+    {
+        let controller = controller();
+        controller.record_loader_failure().await;
+        (retry_index < RETRY_DELAYS.len()).then(|| controller.retry_delay(retry_index))
+    }
+}
+
+pub(crate) async fn spawn_with_control<F>(mut build: F) -> Result<StartedChild, ProcessStartError>
+where
+    F: FnMut() -> Command,
+{
+    match start_process_with_control(|| {
+        build()
+            .spawn()
+            .map(ProcessChild::from_tokio)
+            .map_err(ProcessStartError::Spawn)
+    })
+    .await
+    {
+        Ok(started) => Ok(started),
+        Err(ControlledProcessStartError::Start(error)) => Err(error),
+        Err(ControlledProcessStartError::LoaderInitialization {
+            exit_code,
+            diagnostics,
+        }) => Err(ProcessStartError::LoaderInitialization {
+            exit_code,
+            diagnostics,
+        }),
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loader_failure_child_probe() {
+        if std::env::var_os("CTMCP_LOADER_FAILURE_CHILD").is_some() {
+            std::process::exit(STATUS_DLL_INIT_FAILED);
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_produced_child_reuses_loader_retry_controller() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut attempts = 0usize;
+        let started = start_process_with_control(|| {
+            attempts += 1;
+            let mut command = Command::new(&executable);
+            command.args([
+                "--exact",
+                "tools::process_start::tests::loader_failure_child_probe",
+            ]);
+            if attempts == 1 {
+                command.env("CTMCP_LOADER_FAILURE_CHILD", "1");
+            } else {
+                command.env_remove("CTMCP_LOADER_FAILURE_CHILD");
+            }
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command.spawn().map(ProcessChild::from_tokio)
+        })
+        .await
+        .expect("backend loader retry");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(started.diagnostics.attempts, 2);
+        assert_eq!(started.diagnostics.retry_delays_ms.len(), 1);
+        let mut child = started.child;
+        assert_eq!(child.wait().await.expect("wait").code(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn backend_produced_process_child_uses_shared_startup_permission() {
+        let permission = acquire_start_permission().await;
+        let started = start_process_with_permission(permission, || {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/d", "/c", "exit 0"]);
+            command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            command.spawn().map(ProcessChild::from_tokio)
+        })
+        .expect("backend child start");
+        assert_eq!(started.diagnostics.attempts, 1);
+        let mut child = started.child;
+        assert_eq!(child.wait().await.expect("wait").code(), Some(0));
+    }
 
     #[test]
     fn recognizes_signed_dll_initialization_status() {

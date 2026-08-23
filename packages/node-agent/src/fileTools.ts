@@ -3,7 +3,7 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type { JsonObject, ToolContext } from './types.js';
-import { runBuffered } from './processes.js';
+import { runGitBuffered } from './gitProcess.js';
 import {
   exists, globRegex, readText, resolveExistingPath, resolveExistingWritePath,
   resolveInside, rootAndCwd, sha256File, walk, WorkspacePathError
@@ -396,6 +396,7 @@ export async function searchTextTool(ctx: ToolContext, key: string, args: JsonOb
   const maxMatchesPerFile = args.max_matches_per_file === undefined ? Number.MAX_SAFE_INTEGER : Math.max(1, Number(args.max_matches_per_file));
   const filesOnly = args.files_only === true;
   const countOnly = args.count_only === true;
+  const calculateTotal = countOnly || args.calculate_total === true;
   const includeRaw = [...(Array.isArray(args.include_globs) ? args.include_globs.map(String) : []), ...(args.glob ? [String(args.glob)] : [])];
   const include = includeRaw.map(globRegex);
   const exclude = (Array.isArray(args.exclude_globs) ? args.exclude_globs : []).map(String).map(globRegex);
@@ -411,11 +412,13 @@ export async function searchTextTool(ctx: ToolContext, key: string, args: JsonOb
   const matches: JsonObject[] = [];
   const files: JsonObject[] = [];
   const queryCounts = queries.map(() => 0);
+  let filesConsidered = 0;
   let scannedFiles = 0;
   let matchedFiles = 0;
   let skippedLargeFiles = 0;
   let skipped = 0;
   let truncated = false;
+  let stoppedEarly = false;
   let stop = false;
 
   for (const entry of entries) {
@@ -423,9 +426,15 @@ export async function searchTextTool(ctx: ToolContext, key: string, args: JsonOb
     if (include.length && !include.some(pattern => pattern.test(entry.path))) continue;
     if (exclude.some(pattern => pattern.test(entry.path))) continue;
     if (filenameMatcher && !filenameMatcher.test(entry.path)) continue;
+    filesConsidered += 1;
     if (filesOnly && !queries.length) {
       if (skipped++ < cursor) continue;
-      if (files.length >= maxResults) { truncated = true; break; }
+      if (files.length >= maxResults) {
+        truncated = true;
+        if (calculateTotal) continue;
+        stoppedEarly = true;
+        break;
+      }
       files.push({ path: entry.path, match_id: stableMatchId(entry.path, 0, 0, 'filename'), matched_by: 'filename' });
       continue;
     }
@@ -452,13 +461,25 @@ export async function searchTextTool(ctx: ToolContext, key: string, args: JsonOb
           if (skipped < cursor) { skipped += 1; continue; }
           if (filesOnly) {
             if (!files.some(item => item.path === entry.path)) {
-              if (files.length >= maxResults) { truncated = true; stop = true; break; }
+              if (files.length >= maxResults) {
+                truncated = true;
+                if (calculateTotal) continue;
+                stoppedEarly = true;
+                stop = true;
+                break;
+              }
               files.push({ path: entry.path, match_id: stableMatchId(entry.path, lineIndex + 1, queryIndex, query.query), matched_by: 'content', query_index: queryIndex, query: query.query });
             }
             continue;
           }
           if (countOnly) continue;
-          if (matches.length >= maxResults) { truncated = true; stop = true; break; }
+          if (matches.length >= maxResults) {
+            truncated = true;
+            if (calculateTotal) continue;
+            stoppedEarly = true;
+            stop = true;
+            break;
+          }
           const item: JsonObject = {
             match_id: stableMatchId(entry.path, lineIndex + 1, queryIndex, query.query),
             path: entry.path,
@@ -481,6 +502,9 @@ export async function searchTextTool(ctx: ToolContext, key: string, args: JsonOb
   }
   const returned = filesOnly ? files.length : matches.length;
   const normalized = requestedMax !== maxResults || requestedPreview !== maxPreview || requestedContext !== contextLines;
+  const searchRecommendation = stoppedEarly && String(args.path ?? '.') === '.' && !includeRaw.length && !filenameQuery
+    ? 'Search stopped at max_results. Narrow path/include_globs/filename_query, or set calculate_total=true only when an exact total is required.'
+    : null;
   return ok({
     query: args.query ?? null,
     queries: queries.map((query, index) => ({ index, query: query.query, regex: query.regex, case_sensitive: query.caseSensitive, matches: queryCounts[index] })),
@@ -488,13 +512,18 @@ export async function searchTextTool(ctx: ToolContext, key: string, args: JsonOb
     matches: filesOnly || countOnly ? [] : matches,
     files,
     total_matches: queryCounts.reduce((sum, count) => sum + count, 0),
-    total_matches_exact: !truncated && maxMatchesPerFile === Number.MAX_SAFE_INTEGER,
+    total_matches_exact: !stoppedEarly,
+    calculate_total: calculateTotal,
     returned_count: returned,
     matched_files: matchedFiles,
+    files_considered: filesConsidered,
     scanned_files: scannedFiles,
     skipped_large_files: skippedLargeFiles,
     cursor,
     next_cursor: truncated ? cursor + returned : null,
+    scan_completed: !stoppedEarly,
+    early_stop_reason: stoppedEarly ? 'result_limit' : null,
+    search_recommendation: searchRecommendation,
     arguments_normalized: normalized,
     normalized_arguments: normalized ? { max_results: maxResults, max_preview_bytes: maxPreview, context_lines: contextLines } : null,
     truncated,
@@ -508,7 +537,7 @@ export async function patchCheckTool(ctx: ToolContext, key: string, args: JsonOb
   const preflightFailure = await preflightPatch(ctx, key, args);
   if (preflightFailure) return preflightFailure;
   const { cwd } = rootAndCwd(ctx, key);
-  const result = await runBuffered('git', ['apply', '--check', '-'], cwd, patch, 30_000);
+  const result = await runGitBuffered(cwd, ['apply', '--check', '-'], patch, 30_000);
   return result.code === 0
     ? ok({ valid: true, preflight: true, stdout: result.stdout, stderr: result.stderr })
     : fail('PATCH_CHECK_FAILED', result.stderr || result.stdout, {
@@ -527,7 +556,7 @@ export async function applyPatchTool(ctx: ToolContext, key: string, args: JsonOb
   const checked = await patchCheckTool(ctx, key, args);
   if (checked.ok !== true || args.dry_run === true) return { ...checked, dry_run: args.dry_run === true, applied: false };
   const { cwd } = rootAndCwd(ctx, key);
-  const result = await runBuffered('git', ['apply', '-'], cwd, String(args.patch), 30_000);
+  const result = await runGitBuffered(cwd, ['apply', '-'], String(args.patch), 30_000);
   return result.code === 0
     ? ok({ applied: true, preflight: true, stdout: result.stdout, stderr: result.stderr })
     : fail('PATCH_APPLY_FAILED', result.stderr || result.stdout, {
@@ -1270,7 +1299,7 @@ export async function viewImageTool(ctx: ToolContext, key: string, args: JsonObj
   const maxWidth = boundedImageInteger(args.max_width, 2_000, 1, 10_000);
   const maxHeight = boundedImageInteger(args.max_height, 2_000, 1, 10_000);
   const autoResize = args.auto_resize !== false;
-  let data = await readFile(file);
+  let data: Buffer = await readFile(file);
   let image: ImageInfo;
   let raster;
   try {

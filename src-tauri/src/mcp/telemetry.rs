@@ -1,32 +1,26 @@
+mod log_writer;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::tools::redaction::{is_sensitive_key, redact_sensitive_text};
-use crate::tools::registry::MUTATING_TOOLS;
-use crate::tunnel::append_profile_log_rotating;
+use crate::tools::tool_runtime::{
+    descriptor as tool_runtime, request_mutates as runtime_request_mutates,
+};
+
+use log_writer::append_tool_usage_log;
 
 const MAX_LOG_VALUE_BYTES: usize = 16 * 1024;
 const MAX_LOG_STRING_CHARS: usize = 4 * 1024;
 const MAX_ARGUMENT_RECORD_BYTES: usize = 4 * 1024;
 const MAX_ARGUMENT_PREVIEW_BYTES: usize = 512;
-const TOOL_USAGE_LOG_FILE: &str = "mcp-tool-usage.jsonl";
 const TOOL_USAGE_LOG_SCHEMA_VERSION: u64 = 7;
-const TOOL_USAGE_LOG_MAX_BYTES: u64 = 20 * 1024 * 1024;
-const TOOL_USAGE_LOG_RETAINED_FILES: usize = 5;
-const TOOL_USAGE_LOG_QUEUE_CAPACITY: usize = 1_024;
 const ACTIVITY_BURST_IDLE_MS: u64 = 120_000;
-
-type ToolUsageLogEntry = (String, String);
-
-static TOOL_USAGE_LOG_SENDER: OnceLock<Option<SyncSender<ToolUsageLogEntry>>> = OnceLock::new();
-static TOOL_USAGE_LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
 static TOOL_USAGE_CALL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static RUNTIME_BOOT_ID: OnceLock<String> = OnceLock::new();
 static ACTIVITY_STATES: OnceLock<Mutex<HashMap<String, ActivityState>>> = OnceLock::new();
@@ -127,6 +121,7 @@ pub(crate) struct ToolUsageInput<'a> {
     pub outcome: &'a str,
     pub response: Option<&'a Value>,
     pub worker_error: Option<&'a str>,
+    pub redact_telemetry: bool,
 }
 
 pub(crate) fn format_log_value(value: &Value) -> String {
@@ -334,47 +329,11 @@ fn json_byte_len(value: &Value) -> usize {
 }
 
 fn tool_family(tool_name: &str) -> &'static str {
-    if tool_name.starts_with("git_") {
-        "git"
-    } else if tool_name == "format_files" {
-        "quality"
-    } else if matches!(
-        tool_name,
-        "read_file"
-            | "read_many"
-            | "list_files"
-            | "apply_patch"
-            | "edit"
-            | "edit_file"
-            | "edit_many"
-            | "file_ops"
-            | "view_image"
-    ) {
-        "filesystem"
-    } else if matches!(tool_name, "search_text" | "project_map") {
-        "search"
-    } else if matches!(
-        tool_name,
-        "exec_command" | "wait_command" | "send_input" | "kill_session" | "read_output"
-    ) {
-        "process"
-    } else if tool_name.starts_with("history_session_") {
-        "history"
-    } else if matches!(
-        tool_name,
-        "server_info" | "set_default_cwd" | "request_permissions"
-    ) {
-        "runtime"
-    } else {
-        "other"
-    }
+    tool_runtime(tool_name).usage_family.as_str()
 }
 
 fn request_mutates(tool_name: &str, arguments: &Value) -> bool {
-    if tool_name == "format_files" {
-        return arguments.get("mode").and_then(Value::as_str) == Some("apply");
-    }
-    MUTATING_TOOLS.contains(&tool_name)
+    runtime_request_mutates(tool_name, arguments)
 }
 
 fn argument_command_preview(arguments: &Value) -> Option<String> {
@@ -519,10 +478,36 @@ fn mcp_text_content_bytes(result: &Value) -> usize {
         .unwrap_or(0)
 }
 
+fn semantic_tool_arguments(arguments: &Value) -> Value {
+    let mut semantic = arguments.clone();
+    if let Some(object) = semantic.as_object_mut() {
+        for field in [
+            "retry_of_call_sequence",
+            "recovery_of_operation_id",
+            "recovery_action_id",
+        ] {
+            object.remove(field);
+        }
+    }
+    semantic
+}
+
 fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
-    let sanitized_arguments = sanitize_log_value(input.arguments, None);
+    let sanitized_arguments = if input.redact_telemetry {
+        sanitize_log_value(input.arguments, None)
+    } else {
+        input.arguments.clone()
+    };
     let arguments_bytes = serde_json::to_vec(&sanitized_arguments).unwrap_or_default();
-    let arguments_sha256 = format!("{:x}", Sha256::digest(&arguments_bytes));
+    let semantic_arguments = semantic_tool_arguments(input.arguments);
+    let sanitized_semantic_arguments = if input.redact_telemetry {
+        sanitize_log_value(&semantic_arguments, None)
+    } else {
+        semantic_arguments.clone()
+    };
+    let semantic_argument_bytes =
+        serde_json::to_vec(&sanitized_semantic_arguments).unwrap_or_default();
+    let arguments_sha256 = format!("{:x}", Sha256::digest(&semantic_argument_bytes));
     let mut record = Map::new();
     record.insert(
         "schema_version".into(),
@@ -582,6 +567,47 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
     record.insert("request_json_bytes".into(), json!(input.request_json_bytes));
     record.insert("arguments_json_bytes".into(), json!(arguments_bytes.len()));
     record.insert("arguments_sha256".into(), json!(arguments_sha256));
+    record.insert(
+        "semantic_arguments_json_bytes".into(),
+        json!(semantic_argument_bytes.len()),
+    );
+    if let Some(sequence) = input
+        .arguments
+        .get("retry_of_call_sequence")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+    {
+        record.insert("retry_of_call_sequence".into(), json!(sequence));
+    }
+    if let Some(operation_id) = input
+        .arguments
+        .get("recovery_of_operation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        record.insert(
+            "recovery_of_operation_id_hash".into(),
+            json!(format!("{:x}", Sha256::digest(operation_id.as_bytes()))),
+        );
+    }
+    if let Some(action_id) = input
+        .arguments
+        .get("recovery_action_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        record.insert(
+            "recovery_action_id".into(),
+            sanitize_log_value(
+                &Value::String(action_id.to_string()),
+                Some("recovery_action_id"),
+            ),
+        );
+    }
+    let recovery_attempt = record.contains_key("retry_of_call_sequence")
+        || record.contains_key("recovery_of_operation_id_hash")
+        || record.contains_key("recovery_action_id");
+    record.insert("recovery_attempt".into(), Value::Bool(recovery_attempt));
     record.insert(
         "arguments_truncated".into(),
         json!(arguments_bytes.len() > MAX_ARGUMENT_RECORD_BYTES),
@@ -777,6 +803,12 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
                     "returned_count",
                     "total_matches",
                     "scanned_files",
+                    "total_matches_exact",
+                    "calculate_total",
+                    "matched_files",
+                    "files_considered",
+                    "scan_completed",
+                    "early_stop_reason",
                     "skipped_large_files",
                     "bytes_read",
                     "total_bytes",
@@ -790,6 +822,13 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
                     "clean",
                     "applied",
                     "dry_run",
+                    "transaction_stage",
+                    "selected_path_count",
+                    "staged_path_count_before",
+                    "staged_path_count",
+                    "index_clean_before",
+                    "staged_by_tool",
+                    "index_restored",
                     "proposal_ttl_seconds",
                     "candidate_start_line",
                     "candidate_end_line",
@@ -940,6 +979,13 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
                             "actual_occurrences",
                             "expected_occurrences",
                             "recovery_reason",
+                            "transaction_stage",
+                            "selected_path_count",
+                            "staged_path_count_before",
+                            "staged_path_count",
+                            "index_clean_before",
+                            "staged_by_tool",
+                            "index_restored",
                         ] {
                             if let Some(value) = details.get(field) {
                                 record.insert(
@@ -955,6 +1001,20 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
                             "recovery_action_count",
                         );
                     }
+                }
+                for field in [
+                    "failure_id",
+                    "recovery_of_operation_id_hash",
+                    "recovery_action_id",
+                    "recovery_attempt",
+                    "recovery_succeeded",
+                ] {
+                    if let Some(value) = structured.get(field) {
+                        record.insert(field.to_string(), sanitize_log_value(value, Some(field)));
+                    }
+                }
+                if let Some(value) = structured.get("retry_of_call_sequence") {
+                    record.insert("retry_of_call_sequence".into(), value.clone());
                 }
                 if let Some(duration) = structured.get("duration_ms") {
                     record.insert("tool_reported_duration_ms".into(), duration.clone());
@@ -1101,70 +1161,6 @@ fn classify_outcome(record: &Map<String, Value>, outcome: &str) -> &'static str 
         "caller_argument_error"
     } else {
         "internal_error"
-    }
-}
-
-fn tool_usage_log_sender() -> Option<&'static SyncSender<ToolUsageLogEntry>> {
-    TOOL_USAGE_LOG_SENDER
-        .get_or_init(|| {
-            let (sender, receiver) =
-                sync_channel::<ToolUsageLogEntry>(TOOL_USAGE_LOG_QUEUE_CAPACITY);
-            let worker = thread::Builder::new()
-                .name("mcp-tool-usage-log".into())
-                .spawn(move || {
-                    while let Ok((profile_id, line)) = receiver.recv() {
-                        append_profile_log_rotating(
-                            &profile_id,
-                            TOOL_USAGE_LOG_FILE,
-                            &line,
-                            TOOL_USAGE_LOG_MAX_BYTES,
-                            TOOL_USAGE_LOG_RETAINED_FILES,
-                        );
-                    }
-                });
-            worker.ok().map(|_| sender)
-        })
-        .as_ref()
-}
-
-fn append_tool_usage_log(profile_id: &str, mut record: Value) {
-    let dropped_before = TOOL_USAGE_LOG_DROPPED.swap(0, Ordering::Relaxed);
-    if dropped_before > 0 {
-        if let Some(object) = record.as_object_mut() {
-            object.insert("telemetry_dropped_before".into(), json!(dropped_before));
-        }
-    }
-
-    let Ok(line) = serde_json::to_string(&record) else {
-        TOOL_USAGE_LOG_DROPPED.fetch_add(dropped_before.saturating_add(1), Ordering::Relaxed);
-        return;
-    };
-
-    let Some(sender) = tool_usage_log_sender() else {
-        append_profile_log_rotating(
-            profile_id,
-            TOOL_USAGE_LOG_FILE,
-            &line,
-            TOOL_USAGE_LOG_MAX_BYTES,
-            TOOL_USAGE_LOG_RETAINED_FILES,
-        );
-        return;
-    };
-
-    match sender.try_send((profile_id.to_string(), line)) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_)) => {
-            TOOL_USAGE_LOG_DROPPED.fetch_add(dropped_before.saturating_add(1), Ordering::Relaxed);
-        }
-        Err(TrySendError::Disconnected((profile_id, line))) => {
-            append_profile_log_rotating(
-                &profile_id,
-                TOOL_USAGE_LOG_FILE,
-                &line,
-                TOOL_USAGE_LOG_MAX_BYTES,
-                TOOL_USAGE_LOG_RETAINED_FILES,
-            );
-        }
     }
 }
 
@@ -1453,6 +1449,7 @@ mod tests {
             outcome: "success",
             response: Some(&response),
             worker_error: None,
+            redact_telemetry: true,
         });
 
         assert_eq!(record["schema_version"], 7);
@@ -1552,6 +1549,7 @@ mod tests {
             outcome: "success",
             response: Some(&response),
             worker_error: None,
+            redact_telemetry: true,
         });
         assert_eq!(record["schema_version"], 7);
         assert_eq!(record["mode"], "parallel");
@@ -1614,6 +1612,7 @@ mod tests {
             outcome: "success",
             response: Some(&response),
             worker_error: None,
+            redact_telemetry: true,
         });
         assert_eq!(check["schema_version"], 7);
         assert_eq!(check["tool_family"], "quality");
@@ -1644,6 +1643,7 @@ mod tests {
             outcome: "success",
             response: None,
             worker_error: None,
+            redact_telemetry: true,
         });
         assert_eq!(apply["mutating_tool"], true);
     }

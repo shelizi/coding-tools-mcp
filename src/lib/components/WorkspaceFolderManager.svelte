@@ -2,7 +2,9 @@
   import FolderOpen from "@lucide/svelte/icons/folder-open";
   import FolderPlus from "@lucide/svelte/icons/folder-plus";
   import Trash2 from "@lucide/svelte/icons/trash-2";
-  import { confirm, open } from "@tauri-apps/plugin-dialog";
+  import { confirm, pickDirectory } from "$lib/api/native";
+  import { getBackend } from "$lib/backend";
+  import DirectoryPicker from "$lib/components/DirectoryPicker.svelte";
   import WslFolderDialog from "$lib/components/WslFolderDialog.svelte";
   import {
     addWorkspaceFolder,
@@ -22,10 +24,12 @@
   }
 
   let { profile, onChanged, onFoldersChanged }: Props = $props();
+  const capabilities = getBackend().capabilities;
   let busyAction = $state("");
   let wslDialogOpen = $state(false);
   let wslDistributions = $state<string[]>([]);
   let wslError = $state("");
+  let directoryPickerOpen = $state(false);
 
   const folders = $derived(workspaceFolders(profile));
 
@@ -35,18 +39,11 @@
     return trimmed.replace(/[\\/]+$/, "");
   }
 
-  async function chooseFolder() {
-    if (busyAction) return;
+  async function addFolderFromPath(selected: string) {
+    const path = normalizePath(selected);
+    if (!path) return;
     busyAction = "add";
     try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        defaultPath: profile.path || undefined,
-      });
-      if (!selected || Array.isArray(selected)) return;
-      const path = normalizePath(selected);
-      if (!path) return;
       const updated = await addWorkspaceFolder(profile.id, path);
       await onChanged(updated);
       await onFoldersChanged?.(updated);
@@ -54,6 +51,26 @@
     } catch (error) {
       showToast(String(error), { kind: "error", title: $t("Could not add folder") });
     } finally {
+      busyAction = "";
+    }
+  }
+
+  async function chooseFolder() {
+    if (busyAction) return;
+    if (!capabilities.nativeDirectoryPicker) {
+      directoryPickerOpen = true;
+      return;
+    }
+    busyAction = "add";
+    try {
+      const selected = await pickDirectory({
+        multiple: false,
+        defaultPath: profile.path || undefined,
+      });
+      if (!selected || Array.isArray(selected)) return;
+      await addFolderFromPath(selected);
+    } catch (error) {
+      showToast(String(error), { kind: "error", title: $t("Could not add folder") });
       busyAction = "";
     }
   }
@@ -147,15 +164,17 @@
       </p>
     </div>
     <div class="flex shrink-0 flex-wrap items-center gap-2">
-      <button
-        type="button"
-        class="tx-btn-ghost"
-        disabled={Boolean(busyAction)}
-        onclick={() => void chooseWslFolder()}
-      >
-        <FolderPlus size={15} class="inline-block" />
-        <span class="ml-1">{$t("Add WSL folder")}</span>
-      </button>
+      {#if capabilities.wslFolders}
+        <button
+          type="button"
+          class="tx-btn-ghost"
+          disabled={Boolean(busyAction)}
+          onclick={() => void chooseWslFolder()}
+        >
+          <FolderPlus size={15} class="inline-block" />
+          <span class="ml-1">{$t("Add WSL folder")}</span>
+        </button>
+      {/if}
       <button
         type="button"
         class="tx-btn-primary"
@@ -191,15 +210,17 @@
           </div>
 
           <div class="flex shrink-0 flex-wrap items-center gap-1.5">
-            <button
-              type="button"
-              class="tx-btn-ghost px-2.5 py-1.5 text-xs"
-              disabled={Boolean(busyAction)}
-              onclick={() => void openFolder(folder.path, folder.id)}
-            >
-              <FolderOpen size={14} class="inline-block" />
-              <span class="ml-1">{$t("Open")}</span>
-            </button>
+            {#if capabilities.openNativePath}
+              <button
+                type="button"
+                class="tx-btn-ghost px-2.5 py-1.5 text-xs"
+                disabled={Boolean(busyAction)}
+                onclick={() => void openFolder(folder.path, folder.id)}
+              >
+                <FolderOpen size={14} class="inline-block" />
+                <span class="ml-1">{$t("Open")}</span>
+              </button>
+            {/if}
             <button
               type="button"
               class="tx-btn-ghost px-2.5 py-1.5 text-xs text-[var(--danger)]"
@@ -224,4 +245,15 @@
   error={wslError}
   onClose={() => (wslDialogOpen = false)}
   onSubmit={addWslFolder}
+/>
+
+<DirectoryPicker
+  open={directoryPickerOpen}
+  workspaceId={profile.id}
+  initialPath={profile.path}
+  onCancel={() => (directoryPickerOpen = false)}
+  onSelect={async (path) => {
+    directoryPickerOpen = false;
+    await addFolderFromPath(path);
+  }}
 />

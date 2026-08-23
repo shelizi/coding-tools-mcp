@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { getBackend } from "$lib/backend";
 
 export type TunnelService = "mcp" | "actions";
 
@@ -16,15 +16,15 @@ export interface TunnelStatus {
 }
 
 export async function getFrpSnippet(id: string, service: TunnelService): Promise<string> {
-  return invoke<string>("get_frp_snippet", { id, service });
+  return getBackend().tunnel.getFrpSnippet(id, service);
 }
 
 export async function startTunnel(id: string, service: TunnelService): Promise<TunnelStatus> {
-  return invoke<TunnelStatus>("start_tunnel", { id, service });
+  return getBackend().tunnel.start(id, service);
 }
 
 export async function stopTunnel(id: string, service: TunnelService): Promise<TunnelStatus> {
-  return invoke<TunnelStatus>("stop_tunnel", { id, service });
+  return getBackend().tunnel.stop(id, service);
 }
 
 export interface TunnelTestResult {
@@ -35,9 +35,9 @@ export interface TunnelTestResult {
 }
 
 export async function testTunnel(id: string, service: TunnelService): Promise<TunnelTestResult> {
-  return invoke<TunnelTestResult>("test_tunnel", { id, service });
+  return getBackend().tunnel.test(id, service);
 }
 
 export async function restartTunnel(id: string, service: TunnelService): Promise<TunnelStatus> {
-  return invoke<TunnelStatus>("restart_tunnel", { id, service });
+  return getBackend().tunnel.restart(id, service);
 }

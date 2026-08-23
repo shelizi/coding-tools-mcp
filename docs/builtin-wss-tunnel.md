@@ -154,7 +154,7 @@ cargo test --manifest-path services/tunnel-server/Cargo.toml
 cargo clippy --manifest-path services/tunnel-server/Cargo.toml --all-targets -- -D warnings
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1
-npm run verify
+pnpm run verify
 ```
 
 The server suite performs actual HTTP enrollment, Ed25519 challenge-response over WebSocket, public HTTP proxying, revocation rejection, idempotent enrollment retry, stale-worker expiry and reconnect, response-timeout cancellation, and immediate `503` behavior when no worker is connected.

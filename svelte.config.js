@@ -5,13 +5,27 @@
 import adapter from "@sveltejs/adapter-static";
 import { vitePreprocess } from "@sveltejs/vite-plugin-svelte";
 
+const base = process.env.CTMCP_UI_BASE ?? "";
+const outDir = process.env.CTMCP_UI_OUT ?? "build";
+
 /** @type {import('@sveltejs/kit').Config} */
 const config = {
   preprocess: vitePreprocess(),
   kit: {
     adapter: adapter({
       fallback: "index.html",
+      pages: outDir,
+      assets: outDir,
     }),
+    paths: {
+      base,
+    },
+    alias: {
+      "$lib/backend/host":
+        process.env.CTMCP_UI_HOST === "node"
+          ? "src/lib/backend/host-node.ts"
+          : "src/lib/backend/host-desktop.ts",
+    },
   },
 };
 

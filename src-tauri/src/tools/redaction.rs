@@ -3,25 +3,53 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
+use crate::workspace::SecurityPolicy;
+
 const REDACTED: &str = "[REDACTED]";
 
 pub struct OutputRedactionContext {
     tool_name: String,
     sensitive_source: bool,
+    redact_sensitive_output: bool,
+    withhold_sensitive_source_output: bool,
 }
 
 impl OutputRedactionContext {
     pub fn new(tool_name: &str, arguments: &Value) -> Self {
+        Self::with_options(tool_name, arguments, true, true)
+    }
+
+    pub fn new_with_policy(tool_name: &str, arguments: &Value, policy: &SecurityPolicy) -> Self {
+        Self::with_options(
+            tool_name,
+            arguments,
+            policy.redact_sensitive_output,
+            policy.withhold_sensitive_source_output,
+        )
+    }
+
+    fn with_options(
+        tool_name: &str,
+        arguments: &Value,
+        redact_sensitive_output: bool,
+        withhold_sensitive_source_output: bool,
+    ) -> Self {
         Self {
             tool_name: tool_name.to_string(),
             sensitive_source: arguments_reference_sensitive_source(arguments),
+            redact_sensitive_output,
+            withhold_sensitive_source_output,
         }
     }
 
     pub fn redact(&self, mut value: Value) -> Value {
         let mut redaction_count = 0u64;
-        redact_sensitive_source_output(self, &mut value, &mut redaction_count);
-        redact_value(&mut value, None, &mut redaction_count);
+        if self.withhold_sensitive_source_output {
+            redact_sensitive_source_output(self, &mut value, &mut redaction_count);
+        }
+        if self.redact_sensitive_output {
+            redact_value(&mut value, None, &mut redaction_count);
+        }
         if redaction_count == 0 {
             return value;
         }
@@ -40,6 +68,15 @@ impl OutputRedactionContext {
 
 pub fn redact_tool_output(tool_name: &str, arguments: &Value, value: Value) -> Value {
     OutputRedactionContext::new(tool_name, arguments).redact(value)
+}
+
+pub fn redact_tool_output_with_policy(
+    tool_name: &str,
+    arguments: &Value,
+    value: Value,
+    policy: &SecurityPolicy,
+) -> Value {
+    OutputRedactionContext::new_with_policy(tool_name, arguments, policy).redact(value)
 }
 
 pub fn arguments_reference_sensitive_source(arguments: &Value) -> bool {

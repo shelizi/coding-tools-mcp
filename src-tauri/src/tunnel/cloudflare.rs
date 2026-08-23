@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
@@ -61,7 +63,9 @@ fn cloudflared_release_asset() -> AppResult<&'static str> {
     }
     #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
     {
-        Ok("cloudflared-windows-arm64.exe")
+        Err(AppError::Message(
+            "cloudflared 2025.6.1 未发布可校验的 Windows ARM64 自动下载资产，请使用系统安装的 cloudflared。".into(),
+        ))
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
@@ -97,6 +101,40 @@ fn cloudflared_release_asset() -> AppResult<&'static str> {
 /// Latest cloudflared release. Pinned for reproducibility; bump as needed.
 const CLOUDFLARED_VERSION: &str = "2025.6.1";
 
+fn expected_cloudflared_sha256(asset: &str) -> AppResult<&'static str> {
+    match asset {
+        "cloudflared-windows-amd64.exe" => {
+            Ok("a4af4d26a86ed48f43647d151be37b0907f15c3ac230f0ab95aa226b3e0b8803")
+        }
+        "cloudflared-linux-amd64" => {
+            Ok("103ff020ffcc4ad6b542948b95ecff417150c70a17bff3a39ac2670b4159c9bb")
+        }
+        "cloudflared-linux-arm64" => {
+            Ok("87a38f8b0c371b926224a1346443096a8b9f38138561e0b314efa4c9fc1f51f7")
+        }
+        "cloudflared-darwin-amd64.tgz" => {
+            Ok("b81b684ff28bd614d048559ba5e45892fb9cdb69347ca83c418dd4386b6e4735")
+        }
+        "cloudflared-darwin-arm64.tgz" => {
+            Ok("9cc4c04b3cec473c3bf4342a7b5b6628358953e568fd4682aadb390bac85a23a")
+        }
+        _ => Err(AppError::Message(format!(
+            "cloudflared {CLOUDFLARED_VERSION} 资产缺少固定 SHA-256：{asset}"
+        ))),
+    }
+}
+
+fn verify_cloudflared_download(asset: &str, bytes: &[u8]) -> AppResult<()> {
+    let expected = expected_cloudflared_sha256(asset)?;
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(AppError::Message(format!(
+            "cloudflared 下载完整性校验失败：{asset} SHA-256 不匹配"
+        )));
+    }
+    Ok(())
+}
+
 /// Download cloudflared into the app cache `bin/` directory, honoring the
 /// configured mirror + proxy. Windows/Linux assets are raw binaries; macOS
 /// assets are `.tgz` archives that need extraction.
@@ -114,6 +152,7 @@ pub(crate) async fn download_cloudflared_to_cache() -> AppResult<PathBuf> {
 
     let bytes =
         crate::tunnel::download::download_release_asset(&settings, &url, "cloudflared").await?;
+    verify_cloudflared_download(asset, &bytes)?;
 
     if asset.ends_with(".tgz") {
         extract_cloudflared_from_tar_gz(&bytes, &dest)?;

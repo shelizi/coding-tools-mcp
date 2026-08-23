@@ -11,9 +11,11 @@
     type TunnelFormConfig,
   } from "$lib/components/TunnelConfigForm.svelte";
   import type { FrpProfileDto } from "$lib/api/settings";
+  import { getBackend } from "$lib/backend";
   import { t } from "$lib/i18n";
   import {
     mcpLocalEndpoint,
+    securityPolicyConfig,
     type AuthConfig,
     type RuntimeState,
     type WorkspaceProfile,
@@ -59,14 +61,17 @@
     onSaveAuth,
   }: Props = $props();
 
-  const tabs = $derived([
-    { value: "service", label: $t("Service") },
-    { value: "tunnel", label: $t("Tunnel") },
-    { value: "auth", label: $t("Authentication") },
-    { value: "policy", label: $t("Policy") },
-    { value: "logs", label: $t("Logs") },
-    { value: "health", label: $t("Health") },
-  ]);
+  const capabilities = getBackend().capabilities;
+  const tabs = $derived(
+    [
+      { value: "service", label: $t("Service") },
+      { value: "tunnel", label: $t("Tunnel") },
+      { value: "auth", label: $t("Authentication") },
+      { value: "policy", label: $t("Policy") },
+      capabilities.rawRuntimeLogs ? { value: "logs", label: $t("Logs") } : null,
+      { value: "health", label: $t("Health") },
+    ].filter((item): item is { value: string; label: string } => item != null),
+  );
 
   const tunnelForm = $derived<TunnelFormConfig>({
     type: profile.tunnel.type ?? "none",
@@ -103,10 +108,11 @@
         {status}
         {statusMessage}
         port={profile.runtime.local_port}
-        portEditable={true}
+        portEditable={capabilities.runtimeSupervisor}
         bindAddress={profile.runtime.bind_address ?? "127.0.0.1"}
-        bindAddressEditable={true}
+        bindAddressEditable={capabilities.runtimeSupervisor}
         {busy}
+        toggleable={capabilities.runtimeSupervisor}
         tunnelType={profile.tunnel.type}
         localEndpoint={localEndpoint || mcpLocalEndpoint(profile.runtime.local_port, profile.runtime.bind_address)}
         {publicEndpoint}
@@ -143,8 +149,7 @@
       <div class="mt-3">
         <RuntimePolicyForm
           transportMode={profile.runtime.transport_mode ?? "streamable-http"}
-          toolProfile={profile.runtime.tool_profile}
-          permissionMode={profile.runtime.permission_mode}
+          securityPolicy={securityPolicyConfig(profile.runtime)}
           allowedCommands={profile.runtime.allowed_commands ?? ""}
           workspaceLocalEntries={profile.runtime.workspace_local_entries ?? true}
           workspaceScriptExtensions={profile.runtime.workspace_script_extensions ?? ".exe,.bat,.cmd,.ps1"}
@@ -157,7 +162,7 @@
         />
       </div>
     </section>
-  {:else if section === "logs"}
+  {:else if section === "logs" && capabilities.rawRuntimeLogs}
     <LogViewer {workspaceId} service="mcp" />
   {:else}
     <HealthPanel {workspaceId} />

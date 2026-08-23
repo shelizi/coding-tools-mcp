@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 2,
+  "id": "ws-full",
+  "name": "full",
+  "folders": [
+    {
+      "id": "folder-1",
+      "name": "repo",
+      "path": "E:\\work\\repo"
+    },
+    {
+      "id": "folder-2",
+      "name": "docs",
+      "path": "E:\\work\\docs"
+    }
+  ],
+  "activeFolderId": "folder-1",
+  "bind": {
+    "host": "127.0.0.1",
+    "port": 8788
+  },
+  "publicBaseUrl": "https://example.test/builtin/clients/full",
+  "auth": {
+    "type": "oauth",
+    "oauthClientId": "chatgpt-client-full"
+  },
+  "toolProfile": "core",
+  "permissionMode": "trusted",
+  "securityPolicy": {
+    "restrictToolCatalog": true,
+    "enforceCommandAllowlist": true,
+    "requireDangerousConfirmation": true,
+    "requireShellConfirmation": true,
+    "blockNetworkCommands": false,
+    "enforceWorkspaceBoundary": true,
+    "protectRepositoryMetadata": true,
+    "blockSymlinkEscape": true,
+    "protectEnvironmentVariables": true,
+    "enforceHarnessBaseline": true,
+    "requireWriteConfirmation": true,
+    "verifyWriteConflicts": true,
+    "enforceResourceLimits": true,
+    "redactSensitiveOutput": true,
+    "withholdSensitiveSourceOutput": true,
+    "redactTelemetry": true,
+    "redactHistory": true
+  },
+  "policy": {
+    "allowedCommands": ["pytest", "cargo"],
+    "workspaceLocalEntries": true,
+    "workspaceScriptExtensions": [".exe", ".cmd"],
+    "maxPatchBytes": 1048576
+  },
+  "sandbox": {
+    "enabled": false,
+    "backend": "appcontainer",
+    "externalPaths": [
+      { "path": "E:\\cache", "access": "read_only" }
+    ],
+    "options": { "network": "none" }
+  },
+  "limits": {
+    "blockingConcurrency": 8,
+    "processConcurrency": 4,
+    "globalBlockingConcurrency": 16,
+    "globalProcessConcurrency": 8,
+    "activeSessionLimit": 16,
+    "maxOutputBytes": 4096,
+    "commandTimeoutMaxMs": 60000
+  },
+  "tunnel": {
+    "builtin": {
+      "enabled": true,
+      "publicUrl": "https://example.test/builtin/clients/full/mcp"
+    }
+  },
+  "skills": { "active": true, "disabled": [] },
+  "extensions": {
+    "hooks": { "active": true, "enabled": [] },
+    "mcp": { "active": false, "enabled": [] }
+  },
+  "host": {
+    "desktop": {},
+    "node": {}
+  }
+}

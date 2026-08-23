@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { message } from "@tauri-apps/plugin-dialog";
+  import { alert as message } from "$lib/api/native";
   import CopyButton from "$lib/components/CopyButton.svelte";
   import SecretInput from "$lib/components/SecretInput.svelte";
   import { getSecret, regenerateSecret, getSharedSecret, regenerateSharedSecret } from "$lib/api/secrets";

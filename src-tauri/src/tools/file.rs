@@ -361,7 +361,8 @@ pub fn list_files(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError>
         .into_iter()
         .filter_entry(|entry| {
             entry.path() == resolved.path
-                || !ws.is_ignored_path(
+                || !ws.is_ignored_scan_path(
+                    &resolved.path,
                     entry.path(),
                     include_hidden,
                     include_ignored,
@@ -468,6 +469,11 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         .get("count_only")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let calculate_total = count_only
+        || args
+            .get("calculate_total")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
     let (include_globs, exclude_globs) = search_globs(args);
     let requested_context_lines = args
         .get("context_lines")
@@ -500,15 +506,23 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
     let mut matches = Vec::new();
     let mut files = Vec::new();
     let mut query_counts = vec![0usize; queries.len()];
+    let mut files_considered = 0usize;
     let mut scanned_files = 0usize;
     let mut matched_files = 0usize;
     let mut skipped_large_files = 0usize;
     let mut skipped = 0usize;
     let mut truncated = false;
+    let mut stopped_early = false;
 
     'files: for p in file_paths {
         if !ws.is_safe_read_path(&p)
-            || ws.is_ignored_path(&p, include_hidden, include_ignored, include_generated)
+            || ws.is_ignored_scan_path(
+                &resolved.path,
+                &p,
+                include_hidden,
+                include_ignored,
+                include_generated,
+            )
         {
             continue;
         }
@@ -522,6 +536,7 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         if filename_matcher.is_some() && !filename_matches {
             continue;
         }
+        files_considered += 1;
         if files_only && queries.is_empty() {
             if skipped < cursor {
                 skipped += 1;
@@ -529,6 +544,10 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
             }
             if files.len() >= max_results {
                 truncated = true;
+                if calculate_total {
+                    continue;
+                }
+                stopped_early = true;
                 break;
             }
             files.push(json!({
@@ -579,6 +598,10 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
                         if !files.iter().any(|item| item["path"] == rel) {
                             if files.len() >= max_results {
                                 truncated = true;
+                                if calculate_total {
+                                    continue;
+                                }
+                                stopped_early = true;
                                 break 'files;
                             }
                             files.push(json!({
@@ -596,6 +619,10 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
                     }
                     if matches.len() >= max_results {
                         truncated = true;
+                        if calculate_total {
+                            continue;
+                        }
+                        stopped_early = true;
                         break 'files;
                     }
                     let column = line[..found.start()].chars().count() + 1;
@@ -633,6 +660,16 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
     } else {
         None
     };
+    let early_stop_reason = stopped_early.then_some("result_limit");
+    let search_recommendation = if stopped_early
+        && path == "."
+        && include_globs.is_empty()
+        && filename_query.is_none()
+    {
+        Some("Search stopped at max_results. Narrow path/include_globs/filename_query, or set calculate_total=true only when an exact total is required.")
+    } else {
+        None
+    };
     Ok(tool_ok(json!({
         "query": args.get("query"),
         "queries": queries.iter().enumerate().map(|(index, query)| json!({
@@ -646,13 +683,18 @@ pub fn search_text(ws: &Workspace, args: &Value) -> Result<Value, WorkspaceError
         "matches": if files_only || count_only { Vec::<Value>::new() } else { matches },
         "files": files,
         "total_matches": query_counts.iter().sum::<usize>(),
-        "total_matches_exact": !truncated && max_matches_per_file == usize::MAX,
+        "total_matches_exact": !stopped_early,
+        "calculate_total": calculate_total,
         "returned_count": returned,
         "matched_files": matched_files,
+        "files_considered": files_considered,
         "scanned_files": scanned_files,
         "skipped_large_files": skipped_large_files,
         "cursor": cursor,
         "next_cursor": next_cursor,
+        "scan_completed": !stopped_early,
+        "early_stop_reason": early_stop_reason,
+        "search_recommendation": search_recommendation,
         "arguments_normalized": arguments_normalized,
         "normalized_arguments": if arguments_normalized {
             json!({
@@ -1021,6 +1063,43 @@ mod tests {
         assert_eq!(result["arguments_normalized"], true);
         assert_eq!(result["normalized_arguments"]["context_lines"], 20);
         assert_eq!(result["normalized_arguments"]["max_preview_bytes"], 64);
+    }
+
+    #[test]
+    fn search_can_stop_early_or_continue_for_an_exact_total() {
+        let workspace = tempdir().expect("workspace");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(workspace.path().join(name), "needle\n").expect("search fixture");
+        }
+        let ws = Workspace::new(workspace.path().to_path_buf()).expect("workspace");
+
+        let bounded = search_text(&ws, &json!({"query": "needle", "max_results": 1}))
+            .expect("bounded search");
+        assert_eq!(bounded["returned_count"], 1);
+        assert_eq!(bounded["truncated"], true);
+        assert_eq!(bounded["calculate_total"], false);
+        assert_eq!(bounded["scan_completed"], false);
+        assert_eq!(bounded["total_matches_exact"], false);
+        assert_eq!(bounded["early_stop_reason"], "result_limit");
+        assert!(bounded["search_recommendation"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Narrow path"));
+        assert!(bounded["files_considered"].as_u64().unwrap_or_default() < 3);
+
+        let exact = search_text(
+            &ws,
+            &json!({"query": "needle", "max_results": 1, "calculate_total": true}),
+        )
+        .expect("exact search");
+        assert_eq!(exact["returned_count"], 1);
+        assert_eq!(exact["truncated"], true);
+        assert_eq!(exact["calculate_total"], true);
+        assert_eq!(exact["scan_completed"], true);
+        assert_eq!(exact["total_matches_exact"], true);
+        assert_eq!(exact["total_matches"], 3);
+        assert_eq!(exact["files_considered"], 3);
+        assert!(exact["early_stop_reason"].is_null());
     }
 
     #[test]

@@ -3,8 +3,12 @@
   import { onMount } from "svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/stores";
-  import { open } from "@tauri-apps/plugin-dialog";
+  import { appUrl, routePath } from "$lib/app-path";
+  import { pickDirectory, confirm } from "$lib/api/native";
+  import { installHostBackend } from "$lib/backend/host";
+  import { getBackend } from "$lib/backend";
   import AppShell from "$lib/components/AppShell.svelte";
+  import DirectoryPicker from "$lib/components/DirectoryPicker.svelte";
   import ToastHost from "$lib/components/ToastHost.svelte";
   import WorkspaceNavItem from "$lib/components/WorkspaceNavItem.svelte";
   import {
@@ -19,7 +23,11 @@
   import { t } from "$lib/i18n";
   import type { RuntimeState } from "$lib/types";
 
+  installHostBackend();
+
   let { children } = $props();
+  const capabilities = getBackend().capabilities;
+  let addWorkspacePickerOpen = $state(false);
 
   async function refreshWorkspaces() {
     const items = await listWorkspaces();
@@ -30,14 +38,19 @@
     await Promise.all(
       items.map(async (item) => {
         try {
-          const [mcp, actions] = await Promise.all([
-            getRuntimeStatus(item.id),
-            getActionsRuntimeStatus(item.id),
-          ]);
+          const mcp = await getRuntimeStatus(item.id);
           mcpStates[item.id] = mcp.state;
-          actionsStates[item.id] = actions.state;
         } catch {
           mcpStates[item.id] = "stopped";
+        }
+        if (!capabilities.actions) {
+          actionsStates[item.id] = "stopped";
+          return;
+        }
+        try {
+          const actions = await getActionsRuntimeStatus(item.id);
+          actionsStates[item.id] = actions.state;
+        } catch {
           actionsStates[item.id] = "stopped";
         }
       }),
@@ -46,13 +59,27 @@
     actionsRuntimeStates.set(actionsStates);
   }
 
+  async function finishAddWorkspace(selected: string) {
+    const profile = await createWorkspace(selected);
+    if (capabilities.agentRestart) {
+      showToast($t("Workspace added. Restart the Agent to start its MCP listener."), { kind: "success" });
+      await getBackend().agent.restart();
+      window.setTimeout(() => window.location.reload(), 2500);
+      return;
+    }
+    await refreshWorkspaces();
+    goto(appUrl(`/workspace/${profile.id}`));
+  }
+
   async function addWorkspace() {
     try {
-      const selected = await open({ directory: true, multiple: false });
+      if (!capabilities.nativeDirectoryPicker) {
+        addWorkspacePickerOpen = true;
+        return;
+      }
+      const selected = await pickDirectory({ multiple: false });
       if (!selected || Array.isArray(selected)) return;
-      const profile = await createWorkspace(selected);
-      await refreshWorkspaces();
-      goto(`/workspace/${profile.id}`);
+      await finishAddWorkspace(selected);
     } catch (error) {
       showToast(String(error), {
         title: $t("Failed to add workspace"),
@@ -63,83 +90,115 @@
   }
 
   function openWorkspace(id: string) {
-    goto(`/workspace/${id}`);
+    goto(appUrl(`/workspace/${id}`));
   }
 
   function openQuickSetup() {
-    goto("/quick-setup");
+    const currentPath = routePath($page.url.pathname);
+    const workspaceMatch = currentPath.match(/^\/workspace\/([^/]+)$/);
+    const target = workspaceMatch
+      ? `/quick-setup?workspace=${encodeURIComponent(workspaceMatch[1]!)}`
+      : "/quick-setup";
+    goto(appUrl(target));
   }
 
   function openFrpSettings() {
-    goto("/settings/frp");
+    goto(appUrl("/settings/frp"));
   }
 
   function openSoftwareSettings() {
-    goto("/settings/software");
+    goto(appUrl("/settings/software"));
   }
 
   function openGeneralSettings() {
-    goto("/settings/general");
+    goto(appUrl("/settings/general"));
   }
 
   function openKeysSettings() {
-    goto("/settings/keys");
+    goto(appUrl("/settings/keys"));
+  }
+
+  async function restartAgent() {
+    try {
+      const confirmed = await confirm(
+        $t("Restart the Agent now? Active tool calls and command sessions will be stopped."),
+        { kind: "warning", title: $t("Restart Agent") },
+      );
+      if (!confirmed) return;
+      await getBackend().agent.restart();
+      window.setTimeout(() => window.location.reload(), 2500);
+    } catch (error) {
+      showToast(String(error), { title: $t("Agent restart failed"), kind: "error", duration: 8000 });
+    }
   }
 
   onMount(async () => {
     await refreshWorkspaces();
-    const path = $page.url.pathname;
+    const path = routePath($page.url.pathname);
     if (path === "/") {
       const lastId = await getLastWorkspaceId();
       if (lastId && $workspaces.some((item) => item.id === lastId)) {
-        goto(`/workspace/${lastId}`);
+        goto(appUrl(`/workspace/${lastId}`));
       } else if ($workspaces.length > 0) {
-        goto(`/workspace/${$workspaces[0].id}`);
+        goto(appUrl(`/workspace/${$workspaces[0].id}`));
       }
     }
   });
 </script>
 
 <AppShell
-  onAddWorkspace={addWorkspace}
-  onQuickSetup={openQuickSetup}
+  onAddWorkspace={capabilities.workspaceLifecycle ? addWorkspace : undefined}
+  onQuickSetup={capabilities.guidedSetup ? openQuickSetup : undefined}
 >
   {#snippet settingsNav()}
-    <button
-      type="button"
-      class="tx-settings-link {$page.url.pathname === '/settings/general' ? 'active' : ''}"
-      onclick={openGeneralSettings}
-    >
-      {$t("General")}
-    </button>
-    <button
-      type="button"
-      class="tx-settings-link {$page.url.pathname === '/settings/keys' ? 'active' : ''}"
-      onclick={openKeysSettings}
-    >
-      {$t("Shared secrets")}
-    </button>
-    <button
-      type="button"
-      class="tx-settings-link {$page.url.pathname === '/settings/frp' ? 'active' : ''}"
-      onclick={openFrpSettings}
-    >
-      {$t("FRP configuration")}
-    </button>
-    <button
-      type="button"
-      class="tx-settings-link {$page.url.pathname === '/settings/software' ? 'active' : ''}"
-      onclick={openSoftwareSettings}
-    >
-      {$t("Software management")}
-    </button>
+    {#if capabilities.host === "desktop"}
+      <button
+        type="button"
+        class="tx-settings-link {routePath($page.url.pathname) === '/settings/general' ? 'active' : ''}"
+        onclick={openGeneralSettings}
+      >
+        {$t("General")}
+      </button>
+    {/if}
+    {#if capabilities.sharedSecretStore}
+      <button
+        type="button"
+        class="tx-settings-link {routePath($page.url.pathname) === '/settings/keys' ? 'active' : ''}"
+        onclick={openKeysSettings}
+      >
+        {$t("Shared secrets")}
+      </button>
+    {/if}
+    {#if capabilities.frpManagement}
+      <button
+        type="button"
+        class="tx-settings-link {routePath($page.url.pathname) === '/settings/frp' ? 'active' : ''}"
+        onclick={openFrpSettings}
+      >
+        {$t("FRP configuration")}
+      </button>
+    {/if}
+    {#if capabilities.softwareManagement}
+      <button
+        type="button"
+        class="tx-settings-link {routePath($page.url.pathname) === '/settings/software' ? 'active' : ''}"
+        onclick={openSoftwareSettings}
+      >
+        {$t("Software management")}
+      </button>
+    {/if}
+    {#if capabilities.agentRestart}
+      <button type="button" class="tx-settings-link" onclick={() => void restartAgent()}>
+        {$t("Restart Agent")}
+      </button>
+    {/if}
   {/snippet}
   {#snippet sidebar()}
     <div class="space-y-1">
       {#each $workspaces as workspace (workspace.id)}
         <WorkspaceNavItem
           workspace={workspace}
-          active={$page.url.pathname === `/workspace/${workspace.id}`}
+          active={routePath($page.url.pathname) === `/workspace/${workspace.id}`}
           mcpState={$mcpRuntimeStates[workspace.id] ?? "stopped"}
           actionsState={$actionsRuntimeStates[workspace.id] ?? "stopped"}
           onClick={() => openWorkspace(workspace.id)}
@@ -152,5 +211,22 @@
     {@render children()}
   {/snippet}
 </AppShell>
+
+<DirectoryPicker
+  open={addWorkspacePickerOpen}
+  onCancel={() => (addWorkspacePickerOpen = false)}
+  onSelect={async (path) => {
+    addWorkspacePickerOpen = false;
+    try {
+      await finishAddWorkspace(path);
+    } catch (error) {
+      showToast(String(error), {
+        title: $t("Failed to add workspace"),
+        kind: "error",
+        duration: 8000,
+      });
+    }
+  }}
+/>
 
 <ToastHost />

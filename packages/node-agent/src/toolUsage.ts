@@ -1,9 +1,24 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFile, mkdir, readFile, rename, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { isSensitiveKey, redactSensitiveText } from './redaction.js';
+import { LATEST_LEGACY_MCP_PROTOCOL_VERSION } from './mcpTransport.js';
 import { AGENT_VERSION } from './version.js';
 import type { JsonObject } from './types.js';
+import { requestMutates, toolUsageFamily } from './toolRuntime.js';
+import type {
+  AsyncSessionUsageInput,
+  ToolRequestTiming,
+  ToolUsageInput,
+  ToolUsageStoreContract
+} from './toolUsage/contract.js';
+import { ToolUsageLogStore } from './toolUsage/logStore.js';
+
+export type {
+  AsyncSessionUsageInput,
+  ToolRequestTiming,
+  ToolUsageInput,
+  ToolUsageStoreContract
+} from './toolUsage/contract.js';
 
 export const TOOL_USAGE_LOG_FILE = 'mcp-tool-usage.jsonl';
 export const TOOL_USAGE_SCHEMA_VERSION = 7;
@@ -33,13 +48,6 @@ const PHASE_METRICS = [
   ['serialization', 'phase_serialization_ms']
 ] as const;
 const REDACTED = '[REDACTED]';
-const MUTATING_TOOLS = new Set([
-  'apply_patch', 'edit', 'edit_file', 'edit_many', 'file_ops', 'format_files',
-  'exec_command', 'exec_many', 'kill_session',
-  'git_branch', 'git_stage', 'git_commit', 'git_restore',
-  'start_task', 'update_task', 'pause_task', 'resume_task', 'finish_task'
-]);
-
 const STRUCTURED_FIELDS = [
   'ok', 'transport_ok', 'execution_ok', 'command_ok', 'verification_ok', 'status',
   'termination_reason', 'exit_code', 'process_exit_code', 'process_still_running',
@@ -55,10 +63,13 @@ const STRUCTURED_FIELDS = [
   'actual_wait_ms', 'snapshot_ms', 'active_session_limit', 'active_session_slots_available',
   'execution_boundary', 'sandbox_enforced', 'program', 'shell', 'resolved_cwd',
   'child_process', 'interactive', 'stdin_open', 'elapsed_ms', 'first_output_ms',
-  'returned_count', 'total_matches', 'scanned_files', 'skipped_large_files', 'bytes_read',
+  'returned_count', 'total_matches', 'total_matches_exact', 'calculate_total', 'matched_files',
+  'files_considered', 'scanned_files', 'scan_completed', 'early_stop_reason', 'skipped_large_files', 'bytes_read',
   'total_bytes', 'total_lines', 'total_stream_bytes', 'total_retained_bytes',
   'retained_start_offset', 'requested_offset', 'offset', 'limit', 'clean', 'applied',
   'dry_run', 'proposal_ttl_seconds', 'candidate_start_line', 'candidate_end_line',
+  'transaction_stage', 'selected_path_count', 'staged_path_count_before', 'staged_path_count',
+  'index_clean_before', 'staged_by_tool', 'index_restored',
   'proposal_apply_format', 'preferred_format', 'preferred_format_reason',
   'replacement_bytes', 'proposed_content_bytes', 'proposed_content_included', 'next_action',
   'failed_command_count', 'skipped_command_count', 'batch_summary', 'mode',
@@ -78,6 +89,10 @@ const STRUCTURED_FIELDS = [
   'attached_to_session_id', 'detached', 'command_fingerprint', 'process_id',
   'process_tree_contained', 'process_tree_control',
   'resolved_by', 'retention_seconds', 'wait_until', 'sensitive_data_redacted',
+  'requested_workspace_id', 'resolved_workspace_id', 'workspace_route_source',
+  'workspace_route_changed', 'conversation_selection_changed',
+  'failure_id', 'retry_of_call_sequence', 'recovery_of_operation_id_hash',
+  'recovery_action_id', 'recovery_attempt', 'recovery_succeeded',
   'redaction_count'
 ] as const;
 
@@ -101,14 +116,6 @@ const ARRAY_COUNTS: ReadonlyArray<readonly [string, string]> = [
   ['would_delete', 'would_delete_count']
 ];
 
-export interface ToolRequestTiming {
-  previousResponseCompletedTsMs: number | null;
-  orchestrationGapMs: number | null;
-  activityBurstId: number;
-  activityBurstSequence: number;
-  concurrentRequest: boolean;
-}
-
 export interface ToolUsageStoreOptions {
   profileId?: string;
   runtimeBootId?: string;
@@ -118,35 +125,6 @@ export interface ToolUsageStoreOptions {
   queueCapacity?: number;
   redactTelemetry?: boolean;
   now?: () => number;
-}
-
-export interface ToolUsageInput {
-  tool: string;
-  arguments: JsonObject;
-  result: JsonObject;
-  startedTsMs: number;
-  durationMs: number;
-  requestTiming: ToolRequestTiming;
-  requestJsonBytes?: number;
-  requestId?: unknown;
-  workspaceId?: string;
-  transportMode?: string;
-  protocolVersion?: string;
-  method?: string;
-  rpcFastPath?: boolean;
-}
-
-export interface AsyncSessionUsageInput {
-  sessionId: string;
-  commandKind: string;
-  startedTsMs: number;
-  completedTsMs?: number;
-  childProcessTotalMs: number;
-  firstOutputMs?: number | null;
-  exitCode?: number | null;
-  terminationReason: string;
-  stdoutBytes: number;
-  stderrBytes: number;
 }
 
 type PhaseName = typeof PHASE_METRICS[number][0];
@@ -194,6 +172,13 @@ interface ToolStats {
   unexpectedChanges: number;
   formatDiffBytes: number;
   formatApplyCalls: number;
+  searchFilesConsidered: number;
+  searchFilesScanned: number;
+  searchReturned: number;
+  searchMatchedFiles: number;
+  searchZeroResultCalls: number;
+  searchEarlyStops: number;
+  searchExactTotalCalls: number;
   phaseLatency: Record<PhaseName, PhaseStats>;
   durations: number[];
 }
@@ -272,6 +257,16 @@ interface RepeatedFailureStats {
   groups: Map<string, RepeatedFailureGroup>;
 }
 
+interface RecoveryChainStats {
+  attempts: number;
+  successes: number;
+  failures: number;
+  originCompletedTsMs: number;
+  firstStartedTsMs: number;
+  lastCompletedTsMs: number;
+  actions: Map<string, number>;
+}
+
 function isRecord(value: unknown): value is JsonObject {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -315,22 +310,6 @@ function sanitizeValue(value: unknown, key?: string, redact = true): unknown {
       : sanitized;
   }
   return value;
-}
-
-function toolFamily(tool: string): string {
-  if (tool.startsWith('git_')) return 'git';
-  if (tool === 'format_files') return 'quality';
-  if (['read_file', 'read_many', 'list_files', 'apply_patch', 'edit', 'edit_file', 'edit_many', 'file_ops', 'view_image'].includes(tool)) return 'filesystem';
-  if (['search_text', 'project_map'].includes(tool)) return 'search';
-  if (['exec_command', 'exec_many', 'wait_command', 'send_input', 'kill_session', 'read_output', 'resolve_operation', 'list_sessions'].includes(tool)) return 'process';
-  if (tool.startsWith('history_session_')) return 'history';
-  if (['server_info', 'set_default_cwd', 'request_permissions', 'query_tool_usage'].includes(tool)) return 'runtime';
-  return 'other';
-}
-
-function requestMutates(tool: string, args: JsonObject): boolean {
-  if (tool === 'format_files') return String(args.mode ?? '') === 'apply';
-  return MUTATING_TOOLS.has(tool);
 }
 
 function commandPreview(args: JsonObject, redact = true): string | undefined {
@@ -405,7 +384,14 @@ function copyResultMetrics(record: JsonObject, tool: string, result: JsonObject,
     if (result.error.category !== undefined) record.error_category = sanitizeValue(result.error.category, 'category', redact);
     if (result.error.retryable !== undefined) record.error_retryable = result.error.retryable;
     if (isRecord(result.error.details)) {
-      for (const field of ['stage', 'reason', 'suggestion', 'recommended_tool', 'recommended_format', 'patch_bytes', 'replacement_bytes', 'path', 'file_index', 'edit_index', 'start_line', 'end_line', 'actual_sha256', 'expected_sha256', 'actual_occurrences', 'expected_occurrences', 'recovery_reason']) {
+      for (const field of [
+        'stage', 'reason', 'suggestion', 'recommended_tool', 'recommended_format',
+        'patch_bytes', 'replacement_bytes', 'path', 'file_index', 'edit_index',
+        'start_line', 'end_line', 'actual_sha256', 'expected_sha256',
+        'actual_occurrences', 'expected_occurrences', 'recovery_reason',
+        'transaction_stage', 'selected_path_count', 'staged_path_count_before',
+        'staged_path_count', 'index_clean_before', 'staged_by_tool', 'index_restored'
+      ]) {
         if (result.error.details[field] !== undefined) record[`error_${field}`] = sanitizeValue(result.error.details[field], field, redact);
       }
       record.recovery_action_count = Array.isArray(result.error.details.recovery_actions) ? result.error.details.recovery_actions.length : numberValue(record.recovery_action_count);
@@ -475,9 +461,23 @@ function failureSignature(record: JsonObject): string | null {
   return createHash('sha256').update(JSON.stringify(identity)).digest('hex');
 }
 
+function semanticToolArguments(argumentsValue: JsonObject): JsonObject {
+  const semantic = { ...argumentsValue };
+  delete semantic.retry_of_call_sequence;
+  delete semantic.recovery_of_operation_id;
+  delete semantic.recovery_action_id;
+  return semantic;
+}
+
 function buildToolCallRecord(store: ToolUsageStore, input: ToolUsageInput): JsonObject {
   const sanitizedArguments = sanitizeValue(input.arguments, undefined, store.redactTelemetry) as JsonObject;
   const argumentBytes = jsonBytes(sanitizedArguments);
+  const sanitizedSemanticArguments = sanitizeValue(
+    semanticToolArguments(input.arguments),
+    undefined,
+    store.redactTelemetry
+  ) as JsonObject;
+  const semanticArgumentBytes = jsonBytes(sanitizedSemanticArguments);
   const resultBytes = jsonBytes(input.result);
   const outcome = input.result.ok === true ? 'success' : 'tool_error';
   const record: JsonObject = {
@@ -490,12 +490,12 @@ function buildToolCallRecord(store: ToolUsageStore, input: ToolUsageInput): Json
     runtime_boot_id: store.runtimeBootId,
     server_version: store.serverVersion,
     transport_mode: input.transportMode ?? 'direct',
-    protocol_version: input.protocolVersion ?? '2025-11-25',
+    protocol_version: input.protocolVersion ?? LATEST_LEGACY_MCP_PROTOCOL_VERSION,
     request_id: input.requestId ?? null,
     call_sequence: store.nextCallSequence(),
     method: input.method ?? 'tools/call',
     tool: input.tool,
-    tool_family: toolFamily(input.tool),
+    tool_family: toolUsageFamily(input.tool),
     mutating_tool: requestMutates(input.tool, input.arguments),
     deprecated_tool: false,
     rpc_fast_path: input.rpcFastPath === true,
@@ -509,7 +509,8 @@ function buildToolCallRecord(store: ToolUsageStore, input: ToolUsageInput): Json
     outcome,
     request_json_bytes: input.requestJsonBytes ?? argumentBytes.length,
     arguments_json_bytes: argumentBytes.length,
-    arguments_sha256: createHash('sha256').update(argumentBytes).digest('hex'),
+    arguments_sha256: createHash('sha256').update(semanticArgumentBytes).digest('hex'),
+    semantic_arguments_json_bytes: semanticArgumentBytes.length,
     arguments_truncated: argumentBytes.length > MAX_ARGUMENT_RECORD_BYTES,
     response_json_bytes: resultBytes.length,
     result_json_bytes: resultBytes.length,
@@ -522,6 +523,24 @@ function buildToolCallRecord(store: ToolUsageStore, input: ToolUsageInput): Json
   const keys = Object.keys(sanitizedArguments).sort();
   record.argument_keys = keys;
   record.argument_field_bytes = Object.fromEntries(keys.map(key => [key, jsonBytes(sanitizedArguments[key]).length]));
+  if (Number.isSafeInteger(input.arguments.retry_of_call_sequence) && Number(input.arguments.retry_of_call_sequence) > 0) {
+    record.retry_of_call_sequence = Number(input.arguments.retry_of_call_sequence);
+  }
+  if (typeof input.arguments.recovery_of_operation_id === 'string' && input.arguments.recovery_of_operation_id) {
+    record.recovery_of_operation_id_hash = createHash('sha256')
+      .update(input.arguments.recovery_of_operation_id)
+      .digest('hex');
+  }
+  if (typeof input.arguments.recovery_action_id === 'string' && input.arguments.recovery_action_id) {
+    record.recovery_action_id = sanitizeValue(
+      input.arguments.recovery_action_id,
+      'recovery_action_id',
+      store.redactTelemetry
+    );
+  }
+  record.recovery_attempt = record.retry_of_call_sequence !== undefined
+    || record.recovery_of_operation_id_hash !== undefined
+    || record.recovery_action_id !== undefined;
   const preview = commandPreview(input.arguments, store.redactTelemetry);
   if (preview !== undefined) {
     record.command_kind = classifyCommandText(preview);
@@ -561,6 +580,9 @@ function newToolStats(): ToolStats {
     formatFilesChanged: 0, formatFilesUnchanged: 0, formatFilesSkipped: 0,
     formatterGroups: 0, customFormatterGroups: 0, unavailableAdapters: 0,
     unexpectedChanges: 0, formatDiffBytes: 0, formatApplyCalls: 0,
+    searchFilesConsidered: 0, searchFilesScanned: 0, searchReturned: 0,
+    searchMatchedFiles: 0, searchZeroResultCalls: 0, searchEarlyStops: 0,
+    searchExactTotalCalls: 0,
     phaseLatency: newPhaseLatency(), durations: []
   };
 }
@@ -619,6 +641,16 @@ function addStats(record: JsonObject, stats: ToolStats): void {
   stats.unexpectedChanges += metric(record, 'format_unexpected_change_count');
   stats.formatDiffBytes += metric(record, 'format_diff_bytes');
   stats.formatApplyCalls += record.format_applied === true ? 1 : 0;
+  if (record.tool === 'search_text') {
+    const returned = metric(record, 'returned_count');
+    stats.searchFilesConsidered += metric(record, 'files_considered');
+    stats.searchFilesScanned += metric(record, 'scanned_files');
+    stats.searchReturned += returned;
+    stats.searchMatchedFiles += metric(record, 'matched_files');
+    stats.searchZeroResultCalls += returned === 0 ? 1 : 0;
+    stats.searchEarlyStops += record.early_stop_reason === 'result_limit' ? 1 : 0;
+    stats.searchExactTotalCalls += record.total_matches_exact === true ? 1 : 0;
+  }
   for (const [phase, field] of PHASE_METRICS) {
     if (record[field] === undefined || record[field] === null) continue;
     const phaseDuration = numberValue(record[field]);
@@ -653,6 +685,18 @@ function formattingStats(stats: ToolStats): JsonObject {
     unexpected_changes: stats.unexpectedChanges,
     diff_bytes: stats.formatDiffBytes,
     apply_calls: stats.formatApplyCalls
+  };
+}
+
+function searchStats(stats: ToolStats): JsonObject {
+  return {
+    files_considered: stats.searchFilesConsidered,
+    files_scanned: stats.searchFilesScanned,
+    returned_results: stats.searchReturned,
+    matched_files: stats.searchMatchedFiles,
+    zero_result_calls: stats.searchZeroResultCalls,
+    early_stop_calls: stats.searchEarlyStops,
+    exact_total_calls: stats.searchExactTotalCalls
   };
 }
 
@@ -695,7 +739,91 @@ function statsRecord(tool: string, stats: ToolStats): JsonObject {
       deduplicated_calls: stats.deduplicatedCalls, heartbeat_responses: stats.heartbeatResponses,
       detached_responses: stats.detachedResponses
     },
-    formatting: formattingStats(stats)
+    formatting: formattingStats(stats),
+    search: searchStats(stats)
+  };
+}
+
+function versionScopeStats(stats: ToolStats): JsonObject {
+  return {
+    calls: stats.calls,
+    errors: stats.errors,
+    warnings: stats.warnings,
+    duration_ms: stats.durationMs,
+    avg_ms: average(stats.durationMs, stats.calls),
+    p50_ms: percentile(stats.durations, 50),
+    p95_ms: percentile(stats.durations, 95),
+    max_ms: stats.durations.length ? Math.max(...stats.durations) : 0,
+    request_bytes: stats.requestBytes,
+    response_bytes: stats.responseBytes
+  };
+}
+
+function newRecoveryChainStats(): RecoveryChainStats {
+  return {
+    attempts: 0,
+    successes: 0,
+    failures: 0,
+    originCompletedTsMs: 0,
+    firstStartedTsMs: 0,
+    lastCompletedTsMs: 0,
+    actions: new Map()
+  };
+}
+
+function recoveryChainKey(record: JsonObject): string | undefined {
+  if (typeof record.recovery_of_operation_id_hash === 'string' && record.recovery_of_operation_id_hash) {
+    return `operation:${record.recovery_of_operation_id_hash}`;
+  }
+  const sequence = numberValue(record.retry_of_call_sequence);
+  return sequence > 0 ? `call:${Math.trunc(sequence)}` : undefined;
+}
+
+function accumulateRecoveryChain(
+  record: JsonObject,
+  callCompletedTs: Map<number, number>,
+  chains: Map<string, RecoveryChainStats>
+): void {
+  const key = recoveryChainKey(record);
+  if (!key) return;
+  const chain = chains.get(key) ?? newRecoveryChainStats();
+  const started = numberValue(record.started_ts_ms);
+  const completed = numberValue(record.completed_ts_ms, started);
+  chain.attempts += 1;
+  if (isErrorRecord(record)) chain.failures += 1;
+  else chain.successes += 1;
+  if (chain.firstStartedTsMs === 0 || started < chain.firstStartedTsMs) chain.firstStartedTsMs = started;
+  chain.lastCompletedTsMs = Math.max(chain.lastCompletedTsMs, completed);
+  const retrySequence = Math.trunc(numberValue(record.retry_of_call_sequence));
+  const origin = retrySequence > 0 ? callCompletedTs.get(retrySequence) : undefined;
+  if (origin !== undefined && (chain.originCompletedTsMs === 0 || origin < chain.originCompletedTsMs)) {
+    chain.originCompletedTsMs = origin;
+  }
+  if (typeof record.recovery_action_id === 'string' && record.recovery_action_id) {
+    chain.actions.set(record.recovery_action_id, (chain.actions.get(record.recovery_action_id) ?? 0) + 1);
+  }
+  chains.set(key, chain);
+}
+
+function recoveryChainReport(chains: Map<string, RecoveryChainStats>, top: number): JsonObject {
+  const rows = [...chains.entries()].map(([chain, stats]) => {
+    const origin = stats.originCompletedTsMs || stats.firstStartedTsMs;
+    return {
+      chain,
+      attempts: stats.attempts,
+      successes: stats.successes,
+      failures: stats.failures,
+      succeeded: stats.successes > 0,
+      elapsed_ms: Math.max(0, stats.lastCompletedTsMs - origin),
+      actions: mapObject(stats.actions)
+    };
+  }).sort((left, right) => right.attempts - left.attempts || left.chain.localeCompare(right.chain)).slice(0, top);
+  return {
+    chain_count: chains.size,
+    attempts: [...chains.values()].reduce((sum, chain) => sum + chain.attempts, 0),
+    successful_chains: [...chains.values()].filter(chain => chain.successes > 0).length,
+    failed_chains: [...chains.values()].filter(chain => chain.successes === 0).length,
+    top: rows
   };
 }
 
@@ -999,7 +1127,7 @@ function sortMetric(record: JsonObject, field: string): number {
   return metric(record, 'calls');
 }
 
-export class ToolUsageStore {
+export class ToolUsageStore implements ToolUsageStoreContract {
   readonly profileId: string;
   readonly runtimeBootId: string;
   readonly serverVersion: string;
@@ -1022,6 +1150,7 @@ export class ToolUsageStore {
   #failureCountsByBurst = new Map<string, number>();
   #failureBurstId = 0;
   #dashboardCache?: { createdAt: number; value: JsonObject };
+  readonly #logStore: ToolUsageLogStore;
 
   constructor(dataDir: string, options: ToolUsageStoreOptions = {}) {
     const resolvedDataDir = path.resolve(dataDir);
@@ -1036,6 +1165,12 @@ export class ToolUsageStore {
     this.queueCapacity = Math.max(1, Math.trunc(options.queueCapacity ?? TOOL_USAGE_QUEUE_CAPACITY));
     this.redactTelemetry = options.redactTelemetry ?? true;
     this.now = options.now ?? Date.now;
+    this.#logStore = new ToolUsageLogStore({
+      logDir: this.logDir,
+      logFile: this.logFile,
+      maxBytes: this.maxBytes,
+      retainedFiles: this.retainedFiles
+    });
   }
 
   nextCallSequence(): number { this.#callSequence += 1; return this.#callSequence; }
@@ -1145,7 +1280,7 @@ export class ToolUsageStore {
       const record = this.#queue.shift();
       if (!record) continue;
       try {
-        await this.appendRecord(record);
+        await this.#logStore.append(sanitizeValue(record));
         this.#lastWriteError = undefined;
       } catch (error) {
         this.#lastWriteError = error instanceof Error ? error.message : String(error);
@@ -1186,63 +1321,6 @@ export class ToolUsageStore {
     return value;
   }
 
-  private async appendRecord(record: JsonObject): Promise<void> {
-    const line = `${JSON.stringify(sanitizeValue(record))}\n`;
-    const lineBytes = Buffer.byteLength(line);
-    await mkdir(this.logDir, { recursive: true });
-    let currentBytes = 0;
-    try { currentBytes = (await stat(this.logFile)).size; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-    if (currentBytes > 0 && currentBytes + lineBytes > this.maxBytes) await this.rotate();
-    await appendFile(this.logFile, line, { encoding: 'utf8', mode: 0o600 });
-  }
-
-  private async rotate(): Promise<void> {
-    if (this.retainedFiles <= 0) {
-      await unlink(this.logFile).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; });
-      return;
-    }
-    await unlink(`${this.logFile}.${this.retainedFiles}`).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; });
-    for (let index = this.retainedFiles - 1; index >= 1; index -= 1) {
-      await rename(`${this.logFile}.${index}`, `${this.logFile}.${index + 1}`).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; });
-    }
-    await rename(this.logFile, `${this.logFile}.1`).catch(error => { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; });
-  }
-
-  private logPaths(): string[] {
-    const paths: string[] = [];
-    for (let index = this.retainedFiles; index >= 1; index -= 1) paths.push(`${this.logFile}.${index}`);
-    paths.push(this.logFile);
-    return paths;
-  }
-
-  private async readCompleteRecords(): Promise<{ records: JsonObject[]; scannedLines: number; invalidLines: number }> {
-    const records: JsonObject[] = [];
-    let scannedLines = 0;
-    let invalidLines = 0;
-    for (const file of this.logPaths()) {
-      let content: string;
-      try { content = await readFile(file, 'utf8'); }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
-        throw Object.assign(new Error(`Unable to read ${file}: ${error instanceof Error ? error.message : String(error)}`), { code: 'LOG_READ_FAILED' });
-      }
-      const lastNewline = content.lastIndexOf('\n');
-      if (lastNewline < 0) continue;
-      const complete = content.slice(0, lastNewline);
-      for (const rawLine of complete.split('\n')) {
-        const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
-        if (!line) continue;
-        scannedLines += 1;
-        try {
-          const parsed = JSON.parse(line);
-          if (isRecord(parsed)) records.push(parsed);
-          else invalidLines += 1;
-        } catch { invalidLines += 1; }
-      }
-    }
-    return { records, scannedLines, invalidLines };
-  }
 
   async query(args: JsonObject): Promise<JsonObject> {
     await this.flush();
@@ -1265,9 +1343,11 @@ export class ToolUsageStore {
     const tools = new Set(Array.isArray(args.tools) ? args.tools.map(String) : []);
     const excludeTools = new Set(Array.isArray(args.exclude_tools) && args.exclude_tools.length ? args.exclude_tools.map(String) : ['query_tool_usage']);
     const outcomes = new Set(Array.isArray(args.outcomes) ? args.outcomes.map(String) : []);
-    const { records: source, scannedLines, invalidLines } = await this.readCompleteRecords();
     const recent: JsonObject[] = [];
     const totals = newToolStats();
+    const currentVersionTotals = newToolStats();
+    const previousVersionTotals = newToolStats();
+    const previousVersions = new Set<string>();
     const byTool = new Map<string, ToolStats>();
     const outcomeCounts = new Map<string, number>();
     const errorCounts = new Map<string, number>();
@@ -1276,12 +1356,14 @@ export class ToolUsageStore {
     const performance = newPerformanceStats();
     const parallelHistory = newParallelHistory();
     const repeatedFailures = newRepeatedFailureStats();
+    const recoveryChains = new Map<string, RecoveryChainStats>();
+    const callCompletedTs = new Map<number, number>();
     let matchedLines = 0;
     let matchedAsync = 0;
     let repeatedIdenticalErrorCount = 0;
     let previousError: string | undefined;
 
-    for (const record of source) {
+    const scan = await this.#logStore.visitCompleteRecords(record => {
       const event = typeof record.event === 'string' ? record.event : 'tool_call';
       if (event === 'async_session_finalized') {
         const execRequested = !tools.size || tools.has('exec_command') || tools.has('exec_many');
@@ -1292,21 +1374,35 @@ export class ToolUsageStore {
           matchedAsync += 1;
           accumulateAsyncSession(record, performance);
         }
-        continue;
+        return;
       }
-      if (event !== 'tool_call') continue;
+      if (event !== 'tool_call') return;
       const tool = typeof record.tool === 'string' ? record.tool : '';
       const outcome = normalizedOutcome(record);
+      const matchesRequestedFilters = (tools.size === 0 || tools.has(tool)) && !excludeTools.has(tool)
+        && (outcomes.size === 0 || outcomes.has(outcome))
+        && (!errorsOnly || isErrorRecord(record)) && metric(record, 'duration_ms') >= minDurationMs;
+      if (scope === 'all' && matchesRequestedFilters
+        && matchesScope(record, 'all', sinceTsMs, this.runtimeBootId, this.serverVersion)) {
+        const version = typeof record.server_version === 'string' ? record.server_version : 'unknown';
+        if (version === this.serverVersion) addStats(record, currentVersionTotals);
+        else {
+          addStats(record, previousVersionTotals);
+          previousVersions.add(version);
+        }
+      }
       if (!matchesScope(record, scope, sinceTsMs, this.runtimeBootId, this.serverVersion)
-        || (tools.size > 0 && !tools.has(tool)) || excludeTools.has(tool)
-        || (outcomes.size > 0 && !outcomes.has(outcome))
-        || (errorsOnly && !isErrorRecord(record)) || metric(record, 'duration_ms') < minDurationMs) continue;
+        || !matchesRequestedFilters) return;
       matchedLines += 1;
       accumulateParallelHistory(parallelHistory, record);
       const signature = errorSignature(record);
       if (signature !== undefined && signature === previousError) repeatedIdenticalErrorCount += 1;
       previousError = signature;
       accumulateRepeatedFailure(record, repeatedFailures);
+      accumulateRecoveryChain(record, callCompletedTs, recoveryChains);
+      const callSequence = Math.trunc(numberValue(record.call_sequence));
+      const completedTs = numberValue(record.completed_ts_ms);
+      if (callSequence > 0 && completedTs > 0) callCompletedTs.set(callSequence, completedTs);
       if (includePerformance) accumulatePerformance(record, performance, burstIdleMs);
       if (aggregateEnabled) {
         addStats(record, totals);
@@ -1332,7 +1428,8 @@ export class ToolUsageStore {
         recent.push(includePayloads ? structuredClone(record) : compact);
         if (recent.length > limit) recent.shift();
       }
-    }
+    });
+    const { scannedLines, invalidLines, bytesRead: logBytesRead } = scan;
 
     const toolStats = [...byTool.entries()].map(([tool, stats]) => statsRecord(tool, stats));
     toolStats.sort((left, right) => sortMetric(right, sortBy) - sortMetric(left, sortBy) || String(left.tool).localeCompare(String(right.tool)));
@@ -1367,6 +1464,7 @@ export class ToolUsageStore {
       matched_lines: matchedLines,
       matched_async_session_events: matchedAsync,
       invalid_complete_lines: invalidLines,
+      log_bytes_read: logBytesRead,
       response_profile: includeRecords || includeSlowest || includeLargest || includeBursts ? 'detailed' : 'summary',
       detail_sections: {
         records: includeRecords,
@@ -1378,14 +1476,21 @@ export class ToolUsageStore {
       slowest: includeSlowest ? slowest : null,
       largest: includeLargest ? largest : null,
       aggregate,
+      scope_breakdown: scope === 'all' ? {
+        current_version: { version: this.serverVersion, stats: versionScopeStats(currentVersionTotals) },
+        previous_versions: { versions: [...previousVersions].sort(), stats: versionScopeStats(previousVersionTotals) },
+        analysis_hint: 'Prioritize current_version for active defects; use previous_versions as regression and fixed-history evidence.'
+      } : null,
       optimization: aggregateEnabled ? {
         recovery_actions: totals.recoveryActions, failed_command_ids: totals.failedCommandIds,
         skipped_command_ids: totals.skippedCommandIds, empty_wait_timeouts: totals.emptyWaitTimeouts,
         deduplicated_calls: totals.deduplicatedCalls, heartbeat_responses: totals.heartbeatResponses,
         detached_responses: totals.detachedResponses, repeated_identical_error_count: repeatedIdenticalErrorCount,
-        repeated_failures: repeatedFailureReport(repeatedFailures, repeatedIdenticalErrorCount, top)
+        repeated_failures: repeatedFailureReport(repeatedFailures, repeatedIdenticalErrorCount, top),
+        recovery_chains: recoveryChainReport(recoveryChains, top)
       } : null,
       formatting: aggregateEnabled ? formattingStats(totals) : null,
+      search: aggregateEnabled ? searchStats(totals) : null,
       parallelism: parallelismReport(parallelHistory, top),
       performance: includePerformance ? performanceReport(performance, top, includeBursts, burstIdleMs) : null,
       warnings: this.#lastWriteError ? [`tool usage telemetry write failed: ${this.#lastWriteError}`] : []

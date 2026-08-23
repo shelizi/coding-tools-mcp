@@ -2,7 +2,7 @@
 
 **Status:** Complete
 
-**Baseline:** Rust/Desktop Client `0.1.40` · Node Agent `0.29.8` · client compatibility `0.1.40`
+**Baseline:** Rust/Desktop Client `0.1.53` — Node Agent `0.29.25` — client compatibility `0.1.53`
 
 This checklist tracks shared Management UI capabilities that should remain synchronized with the Rust Desktop console while preserving the pure Node Agent product boundary. It does not require visual identity or desktop-only process management.
 
@@ -19,11 +19,15 @@ The following remain intentional exclusions rather than Node UI defects:
 - Live history-session running/active/inactive badges; the Node UI provides a read-only archive browser.
 - Raw Desktop per-service stdout/stderr and Actions/FRP/Cloudflare log files; Node exposes structured persisted operation logs and sanitized telemetry instead.
 
+## Follow-up (not this checklist)
+
+Workspace **config** sharing across Desktop and Node is planned separately: [shared-workspace-config](../shared-workspace-config/README.md). Do not treat host-specific documents or `node-map.ts` overlays as UI parity defects.
+
 ## UI-001 — Telemetry browser
 
 Rust evidence: `src/lib/components/TelemetryViewer.svelte`
 
-Node evidence: `packages/node-agent/src/managementObservability.ts`, `packages/node-agent/ui/src/components/TelemetryView.tsx`
+Node evidence: `packages/node-agent/src/managementObservability.ts`, `src/lib/components/TelemetryViewer.svelte`, `src/lib/backend/node.ts`
 
 - [x] Query retained telemetry by runtime/version/all scope.
 - [x] Support errors-only, record limit, minimum duration, and aggregate sort controls.
@@ -36,7 +40,7 @@ Node evidence: `packages/node-agent/src/managementObservability.ts`, `packages/n
 
 Rust evidence: `src/lib/components/HistoryViewer.svelte`
 
-Node evidence: `packages/node-agent/src/historyStorage.ts`, `packages/node-agent/src/historyMarkdown.ts`, `packages/node-agent/ui/src/components/HistoryView.tsx`
+Node evidence: `packages/node-agent/src/historyStorage.ts`, `packages/node-agent/src/historyMarkdown.ts`, `src/lib/components/HistoryViewer.svelte`
 
 - [x] Restrict browsing to configured workspace folders and `docs/history-session`.
 - [x] Reject a history directory whose canonical target escapes through a symlink or junction.
@@ -51,7 +55,7 @@ Node evidence: `packages/node-agent/src/historyStorage.ts`, `packages/node-agent
 
 Rust evidence: `src/lib/components/HealthPanel.svelte`
 
-Node evidence: `packages/node-agent/src/managementObservability.ts`, `packages/node-agent/ui/src/components/HealthView.tsx`
+Node evidence: `packages/node-agent/src/managementObservability.ts`, `src/lib/components/HealthPanel.svelte`
 
 - [x] Probe only fixed routes on the same local Agent listener, derived from the accepted socket rather than the HTTP `Host` header.
 - [x] Validate endpoint-specific contracts for `/health`, `/mcp/info`, OAuth authorization metadata, and protected-resource metadata.
@@ -63,7 +67,7 @@ Node evidence: `packages/node-agent/src/managementObservability.ts`, `packages/n
 
 Rust evidence: `src/routes/workspace/[id]/+page.svelte`
 
-Node evidence: `packages/node-agent/src/dashboard.ts`, `packages/node-agent/ui/src/components/OperationalSummary.tsx`
+Node evidence: `packages/node-agent/src/dashboard.ts`, `src/routes/workspace/[id]/+page.svelte`
 
 - [x] Display pending permissions by workspace folder.
 - [x] Display persistent telemetry scanned, matched, and invalid-record counts.
@@ -75,20 +79,22 @@ Node evidence: `packages/node-agent/src/dashboard.ts`, `packages/node-agent/ui/s
 
 Rust evidence: `src/routes/workspace/[id]/+page.svelte`
 
-Node evidence: `packages/node-agent/src/config.ts`, `packages/node-agent/ui/src/components/ConfigForm.tsx`
+Node evidence: `packages/node-agent/src/config.ts`, `packages/node-agent/src/management/configStore.ts`, `packages/node-agent/src/sandbox.ts`, `src/lib/components/RuntimePolicyForm.svelte`, `src/lib/backend/node-map.ts`
 
 - [x] Edit allowed commands.
 - [x] Edit workspace-local executable policy.
 - [x] Edit workspace script extensions.
 - [x] Edit maximum patch bytes.
 - [x] Edit workspace and global blocking/process concurrency limits.
-- [x] Preserve policy and global limits when Quick Setup changes tunnel or OAuth settings.
+- [x] Configure command sandbox enablement, backend, external filesystem grants, and backend options.
+- [x] Configure Rust MCP security protections independently with per-item checkboxes and preserve legacy mode/profile compatibility fields.
+- [x] Preserve policy, global limits, and sandbox settings when Quick Setup changes tunnel or OAuth settings.
 
 ## UI-006 — Sanitized diagnostics export
 
 Rust evidence: `src/lib/components/TelemetryViewer.svelte`, `src/lib/components/HealthPanel.svelte`
 
-Node evidence: `packages/node-agent/src/managementObservability.ts`, `packages/node-agent/ui/src/components/WorkspaceView.tsx`
+Node evidence: `packages/node-agent/src/managementObservability.ts`, `src/routes/workspace/[id]/+page.svelte`
 
 - [x] Export version, platform, tool profile, admission, session, permission, task, tunnel, policy, and telemetry summaries as JSON.
 - [x] Exclude secrets, configured paths, public endpoints, raw commands, raw arguments, process output, and private runtime/session identifiers.
@@ -98,7 +104,7 @@ Node evidence: `packages/node-agent/src/managementObservability.ts`, `packages/n
 
 Rust evidence: `src-tauri/src/harness/model.rs`, `src-tauri/src/harness/store.rs`, `src-tauri/src/harness/tools.rs`, `src-tauri/src/tools/dispatch.rs`, `src-tauri/src/tools/session.rs`
 
-Node evidence: `packages/node-agent/src/state.ts`, `packages/node-agent/src/taskTools.ts`, `packages/node-agent/src/operationSummary.ts`, `packages/node-agent/src/processes.ts`, `packages/node-agent/src/managementObservability.ts`, `packages/node-agent/ui/src/components/OperationLogView.tsx`
+Node evidence: `packages/node-agent/src/state.ts`, `packages/node-agent/src/taskTools.ts`, `packages/node-agent/src/operationSummary.ts`, `packages/node-agent/src/processes.ts`, `packages/node-agent/src/managementObservability.ts`, `src/lib/components/OperationLogViewer.svelte`
 
 - [x] Read persisted Rust-shaped Harness operation JSONL by canonical workspace identity, with legacy folder-ID compatibility.
 - [x] Pair started and completed/failed events by correlation ID and derive duration, affected-file count, task tracking, and incomplete operations.

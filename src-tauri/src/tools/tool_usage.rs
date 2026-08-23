@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -70,6 +70,13 @@ struct ToolStats {
     unexpected_changes: u64,
     format_diff_bytes: u64,
     format_apply_calls: u64,
+    search_files_considered: u64,
+    search_files_scanned: u64,
+    search_returned: u64,
+    search_matched_files: u64,
+    search_zero_result_calls: u64,
+    search_early_stops: u64,
+    search_exact_total_calls: u64,
     phase_latency: BTreeMap<String, PhaseStats>,
     durations: Vec<u64>,
 }
@@ -134,6 +141,17 @@ struct RepeatedFailureStats {
     wasted_duration_ms: u128,
     max_attempt_count: u64,
     groups: BTreeMap<String, RepeatedFailureGroup>,
+}
+
+#[derive(Default)]
+struct RecoveryChainStats {
+    attempts: u64,
+    successes: u64,
+    failures: u64,
+    origin_completed_ts_ms: u64,
+    first_started_ts_ms: u64,
+    last_completed_ts_ms: u64,
+    actions: BTreeMap<String, u64>,
 }
 
 pub fn query_tool_usage(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -231,11 +249,16 @@ pub fn query_tool_usage_for_profile(
     let mut repeated_identical_error_count = 0u64;
     let mut previous_error_signature: Option<(String, String, String)> = None;
     let mut totals = ToolStats::default();
+    let mut current_version_totals = ToolStats::default();
+    let mut previous_version_totals = ToolStats::default();
+    let mut previous_versions = BTreeSet::<String>::new();
     let mut slowest = Vec::<Value>::new();
     let mut largest = Vec::<Value>::new();
     let mut performance = PerformanceStats::default();
     let mut parallel_history = ParallelHistory::default();
     let mut repeated_failures = RepeatedFailureStats::default();
+    let mut recovery_chains = BTreeMap::<String, RecoveryChainStats>::new();
+    let mut call_completed_ts = BTreeMap::<u64, u64>::new();
 
     for path in paths {
         let (scanned, invalid) = visit_complete_jsonl_records(&path, |record| {
@@ -272,6 +295,29 @@ pub fn query_tool_usage_for_profile(
             if event != "tool_call" {
                 return;
             }
+            if scope == "all"
+                && matches_filters(
+                    &record,
+                    &tools,
+                    &exclude_tools,
+                    &outcomes,
+                    errors_only,
+                    min_duration_ms,
+                    since_ts_ms,
+                    "all",
+                )
+            {
+                let version = record
+                    .get("server_version")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                if version == env!("CARGO_PKG_VERSION") {
+                    add_stats(&record, &mut current_version_totals);
+                } else {
+                    add_stats(&record, &mut previous_version_totals);
+                    previous_versions.insert(version.to_string());
+                }
+            }
             if !matches_filters(
                 &record,
                 &tools,
@@ -294,6 +340,13 @@ pub fn query_tool_usage_for_profile(
             }
             previous_error_signature = current_error_signature;
             accumulate_repeated_failure(&record, &mut repeated_failures);
+            accumulate_recovery_chain(&record, &call_completed_ts, &mut recovery_chains);
+            if let (Some(sequence), Some(completed)) = (
+                record.get("call_sequence").and_then(Value::as_u64),
+                record.get("completed_ts_ms").and_then(Value::as_u64),
+            ) {
+                call_completed_ts.insert(sequence, completed);
+            }
             if include_performance {
                 accumulate_performance(&record, &mut performance, burst_idle_ms);
             }
@@ -366,6 +419,7 @@ pub fn query_tool_usage_for_profile(
                     "detached_responses": stats.detached_responses
                 }
                 ,"formatting": formatting_stats(&stats)
+                ,"search": search_stats(&stats)
             })
         })
         .collect::<Vec<_>>();
@@ -420,6 +474,21 @@ pub fn query_tool_usage_for_profile(
     } else {
         Value::Null
     };
+    let scope_breakdown = if scope == "all" {
+        json!({
+            "current_version": {
+                "version": env!("CARGO_PKG_VERSION"),
+                "stats": version_scope_stats(&current_version_totals)
+            },
+            "previous_versions": {
+                "versions": previous_versions.into_iter().collect::<Vec<_>>(),
+                "stats": version_scope_stats(&previous_version_totals)
+            },
+            "analysis_hint": "Prioritize current_version for active defects; use previous_versions as regression and fixed-history evidence."
+        })
+    } else {
+        Value::Null
+    };
     let optimization_value = if aggregate {
         json!({
             "recovery_actions": totals.recovery_actions,
@@ -434,13 +503,19 @@ pub fn query_tool_usage_for_profile(
                 &repeated_failures,
                 repeated_identical_error_count,
                 top,
-            )
+            ),
+            "recovery_chains": recovery_chain_report(&recovery_chains, top)
         })
     } else {
         Value::Null
     };
     let formatting_value = if aggregate {
         formatting_stats(&totals)
+    } else {
+        Value::Null
+    };
+    let search_value = if aggregate {
+        search_stats(&totals)
     } else {
         Value::Null
     };
@@ -466,12 +541,29 @@ pub fn query_tool_usage_for_profile(
         "slowest": if include_slowest { Value::Array(slowest) } else { Value::Null },
         "largest": if include_largest { Value::Array(largest) } else { Value::Null },
         "aggregate": aggregate_value,
+        "scope_breakdown": scope_breakdown,
         "optimization": optimization_value,
         "formatting": formatting_value,
+        "search": search_value,
         "parallelism": parallelism_report(&parallel_history, top),
         "performance": performance_value,
         "warnings": Vec::<String>::new()
     })))
+}
+
+fn version_scope_stats(stats: &ToolStats) -> Value {
+    json!({
+        "calls": stats.calls,
+        "errors": stats.errors,
+        "warnings": stats.warnings,
+        "duration_ms": stats.duration_ms,
+        "avg_ms": average(stats.duration_ms, stats.calls),
+        "p50_ms": percentile(&stats.durations, 50),
+        "p95_ms": percentile(&stats.durations, 95),
+        "max_ms": stats.durations.iter().copied().max().unwrap_or(0),
+        "request_bytes": stats.request_bytes,
+        "response_bytes": stats.response_bytes
+    })
 }
 
 fn log_paths(log_dir: &Path) -> Vec<PathBuf> {
@@ -746,6 +838,31 @@ fn add_stats(record: &Value, stats: &mut ToolStats) {
         .unwrap_or(0);
     stats.format_apply_calls +=
         u64::from(record.get("format_applied").and_then(Value::as_bool) == Some(true));
+    if record.get("tool").and_then(Value::as_str) == Some("search_text") {
+        let returned = record
+            .get("returned_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        stats.search_files_considered += record
+            .get("files_considered")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        stats.search_files_scanned += record
+            .get("scanned_files")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        stats.search_returned += returned;
+        stats.search_matched_files += record
+            .get("matched_files")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        stats.search_zero_result_calls += u64::from(returned == 0);
+        stats.search_early_stops += u64::from(
+            record.get("early_stop_reason").and_then(Value::as_str) == Some("result_limit"),
+        );
+        stats.search_exact_total_calls +=
+            u64::from(record.get("total_matches_exact").and_then(Value::as_bool) == Some(true));
+    }
     for (phase, field) in PHASE_METRICS {
         if let Some(duration) = record.get(field).and_then(Value::as_u64) {
             let phase_stats = stats.phase_latency.entry(phase.to_string()).or_default();
@@ -769,6 +886,18 @@ fn formatting_stats(stats: &ToolStats) -> Value {
         "unexpected_changes": stats.unexpected_changes,
         "diff_bytes": stats.format_diff_bytes,
         "apply_calls": stats.format_apply_calls
+    })
+}
+
+fn search_stats(stats: &ToolStats) -> Value {
+    json!({
+        "files_considered": stats.search_files_considered,
+        "files_scanned": stats.search_files_scanned,
+        "returned_results": stats.search_returned,
+        "matched_files": stats.search_matched_files,
+        "zero_result_calls": stats.search_zero_result_calls,
+        "early_stop_calls": stats.search_early_stops,
+        "exact_total_calls": stats.search_exact_total_calls
     })
 }
 
@@ -887,6 +1016,101 @@ fn repeated_failure_report(
         } else {
             Value::Null
         }
+    })
+}
+
+fn recovery_chain_key(record: &Value) -> Option<String> {
+    if let Some(operation) = record
+        .get("recovery_of_operation_id_hash")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(format!("operation:{operation}"));
+    }
+    record
+        .get("retry_of_call_sequence")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .map(|sequence| format!("call:{sequence}"))
+}
+
+fn accumulate_recovery_chain(
+    record: &Value,
+    call_completed_ts: &BTreeMap<u64, u64>,
+    chains: &mut BTreeMap<String, RecoveryChainStats>,
+) {
+    let Some(key) = recovery_chain_key(record) else {
+        return;
+    };
+    let started = record
+        .get("started_ts_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completed = record
+        .get("completed_ts_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(started);
+    let chain = chains.entry(key).or_default();
+    chain.attempts = chain.attempts.saturating_add(1);
+    if is_error_record(record) {
+        chain.failures = chain.failures.saturating_add(1);
+    } else {
+        chain.successes = chain.successes.saturating_add(1);
+    }
+    if chain.first_started_ts_ms == 0 || started < chain.first_started_ts_ms {
+        chain.first_started_ts_ms = started;
+    }
+    chain.last_completed_ts_ms = chain.last_completed_ts_ms.max(completed);
+    if let Some(origin) = record
+        .get("retry_of_call_sequence")
+        .and_then(Value::as_u64)
+        .and_then(|sequence| call_completed_ts.get(&sequence).copied())
+    {
+        if chain.origin_completed_ts_ms == 0 || origin < chain.origin_completed_ts_ms {
+            chain.origin_completed_ts_ms = origin;
+        }
+    }
+    if let Some(action) = record
+        .get("recovery_action_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        *chain.actions.entry(action.to_string()).or_default() += 1;
+    }
+}
+
+fn recovery_chain_report(chains: &BTreeMap<String, RecoveryChainStats>, top: usize) -> Value {
+    let mut rows = chains
+        .iter()
+        .map(|(key, chain)| {
+            let origin = if chain.origin_completed_ts_ms > 0 {
+                chain.origin_completed_ts_ms
+            } else {
+                chain.first_started_ts_ms
+            };
+            json!({
+                "chain": key,
+                "attempts": chain.attempts,
+                "successes": chain.successes,
+                "failures": chain.failures,
+                "succeeded": chain.successes > 0,
+                "elapsed_ms": chain.last_completed_ts_ms.saturating_sub(origin),
+                "actions": chain.actions
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        metric_u64(right, "attempts")
+            .cmp(&metric_u64(left, "attempts"))
+            .then_with(|| left["chain"].as_str().cmp(&right["chain"].as_str()))
+    });
+    rows.truncate(top);
+    json!({
+        "chain_count": chains.len(),
+        "attempts": chains.values().map(|chain| chain.attempts).sum::<u64>(),
+        "successful_chains": chains.values().filter(|chain| chain.successes > 0).count(),
+        "failed_chains": chains.values().filter(|chain| chain.successes == 0).count(),
+        "top": rows
     })
 }
 
@@ -1403,6 +1627,26 @@ mod tests {
     }
 
     #[test]
+    fn version_scope_stats_exposes_compact_version_summary() {
+        let mut stats = ToolStats::default();
+        add_stats(
+            &json!({
+                "tool": "server_info",
+                "duration_ms": 25,
+                "request_json_bytes": 10,
+                "response_json_bytes": 100,
+                "outcome": "tool_error"
+            }),
+            &mut stats,
+        );
+        let summary = version_scope_stats(&stats);
+        assert_eq!(summary["calls"], 1);
+        assert_eq!(summary["duration_ms"], 25);
+        assert_eq!(summary["request_bytes"], 10);
+        assert_eq!(summary["response_bytes"], 100);
+    }
+
+    #[test]
     fn phase_latency_metrics_count_only_instrumented_records() {
         let mut stats = ToolStats::default();
         add_stats(
@@ -1486,6 +1730,74 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Stop retrying"));
+    }
+
+    #[test]
+    fn search_stats_report_scan_cost_and_usefulness() {
+        let mut stats = ToolStats::default();
+        add_stats(
+            &json!({
+                "tool": "search_text",
+                "duration_ms": 5,
+                "returned_count": 1,
+                "files_considered": 2,
+                "scanned_files": 2,
+                "matched_files": 2,
+                "early_stop_reason": "result_limit",
+                "total_matches_exact": false,
+                "ok": true
+            }),
+            &mut stats,
+        );
+        add_stats(
+            &json!({
+                "tool": "search_text",
+                "duration_ms": 5,
+                "returned_count": 0,
+                "files_considered": 3,
+                "scanned_files": 3,
+                "matched_files": 0,
+                "total_matches_exact": true,
+                "ok": true
+            }),
+            &mut stats,
+        );
+        let report = search_stats(&stats);
+        assert_eq!(report["files_considered"], 5);
+        assert_eq!(report["files_scanned"], 5);
+        assert_eq!(report["returned_results"], 1);
+        assert_eq!(report["matched_files"], 2);
+        assert_eq!(report["zero_result_calls"], 1);
+        assert_eq!(report["early_stop_calls"], 1);
+        assert_eq!(report["exact_total_calls"], 1);
+    }
+
+    #[test]
+    fn recovery_chain_report_uses_referenced_call_time_and_selected_action() {
+        let mut chains = BTreeMap::<String, RecoveryChainStats>::new();
+        let call_completed = BTreeMap::from([(41_u64, 1_010_u64)]);
+        accumulate_recovery_chain(
+            &json!({
+                "event": "tool_call",
+                "tool": "read_file",
+                "retry_of_call_sequence": 41,
+                "recovery_of_operation_id_hash": "a".repeat(64),
+                "recovery_action_id": "read_current_file",
+                "started_ts_ms": 1_050,
+                "completed_ts_ms": 1_055,
+                "ok": true,
+                "outcome": "success"
+            }),
+            &call_completed,
+            &mut chains,
+        );
+        let report = recovery_chain_report(&chains, 20);
+        assert_eq!(report["chain_count"], 1);
+        assert_eq!(report["attempts"], 1);
+        assert_eq!(report["successful_chains"], 1);
+        assert_eq!(report["failed_chains"], 0);
+        assert_eq!(report["top"][0]["elapsed_ms"], 45);
+        assert_eq!(report["top"][0]["actions"]["read_current_file"], 1);
     }
 
     #[test]

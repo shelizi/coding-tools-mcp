@@ -24,7 +24,11 @@ Resolved in Node Agent 0.23.0. Node now recognizes the Rust WSL UNC forms, prese
 - `packages/node-agent/src/workspace.ts`
 - `packages/node-agent/src/policy.ts`
 - `packages/node-agent/src/processes.ts`
+- `packages/node-agent/src/gitProcess.ts`
+- `packages/node-agent/src/gitTools.ts`
+- `packages/node-agent/src/fileTools.ts`
 - `packages/node-agent/src/formatterTools.ts`
+- `packages/node-agent/src/taskTools.ts`
 - `packages/node-agent/src/tools.ts`
 - `packages/node-agent/test/wsl.test.mjs`
 
@@ -34,15 +38,19 @@ The pure-JavaScript WSL model parses `\\wsl.localhost`, `\\wsl$`, and extended U
 
 Process launch uses `wsl.exe --distribution <distro> --cd <cwd> --exec ...` without host-shell interpolation. Explicit environment additions and removals are passed through Linux `env`; same-distribution UNC arguments become Linux paths; cross-distribution UNC and Windows drive arguments are rejected before session creation. WSL shell execution is limited to `sh -c`, matching Rust.
 
-Formatter discovery uses Linux `node_modules/.bin`, `.venv/bin`, and `venv/bin` candidates for WSL roots. Formatter mirrors and JavaScript custom adapters execute inside the selected distribution, using its `node` rather than the Windows Node executable.
+Git subprocesses used by Git tools, patch application, formatter scopes, and task baselines share one WSL-aware runner with `GIT_TERMINAL_PROMPT=0` set inside the distribution. Absolute Linux executables are normalized before policy checks: workspace-local entries retain the configured extension policy, while allowlisted system commands are accepted only from trusted system directories. Windows UNC host arguments and option-like environment names are rejected before `wsl.exe` launch.
+
+Formatter discovery uses Linux `node_modules/.bin`, `.venv/bin`, and `venv/bin` candidates for WSL roots. Formatter mirrors and JavaScript custom adapters execute inside the selected distribution, using its `node` rather than the Windows Node executable. Formatter children run through a shell-safe `env -i` wrapper that retains only the required distro environment fields.
 
 ## Acceptance checklist
 
 - [x] WSL UNC paths parse into distribution and Linux path.
-- [x] Invalid, parent-traversing, host-drive, and cross-distribution paths are rejected.
+- [x] Invalid, parent-traversing, host-drive, host-UNC, and cross-distribution paths are rejected.
 - [x] Program, cwd, arguments, environment changes, and post-checks are translated without host-shell interpolation.
+- [x] Absolute executables are normalized and limited to workspace-local entries or trusted system directories.
+- [x] Git subprocesses route through WSL with non-interactive authentication.
 - [x] Shell restrictions match Rust: `sh` only for WSL workspaces.
-- [x] Formatter mirrors and custom adapters run in the selected distribution.
+- [x] Formatter mirrors and custom adapters run in the selected distribution with a clean inherited environment.
 - [x] Host workspace command and formatter behavior remains unchanged.
 
 ## Dependencies

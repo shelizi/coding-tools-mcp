@@ -14,6 +14,22 @@ import {
 
 const nodeProgram = path.basename(process.execPath);
 
+test('tool usage context depends on a pure contract instead of the telemetry implementation', async () => {
+  const [typesSource, usageSource, contractSource, logStoreSource] = await Promise.all([
+    readFile(new URL('../src/types.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/toolUsage.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/toolUsage/contract.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/toolUsage/logStore.ts', import.meta.url), 'utf8')
+  ]);
+  assert.match(typesSource, /from ['"]\.\/toolUsage\/contract\.js['"]/);
+  assert.doesNotMatch(typesSource, /from ['"]\.\/toolUsage\.js['"]/);
+  assert.match(usageSource, /implements ToolUsageStoreContract/);
+  assert.doesNotMatch(contractSource, /from\s+['"]/);
+  assert.match(logStoreSource, /createReadStream/);
+  assert.match(logStoreSource, /visitCompleteRecords/);
+  assert.doesNotMatch(logStoreSource, /readFile\(/);
+});
+
 function config(root, dataDir) {
   return {
     host: '127.0.0.1', port: 0, dataDir, permissionMode: 'trusted',
@@ -94,6 +110,24 @@ test('persistent usage records survive restart and obey runtime/version/all scop
   assert.equal(viaTool.ok, true);
   assert.equal(viaTool.matched_lines, 1);
   assert.equal(viaTool.records[0].tool, 'server_info');
+});
+
+test('scope all separates current-version telemetry from historical versions', async t => {
+  const { dataDir } = await fixture(t);
+  const store = new ToolUsageStore(dataDir, {
+    profileId: 'version-scope-profile', runtimeBootId: 'runtime-current', serverVersion: '0.19.0'
+  });
+  store.enqueue(toolRecord({ server_version: '0.18.0', runtime_boot_id: 'runtime-old', duration_ms: 40 }));
+  store.enqueue(toolRecord({ server_version: '0.19.0', runtime_boot_id: 'runtime-current', duration_ms: 10 }));
+
+  const report = await store.query({ scope: 'all', exclude_tools: [] });
+  assert.equal(report.scope_breakdown.current_version.version, '0.19.0');
+  assert.equal(report.scope_breakdown.current_version.stats.calls, 1);
+  assert.equal(report.scope_breakdown.current_version.stats.duration_ms, 10);
+  assert.deepEqual(report.scope_breakdown.previous_versions.versions, ['0.18.0']);
+  assert.equal(report.scope_breakdown.previous_versions.stats.calls, 1);
+  assert.equal(report.scope_breakdown.previous_versions.stats.duration_ms, 40);
+  assert.match(report.scope_breakdown.analysis_hint, /Prioritize current_version/);
 });
 
 test('request timing distinguishes concurrency from the next orchestration gap', async t => {
@@ -279,6 +313,104 @@ test('repeated failure detection resets on success and burst while counting conc
   assert.match(repeated.recovery_hint, /Stop retrying unchanged arguments/);
 });
 
+test('search telemetry aggregates scan cost and usefulness signals', async t => {
+  const { dataDir } = await fixture(t);
+  const store = new ToolUsageStore(dataDir, {
+    profileId: 'search-profile', runtimeBootId: 'search-runtime', serverVersion: '0.19.0'
+  });
+  store.recordToolCall({
+    tool: 'search_text',
+    arguments: { query: 'needle', max_results: 1 },
+    result: {
+      ok: true,
+      returned_count: 1,
+      total_matches: 2,
+      total_matches_exact: false,
+      files_considered: 2,
+      scanned_files: 2,
+      matched_files: 2,
+      scan_completed: false,
+      early_stop_reason: 'result_limit'
+    },
+    startedTsMs: 2_000,
+    durationMs: 5,
+    requestTiming: requestTiming({ activityBurstId: 13, activityBurstSequence: 1 })
+  });
+  store.recordToolCall({
+    tool: 'search_text',
+    arguments: { query: 'missing' },
+    result: {
+      ok: true,
+      returned_count: 0,
+      total_matches: 0,
+      total_matches_exact: true,
+      files_considered: 3,
+      scanned_files: 3,
+      matched_files: 0,
+      scan_completed: true,
+      early_stop_reason: null
+    },
+    startedTsMs: 2_010,
+    durationMs: 5,
+    requestTiming: requestTiming({ activityBurstId: 13, activityBurstSequence: 2 })
+  });
+  await store.flush();
+  const queried = await store.query({ scope: 'all', exclude_tools: [] });
+  assert.equal(queried.search.files_considered, 5);
+  assert.equal(queried.search.files_scanned, 5);
+  assert.equal(queried.search.returned_results, 1);
+  assert.equal(queried.search.matched_files, 2);
+  assert.equal(queried.search.zero_result_calls, 1);
+  assert.equal(queried.search.early_stop_calls, 1);
+  assert.equal(queried.search.exact_total_calls, 1);
+});
+
+test('recovery correlation preserves semantic fingerprints and reports successful chains', async t => {
+  const { dataDir } = await fixture(t);
+  const store = new ToolUsageStore(dataDir, {
+    profileId: 'recovery-profile', runtimeBootId: 'recovery-runtime', serverVersion: '0.19.0'
+  });
+  const semanticArguments = { path: 'main.txt', start_line: 1 };
+  const first = store.recordToolCall({
+    tool: 'read_file',
+    arguments: semanticArguments,
+    result: { ok: false, error: { code: 'NOT_FOUND', category: 'not_found', retryable: false, details: {} } },
+    startedTsMs: 1_000,
+    durationMs: 10,
+    requestTiming: requestTiming({ activityBurstId: 12, activityBurstSequence: 1 })
+  });
+  const recovered = store.recordToolCall({
+    tool: 'read_file',
+    arguments: {
+      ...semanticArguments,
+      retry_of_call_sequence: first.call_sequence,
+      recovery_of_operation_id: 'operation-42',
+      recovery_action_id: 'read_current_file'
+    },
+    result: { ok: true, recovery_attempt: true, recovery_succeeded: true },
+    startedTsMs: 1_050,
+    durationMs: 5,
+    requestTiming: requestTiming({ activityBurstId: 12, activityBurstSequence: 2 })
+  });
+  assert.equal(recovered.arguments_sha256, first.arguments_sha256);
+  assert.equal(recovered.retry_of_call_sequence, first.call_sequence);
+  assert.match(recovered.recovery_of_operation_id_hash, /^[0-9a-f]{64}$/);
+  assert.equal(recovered.recovery_action_id, 'read_current_file');
+  assert.equal(recovered.recovery_attempt, true);
+
+  await store.flush();
+  const queried = await store.query({ scope: 'all', exclude_tools: [] });
+  const chains = queried.optimization.recovery_chains;
+  assert.equal(chains.chain_count, 1);
+  assert.equal(chains.attempts, 1);
+  assert.equal(chains.successful_chains, 1);
+  assert.equal(chains.failed_chains, 0);
+  assert.equal(chains.top[0].attempts, 1);
+  assert.equal(chains.top[0].succeeded, true);
+  assert.equal(chains.top[0].elapsed_ms, 45);
+  assert.equal(chains.top[0].actions.read_current_file, 1);
+});
+
 test('bounded writer queue drops overload and annotates the next accepted record', async t => {
   const { dataDir } = await fixture(t);
   const store = new ToolUsageStore(dataDir, {
@@ -330,6 +462,7 @@ test('rotation keeps bounded history and complete-line reader ignores an active 
   const queried = await store.query({ scope: 'all', exclude_tools: [], include_records: true, limit: 1000 });
   assert.ok(queried.scanned_lines > 0);
   assert.equal(queried.invalid_complete_lines, 1);
+  assert.ok(queried.log_bytes_read > 0);
   assert.ok(queried.matched_lines > 0);
   assert.ok(queried.matched_lines < 12, 'oldest records should be evicted by bounded rotation');
   assert.ok(queried.records.every(record => record.event === 'tool_call'));

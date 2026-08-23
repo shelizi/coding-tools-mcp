@@ -13,6 +13,21 @@ import { captureBaseline, harnessWorkspaceId } from '../dist/taskTools.js';
 const execFile = promisify(execFileCallback);
 const nodeProgram = path.basename(process.execPath);
 
+test('runtime context depends on a pure state contract instead of the store implementation', async () => {
+  const [typesSource, stateSource, contractSource] = await Promise.all([
+    readFile(new URL('../src/types.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/state.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/state/contract.ts', import.meta.url), 'utf8')
+  ]);
+  assert.match(typesSource, /from ['"]\.\/state\/contract\.js['"]/);
+  assert.doesNotMatch(typesSource, /from ['"]\.\/state\.js['"]/);
+  assert.match(typesSource, /export type \{[^}]*OperationRecord[^}]*\} from ['"]\.\/state\/contract\.js['"]/s);
+  assert.match(typesSource, /export type \{[^}]*TaskRecord[^}]*\} from ['"]\.\/state\/contract\.js['"]/s);
+  assert.match(stateSource, /implements StateStoreContract/);
+  assert.doesNotMatch(stateSource, /from ['"]\.\/types\.js['"]/);
+  assert.doesNotMatch(contractSource, /from\s+['"]/);
+});
+
 function config(folders, dataDir) {
   return {
     host: '127.0.0.1',
@@ -177,14 +192,15 @@ test('task_context trims a production-sized baseline without quadratic work', { 
   }));
   await state.ctx.state.setTask(started.task.workspace_id, started.task);
 
-  const before = Date.now();
+  const beforeCpu = process.cpuUsage();
   const context = await callTool(state.ctx, 'task_context', { max_bytes: 8_192 }, state.meta);
-  const elapsedMs = Date.now() - before;
+  const cpu = process.cpuUsage(beforeCpu);
+  const elapsedCpuMs = (cpu.user + cpu.system) / 1_000;
   assert.equal(context.ok, true);
   assert.equal(context.truncated, true);
   assert.ok(Buffer.byteLength(JSON.stringify(context)) <= 8_192);
   assert.ok(context.task.baseline.entries.length < entryCount);
-  assert.ok(elapsedMs < 5_000, `large task_context took ${elapsedMs}ms`);
+  assert.ok(elapsedCpuMs < 5_000, `large task_context used ${elapsedCpuMs.toFixed(0)}ms CPU`);
 });
 
 test('external changes remain writable and are adopted before real writes', async () => {
@@ -373,6 +389,44 @@ test('finish_task summary persists an immutable change selected by change_id', a
   });
 });
 
+test('finish_task finalizes a verifying task without recapturing its immutable change', async () => {
+  const state = await fixture({ 'tracked.txt': 'initial\n' });
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Verified completion' }, state.meta);
+  await writeFile(path.join(state.root, 'tracked.txt'), 'verified\n');
+
+  const verifying = await callTool(state.ctx, 'finish_task', {
+    task_id: started.task.id,
+    summary: 'Captured before verification'
+  }, state.meta);
+  assert.equal(verifying.ok, true);
+  assert.equal(verifying.task.status, 'verifying');
+  const changeId = verifying.change_id;
+
+  const completed = await callTool(state.ctx, 'finish_task', { task_id: started.task.id }, state.meta);
+  assert.equal(completed.ok, true);
+  assert.equal(completed.task.status, 'completed');
+  assert.equal(completed.change_id, changeId);
+  assert.equal(completed.finalized_existing_change, true);
+  assert.equal(completed.phase_durations_ms.baseline_capture_ms, 0);
+  assert.equal(completed.change_summary.why.text, 'Captured before verification');
+});
+
+test('start_task can safely finalize a completed verifying task before starting the next task', async () => {
+  const state = await fixture();
+  const first = await callTool(state.ctx, 'start_task', { objective: 'First task' }, state.meta);
+  const verifying = await callTool(state.ctx, 'finish_task', { task_id: first.task.id }, state.meta);
+  assert.equal(verifying.task.status, 'verifying');
+
+  const next = await callTool(state.ctx, 'start_task', {
+    objective: 'Second task',
+    existing_task: 'finish_if_complete'
+  }, state.meta);
+  assert.equal(next.ok, true);
+  assert.equal(next.recovered_task_id, first.task.id);
+  assert.equal(next.task.status, 'active');
+  assert.notEqual(next.task.id, first.task.id);
+});
+
 test('operation logs persist bounded execution diagnostics without raw process payloads', async () => {
   const state = await fixture();
   const outputMarker = 'OPERATION_OUTPUT_MUST_NOT_PERSIST';
@@ -529,6 +583,57 @@ test('active task conflicts are state-aware and use lightweight error enrichment
   assert.ok(Number(duplicate.phase_durations_ms.error_enrichment_ms) >= 0);
   assert.equal(duplicate.phase_durations_ms.baseline_capture_ms, undefined);
   assert.ok(Number(duplicate.phase_durations_ms.serialization_ms) >= 0);
+});
+
+test('active tasks are scoped to the current linked worktree while operation history stays workspace-wide', async () => {
+  const state = await fixture();
+  const rootTask = await callTool(state.ctx, 'start_task', { objective: 'Root task' }, state.meta);
+  assert.equal(rootTask.ok, true);
+
+  const linked = path.join(state.root, '.worktrees', 'scoped-task');
+  await mkdir(path.dirname(linked), { recursive: true });
+  const branch = `task-scope-${Math.random().toString(36).slice(2)}`;
+  await git(state.root, 'worktree', 'add', '-b', branch, linked);
+  const selected = await callTool(state.ctx, 'set_default_cwd', { path: '.worktrees/scoped-task' }, state.meta);
+  assert.equal(selected.ok, true);
+
+  const linkedTask = await callTool(state.ctx, 'start_task', { objective: 'Linked worktree task' }, state.meta);
+  assert.equal(linkedTask.ok, true, JSON.stringify(linkedTask));
+  assert.notEqual(linkedTask.task.id, rootTask.task.id);
+  assert.equal(linkedTask.task.workspace_id, rootTask.task.workspace_id);
+  assert.notEqual(linkedTask.task.scope_id, rootTask.task.scope_id);
+  assert.equal(linkedTask.task.scope_root.replaceAll('\\', '/'), linked.replaceAll('\\', '/'));
+
+  const duplicate = await callTool(state.ctx, 'start_task', { objective: 'Duplicate linked task' }, state.meta);
+  assert.equal(duplicate.ok, false);
+  assert.equal(duplicate.error.code, 'TASK_ALREADY_ACTIVE');
+  assert.equal(duplicate.error.details.active_task_id, linkedTask.task.id);
+
+  const edited = await callTool(state.ctx, 'edit_file', {
+    path: 'tracked.txt',
+    edits: [{ type: 'replace', old_text: 'initial\n', new_text: 'linked\n' }]
+  }, state.meta);
+  assert.equal(edited.ok, true, JSON.stringify(edited));
+  const operations = await callTool(state.ctx, 'operation_log', { cursor: 0, limit: 100 }, state.meta);
+  assert.ok(operations.operations.some(row => row.tool === 'edit' && row.task_id === linkedTask.task.id));
+  assert.equal(operations.operations.some(row => row.tool === 'edit' && row.task_id === rootTask.task.id), false);
+
+  await callTool(state.ctx, 'set_default_cwd', { path: '.' }, state.meta);
+  const rootStatus = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(rootStatus.task_id, rootTask.task.id);
+
+  await callTool(state.ctx, 'set_default_cwd', { path: '.worktrees/scoped-task' }, state.meta);
+  const linkedStatus = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(linkedStatus.task_id, linkedTask.task.id);
+
+  const restarted = await createToolContext(config([{ id: 'repo', name: 'Repo', path: state.root }], state.dataDir));
+  await callTool(restarted, 'switch_workspace_folder', { folder_id: 'repo' }, state.meta);
+  await callTool(restarted, 'set_default_cwd', { path: '.worktrees/scoped-task' }, state.meta);
+  const restoredLinked = await callTool(restarted, 'harness_status', {}, state.meta);
+  assert.equal(restoredLinked.task_id, linkedTask.task.id);
+  await callTool(restarted, 'set_default_cwd', { path: '.' }, state.meta);
+  const restoredRoot = await callTool(restarted, 'harness_status', {}, state.meta);
+  assert.equal(restoredRoot.task_id, rootTask.task.id);
 });
 
 test('disabling automatic baseline checks keeps task evidence without adopting external drift', async () => {

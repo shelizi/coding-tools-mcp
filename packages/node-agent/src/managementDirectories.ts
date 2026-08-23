@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { readdir, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -67,4 +68,13 @@ export async function managementDirectoryPayload(config: AgentConfig, requestedP
     totalDirectories: allDirectories.length,
     truncated: allDirectories.length > MAX_DIRECTORY_ENTRIES
   };
+}
+
+export async function openManagementDirectory(requestedPath: string): Promise<{ ok: true; path: string }> {
+  const selected = absoluteDirectory(requestedPath);
+  const metadata = await stat(selected);
+  if (!metadata.isDirectory()) throw new Error('Selected path is not a directory.');
+  const command = process.platform === 'win32' ? 'explorer' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+  spawn(command, [selected], { detached: true, stdio: 'ignore' }).unref();
+  return { ok: true, path: selected };
 }

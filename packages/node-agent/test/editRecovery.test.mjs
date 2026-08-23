@@ -4,8 +4,13 @@ import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EDIT_PROPOSAL_TTL_MS } from '../dist/editRecovery.js';
+import { runtimeForFolderId } from '../dist/folderRuntime.js';
 import { createToolContext } from '../dist/server.js';
 import { callTool } from '../dist/tools.js';
+
+function proposals(ctx) {
+  return runtimeForFolderId(ctx, 'repo').editProposals;
+}
 
 function config(root, dataDir) {
   return {
@@ -77,7 +82,7 @@ test('ambiguous exact edit returns a bounded proposal without writing', async t 
   assert.equal(result.proposal_patch_format, 'unified_diff_single_file_single_hunk');
   assert.equal(result.next_action, 'apply_proposal');
   assert.equal(await readFile(file, 'utf8'), 'let  value = 1;\n');
-  assert.equal(ctx.editProposals.size, 1);
+  assert.equal(proposals(ctx).size, 1);
 });
 
 test('precise edit contracts aggregate invalid fields with guarded recovery metadata', async t => {
@@ -297,7 +302,7 @@ test('proposal accept and replacement modes apply atomically and consume the pro
   assert.equal(accepted.applied, true);
   assert.match(accepted.diff, /\+let value = 2;/);
   assert.equal(await readFile(file, 'utf8'), 'let value = 2;\n');
-  assert.equal(ctx.editProposals.has(acceptedProposal.proposal_id), false);
+  assert.equal(proposals(ctx).has(acceptedProposal.proposal_id), false);
 
   await writeFile(file, 'let  value = 1;\n');
   const dryRunProposal = await proposal(ctx, meta);
@@ -309,7 +314,7 @@ test('proposal accept and replacement modes apply atomically and consume the pro
   assert.equal(dryRun.ok, true, JSON.stringify(dryRun));
   assert.equal(dryRun.dry_run, true);
   assert.equal(dryRun.applied, false);
-  assert.equal(ctx.editProposals.has(dryRunProposal.proposal_id), true);
+  assert.equal(proposals(ctx).has(dryRunProposal.proposal_id), true);
   assert.equal(await readFile(file, 'utf8'), 'let  value = 1;\n');
 
   await writeFile(file, 'let  value = 1;\n');
@@ -346,7 +351,7 @@ test('proposal rejects changed files, expired IDs and missing IDs', async t => {
 
   await writeFile(file, 'let  value = 1;\n');
   const candidateProposal = await proposal(ctx, meta);
-  ctx.editProposals.get(candidateProposal.proposal_id).actualText = 'different-candidate';
+  proposals(ctx).get(candidateProposal.proposal_id).actualText = 'different-candidate';
   const candidateChanged = await callTool(ctx, 'edit_file', {
     path: 'main.txt',
     apply_proposal: { proposal_id: candidateProposal.proposal_id }
@@ -357,7 +362,7 @@ test('proposal rejects changed files, expired IDs and missing IDs', async t => {
 
   await writeFile(file, 'let  value = 1;\n');
   const expiredProposal = await proposal(ctx, meta);
-  ctx.editProposals.get(expiredProposal.proposal_id).createdAt -= EDIT_PROPOSAL_TTL_MS + 1;
+  proposals(ctx).get(expiredProposal.proposal_id).createdAt -= EDIT_PROPOSAL_TTL_MS + 1;
   const expired = await callTool(ctx, 'edit_file', {
     path: 'main.txt',
     apply_proposal: { proposal_id: expiredProposal.proposal_id }
@@ -382,9 +387,9 @@ test('proposal store remains bounded and evicts the oldest proposal', async t =>
     const result = await proposal(ctx, meta, 'main.txt', `let value = ${index + 2};`);
     ids.push(result.proposal_id);
   }
-  assert.equal(ctx.editProposals.size, 200);
-  assert.equal(ctx.editProposals.has(ids[0]), false);
-  assert.equal(ctx.editProposals.has(ids.at(-1)), true);
+  assert.equal(proposals(ctx).size, 200);
+  assert.equal(proposals(ctx).has(ids[0]), false);
+  assert.equal(proposals(ctx).has(ids.at(-1)), true);
 });
 
 test('large proposals accept an efficient restricted single-hunk patch', async t => {

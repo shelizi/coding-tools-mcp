@@ -19,12 +19,23 @@ mod task_runtime;
 pub mod tools;
 mod tunnel;
 mod workspace;
+mod workspace_features;
 
 /// Stable, UI-independent types for future headless and cross-platform hosts.
 ///
 /// The desktop application remains the default feature. Consumers that only
 /// need the core can build this library with `--no-default-features` without
 /// pulling Tauri, GTK, or WebView dependencies into their binary.
+pub fn run_protect_cli() -> i32 {
+    match crate::data::protection_cli() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
 pub mod core {
     pub use crate::app_state::{bootstrap_workspace, teardown_workspace, AppState};
     pub use crate::application::runtime::{
@@ -36,8 +47,20 @@ pub mod core {
     pub use crate::runtime::{RuntimeSupervisor, ServiceKind};
     pub use crate::workspace::{
         ActionsConfig, AuthConfig, ExecutionTarget, McpPublicEndpoint, RuntimeConfig,
-        RuntimeStatusDto, WorkspaceFolder, WorkspaceProfile, WslLocation,
+        RuntimeStatusDto, SandboxConfig, WorkspaceFolder, WorkspaceProfile, WslLocation,
     };
+}
+
+#[doc(hidden)]
+pub fn run_appcontainer_acl_helper_if_requested() -> Option<i32> {
+    #[cfg(windows)]
+    {
+        return tools::sandbox::run_appcontainer_acl_helper_if_requested();
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 #[doc(hidden)]
@@ -65,16 +88,19 @@ use app_state::AppState;
 #[cfg(feature = "desktop")]
 use commands::{
     add_workspace_folder, add_wsl_workspace_folder, create_workspace, delete_frp_profile,
-    delete_workspace, get_actions_runtime_status, get_app_settings, get_download_config,
-    get_frp_snippet, get_last_workspace_id, get_proxy, get_runtime_status, get_shared_secret,
-    get_workspace_secret, install_software, list_frp_profiles, list_history_sessions,
-    list_software, list_workspaces, list_wsl_distributions, open_workspace_directory,
-    read_history_session, read_workspace_logs, read_workspace_telemetry, regenerate_shared_secret,
+    delete_workspace, export_shared_workspace, export_workspace_pack, get_actions_runtime_status,
+    get_app_settings, get_download_config, get_frp_snippet, get_last_workspace_id, get_proxy,
+    get_runtime_status, get_shared_secret, get_workspace_extensions, get_workspace_secret,
+    get_workspace_skills, import_workspace_pack, install_software, list_frp_profiles,
+    list_history_sessions, list_sandbox_backends, list_software, list_workspaces,
+    list_wsl_distributions, open_shared_workspace, open_workspace_directory, read_history_session,
+    read_workspace_logs, read_workspace_telemetry, regenerate_shared_secret,
     regenerate_workspace_secret, remove_workspace_folder, restart_actions_runtime, restart_runtime,
     restart_tunnel, run_health_checks, save_frp_profile, set_download_config, set_last_workspace,
-    set_proxy, set_shared_secret, set_workspace_secret, start_actions_runtime, start_runtime,
-    start_tunnel, stop_actions_runtime, stop_runtime, stop_tunnel, test_tunnel, uninstall_software,
-    update_workspace,
+    set_proxy, set_shared_secret, set_workspace_extension_active, set_workspace_extension_enabled,
+    set_workspace_secret, set_workspace_skill_enabled, set_workspace_skills_active,
+    start_actions_runtime, start_runtime, start_tunnel, stop_actions_runtime, stop_runtime,
+    stop_tunnel, test_tunnel, uninstall_software, update_workspace,
 };
 #[cfg(feature = "desktop")]
 use tauri::Manager;
@@ -160,7 +186,42 @@ pub fn run() {
             }
             tray_builder.build(app)?;
 
-            app.manage(AppState::new().expect("failed to load app state"));
+            let state = AppState::new().expect("failed to load app state");
+            if let Err(error) =
+                state.with_workspaces(|store| store.consume_runtime_handoff_state().map(|_| ()))
+            {
+                eprintln!("匯入版本切換 runtime 狀態失敗：{error}");
+            }
+            let (mcp_auto_start_ids, actions_auto_start_ids) = state
+                .with_workspaces(|store| {
+                    Ok((
+                        store.mcp_auto_start_workspace_ids(),
+                        store.actions_auto_start_workspace_ids(),
+                    ))
+                })
+                .expect("failed to load runtime auto-start state");
+            app.manage(state);
+            if !mcp_auto_start_ids.is_empty() || !actions_auto_start_ids.is_empty() {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    for id in mcp_auto_start_ids {
+                        let state = app_handle.state::<AppState>();
+                        if let Err(error) =
+                            application::runtime::start_mcp_runtime(&state, &id).await
+                        {
+                            eprintln!("自動恢復 workspace {id} 的 MCP 失敗：{error}");
+                        }
+                    }
+                    for id in actions_auto_start_ids {
+                        let state = app_handle.state::<AppState>();
+                        if let Err(error) =
+                            application::runtime::start_actions_runtime(&state, &id).await
+                        {
+                            eprintln!("自動恢復 workspace {id} 的 Actions 失敗：{error}");
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -179,8 +240,19 @@ pub fn run() {
             read_history_session,
             read_workspace_telemetry,
             create_workspace,
+            export_workspace_pack,
+            export_shared_workspace,
+            import_workspace_pack,
+            open_shared_workspace,
             list_wsl_distributions,
+            list_sandbox_backends,
             update_workspace,
+            get_workspace_skills,
+            set_workspace_skills_active,
+            set_workspace_skill_enabled,
+            get_workspace_extensions,
+            set_workspace_extension_active,
+            set_workspace_extension_enabled,
             add_workspace_folder,
             add_wsl_workspace_folder,
             remove_workspace_folder,

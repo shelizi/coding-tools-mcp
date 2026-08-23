@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { message } from "@tauri-apps/plugin-dialog";
+  import { alert as message } from "$lib/api/native";
   import { getFrpSnippet, startTunnel, stopTunnel, type TunnelStatus } from "$lib/api/tunnel";
   import CopyButton from "$lib/components/CopyButton.svelte";
   import { t } from "$lib/i18n";

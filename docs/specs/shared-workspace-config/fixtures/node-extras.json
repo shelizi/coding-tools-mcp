@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 2,
+  "id": "ws-node",
+  "name": "node-extras",
+  "folders": [
+    {
+      "id": "folder-1",
+      "name": "repo",
+      "path": "E:\\work\\repo"
+    }
+  ],
+  "bind": { "host": "127.0.0.1", "port": 3789 },
+  "auth": { "type": "oauth", "oauthClientId": "chatgpt" },
+  "host": {
+    "node": {
+      "dataDir": "C:\\Users\\tester\\AppData\\Local\\CodingToolsMCPNode",
+      "management": { "enabled": true }
+    }
+  }
+}

@@ -19,11 +19,23 @@
   <a href="README.md">繁體中文</a> · <a href="README.en.md">English</a> · Releases
 </p>
 
-Coding Tools MCP 是一套 Rust + Tauri 2 桌面應用。選好專案目錄並啟動服務後，AI Agent 就能透過 MCP 讀取檔案、修改程式碼、執行指令與測試、查看 Git 狀態，並把關鍵進度存成專案內的歷史工作階段。它比較像「AI 打開一個會記住開發進度的 IDE 工作區」；一般開發工具不需要先建立 Task，歷史工作階段則負責在新對話中還原上下文。
+Coding Tools MCP 現在提供 Desktop Client（Rust + Tauri 2）與可攜式 Node Agent 兩種執行方式，兩者共用同一套 Svelte 管理介面與 Workspace 模型。選好專案目錄並啟動服務後，AI Agent 可透過 MCP 讀寫檔案、修改程式碼、執行指令與測試、操作 Git，並把關鍵進度存成專案內的歷史工作階段；Windows 還可使用 Computer Use 進行螢幕列舉、截圖、點擊、拖曳、滾動、文字輸入與按鍵操作。
+
+同一個邏輯 Workspace 在 Desktop / Node 間可共用受保護的 canonical 設定與 secrets store，host-specific 欄位各自保留，減少重複設定。Node Agent 維持 MCP-only 的 headless / portable 產品邊界；Actions、FRP／Cloudflare 程序管理等 Desktop 專屬能力仍由 Desktop Client 提供。
 
 ![Coding Tools MCP 工作區總覽](docs/images/workspace-overview.png)
 
-*一個桌面端同時管理工作區、MCP 服務、連線資訊與工作階段還原提示詞。*
+*Desktop 與 Node Agent 共用同一套管理介面；畫面中的公網端點與本機路徑已使用實心遮罩處理。*
+
+## 目前重點能力
+
+| 能力 | 目前內容 |
+| --- | --- |
+| **共用管理介面** | Desktop Client 與 Node Agent 使用同一套 Svelte UI；Workspace、MCP、健康、Telemetry、操作紀錄與設定頁保持一致 |
+| **共用 Workspace** | canonical 設定與 secrets 使用受保護的 shared store；Desktop / Node 各自保留 host-specific 欄位，同一組資料夾可延續同一個邏輯 Workspace |
+| **Skills / Hooks / 外部 MCP** | 可掃描並個別啟用／停用 Skills、Claude/Codex Hooks 與外部 MCP；Node Agent 可代理 stdio 與 Streamable HTTP MCP |
+| **Computer Use（Windows）** | `desktop_displays`、`desktop_screenshot`、`desktop_click`、`desktop_drag`、`desktop_scroll`、`desktop_type`、`desktop_key`，座標使用實體像素 |
+| **執行安全** | Workspace-first 邊界、敏感輸出遮蔽、Git 防護與可選命令沙盒；沙盒開啟時採 fail-closed，不靜默退回非沙盒執行 |
 
 ## 30 秒看懂怎麼用
 
@@ -37,7 +49,7 @@ Coding Tools MCP 是一套 Rust + Tauri 2 桌面應用。選好專案目錄並�
   → 完成授權，在新對話中開始開發
 ```
 
-第一次使用只要記住兩件事：**桌面端負責把專案變成 MCP 工作區，ChatGPT 負責透過公網 `/mcp` 位址連上它。**
+第一次使用只要記住兩件事：**Desktop Client 或 Node Agent 負責把專案變成 MCP Workspace，AI 用戶端再透過 `/mcp` 位址連上它。** 若需要 Actions、FRP／Cloudflare 程序管理或其他 Desktop 專屬整合，請使用 Desktop Client。
 
 - [查看完整安裝與桌面端啟動步驟](#五分鐘開始使用)
 - [快速設定（引導）](#2-快速設定建議首次使用)
@@ -156,26 +168,18 @@ ChatGPT / 公開 HTTPS 用戶端
 
 ### 5. 啟動 MCP
 
-進入工作區並點 MCP 的「啟動」。用戶端會顯示：
+進入工作區並啟動 MCP。管理介面會集中顯示：
 
 - 本機 MCP 位址，例如 `http://127.0.0.1:28766/mcp`；
-- 公網 HTTPS MCP 位址；
-- ChatGPT 連線所需的驗證資訊；
-- 即時日誌與健康檢查結果。
+- 公網 HTTPS MCP 位址與 ChatGPT 連線設定；
+- OAuth／驗證、原則與健康檢查入口；
+- Telemetry、操作紀錄與工具區設定。
 
-![MCP 本機、公網與 ChatGPT 連線資訊](docs/images/workspace-connection.png)
+![MCP 服務與本機連線設定](docs/images/workspace-connection.png)
 
-啟動後可直接檢查本機與公網端點、OAuth 中繼資料與 MCP 受保護資源：
+*公開 MCP、OAuth 與其他可識別連線資料仍可在 MCP 頁面管理；README 截圖只保留安全的 loopback 範例，實際端點不會公開。*
 
-![MCP 健康檢查結果](docs/images/health-check.png)
-
-*健康檢查會逐項顯示連線與驗證中繼資料是否可用。*
-
-遇到連線問題時，不必離開桌面端即可查看最近的 MCP 請求日誌：
-
-![MCP 執行日誌](docs/images/runtime-logs.png)
-
-*日誌可快速確認工具清單、歷史初始化與檢查點呼叫是否真的到達伺服端。*
+啟動後可從「健康」檢查本機／公網端點與 OAuth 中繼資料；「Telemetry」與「操作紀錄」則用來追查工具呼叫、耗時、結果與失敗。Desktop Client 另外保留其專屬的 runtime / tunnel 診斷能力。
 
 ### 6. 連接 AI 用戶端
 
@@ -271,8 +275,10 @@ MCP 與 Actions 可以在同一工作區同時執行，也可以分別使用不�
 - **面向真實開發**：檔案、指令、Git、測試與長時間執行的程序都在同一個 Workspace 中。
 - **跨對話持續開發**：新對話可以讀取全部歷史摘要與最近一次完整交接，不必反覆向 AI 解釋專案背景與目前進度。
 - **進度可追溯**：每輪任務完成後可儲存結構化檢查點，決策、修改、測試結果與下一步都留在專案目錄中。
-- **多工作區管理**：一個桌面用戶端可保存多個專案，並管理各自的 MCP、Actions 與公網位址。
+- **多工作區、多 runtime**：Desktop Client 與 Node Agent 共用管理介面與 Workspace 模型；Desktop 可管理 MCP、Actions 與完整隧道整合，Node Agent 專注於 MCP。
 - **連接 ChatGPT 更直接**：內建 Streamable HTTP、OAuth、Bearer Token、OpenAPI，以及內建 WSS／FRP／Cloudflare 隧道。
+- **可擴充 Agent 行為**：Skills、Hooks 與外部 MCP 可掃描、分組並個別啟用，不必把所有擴充永久打開。
+- **可操作桌面**：Windows Computer Use 可截圖並執行滑鼠、滾動、文字與鍵盤操作，適合需要實際 GUI 驗證的流程。
 - **預設工具面保持簡單**：穩定的核心工具預設可用，進階 Harness 能力可按需開啟。
 
 ## 讓專案記住每次對話
@@ -305,16 +311,17 @@ MCP 與 Actions 可以在同一工作區同時執行，也可以分別使用不�
 
 ## Agent 可以做什麼
 
-預設 `core` profile 提供一組穩定、可組合的開發工具：
+常見的開發工具依 profile / runtime 開放，主要包含：
 
 | 類別 | 主要工具 |
 | --- | --- |
-| 檔案讀取 | `read_file`、`list_dir`、`list_files`、`search_text`、`grep_text`、`view_image` |
-| 檔案修改 | `apply_patch` |
-| 指令執行 | `exec_command`、`write_stdin`、`read_output`、`kill_session` |
-| Git | `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame` |
-| 環境 | `server_info`、`check_exec_environment`、`get_default_cwd`、`set_default_cwd` |
+| 檔案讀取 | `read_file`、`read_many`、`list_files`、`search_text`、`view_image` |
+| 檔案修改 | `apply_patch`、`edit`、`file_ops`、`format_files` |
+| 指令與工作階段 | `exec_command`、`exec_many`、`wait_command`、`send_input`、`kill_session` |
+| Git | `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame`、`git_stage`、`git_commit` |
+| Workspace 路由 | `list_workspace_folders`、`switch_workspace_folder`、`set_default_cwd` |
 | 歷史工作階段 | `history_session_bootstrap`、`history_session_checkpoint`、`history_session_validate` |
+| Computer Use（Windows） | `desktop_displays`、`desktop_screenshot`、`desktop_click`、`desktop_drag`、`desktop_scroll`、`desktop_type`、`desktop_key` |
 
 典型開發流程：
 
@@ -339,16 +346,16 @@ MCP 與 Actions 可以在同一工作區同時執行，也可以分別使用不�
 - `.git` 與 `.github` 不能被一般檔案工具、Patch 或直譯器指令破壞。
 - Patch 在單次操作內進行預檢與失敗還原；長期還原統一使用 Git，不建立全量 Workspace Snapshot。
 
-> Windows 子程序目前仍是 `policy_only` 執行邊界，回傳中的 `sandbox_enforced: false` 是真實狀態。靜態指令策略不能等同於完整的作業系統檔案系統沙箱。
+> 命令沙盒是 workspace 設定，預設關閉。關閉時執行邊界仍是 `policy_only`，`sandbox_enforced: false`。開啟後必須走選定的 OS 沙盒，不會偷偷退回政策層：Windows 主機資料夾可用 AppContainer（預設拒絕網路，可用 `appcontainer.network=internet` 放行）；WSL 資料夾請改用 Docker、Podman、Docker Sandboxes（sbx）或 WSL Containers。原生 Docker / Podman 用 ephemeral Linux 容器，網路預設 `none`，拒絕 `host`。可在「軟體管理」安裝或辨識 `docker`、`podman`、`sbx` 與 `wslc`；引擎啟動與 `podman machine` 需自行完成。檔案工具的 workspace 唯讀邊界與沙盒是分開的。
 
 ## 本機開發
 
 環境需求：Node.js 20+、Rust stable，以及目前系統的 [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/)。
 
 ```bash
-npm install
-npm run hooks:install
-npm run desktop
+pnpm install --frozen-lockfile
+pnpm run hooks:install
+pnpm run desktop
 ```
 
 `hooks:install` 會把此 clone 的 `core.hooksPath` 指向 repo 內的 `.githooks`。提交 staged Rust 檔案時，pre-commit 只會格式化完整 staged 的檔案並重新 stage；若同一檔案同時存在 unstaged hunks，hook 會停止提交而不改動 index，避免意外把額外變更帶進 commit。
@@ -356,24 +363,28 @@ npm run desktop
 常用驗證指令：
 
 ```bash
-npm run check
-npm run build
+pnpm run check
+pnpm run build
 cd src-tauri && cargo test
 cd src-tauri && cargo clippy --all-targets -- -D warnings
 ```
 
-Windows 也可以雙擊 `dev-desktop.cmd`。不要只用 `npm run dev` 驗證桌面應用，它只會啟動 Vite，不會啟動 Tauri 外殼。
+Windows 也可以雙擊 `dev-desktop.cmd`。不要只用 `pnpm run dev` 驗證桌面應用，它只會啟動 Vite，不會啟動 Tauri 外殼。
 
 ## 專案結構
 
 | 路徑 | 作用 |
 | --- | --- |
 | `src-tauri/src/tools/` | 檔案、Patch、Exec、Git 等共用工具核心 |
+| `src-tauri/src/tools/registry_metadata.rs` | 工具 catalog、profile、權限與序列化分類 metadata |
+| `src-tauri/src/tools/registry.rs` | MCP schema 路由、profile 解析與工具清單輸出 |
+| `src-tauri/src/tools/registry_schemas/` | 依工具 domain 拆分的 MCP input schema builders |
 | `src-tauri/src/mcp/` | MCP Streamable HTTP 服務 |
 | `src-tauri/src/actions/` | ChatGPT Actions OpenAPI 閘道 |
 | `src-tauri/src/tunnel/` | 內建 WSS／FRP／Cloudflare 隧道與程序管理 |
 | `services/tunnel-server/` | 自建內建 WSS 隧道伺服器（Rust） |
-| `src/` | SvelteKit 桌面介面 |
+| `src/` | Desktop Client 與 Node Agent 共用的 Svelte 管理介面 |
+| `packages/node-agent/` | 可攜式／headless Node Agent、管理 HTTP API 與共用 UI adapter |
 | `old/` | Python 參考實作與相容性基準 |
 
 ## 來源倉庫與歸屬

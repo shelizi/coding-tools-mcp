@@ -50,7 +50,6 @@ Both editions require:
 app/dist/
 app/node_modules/
 app/package.json
-app/package-lock.json
 LICENSE.txt
 data/
 logs/
@@ -75,7 +74,7 @@ The `system-node` edition must not contain either runtime file.
 - Build deliverable ZIPs only from the clean, tagged `HEAD` defined by the Git release identity contract.
 - Build `dist` once before staging.
 - Create common staging in a new temporary directory.
-- Copy manifests and compiled output, then run `npm ci --omit=dev --ignore-scripts` once inside common staging.
+- Deploy the workspace package once with `pnpm --filter @coding-tools/node-agent deploy --prod <staging>` to create common production staging.
 - Resolve `ws`, `pngjs`, and `jpeg-js` from the staged application.
 - Derive both edition directories from the same common staging content.
 - Bundle the selected Windows x64 `node.exe` and its license only in `bundled-node`.

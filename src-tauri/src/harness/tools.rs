@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 use crate::tools::ToolContext;
 
-use super::model::{HarnessEvent, TaskSession, TaskStatus};
+use super::model::{ChangeSet, HarnessEvent, TaskSession, TaskStatus};
 use super::store::HarnessError;
 
 pub const TOOL_NAMES: &[&str] = &[
@@ -41,7 +41,8 @@ pub fn call(ctx: &ToolContext, name: &str, args: &Value) -> Result<Value, Worksp
 }
 
 fn harness_status(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
-    serde_json::to_value(ctx.harness.status().map_err(map_error)?)
+    let scope_root = ctx.harness.scope_root_for(&ctx.default_cwd_path());
+    serde_json::to_value(ctx.harness.status_for(&scope_root).map_err(map_error)?)
         .map_err(|e| tool_error("SERIALIZE_FAILED", e.to_string()))
 }
 
@@ -111,8 +112,43 @@ fn operation_log(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
 
 fn project_state(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let max_files = args.get("max_files").and_then(Value::as_u64).unwrap_or(200) as usize;
-    serde_json::to_value(ctx.harness.project_state(max_files).map_err(map_error)?)
-        .map_err(|e| tool_error("SERIALIZE_FAILED", e.to_string()))
+    let scope_root = ctx.harness.scope_root_for(&ctx.default_cwd_path());
+    serde_json::to_value(
+        ctx.harness
+            .project_state_for(&scope_root, max_files)
+            .map_err(map_error)?,
+    )
+    .map_err(|e| tool_error("SERIALIZE_FAILED", e.to_string()))
+}
+
+fn finalize_verifying_task(
+    ctx: &ToolContext,
+    task: &TaskSession,
+) -> Result<(TaskSession, ChangeSet), WorkspaceError> {
+    if task.status != TaskStatus::Verifying {
+        return Err(tool_error(
+            "INVALID_TASK_TRANSITION",
+            "Only a verifying task can finalize an existing captured change.",
+        ));
+    }
+    let change_id = task.latest_change_id.as_deref().ok_or_else(|| {
+        tool_error(
+            "CHANGE_NOT_FOUND",
+            "Verifying task has no captured change to finalize.",
+        )
+    })?;
+    let change = ctx.harness.change(change_id).map_err(map_error)?;
+    if change.task_id != task.id {
+        return Err(tool_error(
+            "CHANGE_TASK_MISMATCH",
+            "Captured change does not belong to the verifying task.",
+        ));
+    }
+    let completed = ctx
+        .harness
+        .transition(&task.id, TaskStatus::Completed)
+        .map_err(map_error)?;
+    Ok((completed, change))
 }
 
 fn start_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -120,8 +156,42 @@ fn start_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> 
         .get("objective")
         .and_then(Value::as_str)
         .ok_or_else(|| tool_error("INVALID_ARGUMENT", "objective 是必填项"))?;
-    let task = ctx.harness.start_task(objective).map_err(map_error)?;
-    Ok(json!({"task": task, "next": ["project_state", "task_context"]}))
+    let existing_task = args
+        .get("existing_task")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    if !matches!(existing_task, "error" | "finish_if_complete") {
+        return Err(tool_error(
+            "INVALID_ARGUMENT",
+            "existing_task must be error or finish_if_complete",
+        ));
+    }
+    let scope_root = ctx.harness.scope_root_for(&ctx.default_cwd_path());
+    let mut recovered_task_id = None;
+    if existing_task == "finish_if_complete" {
+        if let Some(existing) = ctx
+            .harness
+            .current_task_for_root(&scope_root)
+            .map_err(map_error)?
+        {
+            if existing.status == TaskStatus::Verifying
+                && existing.pending_steps.is_empty()
+                && existing.latest_change_id.is_some()
+            {
+                finalize_verifying_task(ctx, &existing)?;
+                recovered_task_id = Some(existing.id);
+            }
+        }
+    }
+    let task = ctx
+        .harness
+        .start_task_for(objective, &scope_root)
+        .map_err(map_error)?;
+    Ok(json!({
+        "task": task,
+        "next": ["project_state", "task_context"],
+        "recovered_task_id": recovered_task_id
+    }))
 }
 
 fn update_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -153,6 +223,18 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         .get("allow_unverified")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let current = ctx.harness.task(task_id).map_err(map_error)?;
+    if current.status == TaskStatus::Verifying && !allow_unverified {
+        let (task, change) = finalize_verifying_task(ctx, &current)?;
+        let summary = stored_change_summary(ctx, &task, &change)?;
+        return Ok(json!({
+            "task": task,
+            "summary": change.reason.text,
+            "change_id": change.id,
+            "change_summary": summary,
+            "finalized_existing_change": true
+        }));
+    }
     let summary = match args.get("summary") {
         None => None,
         Some(value) => Some(
@@ -343,7 +425,10 @@ fn task_context(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError
     let task = if let Some(task_id) = args.get("task_id").and_then(Value::as_str) {
         Some(ctx.harness.task(task_id).map_err(map_error)?)
     } else {
-        ctx.harness.current_task().map_err(map_error)?
+        let scope_root = ctx.harness.scope_root_for(&ctx.default_cwd_path());
+        ctx.harness
+            .current_task_for_root(&scope_root)
+            .map_err(map_error)?
     };
     let Some(task) = task else {
         return Ok(json!({
@@ -577,6 +662,8 @@ mod tests {
         let task = TaskSession {
             id: "task".into(),
             workspace_id: "workspace".into(),
+            scope_id: None,
+            scope_root: None,
             objective: "Bound a large baseline".into(),
             status: TaskStatus::Active,
             baseline: ProjectBaseline {

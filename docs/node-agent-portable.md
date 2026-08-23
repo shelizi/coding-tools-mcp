@@ -7,7 +7,7 @@ The Node Agent portable release produces two Windows x64 ZIP editions from one v
 | `bundled-node` | Yes, `runtime/node.exe` and its license | None after extraction | Default distribution for users who want a self-contained package |
 | `system-node` | No | Windows x64 Node.js 22 or later available as `node.exe` on `PATH` | Smaller package for managed machines that already provide Node.js |
 
-Neither edition requires npm after extraction. Both include compiled server/UI assets, production-only dependencies, checksums, the project license, and double-click BAT launchers.
+Neither edition requires pnpm after extraction. Both include compiled server/UI assets, production-only dependencies, checksums, the project license, and double-click BAT launchers.
 
 ## Independent versions
 
@@ -24,34 +24,34 @@ Never synchronize these three versions automatically. A source-only Agent fix no
 From the repository root, build both editions:
 
 ```powershell
-npm run node-agent:portable
+pnpm run node-agent:portable
 ```
 
 Build only one edition when needed:
 
 ```powershell
-npm run node-agent:portable:bundled
-npm run node-agent:portable:system
+pnpm run node-agent:portable:bundled
+pnpm run node-agent:portable:system
 ```
 
-Equivalent package-level commands are `npm run portable`, `npm run portable:bundled`, and `npm run portable:system` from `packages/node-agent`.
+Equivalent package-level commands are `pnpm run portable`, `pnpm run portable:bundled`, and `pnpm run portable:system` from `packages/node-agent`.
 
 To rebuild both editions while deliberately skipping the full Node Agent verification suite:
 
 ```powershell
-npm --prefix packages/node-agent run portable -- --SkipVerify
+pnpm --filter @coding-tools/node-agent run portable -- --SkipVerify
 ```
 
 The default outputs are:
 
 ```text
-dist-node-portable/Coding.Tools.Node.Agent_<agent-version>_portable-<portable-version>_bundled-node_win-x64.zip
-dist-node-portable/Coding.Tools.Node.Agent_<agent-version>_portable-<portable-version>_system-node_win-x64.zip
-dist-node-portable/Coding.Tools.Node.Agent_portable_bundled-node_win-x64/
-dist-node-portable/Coding.Tools.Node.Agent_portable_system-node_win-x64/
+dist-node-portable/ctnode-<agent-version>-p<portable-version>-win64.zip
+dist-node-portable/ctnode-<agent-version>-p<portable-version>-sys-win64.zip
+dist-node-portable/ctnode-win64/
+dist-node-portable/ctnode-sys-win64/
 ```
 
-ZIP filenames and their top-level directories remain versioned release artifacts. The two expanded directories are stable latest-build locations: every successful build replaces the matching directory instead of accumulating versioned expanded copies.
+ZIP filenames and their top-level directories remain versioned release artifacts. The two expanded directories are stable latest-build locations: every successful build replaces the matching directory instead of accumulating versioned expanded copies. Release packaging rejects package-relative paths longer than 180 characters to leave headroom for normal Windows extraction destinations.
 
 ## Archive contents
 
@@ -61,10 +61,7 @@ Both editions include:
 app/dist/                    compiled Node Agent and Management UI
 app/node_modules/            production dependencies only
 app/package.json
-app/package-lock.json
 LICENSE.txt                  project license
-data/                        optional package-local isolation target
-logs/                        local log directory
 start-node-agent.bat         validate runtime, start Agent, and open UI after health is ready
 open-management-ui.bat       open the configured local UI port
 portable-manifest.json       edition/application/runtime/build metadata
@@ -100,8 +97,8 @@ An existing process, user, or machine `CTMCP_DATA_DIR` environment variable take
 ## Release checks
 
 1. Run the Node Agent verification suite once before staging unless there is an explicit reason to use `-SkipVerify`.
-2. Install dependencies into temporary common staging with `npm ci --omit=dev --ignore-scripts`.
-3. Confirm `ws`, `pngjs`, and `jpeg-js` resolve from common staging.
+2. Deploy the Node Agent workspace package into temporary common staging with `pnpm --filter @coding-tools/node-agent deploy --prod <staging>`.
+3. Confirm `ws`, `pngjs`, and `jpeg-js` resolve from the deployed production staging tree.
 4. Require the build runtime to be Windows x64 at or above the minimum major version.
 5. Confirm `bundled-node` contains `runtime/node.exe` and its license.
 6. Confirm `system-node` contains neither `runtime/node.exe` nor `runtime/NODE-LICENSE.txt`.

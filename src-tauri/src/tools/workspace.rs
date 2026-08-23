@@ -360,33 +360,54 @@ impl Workspace {
         &self,
         path: &Path,
         include_hidden: bool,
+        include_ignored: bool,
+        include_generated: bool,
+    ) -> bool {
+        self.is_ignored_scan_path(
+            &self.root,
+            path,
+            include_hidden,
+            include_ignored,
+            include_generated,
+        )
+    }
+
+    pub fn is_ignored_scan_path(
+        &self,
+        scan_root: &Path,
+        path: &Path,
+        include_hidden: bool,
         _include_ignored: bool,
         include_generated: bool,
     ) -> bool {
-        let Ok(scan_path) = path.strip_prefix(&self.root) else {
+        let Ok(workspace_path) = path.strip_prefix(&self.root) else {
             return true;
         };
-        let parts: Vec<String> = scan_path
+        let workspace_parts: Vec<String> = workspace_path
             .components()
             .filter_map(|part| match part {
                 Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
                 _ => None,
             })
             .collect();
-        for part in &parts {
+        for part in &workspace_parts {
             if part.eq_ignore_ascii_case(".git") {
                 return true;
             }
         }
         if !include_hidden {
-            for part in &parts {
+            let hidden_path = path.strip_prefix(scan_root).unwrap_or(workspace_path);
+            for part in hidden_path.components().filter_map(|part| match part {
+                Component::Normal(name) => Some(name.to_string_lossy()),
+                _ => None,
+            }) {
                 if part.starts_with('.') && part != "." {
                     return true;
                 }
             }
         }
         if !include_generated {
-            for part in &parts {
+            for part in &workspace_parts {
                 if DEFAULT_EXCLUDED_NAMES.contains(&part.as_str()) {
                     return true;
                 }
@@ -468,7 +489,7 @@ pub fn wrap_tool_result(structured: Value) -> Value {
 
 pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) -> Value {
     let is_error = structured.get("ok").and_then(Value::as_bool) == Some(false);
-    let content = if tool_name == "view_image"
+    let content = if matches!(tool_name, "view_image" | "desktop_screenshot")
         && args
             .get("output")
             .and_then(Value::as_str)

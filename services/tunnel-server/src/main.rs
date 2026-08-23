@@ -184,6 +184,12 @@ struct AvailableWorker {
     assign: oneshot::Sender<ProxyJob>,
 }
 
+fn discard_closed_workers(workers: &mut VecDeque<AvailableWorker>) -> usize {
+    let before = workers.len();
+    workers.retain(|worker| !worker.assign.is_closed());
+    before.saturating_sub(workers.len())
+}
+
 struct ActiveWorkerGuard {
     active_workers: Arc<AtomicUsize>,
 }
@@ -260,6 +266,7 @@ async fn dispatch_requests(
 
     loop {
         jobs.retain(|job| !job.abandoned());
+        discard_closed_workers(&mut workers);
         while !workers.is_empty() && !jobs.is_empty() {
             let worker = workers.pop_front().expect("worker queue checked");
             let mut job = jobs.pop_front().expect("job queue checked");
@@ -306,6 +313,7 @@ async fn dispatch_requests(
                     job.assigned = assigned;
                     job.pending_slot = pending_slot;
                     jobs.push_front(job);
+                    discard_closed_workers(&mut workers);
                 }
             }
         }
@@ -1533,6 +1541,25 @@ mod tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    #[test]
+    fn dispatcher_discards_closed_worker_slots_before_assignment() {
+        let (closed_assign, closed_receiver) = oneshot::channel::<ProxyJob>();
+        drop(closed_receiver);
+        let (live_assign, _live_receiver) = oneshot::channel::<ProxyJob>();
+        let mut workers = VecDeque::from([
+            AvailableWorker {
+                assign: closed_assign,
+            },
+            AvailableWorker {
+                assign: live_assign,
+            },
+        ]);
+
+        assert_eq!(discard_closed_workers(&mut workers), 1);
+        assert_eq!(workers.len(), 1);
+        assert!(!workers.front().expect("live worker").assign.is_closed());
+    }
 
     async fn start_test_server(
         devices: DeviceRegistry,

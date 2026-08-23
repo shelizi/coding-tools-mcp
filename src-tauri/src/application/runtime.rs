@@ -30,6 +30,14 @@ fn validate_start_resources(
     state.with_workspaces(|store| validate_service_start(store.list(), id, service))
 }
 
+fn persist_mcp_runtime_enabled(state: &AppState, id: &str, enabled: bool) -> AppResult<()> {
+    state.with_workspaces(|store| store.set_mcp_runtime_enabled(id, enabled))
+}
+
+fn persist_actions_runtime_enabled(state: &AppState, id: &str, enabled: bool) -> AppResult<()> {
+    state.with_workspaces(|store| store.set_actions_runtime_enabled(id, enabled))
+}
+
 fn persist_tunnel_url(
     state: &AppState,
     id: &str,
@@ -94,6 +102,9 @@ pub async fn start_mcp_runtime(state: &AppState, id: &str) -> AppResult<RuntimeS
     ensure_port_available(profile.runtime.local_port, "本地 MCP").await?;
 
     state.with_runtime(|runtime| runtime.start_mcp(&profile))?;
+    // The local listener is already running even if tunnel startup below fails,
+    // so remember MCP as enabled at this point.
+    persist_mcp_runtime_enabled(state, id, true)?;
     sync_tunnel_routes_from_runtime(state).await?;
 
     match maybe_start_for_runtime(&profile, TunnelServiceKind::Mcp).await {
@@ -117,6 +128,9 @@ pub async fn start_mcp_runtime(state: &AppState, id: &str) -> AppResult<RuntimeS
 
 pub async fn stop_mcp_runtime(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
     let profile = profile_by_id(state, id)?;
+    // Explicit stop is the durable user intent, even if cleanup later reports
+    // an error.
+    persist_mcp_runtime_enabled(state, id, false)?;
     let port = profile.runtime.local_port;
     let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(id, ServiceKind::Mcp)))?;
 
@@ -146,6 +160,7 @@ pub async fn start_actions_runtime(state: &AppState, id: &str) -> AppResult<Runt
     ensure_port_available(profile.actions.local_port, "本地 Actions").await?;
 
     state.with_runtime(|runtime| runtime.start_actions(&profile))?;
+    persist_actions_runtime_enabled(state, id, true)?;
     sync_tunnel_routes_from_runtime(state).await?;
 
     match maybe_start_for_runtime(&profile, TunnelServiceKind::Actions).await {
@@ -169,6 +184,7 @@ pub async fn start_actions_runtime(state: &AppState, id: &str) -> AppResult<Runt
 
 pub async fn stop_actions_runtime(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
     let profile = profile_by_id(state, id)?;
+    persist_actions_runtime_enabled(state, id, false)?;
     let port = profile.actions.local_port;
     let handle = state.with_runtime(|runtime| Ok(runtime.begin_stop(id, ServiceKind::Actions)))?;
 
@@ -194,11 +210,15 @@ pub fn actions_runtime_status(state: &AppState, id: &str) -> AppResult<RuntimeSt
 pub fn restart_mcp_runtime(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
     validate_start_resources(state, id, WorkspaceService::Mcp)?;
     let profile = profile_by_id(state, id)?;
-    state.with_runtime(|runtime| runtime.restart_mcp(&profile))
+    let status = state.with_runtime(|runtime| runtime.restart_mcp(&profile))?;
+    persist_mcp_runtime_enabled(state, id, true)?;
+    Ok(status)
 }
 
 pub fn restart_actions_runtime(state: &AppState, id: &str) -> AppResult<RuntimeStatusDto> {
     validate_start_resources(state, id, WorkspaceService::Actions)?;
     let profile = profile_by_id(state, id)?;
-    state.with_runtime(|runtime| runtime.restart_actions(&profile))
+    let status = state.with_runtime(|runtime| runtime.restart_actions(&profile))?;
+    persist_actions_runtime_enabled(state, id, true)?;
+    Ok(status)
 }

@@ -56,10 +56,13 @@
   - **证据块**：Workspace 子进程可执行并返回 `sandbox_enforced=false`；`host` scope 要求 `confirm=true`；仓库保护资产删除测试通过。
   - **涉及文件**：`src-tauri/src/tools/exec.rs`、`src-tauri/src/tools/policy.rs`、`src-tauri/src/tools/registry.rs`、相关安全测试。
   - _需求：FR-4、NFR-4_ ｜ _设计：Exec 子进程安全闸_
-- [ ] 4.2 实现 Windows-rs 原生进程文件系统授权，使 Python、Node、Git、PowerShell 及其子进程继承 Workspace/外部授权范围。
+- [x] 4.2 实现 Windows-rs 原生进程文件系统授权，使 Python、Node、Git、PowerShell 及其子进程继承 Workspace/外部授权范围。
   - **验收重点**：越界读取、越界写入、`.git/.github`、junction、symlink、UNC 和 `\\?\\` 路径均不能绕过授权。
+  - **当前状态**：Workspace AppContainer 已通过生产 readiness matrix。外部路径授权已落地（read-only / modify / 未授权目录、子孙行程继承）。workspace 根与 **grant 内部** 的 junction/symlink/`\\?\\` 绕过均被 OS ACL 拒绝；UNC 外部授权继续 fail-closed（`SANDBOX_EXTERNAL_PATH_UNSUPPORTED`），不作为可授权范围。
   - _需求：FR-2、FR-4_ ｜ _设计：Exec 子进程安全闸_
-- [ ] 4.3 使用 Job Object 管理整个进程树的终止、超时和资源上限；不将 Job Object 单独当作文件系统沙箱。
+- [x] 4.3 使用 Job Object 管理整个进程树的终止、超时和资源上限；不将 Job Object 单独当作文件系统沙箱。
+  - **证据块**：AppContainer 进程以 suspended `CreateProcessW` 启动、在 resume 前绑定 kill-on-close Job Object；shared exec regressions 验证 `process_tree_contained=true`、process timeout 与 explicit `kill_session` cancellation，且文件系统隔离由 AppContainer/DACL 独立承担。
+  - **涉及文件**：`src-tauri/src/platform/process_tree.rs`、`src-tauri/src/tools/sandbox/appcontainer.rs`、`src-tauri/src/tools/exec/tests.rs`、AppContainer research matrix。
   - _需求：FR-4、NFR-4_ ｜ _设计：Exec 子进程安全闸_
 
 ## 检查点
@@ -75,11 +78,11 @@
 | FR-1 | Exec 结果模型 | 2.1、3.1 | 已完成 |
 | FR-2 | Workspace 安全模型 | 3.2 | 已完成 |
 | FR-3 | Workspace 安全模型 | 3.2 | 已完成 |
-| FR-4 | Exec 子进程安全闸 | 4.1、4.2、4.3 | 4.1 已完成，4.2/4.3 待完成 |
+| FR-4 | Exec 子进程安全闸 | 4.1、4.2、4.3 | 已完成 |
 | NFR-1 | 决策 2、风险评估 | 2.1、3.3 | 已完成 |
 | NFR-2 | 测试策略 | 3.2、3.3 | 已完成 |
 | NFR-3 | 测试策略 | 3.1、3.2、3.3 | 已完成 |
-| NFR-4 | Exec 子进程安全闸 | 4.1、4.2、4.3 | 4.1 已完成，4.2/4.3 待完成 |
+| NFR-4 | Exec 子进程安全闸 | 4.1、4.2、4.3 | 已完成 |
 
 ## 文件变更清单
 

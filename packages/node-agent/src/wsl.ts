@@ -47,6 +47,10 @@ function validDistro(value: string): boolean {
     && ![...value].some(character => /[\u0000-\u001f\u007f]/.test(character));
 }
 
+export function isWslUncPath(value: string): boolean {
+  return Boolean(parseWslUncPath(value));
+}
+
 export function parseWslUncPath(value: string): WslLocation | undefined {
   let normalized = value.trim().replaceAll('/', '\\');
   const extendedPrefix = '\\\\?\\UNC\\';
@@ -123,6 +127,48 @@ export function looksLikeWindowsDrivePath(value: string): boolean {
   return /^[A-Za-z]:[\\/]/.test(value);
 }
 
+function looksLikeWindowsHostPath(value: string): boolean {
+  return looksLikeWindowsDrivePath(value) || value.startsWith('\\\\');
+}
+
+function validWslEnvironmentKey(value: string): boolean {
+  return Boolean(value) && !value.startsWith('-') && !value.includes('=') && !value.includes('\0');
+}
+
+function validateWslEnvironment(
+  environment: readonly (readonly [string, string])[],
+  removeEnvironment: readonly string[]
+): void {
+  for (const [key, value] of environment) {
+    if (!validWslEnvironmentKey(key) || value.includes('\0')) {
+      throw new WslRoutingError(
+        'WSL_ENVIRONMENT_INVALID',
+        `env contains an invalid WSL environment entry: ${key}`,
+        'validation',
+        false,
+        {
+          key,
+          suggestion: "Use a non-empty environment name that does not start with '-' and contains neither '=' nor NUL."
+        }
+      );
+    }
+  }
+  for (const key of removeEnvironment) {
+    if (!validWslEnvironmentKey(key)) {
+      throw new WslRoutingError(
+        'WSL_ENVIRONMENT_INVALID',
+        `remove_env contains an invalid WSL environment name: ${key}`,
+        'validation',
+        false,
+        {
+          key,
+          suggestion: "Use a non-empty environment name that does not start with '-' and contains neither '=' nor NUL."
+        }
+      );
+    }
+  }
+}
+
 export function validateWslExecPaths(cwd: string, program: string, args: readonly string[]): void {
   const workspace = parseWslUncPath(cwd);
   if (!workspace) return;
@@ -147,7 +193,7 @@ export function validateWslExecPaths(cwd: string, program: string, args: readonl
       }
       continue;
     }
-    if (looksLikeWindowsDrivePath(value)) {
+    if (looksLikeWindowsHostPath(value)) {
       throw new WslRoutingError(
         'WSL_HOST_PATH_REQUIRES_TRANSLATION',
         `${position} uses a Windows host path that is not valid as a Linux command argument`,
@@ -170,11 +216,13 @@ export function wslInvocationForPath(
   args: readonly string[],
   environment: readonly (readonly [string, string])[] = [],
   removeEnvironment: readonly string[] = [],
-  platform: NodeJS.Platform = process.platform
+  platform: NodeJS.Platform = process.platform,
+  cleanEnvironment = false
 ): WslInvocation | undefined {
   const workspace = parseWslUncPath(cwd);
   if (!workspace || platform !== 'win32') return undefined;
   validateWslExecPaths(cwd, program, args);
+  validateWslEnvironment(environment, removeEnvironment);
   const programLocation = parseWslUncPath(program);
   const innerProgram = programLocation && programLocation.distro.toLowerCase() === workspace.distro.toLowerCase()
     ? programLocation.linuxPath
@@ -185,17 +233,31 @@ export function wslInvocationForPath(
       ? location.linuxPath
       : argument;
   });
-  const wrapped = [
+  const wrapped: string[] = [
     '--distribution', workspace.distro,
     '--cd', workspace.linuxPath,
     '--exec'
   ];
+  const innerCommand: string[] = [];
   if (environment.length || removeEnvironment.length) {
-    wrapped.push('env');
-    for (const key of removeEnvironment) wrapped.push('-u', key);
-    for (const [key, value] of environment) wrapped.push(`${key}=${value}`);
+    innerCommand.push('env');
+    for (const key of removeEnvironment) innerCommand.push('-u', key);
+    for (const [key, value] of environment) innerCommand.push(`${key}=${value}`);
   }
-  wrapped.push(innerProgram, ...innerArgs);
+  innerCommand.push(innerProgram, ...innerArgs);
+  if (cleanEnvironment) {
+    const cleanEnvironmentScript = [
+      'exec env -i',
+      'PATH="$PATH" HOME="$HOME" PWD="$PWD"',
+      'USER="${USER-}" LOGNAME="${LOGNAME-}" TMPDIR="${TMPDIR-}"',
+      'CARGO_HOME="${CARGO_HOME-}" RUSTUP_HOME="${RUSTUP_HOME-}"',
+      'XDG_CONFIG_HOME="${XDG_CONFIG_HOME-}" XDG_CACHE_HOME="${XDG_CACHE_HOME-}"',
+      'LANG="${LANG-}" LC_ALL="${LC_ALL-}" "$@"'
+    ].join(' ');
+    wrapped.push('/bin/sh', '-c', cleanEnvironmentScript, 'coding-tools-clean-env', ...innerCommand);
+  } else {
+    wrapped.push(...innerCommand);
+  }
   return { program: 'wsl.exe', args: wrapped };
 }
 

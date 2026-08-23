@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { getBackend } from "$lib/backend";
 
 export interface SoftwareStatus {
   kind: string;
@@ -6,6 +6,10 @@ export interface SoftwareStatus {
   installed: boolean;
   path: string;
   managed: boolean;
+  group?: "tunnel" | "sandbox" | string;
+  installable?: boolean;
+  hint?: string;
+  nextSteps?: string;
 }
 
 export interface DownloadConfig {
@@ -15,21 +19,21 @@ export interface DownloadConfig {
 }
 
 export async function listSoftware(): Promise<SoftwareStatus[]> {
-  return invoke("list_software");
+  return getBackend().software.list();
 }
 
 export async function installSoftware(kind: string): Promise<SoftwareStatus> {
-  return invoke("install_software", { kind });
+  return getBackend().software.install(kind);
 }
 
 export async function uninstallSoftware(kind: string): Promise<SoftwareStatus> {
-  return invoke("uninstall_software", { kind });
+  return getBackend().software.uninstall(kind);
 }
 
 export async function getDownloadConfig(): Promise<DownloadConfig> {
-  return invoke("get_download_config");
+  return getBackend().software.getDownloadConfig();
 }
 
 export async function setDownloadConfig(config: DownloadConfig): Promise<void> {
-  return invoke("set_download_config", { config });
+  return getBackend().software.setDownloadConfig(config);
 }

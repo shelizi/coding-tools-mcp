@@ -493,7 +493,7 @@ version = "0.1.0"
 
 [[package]]
 name = "coding-tools-mcp-desktop"
-version = "0.1.40"
+version = "0.1.53"
 dependencies = [
  "aes-gcm",
  "axum",
@@ -528,11 +528,13 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "toml 1.1.2+spec-1.1.0",
  "tower-http",
  "uuid",
  "walkdir",
  "which",
  "windows",
+ "windows-core 0.61.2",
  "zip",
 ]
 

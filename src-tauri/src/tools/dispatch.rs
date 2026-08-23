@@ -1,28 +1,32 @@
+mod exec_many;
+mod tracking;
+
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Map, Value};
-use sha2::{Digest, Sha256};
-
-use crate::harness::model::OperationRecord;
-use crate::tools::context::{MutationLockGroup, SharedToolContext, ToolContext};
-use crate::tools::parallel_stats::{
-    parallel_pair_history, parallel_safety_lower_bound, record_parallel_observations,
-    ParallelPairStats,
-};
+use crate::tools::context::{SharedToolContext, ToolContext};
 use crate::tools::policy::{validate_tool_arguments_for_workspace, PolicyError};
-use crate::tools::redaction::{redact_tool_output, OutputRedactionContext};
-use crate::tools::workspace::{tool_err, tool_err_code, tool_ok, WorkspaceError};
-use crate::tools::{exec, file, file_action, git, history, image_tool, patch, project, session};
+use crate::tools::redaction::{redact_tool_output_with_policy, OutputRedactionContext};
+use crate::tools::tool_runtime::{descriptor as tool_runtime, MutationLockGroup};
+use crate::tools::workspace::{relative_display, tool_err, tool_err_code, tool_ok, WorkspaceError};
+use crate::tools::{
+    desktop, exec, file, file_action, git, history, image_tool, patch, project, session,
+};
+use serde_json::{json, Value};
+
+use exec_many::{call_exec_many_async, call_exec_many_sync};
+pub(crate) use tracking::operation_result_summary;
+use tracking::{attach_harness_status, begin_tracked_call, finish_tracked_call};
+
+#[cfg(test)]
+use exec_many::{
+    collect_parallelism_observations, command_parallel_signature, default_exec_many_parallelism,
+    parallel_pair_key, parse_exec_batch_commands, resolve_exec_many_decision_with_history,
+};
 
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
-const PARALLEL_MIN_CONFIDENT_SAMPLES: u64 = 5;
-const PARALLEL_SAFE_LOWER_BOUND: f64 = 0.70;
-const MAX_PARALLEL_OBSERVATIONS: usize = 128;
 
 fn policy_tool_err(
     ctx: &ToolContext,
@@ -106,11 +110,13 @@ fn permission_kind(message: &str) -> Option<&'static str> {
 /// **唯一工具执行入口**。MCP `tools/call` 与 Actions `POST /actions/{tool}` 必须且只能调用此函数。
 /// 策略校验、分发、错误格式在此统一，两路传输层不得另做执行前校验（Actions 仅允许额外的暴露层 `validate_actions_exposure`）。
 pub fn call_tool(ctx: &ToolContext, name: &str, args: &Value) -> Value {
-    redact_tool_output(name, args, call_tool_inner(ctx, name, args, false))
+    let policy = ctx.runtime_config().policy.security_policy;
+    redact_tool_output_with_policy(name, args, call_tool_inner(ctx, name, args, false), &policy)
 }
 
 pub async fn call_tool_async(ctx: SharedToolContext, name: String, args: Value) -> Value {
-    let redaction = OutputRedactionContext::new(&name, &args);
+    let policy = ctx.runtime_config().policy.security_policy;
+    let redaction = OutputRedactionContext::new_with_policy(&name, &args, &policy);
     let lock_groups = mutation_lock_groups(ctx.as_ref(), &name, &args);
     let lock_started = Instant::now();
     let mut mutation_guards = Vec::with_capacity(lock_groups.len());
@@ -151,24 +157,7 @@ fn mutation_lock_groups(ctx: &ToolContext, name: &str, args: &Value) -> Vec<Muta
     } else {
         name.to_string()
     };
-    let mut groups = match effective_name.as_str() {
-        "history_session_bootstrap" | "history_session_checkpoint" | "history_session_validate" => {
-            vec![MutationLockGroup::History]
-        }
-        "apply_patch" | "edit" | "edit_file" | "edit_many" | "file_ops" => {
-            vec![MutationLockGroup::WorkspaceContent]
-        }
-        "git_restore" => vec![MutationLockGroup::WorkspaceContent, MutationLockGroup::Git],
-        "git_branch" | "git_stage" | "git_commit" | "git_push" => vec![MutationLockGroup::Git],
-        "start_task" | "update_task" | "pause_task" | "resume_task" | "finish_task" => {
-            vec![MutationLockGroup::Task]
-        }
-        "set_default_cwd" => vec![MutationLockGroup::Cwd],
-        _ => Vec::new(),
-    };
-    groups.sort_unstable();
-    groups.dedup();
-    groups
+    tool_runtime(&effective_name).lock_groups.to_vec()
 }
 
 async fn call_tool_async_inner(ctx: SharedToolContext, name: String, args: Value) -> Value {
@@ -358,1486 +347,6 @@ async fn call_tool_async_inner(ctx: SharedToolContext, name: String, args: Value
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ParallelPrior {
-    Safe,
-    EvidenceRequired,
-    Unsafe,
-}
-
-#[derive(Clone, Debug)]
-struct ParallelDecision {
-    mode: &'static str,
-    source: &'static str,
-    confidence: f64,
-    history_samples: u64,
-    blocked_pairs: usize,
-    recommended_max_parallel: usize,
-    reasons: Vec<String>,
-}
-
-#[derive(Clone)]
-struct ExecBatchCommand {
-    index: usize,
-    id: String,
-    depends_on: Vec<String>,
-    lock_group: Option<String>,
-    lock_group_inferred: bool,
-    parallel_signature: String,
-    parallel_prior: ParallelPrior,
-    args: Value,
-}
-
-async fn call_exec_many_async(ctx: SharedToolContext, args: &Value) -> Value {
-    let Some(commands) = args.get("commands").and_then(Value::as_array) else {
-        return tool_err(WorkspaceError::invalid_argument("commands is required"));
-    };
-    let commands = match parse_exec_batch_commands(commands) {
-        Ok(commands) => commands,
-        Err(error) => return tool_err(error),
-    };
-    let requested_mode = match exec_many_mode(args) {
-        Ok(mode) => mode,
-        Err(error) => return tool_err(error),
-    };
-    let stop_on_error = args
-        .get("stop_on_error")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let process_limit = ctx.execution_limits().process_admission.clamp(1, 256);
-    let default_parallel = default_exec_many_parallelism(commands.len(), process_limit);
-    let decision =
-        resolve_exec_many_decision(&ctx.profile_id, requested_mode, &commands, default_parallel);
-    let mode = decision.mode;
-    if mode == "dag" {
-        if let Err(error) = validate_exec_batch_dag(&commands) {
-            return tool_err(error);
-        }
-    }
-    let configured_parallel = args
-        .get("max_parallel")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(default_parallel)
-        .clamp(1, process_limit);
-    let max_parallel = match mode {
-        "sequential" => 1,
-        _ if requested_mode == "auto" => configured_parallel
-            .min(decision.recommended_max_parallel)
-            .max(1),
-        _ => configured_parallel,
-    };
-    let inferred_lock_groups = commands
-        .iter()
-        .filter(|command| command.lock_group_inferred)
-        .count();
-    let started = Instant::now();
-    let mut warnings = Vec::<String>::new();
-    if requested_mode == "auto" {
-        warnings.push(format!(
-            "auto scheduler selected {mode}; source={}; confidence={:.3}; samples={}; max_parallel={max_parallel}; inferred_lock_groups={inferred_lock_groups}",
-            decision.source,
-            decision.confidence,
-            decision.history_samples,
-        ));
-        warnings.extend(decision.reasons.iter().take(8).cloned());
-    }
-
-    let results = match mode {
-        "sequential" => {
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
-            let mut results = Vec::with_capacity(commands.len());
-            for command in commands.iter().cloned() {
-                let result = run_exec_batch_command(ctx.clone(), command, semaphore.clone()).await;
-                let command_ok = result.get("command_ok").and_then(Value::as_bool) == Some(true);
-                results.push(result);
-                if stop_on_error && !command_ok {
-                    break;
-                }
-            }
-            results
-        }
-        "parallel" => {
-            if stop_on_error {
-                warnings.push(
-                    "parallel mode schedules independent commands immediately; stop_on_error cannot cancel commands that already started".into(),
-                );
-            }
-            run_exec_batch_wave(ctx.clone(), commands.clone(), max_parallel).await
-        }
-        "dag" => {
-            run_exec_batch_dag(ctx.clone(), commands.clone(), max_parallel, stop_on_error).await
-        }
-        _ => unreachable!("validated exec_many mode"),
-    };
-
-    let (parallelism_observations, observations_truncated) =
-        collect_parallelism_observations(&commands, &results, mode);
-    record_parallel_observations(&ctx.profile_id, &parallelism_observations);
-    let observation_count = parallelism_observations.len();
-    let mut output = exec_many_output(
-        ctx.as_ref(),
-        mode,
-        max_parallel,
-        stop_on_error,
-        commands.len(),
-        results,
-        started,
-        warnings,
-        "async_batch",
-    );
-    if let Some(object) = output.as_object_mut() {
-        object.insert("requested_mode".into(), json!(requested_mode));
-        object.insert("auto_selected".into(), json!(requested_mode == "auto"));
-        object.insert(
-            "inferred_lock_group_count".into(),
-            json!(inferred_lock_groups),
-        );
-        object.insert("parallel_decision_source".into(), json!(decision.source));
-        object.insert(
-            "parallel_confidence".into(),
-            json!(round_parallel_confidence(decision.confidence)),
-        );
-        object.insert(
-            "parallel_history_samples".into(),
-            json!(decision.history_samples),
-        );
-        object.insert(
-            "parallel_blocked_pair_count".into(),
-            json!(decision.blocked_pairs),
-        );
-        object.insert(
-            "recommended_max_parallel".into(),
-            json!(decision.recommended_max_parallel),
-        );
-        object.insert("parallel_decision_reasons".into(), json!(decision.reasons));
-        object.insert(
-            "parallel_observation_count".into(),
-            json!(observation_count),
-        );
-        object.insert(
-            "parallelism_observation_truncated".into(),
-            json!(observations_truncated),
-        );
-        object.insert(
-            "parallelism_observations".into(),
-            Value::Array(parallelism_observations),
-        );
-    }
-    output
-}
-
-fn call_exec_many_sync(ctx: &ToolContext, args: &Value) -> Value {
-    let requested_mode = match exec_many_mode(args) {
-        Ok(mode) => mode,
-        Err(error) => return tool_err(error),
-    };
-    if !matches!(requested_mode, "auto" | "sequential") {
-        return tool_err(WorkspaceError::invalid_argument(
-            "parallel and dag exec_many modes require the async MCP/Actions execution path",
-        ));
-    }
-    let mode = "sequential";
-    let Some(commands) = args.get("commands").and_then(Value::as_array) else {
-        return tool_err(WorkspaceError::invalid_argument("commands is required"));
-    };
-    let commands = match parse_exec_batch_commands(commands) {
-        Ok(commands) => commands,
-        Err(error) => return tool_err(error),
-    };
-    let stop_on_error = args
-        .get("stop_on_error")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let started = Instant::now();
-    let mut results = Vec::with_capacity(commands.len());
-    for command in commands.iter().cloned() {
-        let mut result = call_tool_inner(ctx, "exec_command", &command.args, false);
-        while result.get("process_still_running").and_then(Value::as_bool) == Some(true) {
-            let Some(session_id) = result
-                .get("session_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-            else {
-                break;
-            };
-            let cursor = result
-                .get("next_cursor")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            result = match session::wait_command(
-                &ctx.sessions,
-                &json!({
-                    "session_id": session_id,
-                    "cursor": cursor,
-                    "timeout_ms": 30000,
-                    "until": "finalized",
-                    "output_mode": "tail"
-                }),
-            ) {
-                Ok(value) => value,
-                Err(error) => tool_err(error),
-            };
-        }
-        let command_ok = result.get("command_ok").and_then(Value::as_bool) == Some(true);
-        results.push(batch_result(
-            &command, result, command_ok, false, None, 0, 0,
-        ));
-        if stop_on_error && !command_ok {
-            break;
-        }
-    }
-    let mut output = exec_many_output(
-        ctx,
-        mode,
-        1,
-        stop_on_error,
-        commands.len(),
-        results,
-        started,
-        if requested_mode == "auto" {
-            vec!["auto scheduler fell back to sequential on the blocking execution path".into()]
-        } else {
-            Vec::new()
-        },
-        "blocking_batch",
-    );
-    if let Some(object) = output.as_object_mut() {
-        object.insert("requested_mode".into(), json!(requested_mode));
-        object.insert("auto_selected".into(), json!(requested_mode == "auto"));
-        object.insert(
-            "parallel_decision_source".into(),
-            json!("blocking_execution_path"),
-        );
-        object.insert("parallel_confidence".into(), json!(1.0));
-        object.insert("parallel_history_samples".into(), json!(0));
-        object.insert("parallel_blocked_pair_count".into(), json!(0));
-        object.insert("recommended_max_parallel".into(), json!(1));
-        object.insert(
-            "parallel_decision_reasons".into(),
-            json!(["The blocking execution path only supports sequential exec_many scheduling."]),
-        );
-        object.insert("parallel_observation_count".into(), json!(0));
-        object.insert("parallelism_observation_truncated".into(), json!(false));
-        object.insert("parallelism_observations".into(), json!([]));
-    }
-    output
-}
-
-fn exec_many_mode(args: &Value) -> Result<&str, WorkspaceError> {
-    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("auto");
-    if matches!(mode, "auto" | "sequential" | "parallel" | "dag") {
-        Ok(mode)
-    } else {
-        Err(WorkspaceError::invalid_argument(
-            "mode must be auto, sequential, parallel, or dag",
-        ))
-    }
-}
-
-fn default_exec_many_parallelism(command_count: usize, process_limit: usize) -> usize {
-    command_count.min(process_limit).clamp(1, 8)
-}
-
-fn resolve_exec_many_decision(
-    profile_id: &str,
-    requested: &str,
-    commands: &[ExecBatchCommand],
-    default_parallel: usize,
-) -> ParallelDecision {
-    let pairs = parallel_command_pairs(commands);
-    let pair_keys = pairs
-        .iter()
-        .map(|(pair, _)| pair.clone())
-        .collect::<Vec<_>>();
-    let history = parallel_pair_history(profile_id, &pair_keys);
-    resolve_exec_many_decision_with_history(requested, commands, default_parallel, &history)
-}
-
-fn resolve_exec_many_decision_with_history(
-    requested: &str,
-    commands: &[ExecBatchCommand],
-    default_parallel: usize,
-    history: &BTreeMap<String, ParallelPairStats>,
-) -> ParallelDecision {
-    if requested != "auto" {
-        let mode = match requested {
-            "parallel" => "parallel",
-            "dag" => "dag",
-            _ => "sequential",
-        };
-        return ParallelDecision {
-            mode,
-            source: "explicit",
-            confidence: 1.0,
-            history_samples: 0,
-            blocked_pairs: 0,
-            recommended_max_parallel: if mode == "sequential" {
-                1
-            } else {
-                default_parallel
-            },
-            reasons: vec!["The caller explicitly selected the execution mode.".into()],
-        };
-    }
-    if commands
-        .iter()
-        .any(|command| !command.depends_on.is_empty())
-    {
-        return ParallelDecision {
-            mode: "dag",
-            source: "dependency_graph",
-            confidence: 1.0,
-            history_samples: 0,
-            blocked_pairs: 0,
-            recommended_max_parallel: default_parallel,
-            reasons: vec!["Command dependencies require DAG scheduling.".into()],
-        };
-    }
-    if commands.len() <= 1 {
-        return ParallelDecision {
-            mode: "sequential",
-            source: "single_command",
-            confidence: 1.0,
-            history_samples: 0,
-            blocked_pairs: 0,
-            recommended_max_parallel: 1,
-            reasons: vec!["Only one command was supplied.".into()],
-        };
-    }
-    let unsafe_commands = commands
-        .iter()
-        .filter(|command| command.parallel_prior == ParallelPrior::Unsafe)
-        .count();
-    if unsafe_commands > 0 {
-        return ParallelDecision {
-            mode: "sequential",
-            source: "hard_safety_rule",
-            confidence: 1.0,
-            history_samples: 0,
-            blocked_pairs: 0,
-            recommended_max_parallel: 1,
-            reasons: vec![format!(
-                "{unsafe_commands} opaque or shell command(s) cannot be proven safe for automatic parallel execution."
-            )],
-        };
-    }
-
-    let pairs = parallel_command_pairs(commands);
-    let mut confidence = 0.75_f64;
-    let mut history_samples = 0_u64;
-    let mut blocked_pairs = 0_usize;
-    let mut conflict_blocks = 0_usize;
-    let mut serialization_pairs = 0_usize;
-    let mut reasons = Vec::<String>::new();
-
-    for (pair, requires_evidence) in &pairs {
-        let stats = history.get(pair);
-        let mut pair_blocked = false;
-        if let Some(stats) = stats {
-            let samples = stats.safety_samples();
-            history_samples = history_samples.saturating_add(samples);
-            if samples > 0 {
-                confidence = confidence.min(parallel_safety_lower_bound(stats));
-            }
-            let conflict_prone =
-                stats.conflicts >= 2 || (samples >= 3 && stats.conflict_rate() >= 0.10);
-            if conflict_prone {
-                conflict_blocks += 1;
-                pair_blocked = true;
-                reasons.push(format!(
-                    "Historical conflicts block pair {pair}: conflicts={}, safety_samples={}.",
-                    stats.conflicts, samples
-                ));
-            }
-            if stats.attempts >= 3 && stats.serialization_rate() >= 0.60 {
-                serialization_pairs += 1;
-            }
-            if *requires_evidence
-                && (samples < PARALLEL_MIN_CONFIDENT_SAMPLES
-                    || parallel_safety_lower_bound(stats) < PARALLEL_SAFE_LOWER_BOUND)
-            {
-                pair_blocked = true;
-                reasons.push(format!(
-                    "Pair {pair} lacks sufficient safe evidence: samples={samples}, lower_bound={:.3}.",
-                    parallel_safety_lower_bound(stats)
-                ));
-            }
-        } else if *requires_evidence {
-            pair_blocked = true;
-            confidence = 0.0;
-            reasons.push(format!(
-                "Pair {pair} has no parallel safety history; run it explicitly in parallel to collect evidence."
-            ));
-        }
-        if pair_blocked {
-            blocked_pairs += 1;
-        }
-    }
-
-    if blocked_pairs > 0 {
-        return ParallelDecision {
-            mode: "sequential",
-            source: if conflict_blocks > 0 {
-                "historical_conflict"
-            } else {
-                "insufficient_history"
-            },
-            confidence,
-            history_samples,
-            blocked_pairs,
-            recommended_max_parallel: 1,
-            reasons,
-        };
-    }
-    if !pairs.is_empty() && serialization_pairs == pairs.len() {
-        reasons.push(
-            "All observed command pairs mostly serialize on resource locks; parallel dispatch adds no useful overlap."
-                .into(),
-        );
-        return ParallelDecision {
-            mode: "sequential",
-            source: "historical_serialization",
-            confidence,
-            history_samples,
-            blocked_pairs: 0,
-            recommended_max_parallel: 1,
-            reasons,
-        };
-    }
-
-    let recommended_max_parallel = if serialization_pairs > 0 {
-        reasons.push(format!(
-            "{serialization_pairs} pair(s) usually serialize on resource locks; cap automatic parallelism at 2."
-        ));
-        default_parallel.min(2)
-    } else {
-        default_parallel
-    };
-    if history_samples == 0 {
-        reasons.push(
-            "Known safe command families and hard resource locks permit parallel execution.".into(),
-        );
-    } else {
-        reasons.push(format!(
-            "Historical evidence supports parallel execution with an 80% Wilson lower bound of {:.3}.",
-            confidence
-        ));
-    }
-    ParallelDecision {
-        mode: "parallel",
-        source: if history_samples == 0 {
-            "hard_rules"
-        } else {
-            "historical_statistics"
-        },
-        confidence,
-        history_samples,
-        blocked_pairs: 0,
-        recommended_max_parallel,
-        reasons,
-    }
-}
-
-fn parallel_command_pairs(commands: &[ExecBatchCommand]) -> Vec<(String, bool)> {
-    let mut pairs = Vec::new();
-    for left in 0..commands.len() {
-        for right in (left + 1)..commands.len() {
-            let requires_evidence = commands[left].parallel_prior
-                == ParallelPrior::EvidenceRequired
-                || commands[right].parallel_prior == ParallelPrior::EvidenceRequired;
-            pairs.push((
-                parallel_pair_key(
-                    &commands[left].parallel_signature,
-                    &commands[right].parallel_signature,
-                ),
-                requires_evidence,
-            ));
-        }
-    }
-    pairs
-}
-
-fn parallel_pair_key(left: &str, right: &str) -> String {
-    if left <= right {
-        format!("{left}|{right}")
-    } else {
-        format!("{right}|{left}")
-    }
-}
-
-fn command_parallel_prior(arguments: &Value, lock_group: Option<&str>) -> ParallelPrior {
-    let Some(program) = normalized_program(arguments) else {
-        return ParallelPrior::Unsafe;
-    };
-    if arguments
-        .get("shell")
-        .and_then(Value::as_str)
-        .is_some_and(|shell| shell != "none")
-    {
-        return ParallelPrior::Unsafe;
-    }
-    if lock_group.is_some() || command_has_version_flag(arguments) {
-        return ParallelPrior::Safe;
-    }
-    let verb = normalized_command_verb(arguments, &program);
-    if program == "git"
-        && matches!(
-            verb.as_str(),
-            "status" | "diff" | "log" | "show" | "rev-parse" | "ls-files" | "cat-file"
-        )
-    {
-        ParallelPrior::Safe
-    } else {
-        ParallelPrior::EvidenceRequired
-    }
-}
-
-fn command_parallel_signature(arguments: &Value) -> String {
-    let program = normalized_program(arguments).unwrap_or_else(|| "opaque".into());
-    let verb = normalized_command_verb(arguments, &program);
-    let workdir = arguments
-        .get("workdir")
-        .and_then(Value::as_str)
-        .unwrap_or(".");
-    let digest = format!("{:x}", Sha256::digest(workdir.as_bytes()));
-    format!("{program}:{verb}@{}", &digest[..12])
-}
-
-fn normalized_program(arguments: &Value) -> Option<String> {
-    let value = arguments
-        .get("program")
-        .and_then(Value::as_str)
-        .and_then(|program| Path::new(program).file_stem())
-        .and_then(|name| name.to_str())?;
-    let normalized = value
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-        .take(64)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if normalized.is_empty() {
-        return None;
-    }
-    if matches!(
-        normalized.as_str(),
-        "cargo"
-            | "rustc"
-            | "git"
-            | "npm"
-            | "pnpm"
-            | "yarn"
-            | "bun"
-            | "python"
-            | "python3"
-            | "node"
-            | "pwsh"
-            | "powershell"
-            | "sh"
-            | "cmd"
-    ) {
-        return Some(normalized);
-    }
-    let digest = format!("{:x}", Sha256::digest(normalized.as_bytes()));
-    Some(format!("custom-{}", &digest[..12]))
-}
-
-fn normalized_command_verb(arguments: &Value, program: &str) -> String {
-    if command_has_version_flag(arguments) {
-        return "version".into();
-    }
-    let first = arguments
-        .get("args")
-        .and_then(Value::as_array)
-        .and_then(|args| args.iter().find_map(Value::as_str))
-        .unwrap_or("");
-    let known_family = matches!(
-        program,
-        "cargo" | "rustc" | "git" | "npm" | "pnpm" | "yarn" | "bun"
-    );
-    if !known_family {
-        return if matches!(
-            program,
-            "python" | "python3" | "node" | "pwsh" | "powershell" | "sh" | "cmd"
-        ) {
-            "script".into()
-        } else {
-            "default".into()
-        };
-    }
-    let normalized = first
-        .trim_start_matches('-')
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
-        .take(32)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if normalized.is_empty() {
-        "default".into()
-    } else {
-        normalized
-    }
-}
-
-fn command_has_version_flag(arguments: &Value) -> bool {
-    arguments
-        .get("args")
-        .and_then(Value::as_array)
-        .is_some_and(|args| {
-            args.iter()
-                .filter_map(Value::as_str)
-                .any(|argument| matches!(argument, "--version" | "-V" | "-v" | "version"))
-        })
-}
-
-fn round_parallel_confidence(value: f64) -> f64 {
-    (value * 1_000.0).round() / 1_000.0
-}
-fn collect_parallelism_observations(
-    commands: &[ExecBatchCommand],
-    results: &[Value],
-    mode: &str,
-) -> (Vec<Value>, bool) {
-    if mode != "parallel" || commands.len() < 2 {
-        return (Vec::new(), false);
-    }
-    let result_by_id = results
-        .iter()
-        .filter_map(|result| {
-            result
-                .get("id")
-                .and_then(Value::as_str)
-                .map(|id| (id, result))
-        })
-        .collect::<HashMap<_, _>>();
-    let total_pairs = commands
-        .len()
-        .saturating_mul(commands.len().saturating_sub(1))
-        / 2;
-    let mut observations = Vec::with_capacity(total_pairs.min(MAX_PARALLEL_OBSERVATIONS));
-    for left in 0..commands.len() {
-        for right in (left + 1)..commands.len() {
-            if observations.len() == MAX_PARALLEL_OBSERVATIONS {
-                return (observations, true);
-            }
-            let Some(left_result) = result_by_id.get(commands[left].id.as_str()) else {
-                continue;
-            };
-            let Some(right_result) = result_by_id.get(commands[right].id.as_str()) else {
-                continue;
-            };
-            let overlap_ms = execution_overlap_ms(left_result, right_result);
-            let lock_wait_ms =
-                result_lock_wait_ms(left_result).saturating_add(result_lock_wait_ms(right_result));
-            let same_lock_group = commands[left].lock_group.is_some()
-                && commands[left].lock_group == commands[right].lock_group;
-            let left_ok = left_result.get("command_ok").and_then(Value::as_bool) == Some(true);
-            let right_ok = right_result.get("command_ok").and_then(Value::as_bool) == Some(true);
-            let outcome = if overlap_ms == 0 && (same_lock_group || lock_wait_ms > 0) {
-                "serialized"
-            } else if overlap_ms > 0
-                && (result_has_conflict_marker(left_result)
-                    || result_has_conflict_marker(right_result))
-            {
-                "conflict"
-            } else if overlap_ms > 0 && left_ok && right_ok {
-                "success"
-            } else if overlap_ms > 0 {
-                "failure"
-            } else {
-                "not_overlapped"
-            };
-            observations.push(json!({
-                "pair": parallel_pair_key(
-                    &commands[left].parallel_signature,
-                    &commands[right].parallel_signature,
-                ),
-                "left": commands[left].parallel_signature,
-                "right": commands[right].parallel_signature,
-                "outcome": outcome,
-                "overlap_ms": overlap_ms,
-                "lock_wait_ms": lock_wait_ms,
-                "same_lock_group": same_lock_group
-            }));
-        }
-    }
-    (observations, total_pairs > MAX_PARALLEL_OBSERVATIONS)
-}
-
-fn execution_overlap_ms(left: &Value, right: &Value) -> u64 {
-    let Some((left_start, left_end)) = execution_interval(left) else {
-        return 0;
-    };
-    let Some((right_start, right_end)) = execution_interval(right) else {
-        return 0;
-    };
-    left_end
-        .min(right_end)
-        .saturating_sub(left_start.max(right_start))
-}
-
-fn execution_interval(batch_result: &Value) -> Option<(u64, u64)> {
-    let result = batch_result.get("result")?;
-    let start = result.get("started_ts_ms").and_then(Value::as_u64)?;
-    let end = result
-        .get("completed_ts_ms")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            result
-                .get("elapsed_ms")
-                .or_else(|| result.get("duration_ms"))
-                .and_then(Value::as_u64)
-                .map(|duration| start.saturating_add(duration))
-        })?;
-    Some((start, end.max(start)))
-}
-
-fn result_lock_wait_ms(batch_result: &Value) -> u64 {
-    batch_result
-        .get("resource_lock_wait_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-}
-
-fn result_has_conflict_marker(batch_result: &Value) -> bool {
-    let text = serde_json::to_string(batch_result.get("result").unwrap_or(&Value::Null))
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    [
-        "resource busy",
-        "file in use",
-        "sharing violation",
-        "index.lock",
-        "another git process",
-        "could not lock",
-        "database is locked",
-        "lock wait timeout",
-        "text file busy",
-        "ebusy",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
-}
-
-fn inferred_exec_lock_group(arguments: &Value) -> Option<String> {
-    let program = arguments
-        .get("program")
-        .and_then(Value::as_str)
-        .and_then(|program| Path::new(program).file_stem())
-        .and_then(|name| name.to_str())?
-        .to_ascii_lowercase();
-    let verb = arguments
-        .get("args")
-        .and_then(Value::as_array)
-        .and_then(|args| args.iter().find_map(Value::as_str))
-        .unwrap_or("")
-        .trim_start_matches('-')
-        .to_ascii_lowercase();
-    let workdir = arguments
-        .get("workdir")
-        .and_then(Value::as_str)
-        .unwrap_or(".");
-    let scope = workdir
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .take(80)
-        .collect::<String>();
-    let group = match program.as_str() {
-        "cargo" | "rustc" => format!("cargo-target:{scope}"),
-        "git"
-            if matches!(
-                verb.as_str(),
-                "add"
-                    | "am"
-                    | "apply"
-                    | "bisect"
-                    | "branch"
-                    | "checkout"
-                    | "cherry-pick"
-                    | "clean"
-                    | "commit"
-                    | "merge"
-                    | "mv"
-                    | "rebase"
-                    | "reset"
-                    | "restore"
-                    | "revert"
-                    | "rm"
-                    | "stash"
-                    | "switch"
-                    | "tag"
-            ) =>
-        {
-            format!("git-index:{scope}")
-        }
-        "npm" | "pnpm" | "yarn" | "bun"
-            if matches!(
-                verb.as_str(),
-                "add" | "ci" | "dedupe" | "install" | "remove" | "uninstall" | "update"
-            ) =>
-        {
-            format!("node-generated:{scope}")
-        }
-        _ => return None,
-    };
-    Some(group)
-}
-
-fn parse_exec_batch_commands(commands: &[Value]) -> Result<Vec<ExecBatchCommand>, WorkspaceError> {
-    if commands.is_empty() || commands.len() > 256 {
-        return Err(WorkspaceError::invalid_argument(
-            "commands must contain between 1 and 256 entries",
-        ));
-    }
-    let mut parsed = Vec::with_capacity(commands.len());
-    let mut ids = HashSet::with_capacity(commands.len());
-    for (index, command) in commands.iter().enumerate() {
-        let Some(_) = command.as_object() else {
-            return Err(WorkspaceError::invalid_argument(format!(
-                "commands[{index}] must be an object"
-            )));
-        };
-        let mut command_args = command.clone();
-        let object = command_args
-            .as_object_mut()
-            .expect("validated command object");
-        let id = match object.remove("id") {
-            None => format!("command-{index}"),
-            Some(Value::String(value)) => value,
-            Some(_) => {
-                return Err(WorkspaceError::invalid_argument(format!(
-                    "commands[{index}].id must be a string"
-                )))
-            }
-        };
-        if id.trim().is_empty() || id.len() > 128 {
-            return Err(WorkspaceError::invalid_argument(format!(
-                "commands[{index}].id must contain between 1 and 128 bytes"
-            )));
-        }
-        if !ids.insert(id.clone()) {
-            return Err(WorkspaceError::invalid_argument(format!(
-                "duplicate exec_many command id: {id}"
-            )));
-        }
-        let depends_on = match object.remove("depends_on") {
-            None => Vec::new(),
-            Some(Value::Array(values)) => values
-                .into_iter()
-                .map(|value| {
-                    value.as_str().map(str::to_string).ok_or_else(|| {
-                        WorkspaceError::invalid_argument(format!(
-                            "commands[{index}].depends_on must contain strings"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            Some(_) => {
-                return Err(WorkspaceError::invalid_argument(format!(
-                    "commands[{index}].depends_on must be an array"
-                )))
-            }
-        };
-        let explicit_lock_group = match object.remove("lock_group") {
-            None => None,
-            Some(Value::String(value)) => {
-                let value = value.trim().to_string();
-                if value.is_empty() || value.len() > 128 {
-                    return Err(WorkspaceError::invalid_argument(format!(
-                        "commands[{index}].lock_group must contain between 1 and 128 bytes"
-                    )));
-                }
-                Some(value)
-            }
-            Some(_) => {
-                return Err(WorkspaceError::invalid_argument(format!(
-                    "commands[{index}].lock_group must be a string"
-                )))
-            }
-        };
-        let (lock_group, lock_group_inferred) = match explicit_lock_group {
-            Some(group) => (Some(group), false),
-            None => (
-                inferred_exec_lock_group(&Value::Object(object.clone())),
-                true,
-            ),
-        };
-        let lock_group_inferred = lock_group_inferred && lock_group.is_some();
-        if let Some(group) = lock_group.as_ref() {
-            object.insert("lock_group".into(), Value::String(group.clone()));
-        }
-        if command_args.get("yield_time_ms").is_none() {
-            command_args["yield_time_ms"] = json!(30_000);
-        }
-        if command_args.get("output_mode").is_none() {
-            command_args["output_mode"] = json!("tail");
-        }
-        let parallel_signature = command_parallel_signature(&command_args);
-        let parallel_prior = command_parallel_prior(&command_args, lock_group.as_deref());
-        parsed.push(ExecBatchCommand {
-            index,
-            id,
-            depends_on,
-            lock_group,
-            lock_group_inferred,
-            parallel_signature,
-            parallel_prior,
-            args: command_args,
-        });
-    }
-    let known_ids = parsed
-        .iter()
-        .map(|command| command.id.as_str())
-        .collect::<HashSet<_>>();
-    for command in &parsed {
-        for dependency in &command.depends_on {
-            if dependency == &command.id {
-                return Err(WorkspaceError::invalid_argument(format!(
-                    "command {} cannot depend on itself",
-                    command.id
-                )));
-            }
-            if !known_ids.contains(dependency.as_str()) {
-                return Err(WorkspaceError::invalid_argument(format!(
-                    "command {} depends on unknown command {}",
-                    command.id, dependency
-                )));
-            }
-        }
-    }
-    Ok(parsed)
-}
-
-fn validate_exec_batch_dag(commands: &[ExecBatchCommand]) -> Result<(), WorkspaceError> {
-    let mut indegree = commands
-        .iter()
-        .map(|command| (command.id.clone(), command.depends_on.len()))
-        .collect::<HashMap<_, _>>();
-    let mut dependents = HashMap::<String, Vec<String>>::new();
-    for command in commands {
-        for dependency in &command.depends_on {
-            dependents
-                .entry(dependency.clone())
-                .or_default()
-                .push(command.id.clone());
-        }
-    }
-    let mut ready = indegree
-        .iter()
-        .filter_map(|(id, degree)| (*degree == 0).then_some(id.clone()))
-        .collect::<Vec<_>>();
-    let mut visited = 0_usize;
-    while let Some(id) = ready.pop() {
-        visited += 1;
-        for dependent in dependents.get(&id).into_iter().flatten() {
-            let degree = indegree
-                .get_mut(dependent)
-                .expect("validated dependent command");
-            *degree = degree.saturating_sub(1);
-            if *degree == 0 {
-                ready.push(dependent.clone());
-            }
-        }
-    }
-    if visited == commands.len() {
-        Ok(())
-    } else {
-        Err(WorkspaceError::invalid_argument(
-            "exec_many DAG contains a dependency cycle",
-        ))
-    }
-}
-
-async fn run_exec_batch_dag(
-    ctx: SharedToolContext,
-    commands: Vec<ExecBatchCommand>,
-    max_parallel: usize,
-    stop_on_error: bool,
-) -> Vec<Value> {
-    let mut pending = commands;
-    let mut completed = HashMap::<String, bool>::new();
-    let mut results = Vec::new();
-    while !pending.is_empty() {
-        let mut ready = Vec::new();
-        let mut remaining = Vec::new();
-        for command in pending {
-            if command
-                .depends_on
-                .iter()
-                .any(|dependency| completed.get(dependency) == Some(&false))
-            {
-                completed.insert(command.id.clone(), false);
-                results.push(skipped_batch_result(command, "dependency_failed"));
-            } else if command
-                .depends_on
-                .iter()
-                .all(|dependency| completed.get(dependency) == Some(&true))
-            {
-                ready.push(command);
-            } else {
-                remaining.push(command);
-            }
-        }
-        if ready.is_empty() {
-            if remaining.is_empty() {
-                break;
-            }
-            for command in remaining {
-                completed.insert(command.id.clone(), false);
-                results.push(skipped_batch_result(command, "dependency_unresolved"));
-            }
-            break;
-        }
-        let wave_results = run_exec_batch_wave(ctx.clone(), ready, max_parallel).await;
-        let wave_failed = wave_results
-            .iter()
-            .any(|result| result.get("command_ok").and_then(Value::as_bool) != Some(true));
-        for result in &wave_results {
-            if let Some(id) = result.get("id").and_then(Value::as_str) {
-                completed.insert(
-                    id.to_string(),
-                    result.get("command_ok").and_then(Value::as_bool) == Some(true),
-                );
-            }
-        }
-        results.extend(wave_results);
-        if stop_on_error && wave_failed {
-            for command in remaining {
-                completed.insert(command.id.clone(), false);
-                results.push(skipped_batch_result(command, "stopped_after_failure"));
-            }
-            break;
-        }
-        pending = remaining;
-    }
-    results.sort_by_key(|result| {
-        result
-            .get("index")
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX)
-    });
-    results
-}
-
-async fn run_exec_batch_wave(
-    ctx: SharedToolContext,
-    commands: Vec<ExecBatchCommand>,
-    max_parallel: usize,
-) -> Vec<Value> {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallel.max(1)));
-    let mut tasks = tokio::task::JoinSet::new();
-    for command in commands {
-        let ctx = ctx.clone();
-        let semaphore = semaphore.clone();
-        tasks.spawn(async move {
-            let index = command.index;
-            (index, run_exec_batch_command(ctx, command, semaphore).await)
-        });
-    }
-    let mut results = Vec::new();
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((_, result)) => results.push(result),
-            Err(error) => results.push(json!({
-                "index": u64::MAX,
-                "id": "join-failure",
-                "command_ok": false,
-                "skipped": false,
-                "result": tool_err(WorkspaceError::ToolDetails {
-                    code: "BATCH_WORKER_FAILED",
-                    message: error.to_string(),
-                    category: "runtime",
-                    retryable: true,
-                    details: json!({"stage": "exec_many_join"})
-                })
-            })),
-        }
-    }
-    results.sort_by_key(|result| {
-        result
-            .get("index")
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX)
-    });
-    results
-}
-
-async fn run_exec_batch_command(
-    ctx: SharedToolContext,
-    command: ExecBatchCommand,
-    semaphore: Arc<tokio::sync::Semaphore>,
-) -> Value {
-    let resource_lock_wait_ms = 0u128;
-    let batch_started = Instant::now();
-    let batch_permit = semaphore
-        .acquire_owned()
-        .await
-        .expect("exec_many semaphore closed");
-    let batch_queue_wait_ms = batch_started.elapsed().as_millis();
-    let redaction = OutputRedactionContext::new("exec_command", &command.args);
-    let Some((
-        admission_lane,
-        admission_limit,
-        admission,
-        global_admission_limit,
-        global_admission,
-    )) = ctx.admission_for("exec_command")
-    else {
-        return batch_result(
-            &command,
-            tool_err(WorkspaceError::Tool {
-                code: "EXEC_ADMISSION_UNAVAILABLE",
-                message: "exec_command admission resources are unavailable".into(),
-                category: "runtime",
-                retryable: true,
-            }),
-            false,
-            false,
-            None,
-            resource_lock_wait_ms,
-            batch_queue_wait_ms,
-        );
-    };
-    let admission_started = Instant::now();
-    let workspace_started = Instant::now();
-    let permit = match tokio::time::timeout(ADMISSION_TIMEOUT, admission.acquire_owned()).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(error)) => {
-            return batch_result(
-                &command,
-                admission_error(
-                    admission_lane,
-                    "workspace",
-                    admission_limit,
-                    workspace_started.elapsed().as_millis(),
-                    0,
-                    format!("Workspace tool admission lane closed: {error}"),
-                ),
-                false,
-                false,
-                None,
-                resource_lock_wait_ms,
-                batch_queue_wait_ms,
-            )
-        }
-        Err(_) => {
-            return batch_result(
-                &command,
-                admission_error(
-                    admission_lane,
-                    "workspace",
-                    admission_limit,
-                    workspace_started.elapsed().as_millis(),
-                    0,
-                    "Workspace tool admission queue exceeded 30 seconds".into(),
-                ),
-                false,
-                false,
-                None,
-                resource_lock_wait_ms,
-                batch_queue_wait_ms,
-            )
-        }
-    };
-    let workspace_admission_wait_ms = workspace_started.elapsed().as_millis();
-    let remaining = ADMISSION_TIMEOUT.saturating_sub(admission_started.elapsed());
-    let global_started = Instant::now();
-    let global_permit =
-        match tokio::time::timeout(remaining, global_admission.acquire_owned()).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(error)) => {
-                return batch_result(
-                    &command,
-                    admission_error(
-                        admission_lane,
-                        "global",
-                        global_admission_limit,
-                        workspace_admission_wait_ms,
-                        global_started.elapsed().as_millis(),
-                        format!("Global tool admission lane closed: {error}"),
-                    ),
-                    false,
-                    false,
-                    None,
-                    resource_lock_wait_ms,
-                    batch_queue_wait_ms,
-                )
-            }
-            Err(_) => {
-                return batch_result(
-                    &command,
-                    admission_error(
-                        admission_lane,
-                        "global",
-                        global_admission_limit,
-                        workspace_admission_wait_ms,
-                        global_started.elapsed().as_millis(),
-                        "Combined workspace/global admission queue exceeded 30 seconds".into(),
-                    ),
-                    false,
-                    false,
-                    None,
-                    resource_lock_wait_ms,
-                    batch_queue_wait_ms,
-                )
-            }
-        };
-    let global_admission_wait_ms = global_started.elapsed().as_millis();
-    let admission_queue_wait_ms = admission_started.elapsed().as_millis();
-    let mut result = call_exec_tool_async(ctx.as_ref(), "exec_command", &command.args).await;
-    if let Some(object) = result.as_object_mut() {
-        object.insert("execution_lane".into(), json!("async_process"));
-        object.insert("blocking_queue_wait_ms".into(), json!(0));
-        attach_admission_metadata(
-            object,
-            admission_lane,
-            admission_limit,
-            global_admission_limit,
-            workspace_admission_wait_ms,
-            global_admission_wait_ms,
-            admission_queue_wait_ms,
-        );
-    }
-    let mut result = redaction.redact(result);
-    while result.get("process_still_running").and_then(Value::as_bool) == Some(true) {
-        let Some(session_id) = result
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
-            break;
-        };
-        let cursor = result
-            .get("next_cursor")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        result = match session::wait_command_async(
-            &ctx.sessions,
-            &json!({
-                "session_id": session_id,
-                "cursor": cursor,
-                "timeout_ms": 120000,
-                "until": "finalized",
-                "output_mode": "tail"
-            }),
-        )
-        .await
-        {
-            Ok(value) => value,
-            Err(error) => tool_err(error),
-        };
-    }
-    drop(global_permit);
-    drop(permit);
-    drop(batch_permit);
-    let resource_lock_wait_ms = result
-        .get("resource_lock_wait_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u128;
-    let command_ok = result.get("command_ok").and_then(Value::as_bool) == Some(true);
-    batch_result(
-        &command,
-        result,
-        command_ok,
-        false,
-        None,
-        resource_lock_wait_ms,
-        batch_queue_wait_ms,
-    )
-}
-
-fn batch_result(
-    command: &ExecBatchCommand,
-    result: Value,
-    command_ok: bool,
-    skipped: bool,
-    skip_reason: Option<&str>,
-    resource_lock_wait_ms: u128,
-    batch_queue_wait_ms: u128,
-) -> Value {
-    json!({
-        "index": command.index,
-        "id": command.id,
-        "depends_on": command.depends_on,
-        "lock_group": command.lock_group,
-        "command": command.args,
-        "command_ok": command_ok,
-        "skipped": skipped,
-        "skip_reason": skip_reason,
-        "resource_lock_wait_ms": resource_lock_wait_ms,
-        "batch_queue_wait_ms": batch_queue_wait_ms,
-        "result": result
-    })
-}
-
-fn skipped_batch_result(command: ExecBatchCommand, reason: &str) -> Value {
-    batch_result(
-        &command,
-        json!({
-            "ok": true,
-            "command_ok": false,
-            "status": "skipped",
-            "outcome_class": "skipped",
-            "reason": reason
-        }),
-        false,
-        true,
-        Some(reason),
-        0,
-        0,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn batch_failure_summary(result: &Value) -> Value {
-    let nested = result.get("result").unwrap_or(&Value::Null);
-    json!({
-        "id": result.get("id").cloned().unwrap_or(Value::Null),
-        "index": result.get("index").cloned().unwrap_or(Value::Null),
-        "status": nested.get("status").cloned().unwrap_or(Value::Null),
-        "outcome_class": nested
-            .get("outcome_class")
-            .cloned()
-            .unwrap_or(Value::Null),
-        "error_code": nested
-            .get("error")
-            .and_then(|error| error.get("code"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        "process_exit_code": nested
-            .get("process_exit_code")
-            .or_else(|| nested.get("exit_code"))
-            .cloned()
-            .unwrap_or(Value::Null)
-    })
-}
-
-fn exec_many_output(
-    ctx: &ToolContext,
-    mode: &str,
-    max_parallel: usize,
-    stop_on_error: bool,
-    commands_requested: usize,
-    mut results: Vec<Value>,
-    started: Instant,
-    warnings: Vec<String>,
-    execution_lane: &str,
-) -> Value {
-    results.sort_by_key(|result| {
-        result
-            .get("index")
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX)
-    });
-    let explicit_skipped = results
-        .iter()
-        .filter(|result| result.get("skipped").and_then(Value::as_bool) == Some(true))
-        .count();
-    let commands_executed = results.len().saturating_sub(explicit_skipped);
-    let implicit_skipped = commands_requested.saturating_sub(results.len());
-    let skipped_command_count = explicit_skipped + implicit_skipped;
-    let failed_command_ids = results
-        .iter()
-        .filter(|result| {
-            result.get("skipped").and_then(Value::as_bool) != Some(true)
-                && result.get("command_ok").and_then(Value::as_bool) != Some(true)
-        })
-        .filter_map(|result| result.get("id").and_then(Value::as_str).map(str::to_string))
-        .collect::<Vec<_>>();
-    let failed_command_count = failed_command_ids.len();
-    let skipped_command_ids = results
-        .iter()
-        .filter(|result| result.get("skipped").and_then(Value::as_bool) == Some(true))
-        .filter_map(|result| result.get("id").and_then(Value::as_str).map(str::to_string))
-        .collect::<Vec<_>>();
-    let successful_command_count = results
-        .iter()
-        .filter(|result| result.get("command_ok").and_then(Value::as_bool) == Some(true))
-        .count();
-    let first_failed_command = results
-        .iter()
-        .find(|result| {
-            result.get("skipped").and_then(Value::as_bool) != Some(true)
-                && result.get("command_ok").and_then(Value::as_bool) != Some(true)
-        })
-        .map(batch_failure_summary);
-    let all_commands_ok = failed_command_count == 0
-        && skipped_command_count == 0
-        && successful_command_count == commands_requested;
-    let outcome_class = if all_commands_ok {
-        "success"
-    } else if successful_command_count > 0 {
-        "partial_failure"
-    } else {
-        "command_failed"
-    };
-    let (workspace_limit, global_limit) = ctx
-        .admission_for("exec_command")
-        .map(|(_, workspace, _, global, _)| (workspace, global))
-        .unwrap_or((0, 0));
-    let batch_summary = if all_commands_ok {
-        format!("All {commands_requested} commands succeeded")
-    } else {
-        format!(
-            "{failed_command_count} failed, {skipped_command_count} skipped, {successful_command_count} succeeded"
-        )
-    };
-    let recovery_actions = if failed_command_ids.is_empty() {
-        Vec::<Value>::new()
-    } else {
-        vec![
-            json!({
-                "action": "inspect_failed_commands",
-                "command_ids": failed_command_ids.clone(),
-                "reason": "exec_many_command_failure"
-            }),
-            json!({
-                "action": "rerun_failed_commands",
-                "tool": "exec_many",
-                "command_ids": failed_command_ids,
-                "required_arguments": ["commands"],
-                "reason": "rerun_only_after_fixing_the_reported_failure"
-            }),
-        ]
-    };
-    let mut output = tool_ok(json!({
-        "mode": mode,
-        "max_parallel": max_parallel,
-        "commands_requested": commands_requested,
-        "commands_executed": commands_executed,
-        "successful_command_count": successful_command_count,
-        "failed_command_count": failed_command_count,
-        "failed_command_ids": failed_command_ids,
-        "skipped_command_count": skipped_command_count,
-        "skipped_command_ids": skipped_command_ids,
-        "first_failed_command": first_failed_command,
-        "batch_summary": batch_summary,
-        "stop_on_error": stop_on_error,
-        "stopped_early": skipped_command_count > 0 || results.len() < commands_requested,
-        "command_ok": all_commands_ok,
-        "all_commands_ok": all_commands_ok,
-        "outcome_class": outcome_class,
-        "recovery_actions": recovery_actions,
-        "results": results,
-        "duration_ms": started.elapsed().as_millis(),
-        "warnings": warnings
-    }));
-    if let Some(object) = output.as_object_mut() {
-        object.insert("execution_lane".into(), json!(execution_lane));
-        object.insert("blocking_queue_wait_ms".into(), json!(0));
-        object.insert("admission_lane".into(), json!("per_command_process"));
-        object.insert("admission_limit".into(), json!(workspace_limit));
-        object.insert("global_admission_limit".into(), json!(global_limit));
-        object.insert("admission_queue_wait_ms".into(), json!(0));
-    }
-    output
-}
 fn attach_admission_metadata(
     object: &mut serde_json::Map<String, Value>,
     lane: &str,
@@ -1898,249 +407,6 @@ fn admission_error(
     value
 }
 
-const OPERATION_RESULT_BOOLEAN_FIELDS: &[&str] = &[
-    "transport_ok",
-    "execution_ok",
-    "command_ok",
-    "verification_ok",
-    "process_timed_out",
-    "request_timed_out",
-    "recoverable",
-    "truncated",
-    "stdout_truncated",
-    "stderr_truncated",
-    "cursor_expired",
-    "post_checks_pending",
-    "detached",
-    "deduplicated",
-];
-
-const OPERATION_RESULT_TOKEN_FIELDS: &[&str] = &[
-    "status",
-    "termination_reason",
-    "execution_lane",
-    "outcome_class",
-];
-
-const OPERATION_RESULT_INTEGER_FIELDS: &[&str] = &[
-    "exit_code",
-    "process_exit_code",
-    "elapsed_ms",
-    "actual_wait_ms",
-    "first_output_ms",
-    "stdout_bytes",
-    "stderr_bytes",
-    "blocking_queue_wait_ms",
-    "workspace_admission_wait_ms",
-    "global_admission_wait_ms",
-    "admission_queue_wait_ms",
-    "workspace_lock_wait_ms",
-    "operation_lock_wait_ms",
-    "resource_lock_wait_ms",
-    "history_lock_wait_ms",
-    "session_registry_wait_ms",
-];
-
-fn operation_summary_token(value: Option<&Value>) -> Option<&str> {
-    value.and_then(Value::as_str).filter(|text| {
-        text.len() <= 128
-            && text.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
-            })
-    })
-}
-
-pub(crate) fn operation_result_summary(name: &str, output: &Value) -> Value {
-    let mut summary = Map::new();
-    summary.insert(
-        "ok".into(),
-        Value::Bool(output.get("ok").and_then(Value::as_bool) == Some(true)),
-    );
-    summary.insert("tool".into(), Value::String(name.to_string()));
-    summary.insert(
-        "affected_files".into(),
-        output.get("affected_files").cloned().unwrap_or(Value::Null),
-    );
-    for field in OPERATION_RESULT_BOOLEAN_FIELDS {
-        if let Some(value) = output.get(*field).and_then(Value::as_bool) {
-            summary.insert((*field).into(), Value::Bool(value));
-        }
-    }
-    for field in OPERATION_RESULT_TOKEN_FIELDS {
-        if let Some(value) = operation_summary_token(output.get(*field)) {
-            summary.insert((*field).into(), Value::String(value.to_string()));
-        }
-    }
-    for field in OPERATION_RESULT_INTEGER_FIELDS {
-        if let Some(value) = output
-            .get(*field)
-            .filter(|value| value.is_i64() || value.is_u64())
-        {
-            summary.insert((*field).into(), value.clone());
-        }
-    }
-    let error = output.get("error").and_then(Value::as_object);
-    if let Some(value) = operation_summary_token(
-        error
-            .and_then(|object| object.get("code"))
-            .or_else(|| output.get("error_code")),
-    ) {
-        summary.insert("error_code".into(), Value::String(value.to_string()));
-    }
-    if let Some(value) = operation_summary_token(
-        error
-            .and_then(|object| object.get("category"))
-            .or_else(|| output.get("error_category")),
-    ) {
-        summary.insert("error_category".into(), Value::String(value.to_string()));
-    }
-    if let Some(value) = error
-        .and_then(|object| object.get("retryable"))
-        .or_else(|| output.get("retryable"))
-        .and_then(Value::as_bool)
-    {
-        summary.insert("retryable".into(), Value::Bool(value));
-    }
-    if let Some(count) = output
-        .get("warnings")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-    {
-        summary.insert("warning_count".into(), json!(count));
-    }
-    Value::Object(summary)
-}
-
-struct TrackedCall {
-    task_id: Option<String>,
-    operation: Option<OperationRecord>,
-}
-
-fn begin_tracked_call(
-    ctx: &ToolContext,
-    name: &str,
-    args: &Value,
-    effective_args: &Value,
-) -> Result<TrackedCall, Value> {
-    let task_id = if requires_write_baseline(name, effective_args) {
-        let task = ctx.harness.current_task().ok().flatten();
-        if let Some(task) = task {
-            if let Err(error) = ctx.harness.check_baseline(&task.id) {
-                return Err(attach_harness_status(
-                    ctx,
-                    tool_err_code(error.code(), error.to_string(), "permission"),
-                    false,
-                ));
-            }
-            let _ = ctx.harness.record_event(
-                &task.id,
-                "operation_started",
-                Some(name),
-                operation_input(args),
-                json!({"ok": true, "tracking": "task"}),
-            );
-            Some(task.id)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let operation = if should_log_operation(name) {
-        ctx.harness
-            .record_operation(
-                None,
-                task_id.as_deref(),
-                name,
-                "started",
-                json!({"arguments_present": !args.is_null()}),
-                json!({"ok": true}),
-            )
-            .ok()
-    } else {
-        None
-    };
-
-    Ok(TrackedCall { task_id, operation })
-}
-
-fn finish_tracked_call(
-    ctx: &ToolContext,
-    name: &str,
-    args: &Value,
-    tracking: TrackedCall,
-    mut output: Value,
-) -> Value {
-    if tracking.task_id.is_none()
-        && standalone_operation(name)
-        && output.get("ok") == Some(&Value::Bool(true))
-    {
-        attach_standalone_metadata(
-            &mut output,
-            "当前操作已在 standalone 模式完成；如需继续，直接调用下一个开发工具。",
-        );
-    }
-    if let Some(operation) = tracking.operation.as_ref() {
-        if let Some(object) = output.as_object_mut() {
-            let field = if object.contains_key("operation_id") {
-                "harness_operation_id"
-            } else {
-                "operation_id"
-            };
-            object.insert(field.into(), Value::String(operation.id.clone()));
-        }
-    }
-    if output.get("ok").and_then(Value::as_bool) == Some(false) {
-        output = attach_harness_status(ctx, output, tracking.task_id.is_none());
-    }
-    let deferred_process_operation = tracking.operation.as_ref().is_some_and(|operation| {
-        if output.get("command_ok") != Some(&Value::Null) {
-            return false;
-        }
-        let Some(session_id) = output.get("session_id").and_then(Value::as_str) else {
-            return false;
-        };
-        let Ok(session) = ctx.sessions.get(session_id) else {
-            return false;
-        };
-        let input_summary = operation_input(args);
-        let mut deferred = operation.clone();
-        deferred.reason = input_summary
-            .get("reason")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        deferred.input_summary = input_summary;
-        session.attach_harness_operation(ctx.harness.clone(), deferred);
-        true
-    });
-    if let Some(task_id) = tracking.task_id.as_deref() {
-        let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
-        let _ = ctx.harness.record_event(
-            task_id,
-            "operation_finished",
-            Some(name),
-            operation_input(args),
-            json!({"ok": succeeded, "tool": name}),
-        );
-        if succeeded {
-            let _ = ctx.harness.refresh_expected_state(task_id);
-        }
-    }
-    if let Some(operation) = tracking.operation.filter(|_| !deferred_process_operation) {
-        let succeeded = output.get("ok").and_then(Value::as_bool) == Some(true);
-        let _ = ctx.harness.record_operation(
-            Some(&operation.id),
-            tracking.task_id.as_deref(),
-            name,
-            if succeeded { "completed" } else { "failed" },
-            operation_input(args),
-            operation_result_summary(name, &output),
-        );
-    }
-    output
-}
-
 async fn call_exec_tool_async(ctx: &ToolContext, name: &str, args: &Value) -> Value {
     call_exec_tool_async_with_policy(ctx, name, args, false).await
 }
@@ -2171,7 +437,7 @@ async fn call_exec_tool_async_with_policy(
         Ok(tracking) => tracking,
         Err(output) => return output,
     };
-    let output = match exec::exec_command_async(ctx, &effective_args).await {
+    let output = match exec::exec_command_async_with_runtime(ctx, &effective_args, runtime).await {
         Ok(value) => value,
         Err(error) => tool_err(error),
     };
@@ -2443,11 +709,19 @@ fn call_tool_inner(
         "git_show" => git::git_show(ws, &effective_args),
         "git_blame" => git::git_blame(ws, &effective_args),
         "git_branch" => git::git_branch(ws, &effective_args),
+        "git_worktree" => git::git_worktree(ws, &effective_args),
         "git_stage" => git::git_stage(ws, &effective_args),
         "git_commit" => git::git_commit(ws, &effective_args),
         "git_push" => git::git_push(ws, &effective_args),
         "git_restore" => git::git_restore(ws, &effective_args),
         "view_image" => image_tool::view_image(ws, &effective_args),
+        "desktop_displays" => desktop::displays(&effective_args),
+        "desktop_screenshot" => desktop::screenshot(&effective_args),
+        "desktop_click" => desktop::click(&effective_args),
+        "desktop_drag" => desktop::drag(&effective_args),
+        "desktop_scroll" => desktop::scroll(&effective_args),
+        "desktop_type" => desktop::type_text(&effective_args),
+        "desktop_key" => desktop::key(&effective_args),
         "request_permissions" => request_permissions(ctx, &effective_args),
         _ => {
             return tool_err_code(
@@ -2551,12 +825,20 @@ fn request_permissions(ctx: &ToolContext, args: &Value) -> Result<Value, Workspa
 }
 
 fn apply_default_cwd<'a>(ctx: &ToolContext, name: &str, args: &'a Value) -> Cow<'a, Value> {
-    let base = if ctx.default_cwd_path() == ctx.workspace.root() {
+    let mut cwd = ctx.default_cwd_path();
+    if !cwd.is_dir() {
+        cwd = ctx.workspace.root().to_path_buf();
+        ctx.set_default_cwd(cwd.clone());
+    }
+    let base = if cwd == ctx.workspace.root() {
         ".".to_string()
     } else {
-        ctx.default_cwd_display()
+        relative_display(ctx.workspace.root(), &cwd)
     };
-    if base == "." {
+    let security = ctx.runtime_config().policy.security_policy;
+    let security_normalization_needed =
+        !security.require_write_confirmation || !security.verify_write_conflicts;
+    if base == "." && !security_normalization_needed {
         return Cow::Borrowed(args);
     }
 
@@ -2565,11 +847,11 @@ fn apply_default_cwd<'a>(ctx: &ToolContext, name: &str, args: &'a Value) -> Cow<
         "exec_command" if effective.get("workdir").is_none() && effective.get("cwd").is_none() => {
             effective["workdir"] = Value::String(base.clone());
         }
-        "list_files" | "project_map" | "git_status" | "git_log" => {
+        "list_files" | "project_map" | "search_text" | "git_status" | "git_log" => {
             let path = effective.get("path").and_then(Value::as_str).unwrap_or(".");
             effective["path"] = Value::String(prefix_relative_path(&base, path));
         }
-        "read_file" | "search_text" | "git_blame" | "view_image" => {
+        "read_file" | "git_blame" | "view_image" => {
             if let Some(path) = effective.get("path").and_then(Value::as_str) {
                 effective["path"] = Value::String(prefix_relative_path(&base, path));
             }
@@ -2670,7 +952,7 @@ fn apply_default_cwd<'a>(ctx: &ToolContext, name: &str, args: &'a Value) -> Cow<
                 &["path", "destination"],
             );
         }
-        "git_stage" | "git_commit" | "git_push" | "git_restore" => {
+        "git_branch" | "git_worktree" | "git_stage" | "git_commit" | "git_push" | "git_restore" => {
             if let Some(repo_path) = effective.get("repo_path").and_then(Value::as_str) {
                 effective["repo_path"] = Value::String(prefix_relative_path(&base, repo_path));
             } else if name == "git_push" {
@@ -2691,7 +973,45 @@ fn apply_default_cwd<'a>(ctx: &ToolContext, name: &str, args: &'a Value) -> Cow<
         }
         _ => {}
     }
+    apply_security_defaults(&security, name, &mut effective);
     Cow::Owned(effective)
+}
+
+fn apply_security_defaults(
+    security: &crate::workspace::SecurityPolicy,
+    name: &str,
+    effective: &mut Value,
+) {
+    if !security.require_write_confirmation
+        && matches!(
+            name,
+            "apply_patch"
+                | "edit"
+                | "edit_file"
+                | "edit_many"
+                | "file_ops"
+                | "format_files"
+                | "git_branch"
+                | "git_restore"
+        )
+    {
+        effective["confirm"] = Value::Bool(true);
+    }
+    if security.verify_write_conflicts {
+        return;
+    }
+    if let Some(object) = effective.as_object_mut() {
+        object.remove("expected_sha256");
+        for key in ["files", "operations"] {
+            if let Some(items) = object.get_mut(key).and_then(Value::as_array_mut) {
+                for item in items {
+                    if let Some(item) = item.as_object_mut() {
+                        item.remove("expected_sha256");
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn prefix_array_paths(value: &mut Value, array_key: &str, base: &str, keys: &[&str]) {
@@ -2737,162 +1057,87 @@ fn prefix_patch_paths(base: &str, patch: &str) -> String {
         .join("\n")
 }
 
-fn requires_write_baseline(name: &str, args: &Value) -> bool {
-    match name {
-        "exec_command" => true,
-        "apply_patch" => !args
-            .get("dry_run")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        "edit" | "edit_file" | "edit_many" | "file_ops" => !args
-            .get("dry_run")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        "format_files" => args.get("mode").and_then(Value::as_str) == Some("apply"),
-        "git_branch" | "git_stage" | "git_commit" | "git_restore" => !args
-            .get("dry_run")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        "git_push" => false,
-        _ => false,
-    }
+struct GitMetadata {
+    git_dir: PathBuf,
+    common_dir: PathBuf,
 }
 
-fn standalone_operation(name: &str) -> bool {
-    matches!(
-        name,
-        "patch_check"
-            | "apply_patch"
-            | "edit"
-            | "edit_file"
-            | "edit_many"
-            | "file_ops"
-            | "format_files"
-            | "exec_command"
-            | "git_branch"
-            | "git_stage"
-            | "git_commit"
-            | "git_push"
-            | "git_restore"
-    )
+fn canonical(path: impl AsRef<Path>) -> Option<PathBuf> {
+    fs::canonicalize(path).ok()
 }
 
-fn should_log_operation(name: &str) -> bool {
-    standalone_operation(name)
-        || matches!(
-            name,
-            "git_status"
-                | "git_diff"
-                | "git_log"
-                | "git_show"
-                | "git_blame"
-                | "git_branch"
-                | "git_stage"
-                | "git_commit"
-                | "git_push"
-                | "git_restore"
-        )
-}
-
-fn operation_input(args: &Value) -> Value {
-    json!({
-        "arguments_present": !args.is_null(),
-        "reason": args.get("reason")
-    })
-}
-
-fn attach_harness_status(ctx: &ToolContext, mut output: Value, standalone: bool) -> Value {
-    if let Ok(mut status) = ctx.harness.status() {
-        if standalone && status.task_id.is_none() {
-            status.next_actions.clear();
-        }
-        status.next_actions = filter_exposed_actions(ctx, status.next_actions);
-        if let Some(object) = output.as_object_mut() {
-            object.insert(
-                "harness".into(),
-                serde_json::to_value(status).unwrap_or_else(|_| {
-                    json!({
-                        "status": "unavailable",
-                        "reason": "无法序列化 Harness 状态"
-                    })
-                }),
-            );
-            if standalone {
-                attach_standalone_metadata(
-                    &mut output,
-                    "命令未成功；请检查 stderr、exit_code 或调整参数后重试。",
-                );
-            }
-        }
-    }
-    output
-}
-
-fn attach_standalone_metadata(output: &mut Value, recovery_hint: &str) {
-    if let Some(object) = output.as_object_mut() {
-        object.insert("harness_mode".into(), Value::String("standalone".into()));
-        object.insert("task_required".into(), Value::Bool(false));
-        object.entry("next_actions").or_insert_with(|| json!([]));
-        object.insert(
-            "recovery_hint".into(),
-            Value::String(recovery_hint.to_string()),
-        );
-    }
-}
-
-fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String> {
-    let runtime = ctx.runtime_config();
-    let exposed = crate::tools::registry::exposed_tool_names(&runtime.tool_profile);
-    actions
-        .into_iter()
-        .filter(|action| exposed.contains(&action.as_str()))
-        .collect()
-}
-
-fn git_dir_for_workspace(root: &Path) -> Option<PathBuf> {
-    let marker = root.join(".git");
+fn git_metadata_for_workspace(root: &Path) -> Option<GitMetadata> {
+    let workspace = canonical(root)?;
+    let marker = workspace.join(".git");
     if marker.is_dir() {
-        return Some(marker);
+        let git_dir = canonical(&marker)?;
+        return git_dir.starts_with(&workspace).then(|| GitMetadata {
+            common_dir: git_dir.clone(),
+            git_dir,
+        });
     }
-    let pointer = fs::read_to_string(marker).ok()?;
+
+    let pointer = fs::read_to_string(&marker).ok()?;
     let raw = pointer.trim().strip_prefix("gitdir:")?.trim();
-    let path = Path::new(raw);
-    Some(if path.is_absolute() {
-        path.to_path_buf()
+    let requested_git_dir = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
     } else {
-        root.join(path)
+        workspace.join(raw)
+    };
+    let git_dir = canonical(requested_git_dir)?;
+    let common_raw = fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let common_raw = common_raw.trim();
+    let requested_common = if Path::new(common_raw).is_absolute() {
+        PathBuf::from(common_raw)
+    } else {
+        git_dir.join(common_raw)
+    };
+    let common_dir = canonical(requested_common)?;
+    if common_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
+        return None;
+    }
+    let repository_root = common_dir.parent()?;
+    if !workspace.starts_with(repository_root) || !git_dir.starts_with(common_dir.join("worktrees"))
+    {
+        return None;
+    }
+    Some(GitMetadata {
+        git_dir,
+        common_dir,
     })
 }
 
-fn common_git_dir(git_dir: &Path) -> PathBuf {
-    let Some(raw) = fs::read_to_string(git_dir.join("commondir")).ok() else {
-        return git_dir.to_path_buf();
-    };
-    let path = Path::new(raw.trim());
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        git_dir.join(path)
-    }
+fn valid_git_hash(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_git_ref(value: &str) -> bool {
+    value.starts_with("refs/")
+        && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 fn fast_workspace_git_head(root: &Path) -> Option<String> {
-    let git_dir = git_dir_for_workspace(root)?;
-    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let metadata = git_metadata_for_workspace(root)?;
+    let head = fs::read_to_string(metadata.git_dir.join("HEAD")).ok()?;
     let head = head.trim();
     let Some(reference) = head.strip_prefix("ref: ").map(str::trim) else {
-        return (!head.is_empty()).then(|| head.to_string());
+        return valid_git_hash(head).then(|| head.to_ascii_lowercase());
     };
-    let common_dir = common_git_dir(&git_dir);
-    for base in [&git_dir, &common_dir] {
+    if !valid_git_ref(reference) {
+        return None;
+    }
+    for base in [&metadata.git_dir, &metadata.common_dir] {
         if let Ok(value) = fs::read_to_string(base.join(reference)) {
             let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
+            if valid_git_hash(value) {
+                return Some(value.to_ascii_lowercase());
             }
         }
     }
-    for base in [&git_dir, &common_dir] {
+    for base in [&metadata.git_dir, &metadata.common_dir] {
         let Ok(packed) = fs::read_to_string(base.join("packed-refs")) else {
             continue;
         };
@@ -2903,12 +1148,23 @@ fn fast_workspace_git_head(root: &Path) -> Option<String> {
             let Some((value, name)) = line.split_once(' ') else {
                 continue;
             };
-            if name.trim() == reference && !value.trim().is_empty() {
-                return Some(value.trim().to_string());
+            if name.trim() == reference && valid_git_hash(value.trim()) {
+                return Some(value.trim().to_ascii_lowercase());
             }
         }
     }
     None
+}
+
+fn is_runtime_source_workspace(root: &Path) -> bool {
+    let node_package = fs::read_to_string(root.join("packages/node-agent/package.json")).ok();
+    let cargo_manifest = fs::read_to_string(root.join("src-tauri/Cargo.toml")).ok();
+    node_package
+        .as_deref()
+        .is_some_and(|value| value.contains("\"name\": \"@coding-tools/node-agent\""))
+        && cargo_manifest
+            .as_deref()
+            .is_some_and(|value| value.contains("name = \"coding-tools-mcp-desktop\""))
 }
 
 pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
@@ -2916,16 +1172,41 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
     let tools = crate::tools::registry::exposed_tool_names(&runtime.tool_profile);
     let toolset_revision = crate::tools::registry::toolset_revision(&runtime.tool_profile);
     let runtime_build_git_sha = option_env!("CTMCP_BUILD_GIT_SHA").unwrap_or("unknown");
+    let runtime_build_source_clean = match option_env!("CTMCP_BUILD_SOURCE_CLEAN") {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    };
     let workspace_git_head = fast_workspace_git_head(ctx.workspace.root());
-    let runtime_matches_workspace = workspace_git_head.as_deref().and_then(|head| {
-        (runtime_build_git_sha != "unknown").then_some(head == runtime_build_git_sha)
-    });
-    let runtime_revision_warning = (runtime_matches_workspace == Some(false)).then(|| {
-        format!(
+    let source_workspace = is_runtime_source_workspace(ctx.workspace.root());
+    let runtime_matches_workspace = if source_workspace {
+        workspace_git_head.as_deref().and_then(|head| {
+            (runtime_build_git_sha != "unknown").then_some(head == runtime_build_git_sha)
+        })
+    } else {
+        None
+    };
+    let runtime_trust_state = if !source_workspace {
+        "not_applicable"
+    } else {
+        match (runtime_build_source_clean, runtime_matches_workspace) {
+            (Some(false), _) => "dirty_build",
+            (Some(true), Some(true)) => "revision_match_unverified",
+            (Some(true), Some(false)) => "mismatch",
+            _ => "unknown",
+        }
+    };
+    let runtime_trusted =
+        matches!(runtime_trust_state, "dirty_build" | "mismatch").then_some(false);
+    let runtime_revision_warning = match runtime_trust_state {
+        "dirty_build" => Some("The MCP binary was built from a dirty worktree; rebuild from a clean commit before trusting live schemas or behavior.".to_string()),
+        "mismatch" => Some(format!(
             "Running MCP build {runtime_build_git_sha} differs from workspace HEAD {}. Restart/rebuild before trusting live schemas or behavior.",
             workspace_git_head.as_deref().unwrap_or("unknown")
-        )
-    });
+        )),
+        "revision_match_unverified" => Some("Build commit matches workspace HEAD, but server_info does not inspect uncommitted worktree changes. Confirm git_status.clean before treating runtime and source as identical.".to_string()),
+        _ => None,
+    };
     let (blocking_limit, global_blocking_limit) = ctx
         .admission_for("read_file")
         .map(|(_, local, _, global, _)| (local, global))
@@ -2934,6 +1215,21 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         .admission_for("exec_command")
         .map(|(_, local, _, global, _)| (local, global))
         .unwrap_or((0, 0));
+    let sandbox_backend_id = runtime.sandbox.backend.trim();
+    let sandbox_backend = crate::tools::sandbox::backend(sandbox_backend_id);
+    let sandbox_supported =
+        sandbox_backend.is_some_and(|backend| backend.supports_workspace(&ctx.workspace));
+    let sandbox_ready =
+        sandbox_backend.is_some_and(|backend| backend.descriptor().enforcement_ready);
+    let sandbox_available = sandbox_supported && sandbox_ready;
+    let sandbox_enforced = runtime.sandbox.enabled && sandbox_available;
+    let sandbox_boundary = if sandbox_enforced {
+        sandbox_backend_id
+    } else if runtime.sandbox.enabled {
+        "sandbox_unavailable"
+    } else {
+        "policy_only"
+    };
     Ok(tool_ok(json!({
         "server": "coding-tools-mcp",
         "title": "Coding Tools MCP",
@@ -2949,7 +1245,13 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
         "runtime_revision": {
             "build_git_sha": runtime_build_git_sha,
             "workspace_git_head": workspace_git_head,
+            "source_workspace": source_workspace,
             "matches_workspace": runtime_matches_workspace,
+            "source_clean": runtime_build_source_clean,
+            "workspace_clean_verified": false,
+            "workspace_clean_verification_tool": "git_status",
+            "trusted": runtime_trusted,
+            "trust_state": runtime_trust_state,
             "warning": runtime_revision_warning
         },
         "auth_enabled": ctx.auth.auth_enabled(),
@@ -2974,15 +1276,20 @@ pub fn server_info(ctx: &ToolContext) -> Result<Value, WorkspaceError> {
             "current_executable": std::env::current_exe().ok().map(|path| path.display().to_string()),
             "powershell": exec::powershell_environment(),
             "filesystem_sandbox": {
-                "available": false,
-                "enforced": false,
+                "available": sandbox_available,
+                "enforced": sandbox_enforced,
+                "enabled": runtime.sandbox.enabled,
+                "backend": sandbox_backend_id,
+                "verification_tool": "exec_health_check",
+                "live_verification_required": runtime.sandbox.enabled,
                 "default_scope": "workspace",
                 "host_scope_available": false
             },
             "workspace_exec": {
-                "available": true,
-                "sandbox_enforced": false,
-                "boundary": "policy_only",
+                "available": !runtime.sandbox.enabled || sandbox_available,
+                "sandbox_enforced": sandbox_enforced,
+                "sandbox_backend": sandbox_backend_id,
+                "boundary": sandbox_boundary,
                 "workspace_local_entries": runtime.policy.workspace_local_entries,
                 "script_extensions": runtime.policy.workspace_script_extensions.iter().cloned().collect::<Vec<_>>(),
                 "system_command_allowlist": runtime.policy.allowed_commands.iter().cloned().collect::<Vec<_>>()
@@ -3028,38 +1335,58 @@ mod tests {
     };
 
     #[test]
-    fn fast_workspace_git_head_reads_normal_and_linked_worktree_refs_without_git_processes() {
+    fn fast_workspace_git_head_reads_repo_local_refs_and_rejects_external_pointers() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let git_dir = workspace.path().join(".git");
         std::fs::create_dir_all(git_dir.join("refs/heads")).expect("git refs");
         std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("head");
-        std::fs::write(git_dir.join("refs/heads/main"), "0123456789abcdef\n").expect("ref");
+        std::fs::write(
+            git_dir.join("refs/heads/main"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .expect("ref");
         assert_eq!(
             super::fast_workspace_git_head(workspace.path()).as_deref(),
-            Some("0123456789abcdef")
+            Some("0123456789abcdef0123456789abcdef01234567")
         );
 
-        let linked = tempfile::tempdir().expect("linked workspace");
-        let common = tempfile::tempdir().expect("common git dir");
-        let worktree_git = common.path().join("worktrees/linked");
+        let repository = tempfile::tempdir().expect("repository tempdir");
+        let common = repository.path().join(".git");
+        let linked = repository.path().join(".worktrees/linked");
+        let worktree_git = common.join("worktrees/linked");
+        std::fs::create_dir_all(&linked).expect("linked workspace");
         std::fs::create_dir_all(&worktree_git).expect("worktree git dir");
-        std::fs::create_dir_all(common.path().join("refs/heads")).expect("common refs");
+        std::fs::create_dir_all(common.join("refs/heads")).expect("common refs");
         std::fs::write(
-            linked.path().join(".git"),
+            linked.join(".git"),
             format!("gitdir: {}\n", worktree_git.display()),
         )
         .expect("git pointer");
         std::fs::write(worktree_git.join("HEAD"), "ref: refs/heads/linked\n").expect("head");
         std::fs::write(worktree_git.join("commondir"), "../..\n").expect("common pointer");
         std::fs::write(
-            common.path().join("refs/heads/linked"),
-            "fedcba9876543210\n",
+            common.join("refs/heads/linked"),
+            "fedcba9876543210fedcba9876543210fedcba98\n",
         )
         .expect("linked ref");
         assert_eq!(
-            super::fast_workspace_git_head(linked.path()).as_deref(),
-            Some("fedcba9876543210")
+            super::fast_workspace_git_head(&linked).as_deref(),
+            Some("fedcba9876543210fedcba9876543210fedcba98")
         );
+
+        let malicious = tempfile::tempdir().expect("malicious workspace");
+        let external = tempfile::tempdir().expect("external directory");
+        std::fs::write(
+            external.path().join("HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .expect("external head");
+        std::fs::write(
+            malicious.path().join(".git"),
+            format!("gitdir: {}\n", external.path().display()),
+        )
+        .expect("malicious pointer");
+        assert_eq!(super::fast_workspace_git_head(malicious.path()), None);
     }
 
     #[test]
@@ -3082,6 +1409,70 @@ mod tests {
         ctx.set_default_cwd(subdir);
         let rewritten = apply_default_cwd(&ctx, "apply_patch", &arguments);
         assert!(matches!(rewritten, Cow::Owned(_)));
+
+        std::fs::remove_dir_all(workspace.path().join("subdir")).expect("remove stale cwd");
+        let root_read = json!({"path": "main.txt"});
+        let repaired = apply_default_cwd(&ctx, "read_file", &root_read);
+        assert!(matches!(repaired, Cow::Borrowed(_)));
+        assert_eq!(ctx.default_cwd_display(), ".");
+    }
+
+    #[test]
+    fn default_cwd_scan_tools_can_operate_inside_hidden_linked_worktree() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let harness = tempfile::tempdir().expect("harness tempdir");
+        let linked = workspace.path().join(".worktrees/linked");
+        std::fs::create_dir_all(linked.join("src")).expect("linked worktree fixture");
+        std::fs::write(
+            linked.join("package.json"),
+            r#"{"name":"linked-fixture","scripts":{"test":"echo ok"}}"#,
+        )
+        .expect("package fixture");
+        std::fs::write(linked.join("src/marker.txt"), "linked-worktree-needle\n")
+            .expect("marker fixture");
+
+        let ctx =
+            ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+                .expect("tool context");
+        ctx.set_default_cwd(linked.canonicalize().expect("canonical linked worktree"));
+
+        let listed = call_tool(&ctx, "list_files", &json!({"recursive": true}));
+        assert_eq!(listed["ok"], true, "{listed}");
+        assert!(
+            listed["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .any(|entry| entry["path"] == ".worktrees/linked/src/marker.txt"),
+            "{listed}"
+        );
+
+        let searched = call_tool(
+            &ctx,
+            "search_text",
+            &json!({"query": "linked-worktree-needle"}),
+        );
+        assert_eq!(searched["ok"], true, "{searched}");
+        assert_eq!(searched["returned_count"], 1, "{searched}");
+        assert_eq!(
+            searched["matches"][0]["path"], ".worktrees/linked/src/marker.txt",
+            "{searched}"
+        );
+
+        let mapped = call_tool(&ctx, "project_map", &json!({"max_depth": 3}));
+        assert_eq!(mapped["ok"], true, "{mapped}");
+        assert!(
+            mapped["scanned_files"].as_u64().unwrap_or_default() >= 2,
+            "{mapped}"
+        );
+        assert!(
+            mapped["manifests"]
+                .as_array()
+                .expect("manifests")
+                .iter()
+                .any(|manifest| manifest["path"] == ".worktrees/linked/package.json"),
+            "{mapped}"
+        );
     }
 
     #[test]
@@ -3627,6 +2018,15 @@ mod tests {
         );
         assert_eq!(
             result["next_actions"][0]["arguments"]["session_id"], result["session_id"],
+            "{result}"
+        );
+        assert_eq!(
+            result["next_actions"][0]["arguments"]["timeout_ms"],
+            60 * 60_000,
+            "{result}"
+        );
+        assert_eq!(
+            result["next_actions"][0]["arguments"]["until"], "output_or_exit",
             "{result}"
         );
 

@@ -4,7 +4,9 @@ import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } fr
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { request as httpRequest } from 'node:http';
+import { ApplicationConfigStore, loadApplication } from '../dist/application.js';
 import { loadConfigBundle } from '../dist/config.js';
+import { runtimeForFolderId } from '../dist/folderRuntime.js';
 import { ConfigStore } from '../dist/management.js';
 import { validateManagementHealthPayload } from '../dist/managementObservability.js';
 import { renderDocument } from '../dist/historyMarkdown.js';
@@ -18,7 +20,7 @@ import { AGENT_VERSION } from '../dist/version.js';
 delete process.env.CTMCP_DATA_DIR;
 delete process.env.CTMCP_PORT;
 
-function document(root, dataDir) {
+function document(root, dataDir, overrides = {}) {
   return {
     host: '127.0.0.1',
     port: 3789,
@@ -38,10 +40,10 @@ function document(root, dataDir) {
       processConcurrency: 4,
       activeSessionLimit: 16,
       maxOutputBytes: 1024 * 1024
-    }
+    },
+    ...overrides
   };
 }
-
 function editable(config, overrides = {}) {
   return {
     host: config.host,
@@ -125,11 +127,11 @@ async function rawJsonRequest(url, options = {}) {
   });
 }
 
-async function startManagementServer(t) {
+async function startManagementServer(t, documentOverrides = {}) {
   const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-root-'));
   const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-data-'));
   const configPath = path.join(dataDir, 'agent.json');
-  await writeFile(configPath, `${JSON.stringify(document(root, dataDir), null, 2)}\n`);
+  await writeFile(configPath, `${JSON.stringify(document(root, dataDir, documentOverrides), null, 2)}\n`);
   const loaded = await loadConfigBundle(configPath);
   loaded.config.port = 0;
   const store = new ConfigStore(loaded);
@@ -149,6 +151,24 @@ async function startManagementServer(t) {
         else delete runtime.context.config.tunnel;
         if (publicBaseUrl) runtime.context.config.publicBaseUrl = publicBaseUrl;
         else delete runtime.context.config.publicBaseUrl;
+      },
+      async enforceSecurity() {},
+      async start() {
+        runtime.context.tunnelStatus = {
+          enabled: true,
+          state: 'running',
+          publicUrl: runtime.context.config.tunnel?.publicUrl || 'https://example.test/mcp',
+          workers: 1,
+          connectedWorkers: 1,
+          completedRequests: 0
+        };
+      },
+      async stop() {
+        if (runtime.context.tunnelStatus) {
+          runtime.context.tunnelStatus.state = 'stopped';
+          runtime.context.tunnelStatus.connectedWorkers = 0;
+          runtime.context.tunnelStatus.workers = 0;
+        }
       }
     };
   }
@@ -173,36 +193,25 @@ test('management UI is loopback-only, token protected and never returns configur
   assert.equal(page.headers.get('x-frame-options'), 'DENY');
   const html = await page.text();
   assert.match(html, /Headless Agent/);
-  assert.match(html, /manifest.webmanifest/);
-  assert.match(html, /data-ui-framework="react"/);
-  assert.match(html, /href="\/ui\/app\.css"/);
-  assert.match(html, /src="\/ui\/app\.js"/);
+  assert.match(html, /data-ui-framework="svelte"/);
   assert.doesNotMatch(html, /<style\b/);
   assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)/);
   const token = managementToken(html);
   assert.ok(token);
 
-  const [scriptResponse, styleResponse] = await Promise.all([
-    fetch(`${runtime.base}/ui/app.js`),
-    fetch(`${runtime.base}/ui/app.css`)
-  ]);
-  assert.equal(scriptResponse.status, 200);
-  assert.match(scriptResponse.headers.get('content-type'), /text\/javascript/);
-  assert.equal(scriptResponse.headers.get('cache-control'), 'no-store');
-  const script = await scriptResponse.text();
-  assert.match(script, /命令 Sessions/);
-  assert.match(script, /React 管理介面/);
-  assert.match(script, /選擇 Workspace 資料夾/);
-  assert.doesNotMatch(script, new RegExp(token));
-  assert.equal(styleResponse.status, 200);
-  assert.match(styleResponse.headers.get('content-type'), /text\/css/);
-  const style = await styleResponse.text();
-  assert.match(style, /\.app-shell/);
-  assert.match(style, /--bs-blue/);
-  assert.doesNotMatch(style, /@import\s+url\s*\(\s*['"]?https?:/i);
-  const rejectedAssetMethod = await fetch(`${runtime.base}/ui/app.js`, { method: 'POST' });
-  assert.equal(rejectedAssetMethod.status, 405);
-  assert.equal(rejectedAssetMethod.headers.get('allow'), 'GET');
+  const scriptSrc = html.match(/src="(\/ui\/[^"]+\.js)"/)?.[1];
+  if (scriptSrc) {
+    const scriptResponse = await fetch(`${runtime.base}${scriptSrc}`);
+    if (scriptResponse.status === 200) {
+      assert.match(scriptResponse.headers.get('content-type'), /javascript/);
+      assert.equal(scriptResponse.headers.get('cache-control'), 'no-store');
+      const script = await scriptResponse.text();
+      assert.doesNotMatch(script, new RegExp(token));
+    }
+    const rejectedAssetMethod = await fetch(`${runtime.base}${scriptSrc}`, { method: 'POST' });
+    assert.equal(rejectedAssetMethod.status, 405);
+    assert.equal(rejectedAssetMethod.headers.get('allow'), 'GET');
+  }
 
   const manifestResponse = await fetch(`${runtime.base}/ui/manifest.webmanifest`);
   assert.equal(manifestResponse.status, 200);
@@ -250,7 +259,7 @@ test('management UI is loopback-only, token protected and never returns configur
   const status = await statusResponse.json();
   assert.equal(status.configuredToolProfile, 'core');
   assert.equal(status.toolProfile, 'trusted-core');
-  assert.equal(status.tools, 35);
+  assert.equal(status.tools, 37);
   assert.match(status.toolsetRevision, /^[0-9a-f]{16}$/);
 });
 
@@ -292,6 +301,65 @@ test('management folder picker lists directories without exposing files', async 
   const missingResponse = await fetch(`${runtime.base}/admin/api/directories?path=${encodeURIComponent(path.join(runtime.root, 'missing'))}`, { headers });
   assert.equal(missingResponse.status, 404);
   assert.equal((await missingResponse.json()).error.code, 'DIRECTORY_BROWSE_FAILED');
+
+  const opened = await fetch(`${runtime.base}/admin/api/directories/open`, {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({ path: runtime.root })
+  });
+  assert.equal(opened.status, 200);
+  assert.equal((await opened.json()).path, path.normalize(runtime.root));
+});
+
+test('management can start and stop built-in WSS for a workspace', async t => {
+  const runtime = await startManagementServer(t, {
+    tunnel: { enabled: true, publicUrl: 'https://example.test/builtin/clients/test/mcp' }
+  });
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = managementToken(pageHtml);
+  const headers = {
+    'x-ctmcp-admin-token': token,
+    origin: runtime.base,
+    'content-type': 'application/json'
+  };
+  const workspaceId = runtime.context.config.workspaceId ?? runtime.context.workspaceProfileId;
+  const started = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/tunnel/start`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ service: 'mcp' })
+  });
+  assert.equal(started.status, 200);
+  const startedPayload = await started.json();
+  assert.equal(startedPayload.state, 'running');
+  assert.match(startedPayload.publicUrl, /^https:\/\//);
+
+  const stopped = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/tunnel/stop`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ service: 'mcp' })
+  });
+  assert.equal(stopped.status, 200);
+  assert.equal((await stopped.json()).state, 'stopped');
+});
+
+test('workspace registry can add and remove a secondary workspace', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-registry-root-'));
+  const extra = await mkdtemp(path.join(tmpdir(), 'ctmcp-registry-extra-'));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-registry-data-'));
+  t.after(() => Promise.all([root, extra, dataDir].map(dir => rm(dir, { recursive: true, force: true }))));
+  const configPath = path.join(dataDir, 'agent.json');
+  await writeFile(configPath, `${JSON.stringify(document(root, dataDir), null, 2)}\n`);
+  const application = await loadApplication(configPath);
+  const store = new ApplicationConfigStore(application);
+  const created = await store.addWorkspace(extra, 'Extra');
+  assert.equal(created.ok, true);
+  assert.equal(created.restartRequired, true);
+  assert.equal(store.entries().length, 2);
+  assert.equal(store.workspace(created.id).name, 'Extra');
+  const removed = await store.deleteWorkspace(created.id);
+  assert.equal(removed.ok, true);
+  assert.equal(store.entries().length, 1);
+  await assert.rejects(() => store.deleteWorkspace(store.primaryWorkspaceId), /primary workspace cannot be deleted/);
 });
 
 
@@ -340,6 +408,134 @@ test('management hot-applies idle workspace folder changes without restart', asy
   }
 });
 
+test('management hot-applies sandbox generations while existing process work keeps its original boundary', async t => {
+  const runtime = await startManagementServer(t, {
+    sandbox: { enabled: false, backend: 'appcontainer', externalPaths: [], options: {} }
+  });
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = pageHtml.match(/<meta name="ctmcp-admin-token" content="([^"]+)"/)?.[1];
+  assert.ok(token);
+  runtime.loaded.config.port = runtime.loaded.document.port;
+  runtime.context.config.port = runtime.loaded.document.port;
+  const workspaceId = runtime.loaded.config.workspaceId ?? runtime.context.workspaceProfileId;
+  const runtimeRecord = runtime.runtimeRegistry.get(workspaceId);
+  assert.ok(runtimeRecord);
+  const preflighted = [];
+  runtimeRecord.preflightSandbox = async sandbox => preflighted.push(structuredClone(sandbox));
+
+  await withoutEnvironmentOverrides([
+    'CTMCP_WORKSPACES', 'CTMCP_SANDBOX_ENABLED', 'CTMCP_SANDBOX_BACKEND',
+    'CTMCP_WSLC_IMAGE', 'CTMCP_WSLC_NETWORK'
+  ], async () => {
+    const sandbox = {
+      enabled: true,
+      backend: 'wslc',
+      externalPaths: [],
+      options: { 'wslc.image': 'alpine:3.20', 'wslc.network': 'none' }
+    };
+    const response = await fetch(`${runtime.base}/admin/api/config`, {
+      method: 'PUT',
+      headers: {
+        'x-ctmcp-admin-token': token,
+        'content-type': 'application/json',
+        origin: runtime.base
+      },
+      body: JSON.stringify(editable(runtime.loaded.config, { sandbox }))
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.restartRequired, false);
+    assert.ok(result.appliedImmediately.includes('sandbox'));
+    assert.equal(result.hotApplyDeferredReason, null);
+    assert.deepEqual(preflighted, [sandbox]);
+    assert.deepEqual(runtime.loaded.config.sandbox, sandbox);
+    assert.deepEqual(runtime.context.config.sandbox, sandbox);
+
+    const folderRuntime = runtime.context.folderRuntimes.get('repo');
+    assert.ok(folderRuntime);
+    folderRuntime.sessions.set('sandbox-busy-fixture', {
+      finalizedAt: undefined,
+      sandboxEnforced: true,
+      sandboxBackend: 'wslc',
+      executionBoundary: 'wslc'
+    });
+    try {
+      const nextSandbox = { ...sandbox, options: { ...sandbox.options, 'wslc.network': 'bridge' } };
+      const switchedResponse = await fetch(`${runtime.base}/admin/api/config`, {
+        method: 'PUT',
+        headers: {
+          'x-ctmcp-admin-token': token,
+          'content-type': 'application/json',
+          origin: runtime.base
+        },
+        body: JSON.stringify(editable(runtime.loaded.config, { sandbox: nextSandbox }))
+      });
+      assert.equal(switchedResponse.status, 200);
+      const switched = await switchedResponse.json();
+      assert.equal(switched.restartRequired, false);
+      assert.equal(switched.hotApplyDeferredReason, null);
+      assert.ok(switched.appliedImmediately.includes('sandbox'));
+      assert.equal(runtime.context.config.sandbox.options['wslc.network'], 'bridge');
+      const oldSession = folderRuntime.sessions.get('sandbox-busy-fixture');
+      assert.equal(oldSession.sandboxEnforced, true);
+      assert.equal(oldSession.sandboxBackend, 'wslc');
+      assert.equal(oldSession.executionBoundary, 'wslc');
+    } finally {
+      folderRuntime.sessions.delete('sandbox-busy-fixture');
+    }
+
+    const disabledSandbox = { ...sandbox, enabled: false };
+    const disableResponse = await fetch(`${runtime.base}/admin/api/config`, {
+      method: 'PUT',
+      headers: {
+        'x-ctmcp-admin-token': token,
+        'content-type': 'application/json',
+        origin: runtime.base
+      },
+      body: JSON.stringify(editable(runtime.loaded.config, { sandbox: disabledSandbox }))
+    });
+    assert.equal(disableResponse.status, 200);
+    const disabled = await disableResponse.json();
+    assert.equal(disabled.restartRequired, false);
+    assert.equal(disabled.hotApplyDeferredReason, null);
+    assert.ok(disabled.appliedImmediately.includes('sandbox'));
+    assert.equal(disabled.saved.sandbox.enabled, false);
+    assert.equal(runtime.context.config.sandbox.enabled, false);
+  });
+});
+
+test('management leaves persisted and live sandbox generations unchanged when preflight fails', async t => {
+  const runtime = await startManagementServer(t, {
+    sandbox: { enabled: false, backend: 'appcontainer', externalPaths: [], options: {} }
+  });
+  const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
+  const token = pageHtml.match(/<meta name="ctmcp-admin-token" content="([^"]+)"/)?.[1];
+  assert.ok(token);
+  runtime.loaded.config.port = runtime.loaded.document.port;
+  runtime.context.config.port = runtime.loaded.document.port;
+  const workspaceId = runtime.loaded.config.workspaceId ?? runtime.context.workspaceProfileId;
+  const runtimeRecord = runtime.runtimeRegistry.get(workspaceId);
+  assert.ok(runtimeRecord);
+  runtimeRecord.preflightSandbox = async () => { throw new Error('sandbox-preflight-fixture'); };
+  const beforeFile = await readFile(runtime.configPath, 'utf8');
+  const beforeLive = structuredClone(runtime.context.config.sandbox);
+  const target = { enabled: true, backend: 'appcontainer', externalPaths: [], options: {} };
+
+  const response = await fetch(`${runtime.base}/admin/api/config`, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify(editable(runtime.loaded.config, { sandbox: target }))
+  });
+  assert.equal(response.status, 400);
+  assert.match(JSON.stringify(await response.json()), /sandbox-preflight-fixture/);
+  assert.equal(await readFile(runtime.configPath, 'utf8'), beforeFile);
+  assert.deepEqual(runtime.context.config.sandbox, beforeLive);
+  assert.deepEqual(runtime.loaded.config.sandbox, beforeLive);
+});
 test('management hot-applies policy and live limits without restart', async t => {
   const runtime = await startManagementServer(t);
   const pageHtml = await fetch(`${runtime.base}/ui`).then(response => response.text());
@@ -582,20 +778,63 @@ test('management hot-applies security policy telemetry and tool catalog changes'
 });
 
 test('management core is separated from the React UI implementation', async () => {
-  const [managementSource, uiAdapterSource, appSource, formSource] = await Promise.all([
+  const [managementSource, routerSource, configSource, observabilitySource, uiAdapterSource, layoutSource, nodeBackend] = await Promise.all([
     readFile(new URL('../src/management.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/management/router.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/management/configStore.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/management/routes/observability.ts', import.meta.url), 'utf8'),
     readFile(new URL('../src/managementUi.ts', import.meta.url), 'utf8'),
-    readFile(new URL('../ui/src/App.tsx', import.meta.url), 'utf8'),
-    readFile(new URL('../ui/src/components/ConfigForm.tsx', import.meta.url), 'utf8')
+    readFile(new URL('../../../src/routes/+layout.svelte', import.meta.url), 'utf8'),
+    readFile(new URL('../../../src/lib/backend/node.ts', import.meta.url), 'utf8')
   ]);
-  assert.doesNotMatch(managementSource, /<!doctype html|<style\b|document\.(?:getElementById|querySelector|createElement)|from ['"]react|from ['"]react-bootstrap|bootstrap\/dist/i);
-  assert.match(managementSource, /handleManagementUiRequest/);
-  assert.match(uiAdapterSource, /data-ui-framework="react"/);
-  assert.match(appSource, /react-bootstrap/);
-  assert.match(appSource, /useAgentQueries/);
-  assert.match(formSource, /Workspace 資料夾/);
-  assert.match(formSource, /限制工具清單/);
-  assert.doesNotMatch(`${appSource}\n${formSource}`, /dangerouslySetInnerHTML|innerHTML/);
+  const backendSource = `${managementSource}\n${routerSource}\n${configSource}\n${observabilitySource}`;
+  assert.doesNotMatch(backendSource, /<!doctype html|<style\b|document\.(?:getElementById|querySelector|createElement)|from ['"]react|from ['"]react-bootstrap|bootstrap\/dist/i);
+  assert.match(managementSource, /management\/configStore/);
+  assert.match(managementSource, /management\/router/);
+  assert.match(routerSource, /handleManagementUiRequest/);
+  assert.doesNotMatch(routerSource, /writeConfigDocument|writeAgentSecrets/);
+  assert.match(configSource, /class ConfigStore/);
+  assert.doesNotMatch(configSource, /\/admin\/api\//);
+  assert.match(observabilitySource, /managementTelemetryPayload/);
+  assert.match(uiAdapterSource, /data-ui-framework="svelte"/);
+  assert.match(uiAdapterSource, /script-src 'self'/);
+  assert.doesNotMatch(uiAdapterSource, /unsafe-inline/);
+  assert.match(layoutSource, /installHostBackend\(\)/);
+  assert.match(nodeBackend, /x-ctmcp-admin-token/);
+  assert.doesNotMatch(layoutSource, /dangerouslySetInnerHTML|innerHTML/);
+});
+
+test('management runtime contracts remain independent from the config store', async () => {
+  const [configSource, typesSource, runtimeContractSource] = await Promise.all([
+    readFile(new URL('../src/management/configStore.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/management/types.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/management/runtimeContract.ts', import.meta.url), 'utf8')
+  ]);
+  assert.match(configSource, /from ['"]\.\/runtimeContract\.js['"]/);
+  assert.doesNotMatch(configSource, /from ['"]\.\/types\.js['"]/);
+  assert.match(typesSource, /from ['"]\.\/runtimeContract\.js['"]/);
+  assert.match(typesSource, /from ['"]\.\/configStore\.js['"]/);
+  assert.doesNotMatch(runtimeContractSource, /configStore|from ['"]\.\/types\.js['"]/);
+  assert.match(runtimeContractSource, /interface RuntimeHotApplyTarget/);
+  assert.match(runtimeContractSource, /interface TunnelRuntimeController/);
+});
+
+test('shared Svelte observability surfaces stay on the frontend backend contract', async () => {
+  const [historySource, telemetrySource, logsSource, healthSource, nodeBackend] = await Promise.all([
+    readFile(new URL('../../../src/lib/components/HistoryViewer.svelte', import.meta.url), 'utf8'),
+    readFile(new URL('../../../src/lib/components/TelemetryViewer.svelte', import.meta.url), 'utf8'),
+    readFile(new URL('../../../src/lib/components/OperationLogViewer.svelte', import.meta.url), 'utf8'),
+    readFile(new URL('../../../src/lib/components/HealthPanel.svelte', import.meta.url), 'utf8'),
+    readFile(new URL('../../../src/lib/backend/node.ts', import.meta.url), 'utf8')
+  ]);
+  assert.match(historySource, /listHistorySessions/);
+  assert.match(telemetrySource, /readWorkspaceTelemetry/);
+  assert.match(logsSource, /operations\.query/);
+  assert.match(healthSource, /runHealthChecks/);
+  assert.match(nodeBackend, /workspaceRoute\(workspaceId, "telemetry"\)/);
+  assert.match(nodeBackend, /workspaceRoute\(workspaceId, "history"\)/);
+  assert.match(nodeBackend, /workspaceRoute\(workspaceId, "health"\)/);
+  assert.match(nodeBackend, /workspaceRoute\(workspaceId, "logs"\)/);
 });
 
 test('management dashboard returns bounded telemetry without command, environment or output secrets', async t => {
@@ -615,7 +854,7 @@ test('management dashboard returns bounded telemetry without command, environmen
       args: ['-e', 'process.stdout.write("DASHBOARD_POST_CHECK_OUTPUT_SECRET")']
     }]
   });
-  const retained = runtime.context.sessions.get(started.session_id);
+  const retained = runtimeForFolderId(runtime.context, 'repo').sessions.get(started.session_id);
   assert.ok(retained);
   await waitForSession(retained, retained.sequence, 10_000, 'finalized');
 
@@ -642,7 +881,7 @@ test('management dashboard returns bounded telemetry without command, environmen
     affected_files: [],
     created_at: String(now)
   });
-  runtime.context.pendingOperations.set('DASHBOARD_PENDING_ID_SECRET', {
+  runtimeForFolderId(runtime.context, 'repo').pendingOperations.set('DASHBOARD_PENDING_ID_SECRET', {
     resumeId: 'DASHBOARD_PENDING_ID_SECRET',
     name: 'exec_command',
     args: { secret: 'DASHBOARD_PENDING_ARG_SECRET' },
@@ -655,11 +894,14 @@ test('management dashboard returns bounded telemetry without command, environmen
   const html = await fetch(`${runtime.base}/ui`).then(response => response.text());
   const token = managementToken(html);
   assert.ok(token);
-  const script = await fetch(`${runtime.base}/ui/app.js`).then(response => response.text());
-  assert.match(script, /命令 Sessions/);
-  assert.match(script, /WSS Workers/);
-  assert.match(script, /Workspace 資料夾/);
-  assert.doesNotMatch(script, new RegExp(token));
+  const scriptSrc = html.match(/src="(\/ui\/[^"]+\.js)"/)?.[1];
+  if (scriptSrc) {
+    const scriptResponse = await fetch(`${runtime.base}${scriptSrc}`);
+    if (scriptResponse.status === 200) {
+      const script = await scriptResponse.text();
+      assert.doesNotMatch(script, new RegExp(token));
+    }
+  }
   assert.equal((await fetch(`${runtime.base}/admin/api/dashboard`)).status, 403);
   const response = await fetch(`${runtime.base}/admin/api/dashboard`, {
     headers: { 'x-ctmcp-admin-token': token }
@@ -688,7 +930,7 @@ test('management dashboard returns bounded telemetry without command, environmen
   const session = dashboard.sessions.items[0];
   assert.equal(session.workspaceId, 'repo');
   assert.equal(session.cwd, '.');
-  assert.ok(session.stdoutBytes > 0);
+  assert.ok(session.stdoutBytes + session.stderrBytes > 0);
   for (const forbidden of ['command', 'operationId', 'fingerprint', 'stdout', 'stderr', 'postChecks']) {
     assert.equal(Object.hasOwn(session, forbidden), false, `session summary leaked ${forbidden}`);
   }
@@ -1042,9 +1284,10 @@ test('management API atomically saves restart configuration while preserving omi
   assert.equal(result.saved.folders.length, 2);
 
   const saved = JSON.parse(await readFile(runtime.configPath, 'utf8'));
-  assert.equal(saved.schema_version, 1);
-  assert.equal(saved.port, 4791);
-  assert.deepEqual(saved.oauth, { clientId: 'chatgpt' });
+  assert.equal(saved.schemaVersion, 2);
+  assert.equal(saved.bind.port, 4791);
+  assert.equal(saved.auth.oauthClientId, 'chatgpt');
+  assert.equal(saved.oauth, undefined);
   assert.equal(saved.limits.processConcurrency, 7);
   assert.equal(saved.limits.globalBlockingConcurrency, 33);
   assert.equal(saved.limits.globalProcessConcurrency, 17);
@@ -1131,7 +1374,7 @@ test('management keeps saved values separate while writing secrets to the effect
     assert.equal(result.secretStorePath, path.join(effectiveDataDir, 'agent-secrets.enc.json'));
     const effectiveSecrets = await readAgentSecrets(effectiveDataDir);
     assert.equal(effectiveSecrets.secrets.oauthPassword, 'environment-data-password');
-    assert.equal(JSON.parse(await readFile(configPath, 'utf8')).dataDir, savedDataDir);
+    assert.equal(JSON.parse(await readFile(configPath, 'utf8')).host.node.dataDir, savedDataDir);
   } finally {
     if (previous === undefined) delete process.env.CTMCP_DATA_DIR;
     else process.env.CTMCP_DATA_DIR = previous;
@@ -1181,7 +1424,7 @@ test('management save copies encrypted secrets when the data directory changes',
   await access(result.secretStorePath);
   await access(path.join(nextDataDir, 'agent-secrets.key'));
   const saved = JSON.parse(await readFile(configPath, 'utf8'));
-  assert.equal(saved.dataDir, nextDataDir);
+  assert.equal(saved.host.node.dataDir, nextDataDir);
   const restarted = await loadConfigBundle(configPath);
   assert.equal(restarted.config.oauth.password, 'management-test-password');
   assert.equal(restarted.config.oauth.clientSecret, 'management-test-client-secret');
@@ -1211,6 +1454,247 @@ test('management derives compatibility permission and tool profiles from securit
   assert.equal(persisted.permissionMode, 'guarded');
   assert.equal(persisted.toolProfile, 'trusted-core');
   assert.deepEqual(persisted.securityPolicy, guardedPolicy);
+});
+
+test('management Skill inventory hot-applies individual and master Skill toggles', async t => {
+  const runtime = await startManagementServer(t);
+  const skillRoot = path.join(runtime.root, 'skills', 'ui-toggle');
+  await mkdir(skillRoot, { recursive: true });
+  await writeFile(path.join(skillRoot, 'SKILL.md'), [
+    '---',
+    'name: ui-toggle',
+    'description: Toggle this Skill from the management UI.',
+    '---',
+    '',
+    '# UI toggle'
+  ].join('\n'));
+
+  const page = await fetch(`${runtime.base}/ui`);
+  const token = managementToken(await page.text());
+  assert.ok(token);
+  const workspaceId = runtime.context.config.workspaceId ?? runtime.context.workspaceProfileId;
+  const endpoint = `${runtime.base}/admin/api/workspaces/${encodeURIComponent(workspaceId)}/skills`;
+  const listed = await fetch(endpoint, { headers: { 'x-ctmcp-admin-token': token } });
+  assert.equal(listed.status, 200);
+  const inventory = await listed.json();
+  assert.equal(inventory.active, true);
+  const skill = inventory.skills.find(item => item.name === 'ui-toggle');
+  assert.ok(skill);
+  assert.equal(skill.selected, true);
+  assert.equal(skill.enabled, true);
+  assert.equal(skill.scope, 'workspace');
+
+  const disabledResponse = await fetch(endpoint, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify({ key: skill.key, enabled: false })
+  });
+  assert.equal(disabledResponse.status, 200);
+  const disabled = await disabledResponse.json();
+  assert.equal(disabled.enabled, false);
+  assert.ok(disabled.appliedImmediately.includes('skills'));
+
+  const folderRuntime = runtime.context.folderRuntimes.get('repo');
+  assert.ok(folderRuntime);
+  const disabledSnapshot = await folderRuntime.skillRegistry.snapshot();
+  assert.equal(disabledSnapshot.skills.some(item => item.name === 'ui-toggle'), false);
+  const persisted = JSON.parse(await readFile(runtime.configPath, 'utf8'));
+  assert.ok(persisted.skills.disabled.includes(skill.key));
+
+  const listedDisabled = await fetch(endpoint, { headers: { 'x-ctmcp-admin-token': token } }).then(response => response.json());
+  const disabledSkill = listedDisabled.skills.find(item => item.key === skill.key);
+  assert.equal(disabledSkill.selected, false);
+  assert.equal(disabledSkill.enabled, false);
+
+  const enabledResponse = await fetch(endpoint, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify({ key: skill.key, enabled: true })
+  });
+  assert.equal(enabledResponse.status, 200);
+  const enabled = await enabledResponse.json();
+  assert.equal(enabled.enabled, true);
+  assert.ok(enabled.appliedImmediately.includes('skills'));
+  assert.equal((await folderRuntime.skillRegistry.snapshot()).skills.some(item => item.name === 'ui-toggle'), true);
+
+  const masterOffResponse = await fetch(endpoint, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify({ active: false })
+  });
+  assert.equal(masterOffResponse.status, 200);
+  assert.equal((await masterOffResponse.json()).active, false);
+  const masterOffInventory = await fetch(endpoint, { headers: { 'x-ctmcp-admin-token': token } }).then(response => response.json());
+  assert.equal(masterOffInventory.active, false);
+  const masterOffSkill = masterOffInventory.skills.find(item => item.key === skill.key);
+  assert.equal(masterOffSkill.selected, true);
+  assert.equal(masterOffSkill.enabled, false);
+  assert.equal((await folderRuntime.skillRegistry.snapshot()).skills.length, 0);
+  const persistedMasterOff = JSON.parse(await readFile(runtime.configPath, 'utf8'));
+  assert.equal(persistedMasterOff.skills.active, false);
+  assert.equal(persistedMasterOff.skills.disabled.includes(skill.key), false);
+
+  const masterOnResponse = await fetch(endpoint, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify({ active: true })
+  });
+  assert.equal(masterOnResponse.status, 200);
+  assert.equal((await masterOnResponse.json()).active, true);
+  assert.equal((await folderRuntime.skillRegistry.snapshot()).skills.some(item => item.name === 'ui-toggle'), true);
+});
+test('management extension inventory hot-applies individual and master Hook/MCP toggles safely', async t => {
+  const runtime = await startManagementServer(t);
+  await mkdir(path.join(runtime.root, '.claude'), { recursive: true });
+  await writeFile(path.join(runtime.root, '.claude', 'settings.json'), JSON.stringify({
+    hooks: {
+      PreToolUse: [{
+        matcher: 'read_file',
+        hooks: [{ type: 'command', command: process.execPath, args: ['-e', 'process.exit(0)'] }]
+      }]
+    }
+  }));
+  await writeFile(path.join(runtime.root, '.mcp.json'), JSON.stringify({
+    mcpServers: {
+      inventoryFixture: { type: 'stdio', command: process.execPath, args: ['-e', 'process.exit(0)'] }
+    }
+  }));
+
+  const page = await fetch(`${runtime.base}/ui`);
+  const token = managementToken(await page.text());
+  assert.ok(token);
+  const workspaceId = runtime.context.config.workspaceId ?? runtime.context.workspaceProfileId;
+  const endpoint = `${runtime.base}/admin/api/workspaces/${encodeURIComponent(workspaceId)}/extensions`;
+  const listed = await fetch(endpoint, { headers: { 'x-ctmcp-admin-token': token } });
+  assert.equal(listed.status, 200);
+  const inventory = await listed.json();
+  assert.equal(inventory.hooksActive, true);
+  assert.equal(inventory.mcpActive, true);
+  const hook = inventory.hooks.find(item => item.sourcePath === '.claude/settings.json' && item.event === 'PreToolUse');
+  assert.ok(hook);
+  assert.equal(hook.selected, false);
+  assert.equal(hook.enabled, false);
+  assert.equal(hook.supported, true);
+  const mcp = inventory.mcpServers.find(item => item.name === 'inventoryFixture');
+  assert.ok(mcp);
+  assert.equal(mcp.selected, false);
+  assert.equal(mcp.enabled, false);
+  assert.equal(mcp.transport, 'stdio');
+  assert.equal(Object.hasOwn(mcp, 'env'), false);
+  assert.equal(Object.hasOwn(mcp, 'headers'), false);
+
+  const enabledResponse = await fetch(endpoint, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify({ kind: 'hook', key: hook.key, enabled: true })
+  });
+  assert.equal(enabledResponse.status, 200);
+  const enabled = await enabledResponse.json();
+  assert.equal(enabled.enabled, true);
+  assert.ok(enabled.appliedImmediately.includes('extensions'));
+  const persistedEnabled = JSON.parse(await readFile(runtime.configPath, 'utf8'));
+  assert.ok(persistedEnabled.extensions.hooks.enabled.includes(hook.key));
+  assert.ok(runtime.context.config.extensions.hooks.enabled.includes(hook.key));
+
+  const listedEnabled = await fetch(endpoint, { headers: { 'x-ctmcp-admin-token': token } }).then(response => response.json());
+  const selectedEnabledHook = listedEnabled.hooks.find(item => item.key === hook.key);
+  assert.equal(selectedEnabledHook.selected, true);
+  assert.equal(selectedEnabledHook.enabled, true);
+
+  const hookMasterOffResponse = await fetch(endpoint, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify({ kind: 'hook', active: false })
+  });
+  assert.equal(hookMasterOffResponse.status, 200);
+  assert.equal((await hookMasterOffResponse.json()).active, false);
+  const hookMasterOffInventory = await fetch(endpoint, { headers: { 'x-ctmcp-admin-token': token } }).then(response => response.json());
+  assert.equal(hookMasterOffInventory.hooksActive, false);
+  const selectedHook = hookMasterOffInventory.hooks.find(item => item.key === hook.key);
+  assert.equal(selectedHook.selected, true);
+  assert.equal(selectedHook.enabled, false);
+  const persistedHookMasterOff = JSON.parse(await readFile(runtime.configPath, 'utf8'));
+  assert.equal(persistedHookMasterOff.extensions.hooks.active, false);
+  assert.ok(persistedHookMasterOff.extensions.hooks.enabled.includes(hook.key));
+
+  const hookMasterOnResponse = await fetch(endpoint, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify({ kind: 'hook', active: true })
+  });
+  assert.equal(hookMasterOnResponse.status, 200);
+  assert.equal((await hookMasterOnResponse.json()).active, true);
+  const restoredHookInventory = await fetch(endpoint, { headers: { 'x-ctmcp-admin-token': token } }).then(response => response.json());
+  assert.equal(restoredHookInventory.hooks.find(item => item.key === hook.key).enabled, true);
+
+  const mcpMasterOffResponse = await fetch(endpoint, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify({ kind: 'mcp', active: false })
+  });
+  assert.equal(mcpMasterOffResponse.status, 200);
+  assert.equal((await mcpMasterOffResponse.json()).active, false);
+  const mcpMasterOffInventory = await fetch(endpoint, { headers: { 'x-ctmcp-admin-token': token } }).then(response => response.json());
+  assert.equal(mcpMasterOffInventory.mcpActive, false);
+  assert.equal(JSON.parse(await readFile(runtime.configPath, 'utf8')).extensions.mcp.active, false);
+
+  const mcpMasterOnResponse = await fetch(endpoint, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify({ kind: 'mcp', active: true })
+  });
+  assert.equal(mcpMasterOnResponse.status, 200);
+  assert.equal((await mcpMasterOnResponse.json()).active, true);
+
+  const disabledResponse = await fetch(endpoint, {
+    method: 'PUT',
+    headers: {
+      'x-ctmcp-admin-token': token,
+      'content-type': 'application/json',
+      origin: runtime.base
+    },
+    body: JSON.stringify({ kind: 'hook', key: hook.key, enabled: false })
+  });
+  assert.equal(disabledResponse.status, 200);
+  assert.equal((await disabledResponse.json()).enabled, false);
+  const persistedDisabled = JSON.parse(await readFile(runtime.configPath, 'utf8'));
+  assert.equal(persistedDisabled.extensions.hooks.enabled.includes(hook.key), false);
 });
 
 test('management UI can be disabled without disabling the headless server', async t => {

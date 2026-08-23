@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
@@ -148,6 +149,133 @@ pub struct AuthConfig {
     pub use_shared_secrets: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxPathAccess {
+    #[default]
+    ReadOnly,
+    Modify,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxPathGrant {
+    pub path: String,
+    #[serde(default)]
+    pub access: SandboxPathAccess,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxConfig {
+    #[serde(default = "default_sandbox_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_sandbox_backend")]
+    pub backend: String,
+    #[serde(default)]
+    pub external_paths: Vec<SandboxPathGrant>,
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecurityPolicy {
+    #[serde(default = "default_true")]
+    pub restrict_tool_catalog: bool,
+    #[serde(default = "default_true")]
+    pub enforce_command_allowlist: bool,
+    #[serde(default = "default_true")]
+    pub require_dangerous_confirmation: bool,
+    #[serde(default = "default_true")]
+    pub require_shell_confirmation: bool,
+    #[serde(default)]
+    pub block_network_commands: bool,
+    #[serde(default = "default_true")]
+    pub enforce_workspace_boundary: bool,
+    #[serde(default = "default_true")]
+    pub protect_repository_metadata: bool,
+    #[serde(default = "default_true")]
+    pub block_symlink_escape: bool,
+    #[serde(default = "default_true")]
+    pub protect_environment_variables: bool,
+    #[serde(default = "default_true")]
+    pub enforce_harness_baseline: bool,
+    #[serde(default = "default_true")]
+    pub require_write_confirmation: bool,
+    #[serde(default = "default_true")]
+    pub verify_write_conflicts: bool,
+    #[serde(default = "default_true")]
+    pub enforce_resource_limits: bool,
+    #[serde(default = "default_true")]
+    pub redact_sensitive_output: bool,
+    #[serde(default = "default_true")]
+    pub withhold_sensitive_source_output: bool,
+    #[serde(default = "default_true")]
+    pub redact_telemetry: bool,
+    #[serde(default = "default_true")]
+    pub redact_history: bool,
+}
+
+impl Default for SecurityPolicy {
+    fn default() -> Self {
+        Self {
+            restrict_tool_catalog: true,
+            enforce_command_allowlist: true,
+            require_dangerous_confirmation: true,
+            require_shell_confirmation: true,
+            block_network_commands: false,
+            enforce_workspace_boundary: true,
+            protect_repository_metadata: true,
+            block_symlink_escape: true,
+            protect_environment_variables: true,
+            enforce_harness_baseline: true,
+            require_write_confirmation: true,
+            verify_write_conflicts: true,
+            enforce_resource_limits: true,
+            redact_sensitive_output: true,
+            withhold_sensitive_source_output: true,
+            redact_telemetry: true,
+            redact_history: true,
+        }
+    }
+}
+
+impl SecurityPolicy {
+    pub fn legacy(permission_mode: &str, tool_profile: &str) -> Self {
+        Self {
+            restrict_tool_catalog: !matches!(tool_profile, "advanced" | "compat-readonly-all"),
+            require_dangerous_confirmation: permission_mode != "dangerous",
+            require_shell_confirmation: permission_mode != "dangerous",
+            require_write_confirmation: permission_mode != "dangerous",
+            block_network_commands: !matches!(permission_mode, "trusted" | "dangerous"),
+            ..Self::default()
+        }
+    }
+
+    pub fn compatibility_permission_mode(&self) -> &'static str {
+        if !self.require_dangerous_confirmation
+            && !self.require_shell_confirmation
+            && !self.require_write_confirmation
+        {
+            "dangerous"
+        } else if self.block_network_commands {
+            "safe"
+        } else {
+            "trusted"
+        }
+    }
+
+    pub fn compatibility_tool_profile(&self) -> &'static str {
+        if self.restrict_tool_catalog {
+            "trusted-core"
+        } else {
+            "advanced"
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     #[serde(default = "default_mcp_port")]
@@ -160,6 +288,8 @@ pub struct RuntimeConfig {
     pub tool_profile: String,
     #[serde(default = "default_permission_mode")]
     pub permission_mode: String,
+    #[serde(default)]
+    pub security_policy: Option<SecurityPolicy>,
     #[serde(default)]
     pub runtime_command: String,
     /// Workspace execution policy shared by MCP clients.
@@ -179,6 +309,8 @@ pub struct RuntimeConfig {
     pub global_process_admission_limit: u16,
     #[serde(default = "default_active_session_limit")]
     pub active_session_limit: u16,
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +472,14 @@ fn default_permission_mode() -> String {
     "trusted".to_string()
 }
 
+fn default_sandbox_backend() -> String {
+    "appcontainer".to_string()
+}
+
+fn default_sandbox_enabled() -> bool {
+    false
+}
+
 fn default_allowed_commands() -> String {
     "pytest,python,python3,npm,npx,node,pnpm,yarn,make,mvn,mvnw,gradle,gradlew,cargo,go,ruff,mypy,eslint,tsc,git,cmd,powershell,pwsh".to_string()
 }
@@ -401,6 +541,17 @@ impl Default for AuthConfig {
     }
 }
 
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: default_sandbox_backend(),
+            external_paths: Vec::new(),
+            options: BTreeMap::new(),
+        }
+    }
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
@@ -409,6 +560,7 @@ impl Default for RuntimeConfig {
             transport_mode: default_transport_mode(),
             tool_profile: default_tool_profile(),
             permission_mode: default_permission_mode(),
+            security_policy: None,
             runtime_command: String::new(),
             allowed_commands: default_allowed_commands(),
             workspace_local_entries: default_workspace_local_entries(),
@@ -418,6 +570,7 @@ impl Default for RuntimeConfig {
             global_blocking_admission_limit: default_global_blocking_admission_limit(),
             global_process_admission_limit: default_global_process_admission_limit(),
             active_session_limit: default_active_session_limit(),
+            sandbox: SandboxConfig::default(),
         }
     }
 }
@@ -547,6 +700,17 @@ impl WorkspaceProfile {
             runtime: RuntimeConfig::default(),
             actions,
         }
+    }
+
+    /// Keep the backend usable for legacy profiles without changing the user's
+    /// explicit sandbox enablement choice.
+    pub fn normalize_sandbox(&mut self) -> bool {
+        let mut changed = false;
+        if self.runtime.sandbox.backend.trim().is_empty() {
+            self.runtime.sandbox.backend = default_sandbox_backend();
+            changed = true;
+        }
+        changed
     }
 
     /// Migrates legacy single-path profiles and keeps the compatibility path
@@ -801,7 +965,7 @@ fn computed_public_url(
 mod tests {
     use super::{
         comparable_folder_path, parse_mcp_public_endpoint, ActionsConfig, RuntimeConfig,
-        TunnelConfig, WorkspaceFolder, WorkspaceProfile, DEFAULT_BIND_ADDRESS,
+        SecurityPolicy, TunnelConfig, WorkspaceFolder, WorkspaceProfile, DEFAULT_BIND_ADDRESS,
     };
     use crate::workspace::ExecutionTarget;
 
@@ -1037,6 +1201,39 @@ mod tests {
 
         assert_eq!(runtime.bind_address, DEFAULT_BIND_ADDRESS);
         assert_eq!(actions.bind_address, DEFAULT_BIND_ADDRESS);
+        assert!(runtime.sandbox.external_paths.is_empty());
+    }
+
+    #[test]
+    fn legacy_security_policy_requires_write_confirmation_except_dangerous() {
+        assert!(SecurityPolicy::legacy("safe", "core").require_write_confirmation);
+        assert!(SecurityPolicy::legacy("trusted", "advanced").require_write_confirmation);
+        assert!(!SecurityPolicy::legacy("dangerous", "advanced").require_write_confirmation);
+    }
+    #[test]
+    fn security_policy_round_trips_individual_protections_and_keeps_legacy_configs_compatible() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.security_policy = Some(SecurityPolicy::default());
+        runtime
+            .security_policy
+            .as_mut()
+            .expect("security policy")
+            .block_network_commands = true;
+        let encoded = serde_json::to_value(&runtime).expect("encode runtime");
+        let restored: RuntimeConfig = serde_json::from_value(encoded).expect("decode runtime");
+        assert!(
+            restored
+                .security_policy
+                .expect("security policy")
+                .block_network_commands
+        );
+
+        let legacy: RuntimeConfig = serde_json::from_value(serde_json::json!({
+            "permission_mode": "dangerous",
+            "tool_profile": "advanced"
+        }))
+        .expect("legacy runtime");
+        assert!(legacy.security_policy.is_none());
     }
 
     #[test]

@@ -36,7 +36,7 @@ test("工作區頂層分頁保存於 URL 並按需載入", async () => {
 
   assert.match(
     source,
-    /type WorkspaceTab = "overview" \| "history" \| "telemetry" \| "mcp" \| "actions" \| "settings"/,
+    /type WorkspaceTab = "overview" \| "history" \| "telemetry" \| "logs" \| "health" \| "features" \| "mcp" \| "actions" \| "settings"/,
   );
   assert.match(source, /searchParams\.set\("tab", tab\)/);
   assert.match(source, /searchParams\.set\("section", mcpSection\)/);
@@ -44,6 +44,7 @@ test("工作區頂層分頁保存於 URL 並按需載入", async () => {
   assert.match(source, /replaceState: false, noScroll: true, keepFocus: true/);
   assert.match(source, /import\("\$lib\/components\/workspace\/WorkspaceOverview\.svelte"\)/);
   assert.match(source, /import\("\$lib\/components\/workspace\/WorkspaceSettings\.svelte"\)/);
+  assert.match(source, /import\("\$lib\/components\/workspace\/WorkspaceFeatureControls\.svelte"\)/);
   assert.match(source, /import\("\$lib\/components\/workspace\/McpWorkspacePanel\.svelte"\)/);
   assert.match(source, /import\("\$lib\/components\/workspace\/ActionsWorkspacePanel\.svelte"\)/);
 });
@@ -51,7 +52,8 @@ test("工作區頂層分頁保存於 URL 並按需載入", async () => {
 test("初始資料平行載入且儲存設定不再全面 reload", async () => {
   const source = await read(workspacePagePath);
 
-  assert.match(source, /Promise\.all\(\[listWorkspaces\(\), listFrpProfiles\(\)\]\)/);
+  assert.match(source, /listWorkspaces\(\)/);
+  assert.match(source, /capabilities\.frpManagement \? listFrpProfiles\(\)/);
   assert.match(source, /async function refreshMcpRuntime/);
   assert.match(source, /async function refreshActionsRuntime/);
   assert.match(source, /persistProfile\("save\.mcp\.port"/);
@@ -111,7 +113,7 @@ test("快速驗證會平行執行前端檢查與測試，完整 build 保持獨�
   const pkg = JSON.parse(await read(packagePath));
 
   assert.equal(pkg.scripts["verify:fast"], "node scripts/verify-frontend.mjs");
-  assert.equal(pkg.scripts.verify, "npm run verify:fast && npm run build");
+  assert.equal(pkg.scripts.verify, "pnpm run verify:fast && pnpm run build");
 });
 
 test("GPT 配置卡片不再重複展示會話恢復入口", async () => {

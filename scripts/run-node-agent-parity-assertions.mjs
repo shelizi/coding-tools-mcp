@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { runCapturedStdoutWithProgress } from './run-streamed-child.mjs';
 import { access, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -63,18 +64,23 @@ export async function runBehavioralAssertions({ root = defaultRoot, registry, bu
   const preflightFailures = new Map();
   for (const assertion of executable.filter(value => value.preflight === 'rust_contract')) {
     const checker = path.resolve(packageRoot, 'scripts', 'sync-rust-catalog.mjs');
-    const outcome = await run(process.execPath, [checker, '--check'], packageRoot);
-    if (outcome.code !== 0) {
+    try {
+      await runCapturedStdoutWithProgress(process.execPath, [checker, '--check'], {
+        cwd: packageRoot,
+        label: 'node-agent-parity/rust-contract',
+        quietHeartbeatMs: 15_000
+      });
+    } catch (error) {
       preflightFailures.set(
         assertion.id,
-        outputTail(outcome.stderr || outcome.stdout) || `Rust contract check exited ${outcome.code}`
+        outputTail(error instanceof Error ? error.message : String(error)) || 'Rust contract check failed'
       );
     }
   }
   if (build) {
     const compiled = process.platform === 'win32'
-      ? await run(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'npm.cmd run build:server'], packageRoot)
-      : await run('npm', ['run', 'build:server'], packageRoot);
+      ? await run(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'pnpm.cmd run build:server'], packageRoot)
+      : await run('pnpm', ['run', 'build:server'], packageRoot);
     if (compiled.code !== 0) {
       const message = outputTail(compiled.stderr || compiled.stdout) || `build exited ${compiled.code}`;
       return results.concat(executable.map(assertion => ({

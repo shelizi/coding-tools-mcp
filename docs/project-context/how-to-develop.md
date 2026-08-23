@@ -1,127 +1,135 @@
-# 如何开发
+# 如何開發
 
-> 本文档描述 Coding Tools MCP Rust 的开发流程。
+## 基本流程
 
-## 概述
+1. 先讀 `AGENTS.md`、本專案上下文與相關 spec。
+2. 依 `.agents/skills/mcp-probe-kit/SKILL.md` 路由工作；大改先做 code insight／impact。
+3. 修改任何 function、class 或 method 前，用 GitNexus `impact` 檢查 upstream blast radius。
+4. 保持 Desktop、Node Agent 與 shared contract parity；不適用時更新 parity manifest 與對應 TODO。
+5. 執行與風險相稱的驗證。
+6. Commit 前執行 GitNexus `detect_changes`，只 stage 本次範圍。
 
-本项目使用 MCP Probe Kit 工作流驱动开发。新功能必须先走规格流程，通过闸门后再写实现代码。
+## 開發環境
 
-## 新功能开发流程
-
-### 第一步：启动功能编排
-
-调用 `start_feature` MCP 工具：
-
-```json
-{
-  "feature_name": "my-feature",
-  "description": "功能描述",
-  "project_root": "e:/workspace/github/coding-tools-mcp-rust"
-}
+```powershell
+pnpm install --frozen-lockfile
+pnpm run hooks:install
+pnpm run desktop
 ```
 
-### 第二步：生成并校验规格
+- `pnpm run desktop`：啟動 Vite 與 Tauri Desktop。
+- `pnpm run dev`：只啟動前端，不能代替 Desktop runtime 驗證。
+- `pnpm run node-agent:start`：啟動已建置的 Node Agent。
+- Node Agent 需要 Node.js 22 或更新版本。
 
-1. 调用 `add_feature` 生成规格模板
-2. Agent 按模板填写 `docs/specs/<feature>/requirements.md`、`design.md`、`tasks.md`
-3. 调用 `check_spec` 校验规格完整性
-4. **未通过前不要写实现代码**
+### 快速 reload 開發模式
 
-### 第三步：工作量估算
+Node Agent server 開發使用 health-checked hot restart：
 
-调用 `estimate` 获取故事点和时间区间。
-
-### 第四步：按 tasks.md 实现
-
-1. 每条任务先写证据块（读相关代码）
-2. 实现后对照验收标准核验
-3. 单文件不超过 500 行，超出需拆分
-
-## Tauri 开发命令（工程创建后）
-
-```bash
-# 开发模式（热重载）
-cargo tauri dev
-
-# 构建发布版
-cargo tauri build
-
-# 仅构建 Rust 后端
-cd src-tauri && cargo build
-
-# 仅构建前端
-pnpm dev
+```powershell
+pnpm --filter @coding-tools/node-agent run dev:server
+pnpm --filter @coding-tools/node-agent run dev:server:stop
 ```
 
-## 安装包版本与发布规则（硬性）
+`dev:server` 會監看 `packages/node-agent/src`、sandbox assets 與 server build inputs。變更後先執行 `build:server`；只有 build 成功才停止目前 Node Agent、啟動新 build 並等待所有已保存 Workspace 的 `/health` 恢復。Build 失敗時目前 Agent 保持運行，因此開發中的 MCP connector 不會因編譯錯誤被主動切掉。狀態與 supervisor/Agent logs 位於 `CodingToolsMCPNode` data dir。
 
-凡是包含功能或缺陷修复、且需要构建、安装、交付或发布桌面安装包的变更，**必须先递增应用版本，再构建**。不得用旧版本号覆盖安装包，也不得只改 DMG、NSIS 等产物文件名。
+Rust Desktop 使用 Tauri dev supervisor + Cargo incremental compilation：
 
-### 版本递增
-
-- 默认递增 patch 版本，例如 `0.1.7` → `0.1.8`。
-- 新功能或不兼容变更按语义化版本递增 minor 或 major。
-- 仅文档、索引或不产生安装包的维护变更可不递增版本。
-
-### 必须同步的版本源
-
-每次递增时，以下位置必须保持为同一版本：
-
-1. `package.json`
-2. `package-lock.json` 的根 `version` 和根包 `version`
-3. `src-tauri/Cargo.toml`
-4. `src-tauri/Cargo.lock` 中 `coding-tools-mcp-desktop` 包的 `version`
-5. `src-tauri/tauri.conf.json`
-
-不要修改依赖自身恰好相同的版本号；只更新本项目包的版本字段。
-
-### 构建门禁
-
-构建前必须：
-
-1. 搜索上述版本源，确认没有旧的项目版本残留。
-2. 运行 `npm run check`、`cargo check`；修复类变更还需运行相关 Rust 测试。
-3. 提交版本升级与功能/修复代码，再从该提交构建。
-
-构建后必须：
-
-1. 校验 App 内部版本（macOS 为 `CFBundleShortVersionString`）。
-2. 校验安装包文件名包含当前版本，例如 `Coding Tools MCP_<version>_aarch64.dmg`。
-3. 校验已安装应用显示的版本与安装包一致；不得把旧包误报为新包。
-4. 清理同一构建目录中旧版本的安装包和临时构建日志，但保留当前版本产物。
-
-若移动了 macOS 源码目录，Rust/Tauri 的 `target` 缓存会保留旧绝对路径；首次在新目录构建前必须执行 `cd src-tauri && cargo clean`，再重新构建。
-
-macOS GitHub Actions 仍仅允许在用户明确要求后通过 `workflow_dispatch` 手动触发，不因版本提交自动触发。
-
-## Rust 后端开发约定
-
-### Tauri Command 模式
-
-```rust
-#[tauri::command]
-async fn list_workspaces(state: State<'_, AppState>) -> Result<Vec<WorkspaceProfile>, String> {
-    state.workspace_store.list().map_err(|e| e.to_string())
-}
+```powershell
+pnpm run desktop:dev:fast
+pnpm run rust:dev:build
 ```
 
-### 状态机模式
+`desktop:dev:fast` 讓 Tauri CLI 負責 source watch、成功 rebuild 後重啟 dev Desktop；腳本固定 `CARGO_INCREMENTAL=1`，並將 workspace-specific `CARGO_TARGET_DIR` 放到 LocalAppData，避免把大量增量編譯 cache 放在 Dropbox worktree。`rust:dev:build` 可單獨暖 cache 或驗證一次 incremental Desktop build。
 
-Runtime 生命周期使用显式 enum，不用字符串状态：
+## 專案常用指令
 
-```rust
-enum RuntimeState {
-    Stopped,
-    Starting { since: Instant },
-    Running { pid: u32, port: u16 },
-    Stopping,
-    Error { message: String },
-}
+```powershell
+pnpm run check
+pnpm run build
+pnpm run rust:check
+pnpm run rust:test
+pnpm run node-agent:test
 ```
 
-## 参考旧版实现
+較完整驗證：
 
-开发 MCP 工具时，以 `old/docs/profile-v0.1.md` 为行为契约，以 `old/tests/compliance/` 为验收标准。不要猜测工具行为，对照规范和测试。
+```powershell
+pnpm run verify
+pnpm run rust:test:full
+pnpm run node-agent:verify-repo
+```
+
+## Rust／Node parity
+
+當 Desktop Client 行為也存在於 `packages/node-agent`：
+
+- 同一變更同步更新 Rust 與 Node；或
+- 在 `docs/todo/node-agent-parity/manifest.json` 記錄為待辦／刻意差異。
+
+Client 或 shared-contract 變更提交前至少執行：
+
+```powershell
+pnpm run version:check
+pnpm run node-agent:parity:check
+pnpm run node-agent:verify-repo
+```
+
+Rust tool catalog 是 Node generated catalog 的來源，不要手動重構 `packages/node-agent/src/rustCatalog.generated.ts`。Schema 變更應使用 Node Agent 的 `sync:rust-contract` 流程產生。
+
+## 模組化原則
+
+- 公開 facade 穩定，先抽純函式或 storage/transaction/runner，再移動 orchestration。
+- Rust patch tools 以 `tools/patch.rs` 作公開 facade，跨 domain 回歸測試集中在 `tools/patch/tests.rs`；apply/edit orchestration、file operations、parser、hunk、precise edit、proposal、transaction 與共用 support 各自保有單一模組責任。
+- Rust session tools 以 `tools/session.rs` 保有唯一的 store/session state、finalization/status primitives 與 snapshot/public tool facades；`ExecSession` constructors、Windows process-tree attach 及 execution identity/active-slot/sensitive-output/telemetry builders 位於同型別 extension impl `tools/session/construction.rs`，harness correlation、operation identity getters 與 detach/reattach generation 位於 `tools/session/attachment.rs`，`SessionStore` registry/admission 位於 `tools/session/registry.rs`，工具請求控制位於 `tools/session/control.rs`，stdout/stderr readers、exit waiter、status recording、kill fallback、platform termination 與 bounded change waits 位於 `tools/session/process_lifecycle.rs`，retention pruning 與 finalization side effects 位於無狀態的 `tools/session/lifecycle.rs`，stream buffer/encoding primitives 位於 `tools/session/output.rs`，delta batching、snapshot payload 與 redaction read model 位於 `tools/session/snapshot.rs`，回歸 suite 位於 `tools/session/tests.rs`。attachment/construction/registry/process_lifecycle 不得定義第二份 `SessionStore`／`SessionRegistry`／`ExecSession`，其他 helper 也不得建立另一套 background process owner；公開 snapshot methods 留在 parent facade，helper 使用可被圖譜唯一解析的 `build_*`／`capture_*` 名稱。
+- Rust exec workspace/scope/spec/post-check/output/runtime-option parsing 位於 session-free `tools/exec/request.rs`；operation lock、automatic dedupe grace、fingerprint conflict 與 retained-session reattachment 位於 process-start-free `tools/exec/admission.rs`；command fingerprint、operation dedupe identity、Cargo target/resource-lock derivation 位於純 `tools/exec/identity.rs`；resource-lock admission、main-process startup permit/loader retry、session registration、request detachment cleanup、stdin handoff、yield/final snapshot、timeout monitor、main-command skip 與 post-check completion 集中在唯一的 `tools/exec/lifecycle.rs`；allowlisted `pwd`／`ls`／`dir`／`which`／`echo` in-process diagnostics 與 workspace-safe directory resolution 位於零子程序 `tools/exec/native_diagnostic.rs`；bounded parallel post-check、單項 timeout、bounded output、startup diagnostics 與結果彙整位於 session-free `tools/exec/post_check.rs`，且必須走共用 `spawn_with_control`；command/post-check specification、PowerShell selection、program resolution 與 WSL path validation 位於 `tools/exec/spec.rs`；WSL invocation、stdio/environment、Windows process flags 與 script adapters 位於 `tools/exec/runner.rs`；session capacity metadata、process-start diagnostics、workspace error envelope、execution failure 與 post-check result merge 位於 `tools/exec/result.rs`；回歸 suite 位於 `tools/exec/tests.rs`。`tools/exec.rs` 只保留 public command/health facade、native fast path、request/admission/lifecycle delegation 與 response boundary metadata；其他模組或 facade 不得建立第二套 main-process 啟動重試、取消或 session lifecycle owner。
+- Rust Built-in tunnel 的純 worker pool/policy 計算放在 `tunnel/builtin/pool_policy.rs`；public snapshot、availability derivation、原子 metrics、policy/pool/recycle/error 更新與 connected-worker RAII guard 放在 `tunnel/builtin/metrics.rs`，由 parent re-export `BuiltinTunnelSnapshot`；request DTO、路徑、local HTTP builder 與 response header 映射放在 `tunnel/builtin/request_mapping.rs`；WebSocket client types、control codec、heartbeat、bounded close handshake 與基本 control frame 收送放在 `tunnel/builtin/protocol_io.rs`；WSS headers／connect timeout／subprotocol negotiation／Challenge-Authenticate-HelloAck 與 initial policy validation 放在 `tunnel/builtin/connection.rs`；回歸 suite 放在 `tunnel/builtin/tests.rs` 並維持 `tunnel::builtin::tests` namespace。五個 production helper 都不得取得 enrollment、worker/channel/task/select-loop lifecycle ownership；metrics 不得建立 channel/task/transport、執行 forwarding 或持有 cancellation，policy/request mapping 不得引用 WebSocket，protocol I/O 不得引用 worker policy、forwarding 或 response streaming，connection 不得發布 policy、發送 Ready、設定 connected 狀態或執行 forwarding。`tunnel/builtin.rs` 保留唯一的 worker/transport/cancellation lifecycle owner 與認證後 policy → Ready → connected handoff；Rust 內部抽離不需複製到 Node，但行為仍須由 worker-policy/forwarding parity assertions 固定。
+- Node management 的 hot-apply target 與 tunnel controller 介面只能由 `management/runtimeContract.ts` 定義；`management/types.ts` 可 re-export 並組合 `ConfigStore` options，但 `configStore.ts` 不得反向 import aggregate `management/types.ts`。新增 runtime contract 時優先保持 type-only、無 storage/router/runtime side effects。
+- Node `ToolContext` 只能依賴 import-free `toolUsage/contract.ts` 的 store surface；`toolUsage.ts` 負責實作與相容 re-export。contract 不得反向 import `types.ts`、catalog、runtime metadata 或 persistence，避免重建 telemetry/catalog 循環。
+- Node conversation 與 durable state 的 data/store surface 分別由無 import 的 `conversation/contract.ts`、`state/contract.ts` 定義；`conversation.ts`／`state.ts` 保留唯一 runtime state 與 persistence owner 並實作 contract，`types.ts` 只依賴 contract 且保留既有 state model re-export。domain handler 只能依賴 type-only `toolDispatch/contract.ts`，不得反向 import `toolDispatch.ts` registry；registry facade 保留 public type re-export。不要為縮行數再拆 conversation/state methods 或 dispatch registry lifecycle。
+- MCP 與 Actions 共用 `tools::call_tool`／`call_tool_async`，不得新增旁路。
+- Rust 與 Node 可有不同內部結構，但輸入、輸出、錯誤、限制與安全行為必須由 parity tests 固定。
+- 長時間 process、retry、tunnel worker 與 cancellation 必須保持單一 lifecycle owner。
+- UI mutation 只更新受影響的 Svelte store／畫面區塊；避免整頁重新載入。 Node 建置使用 `pnpm run ui:build:node`。
+
+## 版本與 Portable 發佈
+
+Desktop 版本變更使用：
+
+```powershell
+pnpm run version:patch
+pnpm run version:sync
+pnpm run version:check
+```
+
+`version:sync` 會同步 Desktop 版本源，以及 Node Agent 的 `codingTools.clientVersion` 與 generated client version。
+
+Portable build 必須使用 repo 的 `build-portable` skill／腳本：
+
+```powershell
+pnpm run desktop:portable
+pnpm run node-agent:portable:bundled
+pnpm run node-agent:portable:system
+```
+
+不要用裸 `cargo build --release` 代替 Desktop portable build，否則可能漏掉 `custom-protocol` 並在封裝後連向 `localhost:1420`。
+
+## GitNexus 維護
+
+```powershell
+node .gitnexus/run.cjs status
+node .gitnexus/run.cjs analyze --force --pdg --index-only --wal-checkpoint-threshold 67108864
+$workspacePath = (Get-Location).Path
+node .gitnexus/run.cjs check --cycles --json --repo $workspacePath
+```
+
+使用 `--index-only` 可避免分析器改寫使用者尚未提交的 `AGENTS.md`／`CLAUDE.md`。`--force` 可避免 GitNexus 1.6.9 增量分析對已搬移 Rust functions 留下不一致 UID；若本機同時索引多個同名 worktree，cycle check 必須以 `--repo` 指定目前 checkout。Windows 環境的 graph/PDG 可用，但 LadybugDB FTS extension 無法載入；精確 `context`／`impact` 可用，關鍵字 `query` 會降級。
+
+若分析期間出現 LadybugDB WAL checkpoint 輪替失敗，使用分析器建議的較高 threshold 重試；未完成旗標會讓下一次執行自動採 full rebuild 恢復一致索引：
+
+```powershell
+node .gitnexus/run.cjs analyze --force --pdg --index-only --wal-checkpoint-threshold 67108864
+```
 
 ---
-*返回索引: [../project-context.md](../project-context.md)*
+*返回索引：[../project-context.md](../project-context.md)*

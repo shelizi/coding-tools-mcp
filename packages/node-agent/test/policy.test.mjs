@@ -4,11 +4,16 @@ import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { normalizeConfig } from '../dist/config.js';
-import { defaultPolicy, resolveCommandSpec, splitShellWords, validateToolPolicy } from '../dist/policy.js';
+import { runtimeForFolderId } from '../dist/folderRuntime.js';
+import { defaultPolicy, resolveCommandSpec, resolvePortableCommandSpec, splitShellWords, validateToolPolicy } from '../dist/policy.js';
 import { createToolContext } from '../dist/server.js';
 import { callTool } from '../dist/tools.js';
 
 const nodeProgram = path.basename(process.execPath);
+
+function sessions(ctx) {
+  return runtimeForFolderId(ctx, 'repo').sessions;
+}
 
 function config(root, dataDir, permissionMode = 'trusted', policy = defaultPolicy()) {
   return {
@@ -59,6 +64,31 @@ test('policy defaults preserve Rust allowlist and configured additions', async (
   assert.equal(normalized.policy.maxPatchBytes, 12345);
 });
 
+test('portable sandbox resolution keeps Linux commands inside the target and rejects Windows launchers', async t => {
+  const { root, ctx, key } = await fixture(t);
+  const bare = await resolvePortableCommandSpec(ctx, key, { program: 'python', args: ['--version'] });
+  assert.equal(bare.program, 'python');
+  assert.deepEqual(bare.argv, ['--version']);
+
+  const shell = await resolvePortableCommandSpec(ctx, key, {
+    script: 'printf portable', shell: 'sh', confirm: true
+  });
+  assert.equal(shell.program, 'sh');
+  assert.deepEqual(shell.argv, ['-c', 'printf portable']);
+
+  await assert.rejects(
+    resolvePortableCommandSpec(ctx, key, { script: 'echo no', shell: 'powershell', confirm: true }),
+    error => error?.code === 'SANDBOX_COMMAND_UNSUPPORTED'
+  );
+
+  const batch = path.join(root, 'portable.cmd');
+  await writeFile(batch, '@echo off\r\n');
+  await assert.rejects(
+    resolvePortableCommandSpec(ctx, key, { program: batch, args: [] }),
+    error => error?.code === 'SANDBOX_COMMAND_UNSUPPORTED'
+  );
+});
+
 test('shell-free cmd uses structured parsing and rejects shell syntax', async t => {
   const { ctx, meta } = await fixture(t);
   assert.deepEqual(splitShellWords('node -e "process.stdout.write(\\"ok\\")"'), [
@@ -75,7 +105,33 @@ test('shell-free cmd uses structured parsing and rejects shell syntax', async t 
   await expectPolicyError(ctx, meta, 'exec_command', {
     cmd: `${nodeProgram} -e "process.stdout.write('first')" && ${nodeProgram} -e "process.stdout.write('second')"`
   }, 'SHELL_MODE_REQUIRED');
-  assert.equal(ctx.sessions.size, 1);
+  assert.equal(sessions(ctx).size, 1);
+});
+
+test('Windows exec_command launches npm through the resolved command shim', { skip: process.platform !== 'win32' }, async t => {
+  const { ctx, meta } = await fixture(t);
+  const started = await callTool(ctx, 'exec_command', {
+    program: 'npm',
+    args: ['--version'],
+    yield_time_ms: 30_000,
+    output_mode: 'all',
+    deduplicate: false
+  }, meta);
+  assert.equal(started.ok, true, JSON.stringify(started));
+  const result = started.command_ok === null
+    ? await callTool(ctx, 'wait_command', {
+        session_id: started.session_id,
+        cursor: started.next_cursor,
+        timeout_ms: 30_000,
+        until: 'finalized',
+        output_mode: 'all'
+      }, meta)
+    : started;
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.command_ok, true, JSON.stringify(result));
+  assert.equal(result.process_exit_code, 0, JSON.stringify(result));
+  assert.match(result.stdout.trim(), /^\d+\.\d+\.\d+(?:[-+].*)?$/);
+  assert.match(result.stderr, /^(?:npm warn Unknown env config "[^"]+"[^\n]*\n)*$/);
 });
 
 test('explicit shell and dangerous commands require confirmation and protect repository assets', async t => {
@@ -105,7 +161,7 @@ test('allowlist, environment and network policies run before process creation', 
   await expectPolicyError(guarded.ctx, guarded.meta, 'exec_command', {
     program: nodeProgram, args: ['-e', 'fetch("https://example.invalid")']
   }, 'NETWORK_COMMAND_BLOCKED');
-  assert.equal(guarded.ctx.sessions.size, 0);
+  assert.equal(sessions(guarded.ctx).size, 0);
 
   const trusted = await fixture(t, 'trusted');
   await validateToolPolicy(trusted.ctx, trusted.key, 'exec_command', {
@@ -142,7 +198,7 @@ test('exec_many validates every child before starting any process', async t => {
     ]
   }, 'COMMAND_REJECTED');
   assert.match(result.error.message, /commands\[1\] rejected/);
-  assert.equal(ctx.sessions.size, 0);
+  assert.equal(sessions(ctx).size, 0);
 });
 
 test('exec_many rejects invalid graph structure before starting any process', async t => {
@@ -161,7 +217,7 @@ test('exec_many rejects invalid graph structure before starting any process', as
   for (const item of cases) {
     const result = await expectPolicyError(ctx, meta, 'exec_many', { mode: 'dag', commands: item.commands }, 'INVALID_ARGUMENT');
     assert.match(result.error.message, item.message, item.name);
-    assert.equal(ctx.sessions.size, 0, item.name);
+    assert.equal(sessions(ctx).size, 0, item.name);
   }
 });
 
@@ -182,6 +238,28 @@ test('mutation payload limits reject work before files change', async t => {
   assert.equal(await import('node:fs/promises').then(fs => fs.readFile(target, 'utf8')), 'original\n');
 });
 
+test('enabled sandbox owns external mutation enforcement while policy-only mode stays workspace-bound', async t => {
+  const { ctx, key } = await fixture(t);
+  const outsideWrite = {
+    cmd: `${nodeProgram} -e \"const fs=require('fs'); fs.writeFileSync('C:/outside.txt','x')\"`
+  };
+
+  await assert.rejects(
+    validateToolPolicy(ctx, key, 'exec_command', outsideWrite),
+    error => error?.code === 'WORKSPACE_PATH_PROTECTED'
+  );
+
+  ctx.config.sandbox = { enabled: true, backend: 'appcontainer', externalPaths: [], options: {} };
+  await validateToolPolicy(ctx, key, 'exec_command', outsideWrite);
+
+  await assert.rejects(
+    validateToolPolicy(ctx, key, 'exec_command', {
+      cmd: `${nodeProgram} -e \"const fs=require('fs'); fs.writeFileSync('C:/repo/.git/config','x')\"`
+    }),
+    error => error?.code === 'PROTECTED_REPOSITORY_ASSET'
+  );
+});
+
 test('workdir and timeout stay within configured command bounds', async t => {
   const { ctx, meta } = await fixture(t);
   await expectPolicyError(ctx, meta, 'exec_command', {
@@ -191,5 +269,5 @@ test('workdir and timeout stay within configured command bounds', async t => {
   await expectPolicyError(ctx, meta, 'exec_command', {
     program: nodeProgram, args: ['-e', ''], timeout_ms: 1_800_001
   }, 'INVALID_ARGUMENT');
-  assert.equal(ctx.sessions.size, 0);
+  assert.equal(sessions(ctx).size, 0);
 });

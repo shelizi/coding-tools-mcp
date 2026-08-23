@@ -160,9 +160,9 @@ test('resolved built-in tunnel endpoint is persisted and clears the one-time enr
   );
 
   const saved = JSON.parse(await readFile(configPath, 'utf8'));
-  assert.equal(saved.tunnel.publicUrl, 'https://tunnel.example/builtin/clients/server_assigned_1/mcp');
+  assert.equal(saved.tunnel.builtin.publicUrl, 'https://tunnel.example/builtin/clients/server_assigned_1/mcp');
   assert.equal(saved.publicBaseUrl, 'https://tunnel.example/builtin/clients/server_assigned_1');
-  assert.equal(loaded.config.tunnel.publicUrl, saved.tunnel.publicUrl);
+  assert.equal(loaded.config.tunnel.publicUrl, saved.tunnel.builtin.publicUrl);
   assert.equal(loaded.config.publicBaseUrl, saved.publicBaseUrl);
   assert.equal(loaded.config.tunnel.enrollmentUrl, undefined);
   const secretState = await readAgentSecrets(dataDir);
