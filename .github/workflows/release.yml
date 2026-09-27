@@ -110,15 +110,6 @@ jobs:
       - name: 检查版本同步
         run: pnpm run version:check
 
-      - name: 检查前端
-        if: github.event_name != 'workflow_run'
-        run: pnpm run check
-
-      - name: 运行 Rust 测试
-        if: github.event_name != 'workflow_run'
-        working-directory: src-tauri
-        run: cargo test
-
       - name: 仅构建 Windows NSIS 安装程序
         run: pnpm run desktop:build:nsis
 
@@ -181,15 +172,6 @@ jobs:
 
       - name: 检查版本同步
         run: pnpm run version:check
-
-      - name: 检查前端
-        if: github.event_name != 'workflow_run'
-        run: pnpm run check
-
-      - name: 运行 Rust 测试
-        if: github.event_name != 'workflow_run'
-        working-directory: src-tauri
-        run: cargo test
 
       - name: 仅构建通用版 macOS DMG
         run: pnpm run desktop:build:macos
