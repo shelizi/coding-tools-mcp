@@ -38,7 +38,7 @@ import type {
   WorkspaceFolder
 } from '../types.js';
 import { canonicalizeWorkspaceFolders } from '../workspace.js';
-import { normalizeWorkspacePath } from '../wsl.js';
+import { canonicalExistingPath, normalizeWorkspacePath } from '../wsl.js';
 import type { RuntimeHotApplyTarget } from './runtimeContract.js';
 import {
   readSharedWorkspace,
@@ -244,6 +244,24 @@ function safeConfig(config: AgentConfig, secrets: AgentSecrets, effective: boole
   };
 }
 
+function comparableConfigPaths(config: AgentConfig): AgentConfig {
+  return {
+    ...config,
+    dataDir: canonicalExistingPath(config.dataDir),
+    folders: config.folders.map(folder => ({ ...folder, path: canonicalExistingPath(folder.path) })),
+    sandbox: {
+      ...config.sandbox,
+      externalPaths: config.sandbox.externalPaths.map(grant => ({
+        ...grant,
+        path: canonicalExistingPath(grant.path)
+      }))
+    },
+    tunnel: config.tunnel
+      ? { ...config.tunnel, stateFile: canonicalExistingPath(config.tunnel.stateFile) }
+      : config.tunnel
+  };
+}
+
 function restartRequired(
   current: AgentConfig,
   document: AgentConfigDocument,
@@ -252,7 +270,7 @@ function restartRequired(
   const desired = normalizeConfig(document, secrets);
   desired.workspaceId = current.workspaceId;
   desired.workspaceName = current.workspaceName;
-  return JSON.stringify(current) !== JSON.stringify(desired);
+  return JSON.stringify(comparableConfigPaths(current)) !== JSON.stringify(comparableConfigPaths(desired));
 }
 
 function sameRuntimeValue(left: unknown, right: unknown): boolean {

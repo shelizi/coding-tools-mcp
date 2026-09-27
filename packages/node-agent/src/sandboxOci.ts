@@ -6,7 +6,7 @@ import path from 'node:path';
 import type { ResolvedCommandSpec } from './policy.js';
 import type { SandboxConfig, SandboxPathAccess, SandboxPathGrant } from './types.js';
 import type { SandboxLaunch } from './sandbox.js';
-import { isWslUncPath } from './wsl.js';
+import { canonicalExistingPath, isWslUncPath } from './wsl.js';
 
 export type OciRuntime = 'docker' | 'podman';
 
@@ -75,7 +75,7 @@ function isUnsupportedRemotePath(value: string): boolean {
 }
 
 function comparablePath(value: string): string {
-  const normalized = path.resolve(stripVerbatimPrefix(value)).replaceAll('\\', '/').replace(/\/+$/, '');
+  const normalized = canonicalExistingPath(stripVerbatimPrefix(value)).replaceAll('\\', '/').replace(/\/+$/, '');
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
@@ -257,7 +257,10 @@ function containerPathForHost(mounts: OciMount[], hostPath: string): string | un
     .filter(mount => pathInside(mount.host, hostPath))
     .sort((left, right) => comparablePath(right.host).length - comparablePath(left.host).length)[0];
   if (!match) return undefined;
-  const relative = path.relative(stripVerbatimPrefix(match.host), stripVerbatimPrefix(hostPath)).replaceAll('\\', '/');
+  const relative = path.relative(
+    canonicalExistingPath(stripVerbatimPrefix(match.host)),
+    canonicalExistingPath(stripVerbatimPrefix(hostPath))
+  ).replaceAll('\\', '/');
   return relative && relative !== '.' ? `${match.container}/${relative}` : match.container;
 }
 

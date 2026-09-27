@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -18,6 +18,15 @@ import {
   resolveAppContainerPathProgram
 } from '../dist/sandboxAppContainer.js';
 import { sandboxBoundary } from '../dist/sandbox.js';
+
+async function mountGrants(mounts, host, access) {
+  for (const mount of mounts) {
+    if (mount.access !== access) continue;
+    const [left, right] = await Promise.all([realpath(mount.host), realpath(host)]);
+    if (process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right) return true;
+  }
+  return false;
+}
 import {
   sandboxBackends,
   sandboxUsesPortableCommand
@@ -168,10 +177,10 @@ test('Docker sbx mount model preserves read-only grants without broadening the w
     { path: readonly, access: 'read_only' },
     { path: writable, access: 'modify' }
   ]);
-  assert.equal(mounts[0].host, workspace);
+  assert.equal(await realpath(mounts[0].host), await realpath(workspace));
   assert.equal(mounts[0].access, 'modify');
-  assert.ok(mounts.some(mount => mount.host === readonly && mount.access === 'read_only'));
-  assert.ok(mounts.some(mount => mount.host === writable && mount.access === 'modify'));
+  assert.ok(await mountGrants(mounts, readonly, 'read_only'));
+  assert.ok(await mountGrants(mounts, writable, 'modify'));
 });
 
 test('Docker sbx rejects writable-parent/read-only-child overlaps', async t => {

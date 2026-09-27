@@ -46,7 +46,7 @@ async function listenOnFetchSafePort(server, host) {
       return;
     } catch (error) {
       lastError = error;
-      if (error?.code !== 'EADDRINUSE') throw error;
+      if (error?.code !== 'EADDRINUSE' && error?.code !== 'EACCES') throw error;
     }
   }
   throw lastError ?? new Error('unable to allocate a fetch-safe MCP test port');

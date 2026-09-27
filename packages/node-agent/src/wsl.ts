@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import type { JsonObject } from './types.js';
 
@@ -116,6 +117,20 @@ export function sameWorkspacePath(left: string, right: string): boolean {
 export function normalizeWorkspacePath(value: string): string {
   const location = parseWslUncPath(value);
   return location ? wslUncPath(location.distro, location.linuxPath) : path.resolve(value);
+}
+
+/** Expand an existing Windows 8.3 path to its long path. Other paths stay path.resolve'd. */
+export function canonicalExistingPath(value: string): string {
+  const resolved = path.resolve(value);
+  if (process.platform !== 'win32') return resolved;
+  try {
+    const native = realpathSync(resolved);
+    if (native.startsWith('\\\\?\\UNC\\')) return `\\\\${native.slice(8)}`;
+    if (native.startsWith('\\\\?\\')) return native.slice(4);
+    return native;
+  } catch {
+    return resolved;
+  }
 }
 
 export function workspaceBasename(value: string): string {

@@ -10,7 +10,7 @@ import {
   acquireWslcStorageProcessLock,
   WSLC_STORAGE_ADMISSION_MAX_MS
 } from './sandboxWslcProcessLock.js';
-import { isWslUncPath } from './wsl.js';
+import { canonicalExistingPath, isWslUncPath } from './wsl.js';
 
 export const WSLC_BACKEND_ID = 'wslc';
 export const WSLC_DEFAULT_IMAGE = 'coding-tools-mcp/wslc-sandbox:alpine-3.21';
@@ -290,8 +290,7 @@ function isUnsupportedRemotePath(value: string): boolean {
 }
 
 function comparablePath(value: string): string {
-  const stripped = stripVerbatimPrefix(value);
-  const normalized = path.resolve(stripped).replaceAll('\\', '/').replace(/\/+$/, '');
+  const normalized = canonicalExistingPath(stripVerbatimPrefix(value)).replaceAll('\\', '/').replace(/\/+$/, '');
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
@@ -380,8 +379,8 @@ export function containerPathForHost(mounts: WslcMount[], hostPath: string): str
     .sort((left, right) => comparablePath(right.host).length - comparablePath(left.host).length);
   const mount = matches[0];
   if (!mount) return undefined;
-  const base = stripVerbatimPrefix(mount.host);
-  const candidate = stripVerbatimPrefix(hostPath);
+  const base = canonicalExistingPath(stripVerbatimPrefix(mount.host));
+  const candidate = canonicalExistingPath(stripVerbatimPrefix(hostPath));
   const relative = path.relative(base, candidate).replaceAll('\\', '/');
   return relative && relative !== '.'
     ? `${mount.container.replace(/\/$/, '')}/${relative}`

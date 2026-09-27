@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -15,6 +15,15 @@ import {
   selectedWslcNetwork,
   WSLC_DEFAULT_IMAGE
 } from '../dist/sandboxWslc.js';
+
+async function mountGrants(mounts, host, access) {
+  for (const mount of mounts) {
+    if (mount.access !== access) continue;
+    const [left, right] = await Promise.all([realpath(mount.host), realpath(host)]);
+    if (process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right) return true;
+  }
+  return false;
+}
 import {
   ensureWslcSessionStorage,
   managedWslcSessionStorage,
@@ -90,8 +99,9 @@ test('WSLC mount model preserves read-only grants without broadening the workspa
   ]);
   assert.equal(mounts[0].container, '/workspace');
   assert.equal(mounts[0].access, 'modify');
-  assert.ok(mounts.some(mount => mount.access === 'read_only' && mount.host === readonly));
-  assert.ok(mounts.some(mount => mount.access === 'modify' && mount.host === writable));
+  assert.equal(await realpath(mounts[0].host), await realpath(workspace));
+  assert.ok(await mountGrants(mounts, readonly, 'read_only'));
+  assert.ok(await mountGrants(mounts, writable, 'modify'));
   assert.equal(containerPathForHost(mounts, path.join(workspace, 'nested')), '/workspace/nested');
   assert.equal(containerPathForHost(mounts, path.join(path.dirname(workspace), 'ungranted')), undefined);
 });
