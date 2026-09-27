@@ -116,6 +116,10 @@ jobs:
       - name: 构建 Rust Desktop portable ZIP
         run: pnpm run desktop:portable
 
+      - name: 还原打包过程改写的清单
+        shell: pwsh
+        run: git checkout -- src-tauri/Cargo.toml
+
       - name: 构建 Node Agent portable ZIP
         shell: pwsh
         run: >
