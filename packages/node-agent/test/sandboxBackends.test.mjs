@@ -208,7 +208,7 @@ test('Docker sbx launch uses the remote supervisor and forwards environment expl
   assert.equal(launch.environmentMode, 'forwarded');
   assert.equal(launch.processTreeContained, false);
   assert.equal(launch.processTreeControl, 'sbx_supervised_process_group');
-  assert.deepEqual(launch.args.slice(0, 5), ['exec', '-i', '-w', dockerSbxRuntimePath(workspace), 'ctmcp-test']);
+  assert.deepEqual(launch.args.slice(0, 5), ['exec', '-i', '-w', dockerSbxRuntimePath(await realpath(workspace)), 'ctmcp-test']);
   assert.ok(launch.args.includes('A=B'));
   assert.ok(!launch.args.includes('DROP=value'));
   assert.ok(launch.args.includes('env'));

@@ -72,8 +72,16 @@ export function resolveSecretInputs(ctx: ToolContext, args: JsonObject): Resolve
   };
 }
 
+const testRunnerIpcEnv = ['NODE_CHANNEL_FD', 'NODE_CHANNEL_SERIALIZATION_MODE'];
+
+export function commandSpawnEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const copy: NodeJS.ProcessEnv = { ...environment };
+  for (const name of testRunnerIpcEnv) delete copy[name];
+  return copy;
+}
+
 export function commandEnvironment(args: JsonObject, secretEnvironment: Array<[string, string]> = []): NodeJS.ProcessEnv {
-  const environment: NodeJS.ProcessEnv = { ...process.env };
+  const environment = commandSpawnEnvironment();
   for (const name of removedEnvironment(args)) delete environment[name];
   for (const [name, value] of explicitEnvironment(args, secretEnvironment)) environment[name] = value;
   return environment;

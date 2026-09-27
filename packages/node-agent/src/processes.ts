@@ -16,7 +16,7 @@ import { nativeLaunchSpec } from './processes/nativeLaunch.js';
 import { cargoTargetLock, commandFingerprint, nodeGeneratedLock, safeAutomaticDedup } from './processes/identity.js';
 import { boundedInteger, commandTimeoutMaxMs, resolveProcessTimeout } from './processes/timeoutPolicy.js';
 import { ProcessToolError, startupToolError } from './processes/errors.js';
-import { commandEnvironment, explicitEnvironment, removedEnvironment, resolveSecretInputs } from './processes/environment.js';
+import { commandEnvironment, commandSpawnEnvironment, explicitEnvironment, removedEnvironment, resolveSecretInputs } from './processes/environment.js';
 import {
   FINALIZED_SESSION_RETENTION_MS,
   MAX_RETAINED_FINALIZED_SESSIONS,
@@ -411,7 +411,11 @@ export async function startProcess(
     const wsl = sandboxLaunch
       ? undefined
       : wslInvocationForPath(cwd, spec.program, spec.argv, explicitEnvironment(args, resolvedSecrets.environment), removedEnvironment(args));
-    const launchEnvironment = sandboxLaunch?.environmentMode === 'forwarded' || wsl ? process.env : commandEnvironment(args, resolvedSecrets.environment);
+    const launchEnvironment = commandSpawnEnvironment(
+      sandboxLaunch?.environmentMode === 'forwarded' || wsl
+        ? process.env
+        : commandEnvironment(args, resolvedSecrets.environment)
+    );
     const nativeLaunch = sandboxLaunch || wsl
       ? undefined
       : nativeLaunchSpec(spec.program, spec.argv, cwd, launchEnvironment);
@@ -853,7 +857,7 @@ export async function runBuffered(
     onStdout: (chunk: Buffer) => void;
     onStderr: (chunk: Buffer) => void;
   }>();
-  const launchEnvironment = environment ?? process.env;
+  const launchEnvironment = commandSpawnEnvironment(environment ?? process.env);
   const nativeLaunch = wsl || routing.wrappedProcess
     ? undefined
     : nativeLaunchSpec(program, args, cwd, launchEnvironment, routing.platform ?? process.platform);

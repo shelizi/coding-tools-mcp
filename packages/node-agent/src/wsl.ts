@@ -120,16 +120,27 @@ export function normalizeWorkspacePath(value: string): string {
 }
 
 /** Expand an existing Windows 8.3 path to its long path. Other paths stay path.resolve'd. */
+function stripExtendedPathPrefix(value: string): string {
+  if (value.startsWith('\\\\?\\UNC\\')) return `\\\\${value.slice(8)}`;
+  if (value.startsWith('\\\\?\\')) return value.slice(4);
+  return value;
+}
+
 export function canonicalExistingPath(value: string): string {
   const resolved = path.resolve(value);
   if (process.platform !== 'win32') return resolved;
-  try {
-    const native = realpathSync.native(resolved);
-    if (native.startsWith('\\\\?\\UNC\\')) return `\\\\${native.slice(8)}`;
-    if (native.startsWith('\\\\?\\')) return native.slice(4);
-    return native;
-  } catch {
-    return resolved;
+  const suffix: string[] = [];
+  let current = resolved;
+  while (true) {
+    try {
+      const native = stripExtendedPathPrefix(realpathSync.native(current));
+      return suffix.length ? path.win32.join(native, ...suffix) : native;
+    } catch {
+      const parent = path.win32.dirname(current);
+      if (parent === current) return resolved;
+      suffix.unshift(path.win32.basename(current));
+      current = parent;
+    }
   }
 }
 
