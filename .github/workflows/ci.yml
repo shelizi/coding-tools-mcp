@@ -1,7 +1,15 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - main
+  pull_request:
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   node-agent:
@@ -28,6 +36,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Allow the container node user to use the runner Docker socket
+        run: sudo chmod 666 /var/run/docker.sock
       - name: Run Node Agent Docker regression
         shell: bash
         run: ./scripts/test-node-agent-docker-regression.sh

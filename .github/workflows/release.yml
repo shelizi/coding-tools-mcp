@@ -1,24 +1,92 @@
 name: Desktop Release
 
+# main 上的 CI 成功後，若 v<package.json version> 還沒有安裝包，就編譯並發布。
+# 推送 v* tag 或手動指定 release_tag 仍會編譯發布。已有安裝包的 tag 會跳過，避免發布動作自己再觸發一輪。
 on:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
   push:
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "要创建或更新的 Release 标签，例如 v0.1.22"
+        description: "要创建或更新的 Release 标签，例如 v0.1.59"
         required: true
         type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
 jobs:
+  gate:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.meta.outputs.publish }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="${HEAD_SHA:-$GITHUB_SHA}"
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              tag="$INPUT_TAG"
+              if [ -z "$tag" ]; then
+                echo "release_tag is required" >&2
+                exit 1
+              fi
+              ;;
+            push)
+              tag="$GITHUB_REF_NAME"
+              ;;
+            workflow_run)
+              tag="v$(jq -r .version package.json)"
+              ;;
+            *)
+              echo "unsupported event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          publish=true
+          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            asset_count="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length' 2>/dev/null || echo missing)"
+            if [ "$asset_count" != "missing" ] && [ "$asset_count" != "0" ]; then
+              echo "Release $tag already has ${asset_count} asset(s); skip."
+              publish=false
+            fi
+          fi
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
   build-windows:
+    needs: gate
+    if: needs.gate.outputs.publish == 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
 
       - uses: pnpm/setup@v2
         with:
@@ -43,26 +111,38 @@ jobs:
         run: pnpm run version:check
 
       - name: 检查前端
+        if: github.event_name != 'workflow_run'
         run: pnpm run check
 
       - name: 运行 Rust 测试
+        if: github.event_name != 'workflow_run'
         working-directory: src-tauri
         run: cargo test
 
       - name: 仅构建 Windows NSIS 安装程序
         run: pnpm run desktop:build:nsis
 
+      - name: 整理 Windows 安装包
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item src-tauri\target\release\bundle\nsis\*.exe release-assets\
+
       - name: 上传 Windows EXE
         uses: actions/upload-artifact@v4
         with:
           name: windows-exe
-          path: src-tauri/target/release/bundle/nsis/*.exe
+          path: release-assets/
           if-no-files-found: error
 
   build-universal-macos:
+    needs: gate
+    if: needs.gate.outputs.publish == 'true'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
 
       - uses: pnpm/setup@v2
         with:
@@ -89,26 +169,35 @@ jobs:
         run: pnpm run version:check
 
       - name: 检查前端
+        if: github.event_name != 'workflow_run'
         run: pnpm run check
 
       - name: 运行 Rust 测试
+        if: github.event_name != 'workflow_run'
         working-directory: src-tauri
         run: cargo test
 
       - name: 仅构建通用版 macOS DMG
         run: pnpm run desktop:build:macos
 
+      - name: 整理 macOS DMG
+        run: |
+          mkdir -p release-assets
+          cp src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg release-assets/
+
       - name: 上传 macOS DMG
         uses: actions/upload-artifact@v4
         with:
           name: macos-dmg
-          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          path: release-assets/
           if-no-files-found: error
 
   publish-release:
     needs:
+      - gate
       - build-windows
       - build-universal-macos
+    if: needs.gate.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: 下载 Windows EXE
@@ -126,10 +215,11 @@ jobs:
       - name: 创建 Release 并上传安装包
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag || github.ref_name }}
-          name: Coding Tools MCP ${{ inputs.release_tag || github.ref_name }}
+          tag_name: ${{ needs.gate.outputs.release_tag }}
+          target_commitish: ${{ needs.gate.outputs.sha }}
+          name: Coding Tools MCP ${{ needs.gate.outputs.release_tag }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/windows/*.exe
-            dist/macos/*.dmg
+            dist/windows/**/*.exe
+            dist/macos/**/*.dmg
