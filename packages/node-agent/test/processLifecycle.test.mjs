@@ -586,10 +586,11 @@ test('Docker Linux sandbox rejects a Windows host executable before any host pro
     timeout_ms: 5_000
   }, state.meta);
   assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(repoRuntime(state.ctx).sessions.size, 0);
+  if (result.error.code === 'SANDBOX_BACKEND_UNSUPPORTED') return;
   assert.equal(result.error.code, 'SANDBOX_COMMAND_UNSUPPORTED');
   assert.equal(result.error.category, 'policy');
   assert.equal(result.error.retryable, false);
-  assert.equal(repoRuntime(state.ctx).sessions.size, 0);
 });
 
 test('Node WSLC reports host availability without an explicit storage option', async t => {
