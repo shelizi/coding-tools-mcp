@@ -72,7 +72,12 @@ export function resolveSecretInputs(ctx: ToolContext, args: JsonObject): Resolve
   };
 }
 
-const testRunnerIpcEnv = ['NODE_CHANNEL_FD', 'NODE_CHANNEL_SERIALIZATION_MODE'];
+const testRunnerIpcEnv = [
+  'NODE_CHANNEL_FD',
+  'NODE_CHANNEL_SERIALIZATION_MODE',
+  'NODE_TEST_CONTEXT',
+  'WATCH_REPORT_DEPENDENCIES',
+];
 
 export function commandSpawnEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const copy: NodeJS.ProcessEnv = { ...environment };
