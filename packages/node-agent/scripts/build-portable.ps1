@@ -181,7 +181,16 @@ if ([string]::IsNullOrWhiteSpace($NodeExecutable)) {
     $NodeExecutable = $nodeCommand.Source
 }
 $NodeExecutable = (Resolve-Path -LiteralPath $NodeExecutable).Path
-$pnpmExecutable = (Get-Command pnpm.cmd -ErrorAction Stop).Source
+$pnpmCommand = @(
+    Get-Command pnpm.cmd -ErrorAction SilentlyContinue
+    Get-Command pnpm.exe -ErrorAction SilentlyContinue
+    Get-Command pnpm.ps1 -ErrorAction SilentlyContinue
+    Get-Command pnpm -ErrorAction SilentlyContinue
+) | Where-Object { $_ } | Select-Object -First 1
+if (-not $pnpmCommand) {
+    throw 'pnpm was not found on PATH.'
+}
+$pnpmExecutable = $pnpmCommand.Source
 $cargoExecutable = (Get-Command cargo.exe -ErrorAction Stop).Source
 $protectManifest = Join-Path $repositoryRoot 'src-tauri\Cargo.toml'
 $protectTargetRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
