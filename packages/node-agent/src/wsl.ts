@@ -124,7 +124,7 @@ export function canonicalExistingPath(value: string): string {
   const resolved = path.resolve(value);
   if (process.platform !== 'win32') return resolved;
   try {
-    const native = realpathSync(resolved);
+    const native = realpathSync.native(resolved);
     if (native.startsWith('\\\\?\\UNC\\')) return `\\\\${native.slice(8)}`;
     if (native.startsWith('\\\\?\\')) return native.slice(4);
     return native;
