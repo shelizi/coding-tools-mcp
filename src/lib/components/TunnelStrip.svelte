@@ -1,6 +1,7 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { alert as message } from "$lib/api/native";
-  import { getFrpSnippet, startTunnel, stopTunnel, type TunnelStatus } from "$lib/api/tunnel";
+  import { getFrpSnippet, getTunnelStatus, startTunnel, stopTunnel, type TunnelStatus } from "$lib/api/tunnel";
   import CopyButton from "$lib/components/CopyButton.svelte";
   import { t } from "$lib/i18n";
 
@@ -26,6 +27,23 @@
 
   const running = $derived(status?.state === "running");
   const displayUrl = $derived(status?.publicUrl || publicUrl);
+  const builtin = $derived(tunnelType === "builtin");
+  const transportLabel = $derived(status?.transportMode || (builtin && running ? "Built-in WSS" : "—"));
+
+  async function refreshStatus() {
+    if (tunnelType === "none") return;
+    try {
+      status = await getTunnelStatus(workspaceId, service);
+    } catch {
+      // Keep the last known status while the runtime or management endpoint restarts.
+    }
+  }
+
+  onMount(() => {
+    void refreshStatus();
+    const timer = setInterval(() => void refreshStatus(), 2000);
+    return () => clearInterval(timer);
+  });
 
   async function toggleTunnel() {
     if (busy) return;
@@ -58,10 +76,10 @@
     <div>
       <p class="text-xs font-medium text-[var(--color-text-secondary)]">{$t("Remote tunnel")}</p>
       <p class="text-[11px] text-[var(--color-text-muted)]">
-        {tunnelType === "cloudflare" ? "Cloudflare" : tunnelType === "frp" ? "FRP" : $t("Not configured")}
+        {builtin ? $t("Built-in WSS tunnel") : tunnelType === "cloudflare" ? "Cloudflare" : tunnelType === "frp" ? "FRP" : $t("Not configured")}
       </p>
     </div>
-    {#if tunnelType === "frp" || tunnelType === "cloudflare"}
+    {#if builtin || tunnelType === "frp" || tunnelType === "cloudflare"}
       <button
         type="button"
         class="tx-btn-ghost px-2.5 py-1 text-xs disabled:opacity-50"
@@ -78,6 +96,33 @@
       <p class="truncate font-mono text-xs">{displayUrl}</p>
       <CopyButton value={displayUrl} />
     </div>
+  {/if}
+
+  {#if builtin}
+    <div class="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-[11px]">
+      <div><span class="text-[var(--color-text-muted)]">State</span><p class="font-medium">{status?.state ?? "—"}</p></div>
+      <div><span class="text-[var(--color-text-muted)]">Transport</span><p class="font-medium">{transportLabel}</p></div>
+      <div><span class="text-[var(--color-text-muted)]">Control</span><p>{status?.controlConnected == null ? "—" : status.controlConnected ? "connected" : "disconnected"}</p></div>
+      <div><span class="text-[var(--color-text-muted)]">Data connections</span><p>{status?.dataConnections ?? status?.connectedWorkers ?? "—"}{status?.maxDataConnections != null ? ` / ${status.maxDataConnections}` : status?.configuredWorkers != null ? ` / ${status.configuredWorkers}` : ""}</p></div>
+      <div><span class="text-[var(--color-text-muted)]">Streams</span><p>{status?.activeStreams ?? "—"}{status?.streamCapacity != null ? ` / ${status.streamCapacity}` : ""}</p></div>
+      <div><span class="text-[var(--color-text-muted)]">Available slots</span><p>{status?.availableStreamSlots ?? "—"}</p></div>
+      <div><span class="text-[var(--color-text-muted)]">Queue</span><p>{status?.queuedRequests ?? "—"}</p></div>
+      <div><span class="text-[var(--color-text-muted)]">Desired data</span><p>{status?.desiredDataConnections ?? "—"}</p></div>
+      <div><span class="text-[var(--color-text-muted)]">Session</span><p class="truncate font-mono" title={status?.sessionId ?? ""}>{status?.sessionId ?? "—"}</p></div>
+      <div><span class="text-[var(--color-text-muted)]">Route</span><p>{status?.routeId ?? "—"}{status?.sharedSession ? " · shared" : ""}</p></div>
+    </div>
+    <details class="mt-3 text-[11px] text-[var(--color-text-muted)]">
+      <summary class="cursor-pointer">WSS identity / endpoint</summary>
+      <div class="mt-2 grid gap-1 break-all font-mono">
+        <div>origin: {status?.serverOrigin ?? "—"}</div>
+        <div>wss: {status?.websocketUrl ?? "—"}</div>
+        <div>server: {status?.serverId ?? "—"}</div>
+        <div>device: {status?.deviceId ?? "—"}</div>
+      </div>
+    </details>
+    {#if status?.lastError}
+      <p class="mt-2 text-[11px] text-[var(--color-danger)]">{status.lastError}</p>
+    {/if}
   {/if}
 
   {#if tunnelType === "cloudflare"}

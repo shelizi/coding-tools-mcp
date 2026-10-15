@@ -1,6 +1,6 @@
 {
   "name": "coding-tools-mcp-desktop",
-  "version": "0.1.59",
+  "version": "0.1.63",
   "description": "Coding Tools MCP desktop client",
   "type": "module",
   "packageManager": "pnpm@12.0.0",
@@ -35,6 +35,9 @@
     "node-agent:portable:bundled": "pnpm --filter @coding-tools/node-agent run portable:bundled",
     "node-agent:portable:system": "pnpm --filter @coding-tools/node-agent run portable:system",
     "node-agent:portable:dev:bundled": "pnpm --filter @coding-tools/node-agent run portable:dev:bundled",
+    "node-agent:docker:switch": "bash scripts/switch-node-agent-docker.sh",
+    "node-agent:docker:switch:rollback": "bash scripts/switch-node-agent-docker.sh --rollback",
+    "node-agent:docker:status": "bash scripts/switch-node-agent-docker.sh --status",
     "start": "tauri dev",
     "ui:build:desktop": "vite build",
     "ui:build:node": "pnpm --filter @coding-tools/node-agent run build:ui",

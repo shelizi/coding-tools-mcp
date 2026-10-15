@@ -49,13 +49,87 @@ pub struct TunnelStatus {
     pub recycled_workers: Option<u64>,
     pub policy_revision: Option<u64>,
     pub last_error: Option<String>,
+    pub server_origin: Option<String>,
+    pub websocket_url: Option<String>,
+    pub server_id: Option<String>,
+    pub device_id: Option<String>,
+    pub transport_mode: Option<String>,
+    pub control_connected: Option<bool>,
+    pub shared_session: Option<bool>,
+    pub session_id: Option<String>,
+    pub route_id: Option<u32>,
+    pub stream_limit: Option<usize>,
+    pub data_connections: Option<usize>,
+    pub max_data_connections: Option<usize>,
+    pub streams_per_connection: Option<usize>,
+    pub active_streams: Option<usize>,
+    pub stream_capacity: Option<usize>,
+    pub available_stream_slots: Option<usize>,
+    pub queued_requests: Option<usize>,
+    pub desired_data_connections: Option<usize>,
+}
+
+fn basic_tunnel_status(state: &str, public_url: String, tunnel_pid: Option<u32>) -> TunnelStatus {
+    TunnelStatus {
+        state: state.into(),
+        server_origin: tunnel_origin(&public_url),
+        public_url,
+        tunnel_pid,
+        configured_workers: None,
+        connected_workers: None,
+        idle_workers: None,
+        busy_workers: None,
+        recycled_workers: None,
+        policy_revision: None,
+        last_error: None,
+        websocket_url: None,
+        server_id: None,
+        device_id: None,
+        transport_mode: None,
+        control_connected: None,
+        shared_session: None,
+        session_id: None,
+        route_id: None,
+        stream_limit: None,
+        data_connections: None,
+        max_data_connections: None,
+        streams_per_connection: None,
+        active_streams: None,
+        stream_capacity: None,
+        available_stream_slots: None,
+        queued_requests: None,
+        desired_data_connections: None,
+    }
+}
+
+fn tunnel_origin(public_url: &str) -> Option<String> {
+    let (scheme, remainder) = public_url.split_once("://")?;
+    let authority = remainder.split('/').next()?;
+    (!scheme.is_empty() && !authority.is_empty()).then(|| format!("{scheme}://{authority}"))
+}
+
+fn tunnel_websocket_url(public_url: &str) -> Option<String> {
+    let origin = tunnel_origin(public_url)?;
+    let websocket_origin = if let Some(rest) = origin.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = origin.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        return None;
+    };
+    Some(format!("{websocket_origin}/_tunnel/v1"))
+}
+
+struct BuiltinRouteSession {
+    hub_key: String,
+    client_id: String,
 }
 
 struct TunnelSession {
     public_url: String,
     pid: Option<u32>,
     child: Option<Child>,
-    builtin: Option<BuiltinTunnelHandle>,
+    builtin: Option<BuiltinRouteSession>,
 }
 
 struct FrpRoute {
@@ -70,6 +144,7 @@ struct FrpcProcess {
 
 pub struct TunnelSupervisor {
     sessions: HashMap<(String, TunnelServiceKind), TunnelSession>,
+    builtin_hubs: HashMap<String, BuiltinTunnelHandle>,
     frp_routes: HashMap<(String, TunnelServiceKind), FrpRoute>,
     frpc: HashMap<String, FrpcProcess>,
 }
@@ -85,6 +160,7 @@ impl TunnelSupervisor {
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
+            builtin_hubs: HashMap::new(),
             frp_routes: HashMap::new(),
             frpc: HashMap::new(),
         }
@@ -107,49 +183,58 @@ impl TunnelSupervisor {
     ) -> TunnelStatus {
         let key = (profile.id.clone(), kind);
         if let Some(session) = self.sessions.get(&key) {
-            if let Some(handle) = session.builtin.as_ref() {
-                let snapshot = handle.snapshot();
-                return TunnelStatus {
-                    state: snapshot.availability_state(handle.is_running()).into(),
-                    public_url: session.public_url.clone(),
-                    tunnel_pid: session.pid,
-                    configured_workers: Some(snapshot.configured_workers),
-                    connected_workers: Some(snapshot.connected_workers),
-                    idle_workers: Some(snapshot.idle_workers),
-                    busy_workers: Some(snapshot.busy_workers),
-                    recycled_workers: Some(snapshot.recycled_workers),
-                    policy_revision: Some(snapshot.policy_revision),
-                    last_error: snapshot.last_error,
-                };
+            if let Some(route) = session.builtin.as_ref() {
+                if let Some(handle) = self.builtin_hubs.get(&route.hub_key) {
+                    let snapshot = handle.snapshot();
+                    return TunnelStatus {
+                        state: snapshot.availability_state(handle.is_running()).into(),
+                        public_url: session.public_url.clone(),
+                        tunnel_pid: session.pid,
+                        configured_workers: Some(snapshot.configured_workers),
+                        connected_workers: Some(snapshot.connected_workers),
+                        idle_workers: Some(snapshot.idle_workers),
+                        busy_workers: Some(snapshot.busy_workers),
+                        recycled_workers: Some(snapshot.recycled_workers),
+                        policy_revision: Some(snapshot.policy_revision),
+                        last_error: snapshot.last_error,
+                        server_origin: tunnel_origin(&session.public_url),
+                        websocket_url: tunnel_websocket_url(&session.public_url),
+                        server_id: snapshot.server_id,
+                        device_id: snapshot.device_id,
+                        transport_mode: snapshot.transport_mode,
+                        control_connected: Some(snapshot.control_connected),
+                        shared_session: None,
+                        session_id: snapshot.session_id,
+                        route_id: snapshot.route_id,
+                        stream_limit: snapshot.stream_limit,
+                        data_connections: Some(snapshot.connected_workers),
+                        max_data_connections: Some(snapshot.configured_workers),
+                        streams_per_connection: snapshot.streams_per_connection,
+                        active_streams: Some(snapshot.active_streams),
+                        stream_capacity: snapshot
+                            .streams_per_connection
+                            .map(|streams| snapshot.connected_workers.saturating_mul(streams)),
+                        available_stream_slots: snapshot.streams_per_connection.map(|streams| {
+                            snapshot
+                                .connected_workers
+                                .saturating_mul(streams)
+                                .saturating_sub(snapshot.active_streams)
+                        }),
+                        queued_requests: Some(snapshot.queued_requests),
+                        desired_data_connections: Some(snapshot.desired_data_connections),
+                    };
+                }
             }
             if self.session_is_running(&key) {
-                return TunnelStatus {
-                    state: "running".into(),
-                    public_url: session.public_url.clone(),
-                    tunnel_pid: session.pid,
-                    configured_workers: None,
-                    connected_workers: None,
-                    idle_workers: None,
-                    busy_workers: None,
-                    recycled_workers: None,
-                    policy_revision: None,
-                    last_error: None,
-                };
+                return basic_tunnel_status("running", session.public_url.clone(), session.pid);
             }
         }
 
-        TunnelStatus {
-            state: "stopped".into(),
-            public_url: public_url_for_profile(profile, kind, settings),
-            tunnel_pid: None,
-            configured_workers: None,
-            connected_workers: None,
-            idle_workers: None,
-            busy_workers: None,
-            recycled_workers: None,
-            policy_revision: None,
-            last_error: None,
-        }
+        basic_tunnel_status(
+            "stopped",
+            public_url_for_profile(profile, kind, settings),
+            None,
+        )
     }
 
     pub fn public_url(
@@ -248,35 +333,70 @@ impl TunnelSupervisor {
                     builtin: None,
                 },
             );
-            return Ok(TunnelStatus {
-                state: "running".into(),
-                public_url,
-                tunnel_pid: pid,
-                configured_workers: None,
-                connected_workers: None,
-                idle_workers: None,
-                busy_workers: None,
-                recycled_workers: None,
-                policy_revision: None,
-                last_error: None,
-            });
+            return Ok(basic_tunnel_status("running", public_url, pid));
         }
 
         if tunnel_type == "builtin" {
-            let (handle, public_url) = match builtin::spawn_builtin_tunnel(profile, kind).await {
-                Ok(result) => result,
-                Err(error) => {
-                    self.restore_route_state(&key, previous_route.take(), previous_session.take());
-                    return Err(error);
+            let shared_hub_key = builtin::builtin_hub_key(profile, kind)?;
+            let mut hub_key = shared_hub_key.clone();
+            let public_url = if let Some(handle) = self.builtin_hubs.get(&shared_hub_key) {
+                if handle.supports_shared_routes() {
+                    match handle.add_route(profile, kind).await {
+                        Ok(public_url) => public_url,
+                        Err(error) => {
+                            self.restore_route_state(
+                                &key,
+                                previous_route.take(),
+                                previous_session.take(),
+                            );
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    let (handle, public_url) =
+                        match builtin::spawn_builtin_tunnel(profile, kind).await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                self.restore_route_state(
+                                    &key,
+                                    previous_route.take(),
+                                    previous_session.take(),
+                                );
+                                return Err(error);
+                            }
+                        };
+                    hub_key = format!(
+                        "{shared_hub_key}#{}#{}",
+                        profile.id,
+                        tunnel_service_label(kind)
+                    );
+                    self.builtin_hubs.insert(hub_key.clone(), handle);
+                    public_url
                 }
+            } else {
+                let (handle, public_url) = match builtin::spawn_builtin_tunnel(profile, kind).await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.restore_route_state(
+                            &key,
+                            previous_route.take(),
+                            previous_session.take(),
+                        );
+                        return Err(error);
+                    }
+                };
+                self.builtin_hubs.insert(hub_key.clone(), handle);
+                public_url
             };
+            let client_id = builtin::builtin_route_client_id(&public_url, kind)?;
             self.sessions.insert(
                 key,
                 TunnelSession {
                     public_url: public_url.clone(),
                     pid: None,
                     child: None,
-                    builtin: Some(handle),
+                    builtin: Some(BuiltinRouteSession { hub_key, client_id }),
                 },
             );
             return Ok(self.status(profile, kind, settings));
@@ -330,18 +450,7 @@ impl TunnelSupervisor {
             },
         );
 
-        Ok(TunnelStatus {
-            state: "running".into(),
-            public_url,
-            tunnel_pid: pid,
-            configured_workers: None,
-            connected_workers: None,
-            idle_workers: None,
-            busy_workers: None,
-            recycled_workers: None,
-            policy_revision: None,
-            last_error: None,
-        })
+        Ok(basic_tunnel_status("running", public_url, pid))
     }
 
     pub async fn stop(
@@ -387,8 +496,20 @@ impl TunnelSupervisor {
             return Ok(());
         };
 
-        if let Some(handle) = session.builtin.take() {
-            handle.stop().await;
+        if let Some(route) = session.builtin.take() {
+            let should_stop = if let Some(handle) = self.builtin_hubs.get(&route.hub_key) {
+                match handle.remove_route(&route.client_id, kind).await {
+                    Ok(remaining) => remaining == 0,
+                    Err(_) => true,
+                }
+            } else {
+                false
+            };
+            if should_stop {
+                if let Some(handle) = self.builtin_hubs.remove(&route.hub_key) {
+                    handle.stop().await;
+                }
+            }
         } else if let Some(child) = session.child.take() {
             let _ = cloudflare::stop_child(child, session.pid).await;
         } else if let Some(pid) = session.pid {
@@ -457,8 +578,20 @@ impl TunnelSupervisor {
             let Some(mut session) = self.sessions.remove(&key) else {
                 continue;
             };
-            if let Some(handle) = session.builtin.take() {
-                handle.stop().await;
+            if let Some(route) = session.builtin.take() {
+                let should_stop = if let Some(handle) = self.builtin_hubs.get(&route.hub_key) {
+                    match handle.remove_route(&route.client_id, key.1).await {
+                        Ok(remaining) => remaining == 0,
+                        Err(_) => true,
+                    }
+                } else {
+                    false
+                };
+                if should_stop {
+                    if let Some(handle) = self.builtin_hubs.remove(&route.hub_key) {
+                        handle.stop().await;
+                    }
+                }
                 continue;
             }
             let child = session.child.take().ok_or_else(|| {
@@ -772,6 +905,7 @@ impl TunnelSupervisor {
             session
                 .builtin
                 .as_ref()
+                .and_then(|route| self.builtin_hubs.get(&route.hub_key))
                 .map(BuiltinTunnelHandle::is_running)
                 .unwrap_or_else(|| {
                     session

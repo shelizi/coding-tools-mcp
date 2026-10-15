@@ -85,7 +85,7 @@ function expectedFingerprint(entries) {
   return hash.digest('hex');
 }
 
-test('start_task captures Git-visible file entries and reports a matching baseline', async () => {
+test('start_task captures only Git-visible dirty state and reports a matching v2 baseline', async () => {
   const state = await fixture({
     '.gitignore': ['node_modules/', 'target/', 'dist/', 'build/', '.svelte-kit/', '.mcp-probe-kit/'].join('\n') + '\n',
     'tracked.txt': 'initial\n',
@@ -101,9 +101,10 @@ test('start_task captures Git-visible file entries and reports a matching baseli
   assert.equal(started.ok, true);
   const entries = started.task.baseline.entries;
   assert.equal(started.task.workspace_id, await harnessWorkspaceId(state.root));
-  assert.deepEqual(entries.map(entry => entry.path), ['.gitignore', 'binary.bin', 'nested/code.ts', 'tracked.txt']);
+  assert.equal(started.task.baseline.baseline_mode, 'git_status_v2');
+  assert.deepEqual(entries.map(entry => entry.path), ['binary.bin']);
   assert.equal(entries.find(entry => entry.path === 'binary.bin').is_binary, true);
-  assert.equal(entries.find(entry => entry.path === 'tracked.txt').sha256, sha256('initial\n'));
+  assert.equal(entries.some(entry => entry.path === 'tracked.txt'), false);
   assert.equal(started.task.baseline.worktree_fingerprint, expectedFingerprint(entries));
 
   const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
@@ -112,6 +113,68 @@ test('start_task captures Git-visible file entries and reports a matching baseli
   assert.equal(status.capabilities.write.status, 'available');
   assert.equal(status.branch, started.task.baseline.branch);
   assert.equal(status.head, started.task.baseline.head);
+});
+
+test('clean Git repo uses an empty v2 task baseline', async () => {
+  const state = await fixture({ 'tracked.txt': 'initial\n' });
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Clean baseline' }, state.meta);
+  assert.equal(started.ok, true);
+  assert.equal(started.task.baseline.baseline_mode, 'git_status_v2');
+  assert.deepEqual(started.task.baseline.entries, []);
+  assert.equal(started.task.baseline.worktree_fingerprint, expectedFingerprint([]));
+  assert.match(started.task.baseline.head, /^[0-9a-f]{40}$/);
+
+  const status = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(status.baseline_matches, true);
+  assert.equal(status.writable, true);
+});
+
+test('v2 baseline preserves pre-existing staged and unstaged dirt and detects later edits to the same dirty file', async () => {
+  const state = await fixture({
+    'tracked.txt': 'tracked-before\n',
+    'staged.txt': 'staged-before\n'
+  });
+  await writeFile(path.join(state.root, 'tracked.txt'), 'tracked-dirty\n');
+  await writeFile(path.join(state.root, 'staged.txt'), 'staged-dirty\n');
+  await git(state.root, 'add', 'staged.txt');
+
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Preserve dirty baseline' }, state.meta);
+  assert.equal(started.ok, true);
+  assert.equal(started.task.baseline.baseline_mode, 'git_status_v2');
+  assert.deepEqual(started.task.baseline.entries.map(entry => entry.path), ['staged.txt', 'tracked.txt']);
+  assert.equal(started.task.baseline.entries.find(entry => entry.path === 'tracked.txt').sha256, sha256('tracked-dirty\n'));
+  assert.equal(started.task.baseline.entries.find(entry => entry.path === 'staged.txt').sha256, sha256('staged-dirty\n'));
+
+  const initialStatus = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(initialStatus.baseline_matches, true);
+  assert.equal(initialStatus.writable, true);
+
+  await writeFile(path.join(state.root, 'tracked.txt'), 'tracked-dirty-again\n');
+  const changedStatus = await callTool(state.ctx, 'harness_status', {}, state.meta);
+  assert.equal(changedStatus.baseline_matches, false);
+  assert.equal(changedStatus.writable, true);
+});
+
+test('non-Git workspace falls back to full filesystem baseline without inventing Git identity', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-harness-non-git-'));
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-harness-non-git-state-'));
+  await writeFile(path.join(root, 'plain.txt'), 'plain\n');
+  const session = meta();
+  const ctx = await createToolContext(config([{ id: 'repo', name: 'Repo', path: root }], dataDir));
+  assert.equal((await callTool(ctx, 'switch_workspace_folder', { folder_id: 'repo' }, session)).ok, true);
+
+  const started = await callTool(ctx, 'start_task', { objective: 'Non Git fallback' }, session);
+  assert.equal(started.ok, true);
+  assert.equal(started.task.baseline.baseline_mode, undefined);
+  assert.equal(started.task.baseline.branch, undefined);
+  assert.equal(started.task.baseline.head, undefined);
+  assert.deepEqual(started.task.baseline.entries.map(entry => entry.path), ['plain.txt']);
+  assert.equal(started.task.baseline.entries[0].sha256, sha256('plain\n'));
+  assert.equal(started.task.baseline.worktree_fingerprint, expectedFingerprint(started.task.baseline.entries));
+
+  const status = await callTool(ctx, 'harness_status', {}, session);
+  assert.equal(status.baseline_matches, true);
+  assert.equal(status.writable, true);
 });
 
 test('baseline follows Git ignore rules and excludes nested worktree management containers from untracked state', async () => {
@@ -134,7 +197,8 @@ test('baseline follows Git ignore rules and excludes nested worktree management 
   assert.equal(started.task.baseline.entries.some(entry => entry.path.startsWith('runtime-data/')), false);
   assert.equal(started.task.baseline.entries.some(entry => entry.path.startsWith('managed-worktrees/linked-worktree/')), false);
   assert.equal(started.task.baseline.entries.some(entry => entry.path === 'managed-worktrees/cargo-target/release/artifact.bin'), false);
-  assert.equal(started.task.baseline.entries.some(entry => entry.path === 'managed-worktrees/keep.txt'), true);
+  assert.equal(started.task.baseline.baseline_mode, 'git_status_v2');
+  assert.equal(started.task.baseline.entries.some(entry => entry.path === 'managed-worktrees/keep.txt'), false);
 
   await writeFile(path.join(state.root, 'runtime-data', 'state.json'), '{"version":2}\n');
   await writeFile(path.join(linked, 'tracked.txt'), 'linked change\n');
@@ -211,7 +275,62 @@ test('project_state computes clean from the complete file set before max_files t
   assert.equal(project.files.length, 1);
   assert.equal(project.files[0].path, 'a-clean.txt');
   assert.equal(project.files[0].status, 'unchanged');
+  assert.equal(project.files[0].sha256, sha256('clean\n'));
+  assert.equal(project.files[0].bytes, Buffer.byteLength('clean\n'));
   assert.equal(project.clean, false);
+});
+
+test('project_state keeps git_status_v2 on the dirty-only baseline path', async () => {
+  const source = await readFile(new URL('../src/taskTools.ts', import.meta.url), 'utf8');
+  const start = source.indexOf('export async function projectState');
+  const end = source.indexOf('\nfunction changeFilesLegacy', start);
+  assert.ok(start >= 0 && end > start);
+  const body = source.slice(start, end);
+  assert.match(
+    body,
+    /task\?\.baseline\.baseline_mode === 'git_status_v2'[\s\S]*?await captureTaskBaseline\(taskRoot\)[\s\S]*?: await captureBaseline\(taskRoot\)/
+  );
+  assert.match(body, /task: task \? taskResponseValue\(task\) : null/);
+});
+
+test('task lifecycle responses bound large baselines without truncating persisted state', { timeout: 60_000 }, async () => {
+  const state = await fixture();
+  const generated = path.join(state.root, 'generated');
+  await mkdir(generated, { recursive: true });
+  const entryCount = 1_000;
+  await Promise.all(Array.from({ length: entryCount }, (_, index) =>
+    writeFile(path.join(generated, `${String(index).padStart(4, '0')}.txt`), `entry-${index}\n`)
+  ));
+
+  const started = await callTool(state.ctx, 'start_task', { objective: 'Bound lifecycle response' }, state.meta);
+  assert.equal(started.ok, true);
+  assert.equal(started.task.baseline_entry_count, entryCount);
+  assert.equal(started.task.baseline_entries_truncated, true);
+  assert.equal(started.task.baseline.entries.length, 256);
+  assert.ok(Buffer.byteLength(JSON.stringify(started)) < 128 * 1024);
+  const workspaceId = await harnessWorkspaceId(state.root);
+  const persisted = state.ctx.state.taskById(workspaceId, started.task.id);
+  assert.equal(persisted.baseline.entries.length, entryCount);
+
+  const project = await callTool(state.ctx, 'project_state', { max_files: 5 }, state.meta);
+  assert.equal(project.ok, true);
+  assert.equal(project.task.baseline_entry_count, entryCount);
+  assert.equal(project.task.baseline_entries_truncated, true);
+  assert.equal(project.task.baseline.entries.length, 256);
+  assert.equal(project.files.length, 5);
+  assert.ok(Buffer.byteLength(JSON.stringify(project)) < 128 * 1024);
+
+  const finished = await callTool(state.ctx, 'finish_task', {
+    task_id: started.task.id,
+    summary: 'bounded lifecycle complete',
+    allow_unverified: true
+  }, state.meta);
+  assert.equal(finished.ok, true);
+  assert.equal(finished.task.baseline_entry_count, entryCount);
+  assert.equal(finished.task.baseline_entries_truncated, true);
+  assert.equal(finished.task.baseline.entries.length, 256);
+  assert.ok(Buffer.byteLength(JSON.stringify(finished)) < 128 * 1024);
+  assert.equal(state.ctx.state.taskById(workspaceId, started.task.id).baseline.entries.length, entryCount);
 });
 
 test('task_context enforces the public max_bytes budget', async () => {

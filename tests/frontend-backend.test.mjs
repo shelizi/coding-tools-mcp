@@ -59,7 +59,12 @@ async function importBackendRuntime() {
       compileTs(path.join(backendDir, name), path.join(tmp, "backend", name.replace(/\.ts$/, ".js"))),
     ),
   ]);
-  return import(pathToFileURL(path.join(tmp, "backend", "index.js")).href);
+  const [runtime, tauri, node] = await Promise.all([
+    import(pathToFileURL(path.join(tmp, "backend", "index.js")).href),
+    import(pathToFileURL(path.join(tmp, "backend", "tauri.js")).href),
+    import(pathToFileURL(path.join(tmp, "backend", "node.js")).href),
+  ]);
+  return { ...runtime, ...tauri, ...node };
 }
 
 function fakeDialog() {
@@ -84,7 +89,6 @@ test("desktop and node capabilities encode the product boundary", async () => {
     "actions",
     "frpManagement",
     "nativeDirectoryPicker",
-    "softwareManagement",
     "rawRuntimeLogs",
     "staticBearerAuth",
     "liveHistoryActivity",
@@ -99,7 +103,7 @@ test("desktop and node capabilities encode the product boundary", async () => {
   assert.equal(DESKTOP_CAPABILITIES.guidedSetup, true, "desktop should expose guided setup");
   assert.equal(NODE_CAPABILITIES.guidedSetup, true, "node should expose guided setup");
 
-  for (const flag of ["agentRestart", "directoryBrowser", "operationLogs", "openNativePath", "workspaceLifecycle", "workspaceFeatureControls"]) {
+  for (const flag of ["agentRestart", "directoryBrowser", "operationLogs", "openNativePath", "workspaceLifecycle", "workspaceFeatureControls", "softwareManagement"]) {
     assert.equal(NODE_CAPABILITIES[flag], true, `node should expose ${flag}`);
   }
   for (const flag of ["agentRestart", "directoryBrowser", "operationLogs"]) {
@@ -107,6 +111,7 @@ test("desktop and node capabilities encode the product boundary", async () => {
   }
   assert.equal(DESKTOP_CAPABILITIES.workspaceFeatureControls, true, "desktop should expose shared workspace feature controls");
   assert.equal(NODE_CAPABILITIES.workspaceFeatureControls, true, "node should expose shared workspace feature controls");
+  assert.equal(DESKTOP_CAPABILITIES.softwareManagement, true, "desktop should expose software management");
 });
 
 test("TauriBackend workspaces and telemetry go through injected invoke", async () => {
@@ -326,11 +331,6 @@ test("NodeBackend keeps desktop-only product features behind CapabilityError", a
     },
   });
 
-  await assert.rejects(() => backend.software.list(), (error) => {
-    assert.equal(error instanceof CapabilityError, true);
-    assert.equal(error.capability, "softwareManagement");
-    return true;
-  });
   await assert.rejects(() => backend.workspaces.startRuntime("ws"), (error) => {
     assert.equal(error.capability, "runtimeSupervisor");
     return true;
@@ -343,6 +343,29 @@ test("NodeBackend keeps desktop-only product features behind CapabilityError", a
     assert.equal(error.capability, "actions");
     return true;
   });
+});
+
+test("NodeBackend software management uses management routes", async () => {
+  const { createNodeBackend } = await importBackendRuntime();
+  const calls = [];
+  const backend = createNodeBackend({
+    request: async (route, init) => {
+      calls.push({ route, method: init?.method ?? "GET", body: init?.body });
+      if (route === "/admin/api/software") return [{ kind: "rg", group: "search" }];
+      if (route === "/admin/api/software/download-config") {
+        return { githubMirror: "", proxyMode: "system", proxyUrl: "" };
+      }
+      return { kind: "rg", installed: true };
+    },
+  });
+
+  assert.deepEqual(await backend.software.list(), [{ kind: "rg", group: "search" }]);
+  await backend.software.install("rg");
+  await backend.software.getDownloadConfig();
+  assert.equal(calls[0].route, "/admin/api/software");
+  assert.equal(calls[1].route, "/admin/api/software/install");
+  assert.equal(calls[1].method, "POST");
+  assert.equal(calls[2].route, "/admin/api/software/download-config");
 });
 
 test("NodeBackend creates workspaces and opens folders through management routes", async () => {
@@ -602,6 +625,9 @@ test("app bootstrap installs the desktop backend before UI code runs", async () 
   assert.match(layoutSvelte, /pickDirectory\(/);
   assert.match(layoutSvelte, /capabilities\.frpManagement/);
   assert.match(layoutSvelte, /capabilities\.softwareManagement/);
+  const softwarePage = await readFile(path.join(srcDir, "routes", "settings", "software", "+page.svelte"), "utf8");
+  assert.match(softwarePage, /item\.group === "search"/);
+  assert.match(softwarePage, /capabilities\.host === "node"/);
   assert.match(layoutSvelte, /goto\(appUrl\(`\/workspace\/\$\{/);
   assert.match(folderManager, /capabilities\.wslFolders/);
   assert.match(folderManager, /pickDirectory\(/);
@@ -634,4 +660,46 @@ test("appUrl prefixes SvelteKit paths.base so Node /ui/ navigations stay in the 
   assert.equal(withoutAppBase("/ui", "/ui"), "/");
   assert.equal(appUrl("/workspace/abc"), "/ui/workspace/abc");
   assert.equal(routePath("/ui/workspace/abc"), "/workspace/abc");
+});
+
+test("both backends forward statistics options and retain bounded bucket results", async () => {
+  const { createTauriBackend, createNodeBackend } = await importBackendRuntime();
+  const statistics = { period: "day", interval_ms: 86_400_000, start_ts_ms: 0, until_ts_ms: 100,
+    buckets: [{ started_ts_ms: 0, calls: 3, errors: 1 }] };
+  const calls = [];
+  const desktop = createTauriBackend({ dialog: fakeDialog(), invoke: async (cmd, args) => {
+    calls.push({ cmd, args });
+    return { statistics };
+  } });
+  const options = { statisticsPeriod: "day", statisticsUntilTsMs: 100, sinceTsMs: 1 };
+  assert.deepEqual((await desktop.telemetry.query("stats", options)).statistics, statistics);
+  assert.equal(calls[0].args.statisticsPeriod, "day");
+  assert.equal(calls[0].args.statisticsUntilTsMs, 100);
+  const controller = new AbortController();
+  const node = createNodeBackend({ request: async (route, init, signal) => {
+    const query = new URL(route, "http://localhost").searchParams;
+    assert.equal(query.get("statisticsPeriod"), "day");
+    assert.equal(query.get("statisticsUntilTsMs"), "100");
+    assert.equal(query.get("sinceTsMs"), "1");
+    assert.equal(signal, controller.signal);
+    return { statistics };
+  } });
+  assert.deepEqual((await node.telemetry.query("stats", options, controller.signal)).statistics, statistics);
+});
+
+test("workspace statistics are lazy, bounded and guarded against stale results", async () => {
+  const [page, viewer] = await Promise.all([
+    readFile(path.join(srcDir, "routes/workspace/[id]/+page.svelte"), "utf8"),
+    readFile(path.join(srcDir, "lib/components/StatisticsViewer.svelte"), "utf8"),
+  ]);
+  assert.match(page, /value: "statistics", label: \$t\("Statistics"\)/);
+  assert.match(page, /import\("\$lib\/components\/StatisticsViewer\.svelte"\)/);
+  assert.match(page, /activeWorkspaceTab === "statistics"/);
+  assert.match(viewer, /value="minute"/);
+  assert.match(viewer, /value="hour"/);
+  assert.match(viewer, /value="day"/);
+  assert.match(viewer, /limit: 200, statisticsPeriod: selectedPeriod/);
+  assert.match(viewer, /if \(!active\) return/);
+  assert.match(viewer, /controller\.abort\(\)/);
+  assert.doesNotMatch(viewer, /JSON\.stringify\(record|command_preview/);
 });

@@ -182,6 +182,8 @@ pub struct SandboxConfig {
 pub struct SecurityPolicy {
     #[serde(default = "default_true")]
     pub restrict_tool_catalog: bool,
+    #[serde(default)]
+    pub advertise_read_only_annotations: bool,
     #[serde(default = "default_true")]
     pub enforce_command_allowlist: bool,
     #[serde(default = "default_true")]
@@ -220,6 +222,7 @@ impl Default for SecurityPolicy {
     fn default() -> Self {
         Self {
             restrict_tool_catalog: true,
+            advertise_read_only_annotations: false,
             enforce_command_allowlist: true,
             require_dangerous_confirmation: true,
             require_shell_confirmation: true,
@@ -244,6 +247,7 @@ impl SecurityPolicy {
     pub fn legacy(permission_mode: &str, tool_profile: &str) -> Self {
         Self {
             restrict_tool_catalog: !matches!(tool_profile, "advanced" | "compat-readonly-all"),
+            advertise_read_only_annotations: tool_profile == "compat-readonly-all",
             require_dangerous_confirmation: permission_mode != "dangerous",
             require_shell_confirmation: permission_mode != "dangerous",
             require_write_confirmation: permission_mode != "dangerous",
@@ -268,6 +272,8 @@ impl SecurityPolicy {
     pub fn compatibility_tool_profile(&self) -> &'static str {
         if self.restrict_tool_catalog {
             "trusted-core"
+        } else if self.advertise_read_only_annotations {
+            "compat-readonly-all"
         } else {
             "advanced"
         }
@@ -288,7 +294,7 @@ pub struct RuntimeConfig {
     pub transport_mode: String,
     #[serde(default = "default_tool_profile")]
     pub tool_profile: String,
-    #[serde(default = "default_permission_mode")]
+    #[serde(default = "legacy_permission_mode")]
     pub permission_mode: String,
     #[serde(default)]
     pub security_policy: Option<SecurityPolicy>,
@@ -339,7 +345,7 @@ pub struct ActionsConfig {
     pub local_port: u16,
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
-    #[serde(default = "default_permission_mode")]
+    #[serde(default = "legacy_permission_mode")]
     pub permission_mode: String,
     #[serde(default)]
     pub runtime_command: String,
@@ -366,6 +372,7 @@ pub struct RuntimeStatusDto {
     pub public_message: String,
     pub local_endpoint: String,
     pub public_endpoint: String,
+    pub last_activity_at_ms: Option<u64>,
 }
 
 fn legacy_tunnel_type() -> String {
@@ -477,6 +484,12 @@ fn default_tool_profile() -> String {
 }
 
 fn default_permission_mode() -> String {
+    "safe".to_string()
+}
+
+/// Keep deserializing older profiles without an explicit mode compatible.
+/// New profiles use `default_permission_mode` through their `Default` impl.
+fn legacy_permission_mode() -> String {
     "trusted".to_string()
 }
 
@@ -979,6 +992,22 @@ mod tests {
     use crate::workspace::ExecutionTarget;
 
     #[test]
+    fn read_only_annotation_advertising_selects_compat_profile() {
+        let mut policy = SecurityPolicy::legacy("trusted", "compat-readonly-all");
+        assert!(!policy.restrict_tool_catalog);
+        assert!(policy.advertise_read_only_annotations);
+        assert_eq!(policy.compatibility_tool_profile(), "compat-readonly-all");
+
+        policy.advertise_read_only_annotations = false;
+        assert_eq!(policy.compatibility_tool_profile(), "advanced");
+
+        policy.advertise_read_only_annotations = true;
+        policy.restrict_tool_catalog = true;
+        assert_eq!(policy.compatibility_tool_profile(), "trusted-core");
+        assert!(!SecurityPolicy::legacy("trusted", "advanced").advertise_read_only_annotations);
+    }
+
+    #[test]
     fn legacy_wsl_folder_is_upgraded_without_schema_breakage() {
         let mut folder: WorkspaceFolder = serde_json::from_value(serde_json::json!({
             "id": "legacy-wsl",
@@ -1034,6 +1063,15 @@ mod tests {
         assert!(!profile.actions.use_proxy);
         assert_eq!(profile.tunnel.frp_server_port, 443);
         assert_eq!(profile.actions.frp_server_port, 443);
+        assert_eq!(profile.runtime.permission_mode, "safe");
+        assert_eq!(profile.actions.permission_mode, "safe");
+        assert!(
+            SecurityPolicy::legacy(
+                &profile.runtime.permission_mode,
+                &profile.runtime.tool_profile
+            )
+            .block_network_commands
+        );
     }
 
     #[test]

@@ -51,7 +51,7 @@
   const capabilities = getBackend().capabilities;
   const isNodeHost = capabilities.host === "node";
   const frpAvailable = capabilities.frpManagement && capabilities.softwareManagement;
-  const cloudflareAvailable = capabilities.softwareManagement;
+  const cloudflareAvailable = capabilities.softwareManagement && capabilities.host === "desktop";
 
   const steps: Array<{ value: WizardStep; label: "Tunnel" | "Project" | "Connection" | "Enable" | "Finish" }> = [
     { value: "provider", label: "Tunnel" },

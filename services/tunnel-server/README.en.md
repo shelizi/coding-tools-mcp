@@ -57,7 +57,7 @@ Admin WebUI manages independent MCP / Actions startup, idle, maximum, pending qu
 
 Public requests now have two separate deadlines:
 
-1. **Worker acquisition**: the pending queue has a real policy limit. A full queue or expired acquisition deadline returns `503 Service Unavailable`, `Retry-After: 1`, and `X-Tunnel-Error` (`worker_capacity_exhausted` or `worker_acquire_timeout`).
+1. **Worker acquisition**: the dispatcher pending queue has a real policy limit. When it is full, ingress applies backpressure and waits for a queue slot within the same worker-acquire deadline instead of rejecting immediately. Only an expired acquisition deadline returns `503 Service Unavailable`, `Retry-After: 1`, and `X-Tunnel-Error: worker_acquire_timeout`.
 2. **Response head**: timing begins only after a worker accepts the job. Only this stage can return `504 Gateway Timeout`.
 
 The server attaches a short-lived demand hint to `request_head`, allowing the desktop to add several workers at once. Connecting workers count as expected capacity only during grace; afterwards they stop suppressing fresh capacity but are not killed merely because the network is slow. After a burst, scale-down occurs in fixed steps and temporarily retains a warm floor to avoid repeated `4 → 16 → 4` oscillation.

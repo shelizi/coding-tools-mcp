@@ -2,7 +2,7 @@
 
 **Status:** Complete
 
-**Baseline:** Rust/Desktop Client `0.1.59` · Node Agent `0.29.35` · client compatibility `0.1.59`
+**Baseline:** Rust/Desktop Client `0.1.61` 繚 Node Agent `0.29.46` 繚 client compatibility `0.1.61`
 
 This checklist tracks shared Management UI capabilities that should remain synchronized with the Rust Desktop console while preserving the pure Node Agent product boundary. It does not require visual identity or desktop-only process management.
 
@@ -23,7 +23,7 @@ The following remain intentional exclusions rather than Node UI defects:
 
 Workspace **config** sharing across Desktop and Node is planned separately: [shared-workspace-config](../shared-workspace-config/README.md). Do not treat host-specific documents or `node-map.ts` overlays as UI parity defects.
 
-## UI-001 — Telemetry browser
+## UI-001 ??Telemetry browser
 
 Rust evidence: `src/lib/components/TelemetryViewer.svelte`
 
@@ -36,7 +36,7 @@ Node evidence: `packages/node-agent/src/managementObservability.ts`, `src/lib/co
 - [x] Show expandable sanitized recent records without raw arguments, commands, paths, session IDs, or runtime IDs.
 - [x] Keep telemetry access behind loopback, admin-token, and same-origin Management controls.
 
-## UI-002 — History archive browser
+## UI-002 ??History archive browser
 
 Rust evidence: `src/lib/components/HistoryViewer.svelte`
 
@@ -51,7 +51,7 @@ Node evidence: `packages/node-agent/src/historyStorage.ts`, `packages/node-agent
 - [x] Redact the stable history session key from list, detail, and raw Markdown responses.
 - [x] Keep archive access read-only and omit the intentionally excluded live activity badges.
 
-## UI-003 — Active MCP health diagnostics
+## UI-003 ??Active MCP health diagnostics
 
 Rust evidence: `src/lib/components/HealthPanel.svelte`
 
@@ -63,7 +63,7 @@ Node evidence: `packages/node-agent/src/managementObservability.ts`, `src/lib/co
 - [x] Report OAuth configuration and optional Built-in WSS runtime state.
 - [x] Provide actionable failure hints without fetching an arbitrary public URL.
 
-## UI-004 — Dashboard contract completion
+## UI-004 ??Dashboard contract completion
 
 Rust evidence: `src/routes/workspace/[id]/+page.svelte`
 
@@ -75,7 +75,7 @@ Node evidence: `packages/node-agent/src/dashboard.ts`, `src/routes/workspace/[id
 - [x] Preserve bounded summaries without exposing command, output, environment, or operation payloads.
 - [x] Expose the six Workspace sections as ARIA tabs with Arrow Left/Right and Home/End keyboard navigation.
 
-## UI-005 — Fine-grained policy management
+## UI-005 ??Fine-grained policy management
 
 Rust evidence: `src/routes/workspace/[id]/+page.svelte`
 
@@ -90,7 +90,7 @@ Node evidence: `packages/node-agent/src/config.ts`, `packages/node-agent/src/man
 - [x] Configure Rust MCP security protections independently with per-item checkboxes and preserve legacy mode/profile compatibility fields.
 - [x] Preserve policy, global limits, and sandbox settings when Quick Setup changes tunnel or OAuth settings.
 
-## UI-006 — Sanitized diagnostics export
+## UI-006 ??Sanitized diagnostics export
 
 Rust evidence: `src/lib/components/TelemetryViewer.svelte`, `src/lib/components/HealthPanel.svelte`
 
@@ -100,7 +100,7 @@ Node evidence: `packages/node-agent/src/managementObservability.ts`, `src/routes
 - [x] Exclude secrets, configured paths, public endpoints, raw commands, raw arguments, process output, and private runtime/session identifiers.
 - [x] Keep export generation within the protected Management API and download it client-side.
 
-## UI-007 — Structured operation log browser
+## UI-007 ??Structured operation log browser
 
 Rust evidence: `src-tauri/src/harness/model.rs`, `src-tauri/src/harness/store.rs`, `src-tauri/src/harness/tools.rs`, `src-tauri/src/tools/dispatch.rs`, `src-tauri/src/tools/session.rs`
 

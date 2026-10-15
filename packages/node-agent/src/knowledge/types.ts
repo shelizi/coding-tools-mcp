@@ -80,6 +80,8 @@ export interface ExperienceObservation {
   operationId?: string;
   taskId?: string;
   conversationContextId?: string;
+  taskIdHash?: string;
+  conversationContextIdHash?: string;
   skill?: {
     source: string;
     name: string;
@@ -87,6 +89,7 @@ export interface ExperienceObservation {
     generation: number;
   };
   runtimeBootId?: string;
+  runtimeBootIdHash?: string;
   taskOutcome?: TaskOutcome;
   canary?: {
     knowledgeId: string;

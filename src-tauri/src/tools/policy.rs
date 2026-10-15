@@ -263,13 +263,14 @@ fn validate_format_path(path: &str, enforce_workspace_boundary: bool) -> Result<
 
 impl Default for PolicySettings {
     fn default() -> Self {
+        let security_policy = SecurityPolicy::legacy("safe", "core");
         Self {
             allowed_commands: default_allowed_command_set(),
             workspace_local_entries: true,
             workspace_script_extensions: default_workspace_script_extension_set(),
             max_patch_bytes: 200_000,
-            permission_mode: "trusted".into(),
-            security_policy: SecurityPolicy::default(),
+            permission_mode: "safe".into(),
+            security_policy,
             explicit_security_policy: false,
             sandbox_enabled: false,
         }

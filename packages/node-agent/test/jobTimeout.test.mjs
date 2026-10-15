@@ -66,3 +66,46 @@ test('operation summaries retain fixed timeout contract metadata without raw com
   assert.equal(Object.hasOwn(summary, 'command'), false);
   assert.equal(Object.hasOwn(summary, 'stdout'), false);
 });
+
+test('operation summaries retain wait observation metadata without raw process output', () => {
+  const summary = operationResultSummary('wait_command', {
+    ok: true,
+    request_timed_out: true,
+    observation_timed_out: true,
+    observation_state: 'working',
+    transport_safe_wait_ms: 8_000,
+    stdout: 'raw build output'
+  });
+  assert.equal(summary.request_timed_out, true);
+  assert.equal(summary.observation_timed_out, true);
+  assert.equal(summary.observation_state, 'working');
+  assert.equal(summary.transport_safe_wait_ms, 8_000);
+  assert.equal(Object.hasOwn(summary, 'stdout'), false);
+});
+
+test('operation summaries retain safe audit references and git provenance without raw output', () => {
+  const summary = operationResultSummary('git_commit', {
+    ok: true,
+    commit: 'a'.repeat(40),
+    previous_head: 'b'.repeat(40),
+    actual_head_after: 'a'.repeat(40),
+    output_refs: {
+      stdout: 'output://session-123/stdout',
+      stderr: 'output://session-123/stderr',
+      extra: 'output://session-123/private'
+    },
+    stdout: 'raw secret output',
+    stderr: 'raw secret error',
+    command: 'git commit -m secret'
+  });
+  assert.equal(summary.commit, 'a'.repeat(40));
+  assert.equal(summary.previous_head, 'b'.repeat(40));
+  assert.equal(summary.actual_head_after, 'a'.repeat(40));
+  assert.deepEqual(summary.output_refs, {
+    stdout: 'output://session-123/stdout',
+    stderr: 'output://session-123/stderr'
+  });
+  assert.equal(Object.hasOwn(summary, 'stdout'), false);
+  assert.equal(Object.hasOwn(summary, 'stderr'), false);
+  assert.equal(Object.hasOwn(summary, 'command'), false);
+});

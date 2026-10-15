@@ -51,6 +51,7 @@ interface NodeTelemetryPayload {
   invalid_complete_lines?: number;
   records?: TelemetryResult["records"];
   aggregate?: TelemetryResult["aggregate"];
+  statistics?: TelemetryResult["statistics"];
   performance?: TelemetryResult["performance"];
   warnings?: string[];
 }
@@ -176,6 +177,24 @@ function mapTunnelStatus(status: Partial<TunnelStatus> | null | undefined): Tunn
     recycledWorkers: status?.recycledWorkers ?? null,
     policyRevision: status?.policyRevision ?? null,
     lastError: status?.lastError ?? null,
+    serverOrigin: status?.serverOrigin ?? null,
+    websocketUrl: status?.websocketUrl ?? null,
+    serverId: status?.serverId ?? null,
+    deviceId: status?.deviceId ?? null,
+    transportMode: status?.transportMode ?? null,
+    controlConnected: status?.controlConnected ?? null,
+    sharedSession: status?.sharedSession ?? null,
+    sessionId: status?.sessionId ?? null,
+    routeId: status?.routeId ?? null,
+    streamLimit: status?.streamLimit ?? null,
+    dataConnections: status?.dataConnections ?? null,
+    maxDataConnections: status?.maxDataConnections ?? null,
+    streamsPerConnection: status?.streamsPerConnection ?? null,
+    activeStreams: status?.activeStreams ?? null,
+    streamCapacity: status?.streamCapacity ?? null,
+    availableStreamSlots: status?.availableStreamSlots ?? null,
+    queuedRequests: status?.queuedRequests ?? null,
+    desiredDataConnections: status?.desiredDataConnections ?? null,
   };
 }
 
@@ -193,6 +212,7 @@ function mapTelemetry(workspaceId: string, payload: NodeTelemetryPayload): Telem
     invalid_complete_lines: payload.invalid_complete_lines ?? 0,
     records: payload.records ?? [],
     aggregate: payload.aggregate ?? null,
+    statistics: payload.statistics ?? null,
     performance: payload.performance ?? null,
     warnings: payload.warnings ?? [],
   };
@@ -365,7 +385,18 @@ export function createNodeBackend(deps: NodeBackendDeps = {}): FrontendBackend {
       stopRuntime: notSupported("runtimeSupervisor"),
       async getRuntimeStatus(id) {
         const saved = await savedConfig(id);
-        return runtimeStatusFromConfig(saved);
+        const status = runtimeStatusFromConfig(saved);
+        try {
+          const payload = await request<{
+            workspaces?: Array<{ id?: string; lastMcpAccessAtMs?: number | null }>;
+          }>("/admin/api/status");
+          const entry = (payload.workspaces ?? []).find((item) => item.id === id);
+          status.lastActivityAtMs =
+            typeof entry?.lastMcpAccessAtMs === "number" ? entry.lastMcpAccessAtMs : null;
+        } catch {
+          status.lastActivityAtMs = null;
+        }
+        return status;
       },
       startActionsRuntime: notSupported("actions"),
       stopActionsRuntime: notSupported("actions"),
@@ -396,6 +427,9 @@ export function createNodeBackend(deps: NodeBackendDeps = {}): FrontendBackend {
           minDurationMs: String(options.minDurationMs ?? 0),
           sortBy: options.sortBy ?? "calls",
         });
+        if (options.sinceTsMs !== undefined) query.set("sinceTsMs", String(options.sinceTsMs));
+        if (options.statisticsPeriod) query.set("statisticsPeriod", options.statisticsPeriod);
+        if (options.statisticsUntilTsMs !== undefined) query.set("statisticsUntilTsMs", String(options.statisticsUntilTsMs));
         const payload = await request<NodeTelemetryPayload>(
           `${workspaceRoute(workspaceId, "telemetry")}?${query}`,
           {},
@@ -476,15 +510,31 @@ export function createNodeBackend(deps: NodeBackendDeps = {}): FrontendBackend {
     },
 
     software: {
-      list: notSupported("softwareManagement"),
-      install: notSupported("softwareManagement"),
-      uninstall: notSupported("softwareManagement"),
-      getDownloadConfig: notSupported("softwareManagement"),
-      setDownloadConfig: notSupported("softwareManagement"),
+      list: () => request("/admin/api/software"),
+      install: (kind) =>
+        request("/admin/api/software/install", {
+          method: "POST",
+          body: JSON.stringify({ kind }),
+        }),
+      uninstall: (kind) =>
+        request("/admin/api/software/uninstall", {
+          method: "POST",
+          body: JSON.stringify({ kind }),
+        }),
+      getDownloadConfig: () => request("/admin/api/software/download-config"),
+      setDownloadConfig: (config) =>
+        request("/admin/api/software/download-config", {
+          method: "PUT",
+          body: JSON.stringify(config),
+        }),
     },
 
     tunnel: {
       getFrpSnippet: notSupported("frpManagement"),
+      async status(id, service) {
+        assertMcpTunnel(service);
+        return mapTunnelStatus(await request<TunnelStatus>(workspaceRoute(id, "tunnel/status")));
+      },
       async start(id, service) {
         assertMcpTunnel(service);
         return mapTunnelStatus(

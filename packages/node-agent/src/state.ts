@@ -10,8 +10,8 @@ import type {
   TaskRecord
 } from './state/contract.js';
 
-function writable(status: TaskRecord['status']): boolean {
-  return ['active', 'paused', 'verifying', 'failed'].includes(status);
+function occupiesCurrentTaskSlot(status: TaskRecord['status']): boolean {
+  return ['active', 'verifying', 'failed'].includes(status);
 }
 
 function operationFromUnknown(value: unknown): OperationRecord | undefined {
@@ -86,7 +86,7 @@ export class StateStore implements StateStoreContract {
       for (const [scopeId, taskId] of Object.entries(this.#state.currentTasks)) {
         const task = this.#state.tasks[taskId];
         const taskScopeId = task?.scope_id ?? task?.workspace_id;
-        if (!task || taskScopeId !== scopeId || !writable(task.status)) delete this.#state.currentTasks[scopeId];
+        if (!task || taskScopeId !== scopeId || !occupiesCurrentTaskSlot(task.status)) delete this.#state.currentTasks[scopeId];
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -166,7 +166,7 @@ export class StateStore implements StateStoreContract {
   async setTask(scopeId: string, task: TaskRecord, event?: TaskEvent): Promise<void> {
     this.#state.tasks[task.id] = task;
     const activeScopeId = task.scope_id ?? scopeId;
-    if (writable(task.status)) this.#state.currentTasks[activeScopeId] = task.id;
+    if (occupiesCurrentTaskSlot(task.status)) this.#state.currentTasks[activeScopeId] = task.id;
     else if (this.#state.currentTasks[activeScopeId] === task.id) delete this.#state.currentTasks[activeScopeId];
     if (event) this.pushTaskEvent(event);
     await this.save();
@@ -176,7 +176,7 @@ export class StateStore implements StateStoreContract {
     this.#state.tasks[task.id] = task;
     this.#state.changeSets[change.id] = change;
     const activeScopeId = task.scope_id ?? scopeId;
-    if (writable(task.status)) this.#state.currentTasks[activeScopeId] = task.id;
+    if (occupiesCurrentTaskSlot(task.status)) this.#state.currentTasks[activeScopeId] = task.id;
     else if (this.#state.currentTasks[activeScopeId] === task.id) delete this.#state.currentTasks[activeScopeId];
     this.pushTaskEvent(event);
     await this.save();

@@ -1,5 +1,7 @@
 import type { JsonObject } from '../types.js';
-import { ExperienceCompiler } from './compiler.js';
+import { createHash } from 'node:crypto';
+import { ExperienceCompiler, EXPERIENCE_COMPILER_REVISION } from './compiler.js';
+import { ExperienceLedger, experienceLedgerRecordToObservation, type ExperienceLedgerState } from './ledger.js';
 import {
   CanaryImpactStore,
   CanaryStrategyEngine,
@@ -25,6 +27,8 @@ const TELEMETRY_FEATURES = [
   'scanned_files',
   'scan_excluded_worktree_container_count',
   'returned_count',
+  'knowledge_shadow_equivalence_implementation',
+  'knowledge_shadow_equivalence_passed',
   'phase_baseline_capture_ms',
   'phase_baseline_refresh_ms',
   'phase_harness_begin_ms',
@@ -39,8 +43,25 @@ const TELEMETRY_FEATURES = [
   'graph_yield_ms',
   'graph_wait_ms',
   'parallel_conflict',
-  'parallel_serialized'
+  'parallel_serialized',
+  'caller_intent_calculate_total_explicit',
+  'caller_intent_calculate_total',
+  'caller_intent_count_only',
+  'caller_intent_patch_bytes',
+  'caller_intent_patch_file_count',
+  'caller_intent_patch_hunk_count',
+  'caller_intent_wait_timeout_ms',
+  'caller_intent_wait_until',
+  'caller_intent_wait_timeout_explicit',
+  'wait_timed_out',
+  'process_completed',
+  'event_count',
+  'error_recommended_tool'
 ] as const;
+
+export const EXPERIENCE_NORMALIZER_REVISION = createHash('sha256')
+  .update(`experience-normalizer-v1\n${TELEMETRY_FEATURES.join(',')}`)
+  .digest('hex');
 
 function finiteNumber(value: unknown): number | undefined {
   const parsed = Number(value);
@@ -82,8 +103,7 @@ export function toolUsageRecordToObservation(
   const recoveryOutcome = record.recovery_attempt === true
     ? record.recovery_succeeded === true ? 'passed' : 'failed'
     : undefined;
-  const recordCanary = record.exact_total_forced_full_scan === true
-    && typeof record.knowledge_canary_id === 'string'
+  const recordCanary = typeof record.knowledge_canary_id === 'string'
     && typeof record.knowledge_canary_implementation === 'string'
     && record.knowledge_canary_eligible === true
     ? {
@@ -168,6 +188,7 @@ export class KnowledgeIngestor {
   private lastError: string | undefined;
   private readonly shadowEvaluator: ShadowEvaluator;
   private readonly validationGate: ValidationGate;
+  private readonly ledger: ExperienceLedger;
 
   constructor(
     private readonly store: KnowledgeStore,
@@ -182,6 +203,10 @@ export class KnowledgeIngestor {
   ) {
     this.shadowEvaluator = new ShadowEvaluator(store, impactStore);
     this.validationGate = new ValidationGate(store, impactStore);
+    this.ledger = new ExperienceLedger(store.rootDir, {
+      compilerRevision: EXPERIENCE_COMPILER_REVISION,
+      normalizerRevision: EXPERIENCE_NORMALIZER_REVISION
+    });
   }
 
   enqueueToolUsage(record: JsonObject, attribution: ExperienceAttribution = {}): void {
@@ -196,6 +221,67 @@ export class KnowledgeIngestor {
     }
     this.queue.push(observation);
     this.startDrain();
+  }
+
+  async backfillToolUsage(records: readonly JsonObject[]): Promise<{
+    sourceEventsSeen: number;
+    ledgerEventsAdded: number;
+    sourceEventsDeduped: number;
+    invalidEvents: number;
+  }> {
+    const observations: ExperienceObservation[] = [];
+    let invalidEvents = 0;
+    for (const record of records) {
+      const observation = toolUsageRecordToObservation(record, this.workspaceId);
+      if (!observation) {
+        invalidEvents += 1;
+        continue;
+      }
+      observations.push(observation);
+    }
+    const appended = await this.ledger.append(observations);
+    return {
+      sourceEventsSeen: records.length,
+      ledgerEventsAdded: appended.added,
+      sourceEventsDeduped: appended.deduped,
+      invalidEvents: invalidEvents + appended.invalid
+    };
+  }
+
+  async finalizeHistoricalReplay(args: { sourceRevision?: string; replayComplete: boolean }): Promise<{
+    materializedEvents: number;
+    materializedRecords: number;
+    ignoredEvents: number;
+  }> {
+    const pending = await this.ledger.pendingMaterialization();
+    let materializedRecords = 0;
+    let ignoredEvents = 0;
+    let updatedAtMs = 0;
+    for (const ledgerRecord of pending) {
+      const observation = experienceLedgerRecordToObservation(ledgerRecord);
+      const records = this.compiler.compile([observation]);
+      if (!records.length) ignoredEvents += 1;
+      for (const record of records) {
+        await this.store.upsert(record);
+        materializedRecords += 1;
+      }
+      updatedAtMs = Math.max(updatedAtMs, observation.timestampMs);
+    }
+    if (pending.length) {
+      await this.ledger.advanceMaterialized(ignoredEvents, pending.length);
+      this.shadowActivated += await this.shadowEvaluator.activateCandidates(updatedAtMs || Date.now());
+      if (this.toolEvolutionPlanner) {
+        const proposalSync = await this.toolEvolutionPlanner.sync(updatedAtMs || Date.now());
+        this.toolEvolutionProposalsPlanned += proposalSync.planned;
+        this.toolEvolutionProposalsSuperseded += proposalSync.superseded;
+      }
+    }
+    await this.ledger.markReplay(args.sourceRevision, args.replayComplete);
+    return { materializedEvents: pending.length, materializedRecords, ignoredEvents };
+  }
+
+  durableSnapshot(): Promise<ExperienceLedgerState> {
+    return this.ledger.snapshot();
   }
 
   snapshot(): KnowledgeIngestionSnapshot {
@@ -246,6 +332,7 @@ export class KnowledgeIngestor {
       this.processed += batch.length;
       try {
         const recordsBeforeBatch = await this.store.list();
+        const ledgerAppend = await this.ledger.append(batch);
         const shadow = await this.shadowEvaluator.evaluate(batch, recordsBeforeBatch);
         this.shadowConsidered += shadow.considered;
         this.shadowMatched += shadow.matched;
@@ -305,6 +392,7 @@ export class KnowledgeIngestor {
           this.canaryPromoted += toolPromotion.promoted + skillPromotion.promoted;
           if (toolRollback.rolledBack > 0 || toolPromotion.promoted > 0) await this.canary.strategyEngine.refresh();
         }
+        if (ledgerAppend.added > 0) await this.ledger.advanceMaterialized(0, ledgerAppend.added);
         this.lastError = undefined;
       } catch (error) {
         this.failed += batch.length;

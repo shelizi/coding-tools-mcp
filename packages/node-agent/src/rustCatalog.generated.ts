@@ -14,6 +14,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -49,6 +56,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "cursor": {
           "default": 0,
           "minimum": 0,
@@ -121,6 +135,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -156,6 +177,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -187,10 +215,21 @@ export const rustCatalog: readonly ToolDefinition[] = [
       "readOnlyHint": false,
       "title": "Bootstrap conversation workspace"
     },
-    "description": "Bind an existing, explicit, or unambiguous workspace folder and initialize compact session history in one call. If multiple folders are unselected, return choices without accessing project content.",
+    "description": "Bind an existing, explicit, or unambiguous workspace folder and initialize compact session history in one call. If multiple folders are unselected, return choices without accessing project content. Authenticated MCP clients without platform conversation identity receive a conversation_handle; pass it on all subsequent built-in tool calls, including the folder-choice retry. Native clients can request one with create_conversation_handle=true.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "create_conversation_handle": {
+          "description": "Request a conversation_handle even when native platform conversation identity is available. Clients without native identity receive one automatically.",
+          "type": "boolean"
+        },
         "create_if_missing": {
           "default": true,
           "type": "boolean"
@@ -253,6 +292,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "folder_id": {
           "minLength": 1,
           "type": "string"
@@ -304,6 +350,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "maximum": 3600000,
           "minimum": 1000,
           "type": "integer"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
         },
         "cursor": {
           "default": 0,
@@ -448,12 +501,23 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "create_if_missing": {
           "default": true,
           "type": "boolean"
         },
         "history_dir": {
           "default": "docs/history-session",
+          "type": "string"
+        },
+        "recall_query": {
+          "minLength": 1,
           "type": "string"
         },
         "recovery_action_id": {
@@ -510,6 +574,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "decisions": {
           "items": {
             "type": "string"
@@ -611,6 +682,79 @@ export const rustCatalog: readonly ToolDefinition[] = [
   {
     "annotations": {
       "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Search session history"
+    },
+    "description": "Search durable session history by relevance using bounded derived retrieval metadata and return ranked session summaries.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "history_dir": {
+          "default": "docs/history-session",
+          "type": "string"
+        },
+        "include_excerpt": {
+          "default": true,
+          "type": "boolean"
+        },
+        "query": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "recent_boost": {
+          "default": 0.05,
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "top_k": {
+          "default": 8,
+          "maximum": 20,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "workspace_root": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "history_search",
+    "title": "Search session history"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
       "idempotentHint": false,
       "openWorldHint": false,
       "readOnlyHint": false,
@@ -620,6 +764,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "history_dir": {
           "default": "docs/history-session",
           "type": "string"
@@ -667,6 +818,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "max_files": {
           "default": 200,
           "maximum": 10000,
@@ -708,6 +866,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "existing_task": {
           "default": "error",
           "enum": [
@@ -764,6 +929,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           },
           "type": "array"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "pending_steps": {
           "items": {
             "type": "string"
@@ -812,6 +984,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -854,6 +1033,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -896,6 +1082,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -938,6 +1131,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -980,6 +1180,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -1026,6 +1233,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": false,
           "type": "boolean"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -1071,6 +1285,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "max_bytes": {
           "default": 32768,
           "maximum": 131072,
@@ -1115,6 +1336,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "cursor": {
           "default": 0,
           "minimum": 0,
@@ -1171,6 +1399,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "change_id": {
           "type": "string"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -1209,6 +1444,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -1250,6 +1492,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "path": {
           "default": ".",
           "type": "string"
@@ -1295,6 +1544,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "end_line": {
           "minimum": 1,
           "type": "integer"
@@ -1372,6 +1628,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "maximum": 500,
           "minimum": 0,
           "type": "integer"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
         },
         "items": {
           "items": {
@@ -1504,6 +1767,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "include_generated": {
           "default": false,
           "description": "Include generated dependency/build trees such as node_modules, target, dist, and build. .git remains excluded.",
@@ -1580,6 +1850,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "entry_types": {
           "default": [
             "file",
@@ -1700,6 +1977,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "maximum": 1000,
           "minimum": 0,
           "type": "integer"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
         },
         "count_only": {
           "default": false,
@@ -1867,6 +2151,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": false,
           "type": "boolean"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "dry_run": {
           "default": false,
           "type": "boolean"
@@ -1931,6 +2222,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "dry_run": {
           "default": false,
           "type": "boolean"
@@ -2272,6 +2570,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": false,
           "type": "boolean"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "dry_run": {
           "default": false,
           "type": "boolean"
@@ -2372,6 +2677,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "confirm": {
           "default": false,
           "type": "boolean"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
         },
         "exclude_patterns": {
           "items": {
@@ -2498,6 +2810,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "patch": {
           "minLength": 1,
           "type": "string"
@@ -2542,7 +2861,7 @@ export const rustCatalog: readonly ToolDefinition[] = [
       "readOnlyHint": false,
       "title": "Execute command"
     },
-    "description": "Run a bounded command in the workspace under runtime policy. Use job_timeout_ms plus a stable operation_id for an authorized long-running process; wait_command controls response waiting only and never extends the fixed process deadline. When a session is retained, continue with wait_command using next_actions.",
+    "description": "Run a bounded command in the workspace under runtime policy. Use job_timeout_ms plus a stable operation_id for an authorized long-running process; wait_command controls response waiting only and never extends the fixed process deadline. Follow next_actions for retained sessions: managed jobs use non-blocking resolve_operation snapshots while ordinary commands use wait_command.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2562,6 +2881,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "confirm": {
           "default": false,
           "type": "boolean"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
         },
         "cursor": {
           "default": 0,
@@ -3022,6 +3348,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minItems": 1,
           "type": "array"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "max_parallel": {
           "description": "Maximum concurrently running batch commands. Auto mode bounds the requested value by 8, workspace process admission, and historical resource-serialization recommendations.",
           "maximum": 256,
@@ -3111,6 +3444,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "cursor": {
           "default": 0,
           "minimum": 0,
@@ -3177,8 +3517,8 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "type": "integer"
         },
         "timeout_ms": {
-          "default": 20000,
-          "description": "Requested server-side event wait, separate from the child-process timeout. Values up to 60 minutes are accepted for compatibility, but each MCP response waits at most 20 seconds and returns retained next_actions so proxy heartbeat behavior cannot cause a lost response.",
+          "default": 8000,
+          "description": "Requested server-side event wait, separate from the child-process timeout. Values up to 60 minutes are accepted for compatibility, but each MCP response waits at most 8 seconds and returns retained next_actions so proxy or tool-layer deadlines cannot make a durable process look failed.",
           "maximum": 3600000,
           "minimum": 0,
           "type": "integer"
@@ -3215,7 +3555,7 @@ export const rustCatalog: readonly ToolDefinition[] = [
       "readOnlyHint": true,
       "title": "Resolve command operation"
     },
-    "description": "Reattach to a retained command by operation_id or command_fingerprint without starting a duplicate process.",
+    "description": "Reattach to a retained command by operation_id or command_fingerprint without starting a duplicate process. Managed jobs return another resolve_operation next_action while still active, enabling non-blocking status/output snapshots.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -3224,10 +3564,26 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minLength": 64,
           "type": "string"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "cursor": {
           "default": 0,
           "minimum": 0,
           "type": "integer"
+        },
+        "event_detail": {
+          "default": "compact",
+          "description": "For delta output, compact avoids duplicating decoded event data that is already present in stdout/stderr.",
+          "enum": [
+            "compact",
+            "full"
+          ],
+          "type": "string"
         },
         "max_output_bytes": {
           "default": 65536,
@@ -3298,6 +3654,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "include_finalized": {
           "default": true,
           "type": "boolean"
@@ -3367,6 +3730,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": false,
           "type": "boolean"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -3415,6 +3785,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "max_output_bytes": {
           "default": 65536,
           "maximum": 1048576,
@@ -3484,6 +3861,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "limit": {
           "default": 4096,
           "maximum": 1048576,
@@ -3543,6 +3927,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "include_untracked": {
           "default": true,
           "type": "boolean"
@@ -3604,6 +3995,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "maximum": 1000,
           "minimum": 0,
           "type": "integer"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
         },
         "max_bytes": {
           "default": 262144,
@@ -3672,6 +4070,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "max_count": {
           "default": 20,
           "maximum": 100,
@@ -3739,6 +4144,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "maximum": 1000,
           "minimum": 0,
           "type": "integer"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
         },
         "include_diff": {
           "default": true,
@@ -3809,6 +4221,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "end_line": {
           "minimum": 1,
           "type": "integer"
@@ -3886,6 +4305,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "confirm": {
           "default": false,
           "type": "boolean"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
         },
         "dry_run": {
           "default": false,
@@ -3993,6 +4419,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": false,
           "type": "boolean"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "delete_branch": {
           "default": false,
           "type": "boolean"
@@ -4078,6 +4511,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": false,
           "type": "boolean"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "dry_run": {
           "default": false,
           "type": "boolean"
@@ -4153,6 +4593,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "allow_empty": {
           "default": false,
           "type": "boolean"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
         },
         "dry_run": {
           "default": false,
@@ -4238,6 +4685,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minLength": 1,
           "type": "string"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "dry_run": {
           "default": false,
           "type": "boolean"
@@ -4312,6 +4766,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
         "confirm": {
           "default": false,
           "type": "boolean"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
         },
         "dry_run": {
           "default": false,
@@ -4407,6 +4868,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": false,
           "type": "boolean"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "permission": {
           "enum": [
             "network",
@@ -4495,6 +4963,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "default": true,
           "type": "boolean"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "max_bytes": {
           "default": 5242880,
           "maximum": 10485760,
@@ -4569,6 +5044,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -4604,6 +5086,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "display_id": {
           "minimum": 0,
           "type": "integer"
@@ -4672,6 +5161,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
           "minimum": 1,
           "type": "integer"
         },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "display_id": {
           "minimum": 0,
           "type": "integer"
@@ -4730,6 +5226,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
             "right",
             "middle"
           ],
+          "type": "string"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
           "type": "string"
         },
         "display_id": {
@@ -4809,6 +5312,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "delta_x": {
           "default": 0,
           "maximum": 12000,
@@ -4870,6 +5380,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -4911,6 +5428,13 @@ export const rustCatalog: readonly ToolDefinition[] = [
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "keys": {
           "items": {
             "minLength": 1,
@@ -4958,6 +5482,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "query_tool_usage",
     "history_session_bootstrap",
     "history_session_checkpoint",
+    "history_search",
     "history_session_validate",
     "project_state",
     "start_task",
@@ -5016,6 +5541,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "server_info",
     "list_workspace_folders",
     "query_tool_usage",
+    "history_search",
     "read_file",
     "read_many",
     "project_map",
@@ -5042,6 +5568,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "query_tool_usage",
     "history_session_bootstrap",
     "history_session_checkpoint",
+    "history_search",
     "history_session_validate",
     "project_state",
     "start_task",
@@ -5104,6 +5631,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "query_tool_usage",
     "history_session_bootstrap",
     "history_session_checkpoint",
+    "history_search",
     "set_default_cwd",
     "read_file",
     "read_many",
@@ -5144,6 +5672,7 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "query_tool_usage",
     "history_session_bootstrap",
     "history_session_checkpoint",
+    "history_search",
     "set_default_cwd",
     "read_file",
     "read_many",
@@ -5437,11 +5966,11 @@ export const rustToolAnnotationOverridesByProfile: Readonly<Record<ToolProfile, 
   "trusted-core": {}
 };
 export const rustToolsetRevisionByProfile: Readonly<Record<ToolProfile, string>> = {
-  "advanced": "a63a3dcecad4c58e",
-  "read-only": "0a428588c2f8c57f",
-  "compat-readonly-all": "546245bb66231e38",
-  "guarded-core": "7f436310989a1db0",
-  "trusted-core": "1f8403a4182bf946"
+  "advanced": "94c98e4bb05588e6",
+  "read-only": "56b2840c6f288a72",
+  "compat-readonly-all": "dc3a1b5adc9bccf5",
+  "guarded-core": "091819cfd1fc5780",
+  "trusted-core": "ff629990a6125490"
 };
 export const rustBehavioralParityFixtures: Readonly<Record<string, unknown>> = {
   "execution_limits": {
@@ -5456,7 +5985,9 @@ export const rustBehavioralParityFixtures: Readonly<Record<string, unknown>> = {
     "process_admission": 64
   },
   "mcp_transport": {
+    "conversation_handle_ttl_ms": 86400000,
     "latest_protocol_version": "2026-07-28",
+    "max_conversation_handles": 1024,
     "stream_channel_capacity": 2,
     "stream_heartbeat_interval_ms": 10000,
     "supported_protocol_versions": [
@@ -5482,7 +6013,11 @@ export const rustBehavioralParityFixtures: Readonly<Record<string, unknown>> = {
   },
   "tunnel": {
     "demand_hint_ttl_ms": 3000,
-    "local_connect_timeout_ms": 10000
+    "heartbeat_interval_ms": 30000,
+    "heartbeat_timeout_ms": 90000,
+    "local_connect_timeout_ms": 10000,
+    "reconnect_initial_ms": 1000,
+    "reconnect_max_ms": 120000
   },
   "workspace": {
     "max_conversation_contexts": 128

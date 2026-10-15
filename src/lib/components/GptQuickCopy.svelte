@@ -11,6 +11,7 @@
     actionsConfig,
   } from "$lib/types";
   import { t } from "$lib/i18n";
+  import { watchRotatingSecrets } from "$lib/runtime/secret-refresh";
 
   interface Props {
     workspaceId: string;
@@ -80,6 +81,22 @@
     actions.use_shared_secrets;
     void loadSecrets();
   });
+
+  $effect(() =>
+    watchRotatingSecrets(() => {
+      if (loading || service !== "mcp") return;
+      void refreshMcpSecrets();
+    }),
+  );
+
+  async function refreshMcpSecrets() {
+    const id = workspaceId;
+    const next = await loadMcpAuthSecrets(getBackend(), id, auth);
+    if (loading || service !== "mcp" || id !== workspaceId) return;
+    if (next.oauth_password !== (secrets.oauth_password ?? "")) {
+      secrets = { ...secrets, oauth_password: next.oauth_password };
+    }
+  }
 </script>
 
 <article class="tx-card p-5">

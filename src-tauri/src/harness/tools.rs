@@ -164,6 +164,26 @@ fn finalize_verifying_task(
     Ok((completed, change))
 }
 
+const TASK_RESPONSE_BASELINE_ENTRY_LIMIT: usize = 256;
+
+fn task_response_value(task: &TaskSession) -> Value {
+    let entry_count = task.baseline.entries.len();
+    if entry_count <= TASK_RESPONSE_BASELINE_ENTRY_LIMIT {
+        return json!(task);
+    }
+    let mut bounded = task.clone();
+    bounded
+        .baseline
+        .entries
+        .truncate(TASK_RESPONSE_BASELINE_ENTRY_LIMIT);
+    let mut value = serde_json::to_value(bounded).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("baseline_entry_count".into(), json!(entry_count));
+        object.insert("baseline_entries_truncated".into(), Value::Bool(true));
+    }
+    value
+}
+
 fn start_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let objective = args
         .get("objective")
@@ -201,7 +221,7 @@ fn start_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> 
         .start_task_for(objective, &scope_root)
         .map_err(map_error)?;
     Ok(json!({
-        "task": task,
+        "task": task_response_value(&task),
         "next": ["project_state", "task_context"],
         "recovered_task_id": recovered_task_id
     }))
@@ -215,7 +235,7 @@ fn update_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         .harness
         .update_steps(task_id, completed_steps, pending_steps)
         .map_err(map_error)?;
-    Ok(json!({"task": task}))
+    Ok(json!({"task": task_response_value(&task)}))
 }
 
 fn transition(
@@ -227,7 +247,7 @@ fn transition(
         .harness
         .transition(task_id(args)?, status)
         .map_err(map_error)?;
-    Ok(json!({"task": task}))
+    Ok(json!({"task": task_response_value(&task)}))
 }
 
 fn close_failed_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -241,7 +261,7 @@ fn close_failed_task(ctx: &ToolContext, args: &Value) -> Result<Value, Workspace
         KnowledgeTaskOutcome::Failure,
         task.updated_at.parse::<u64>().unwrap_or(0),
     );
-    Ok(json!({"task": task}))
+    Ok(json!({"task": task_response_value(&task)}))
 }
 
 fn rollback_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -279,7 +299,7 @@ fn rollback_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceErro
         KnowledgeTaskOutcome::RolledBack,
         task.updated_at.parse::<u64>().unwrap_or(0),
     );
-    Ok(json!({"task": task, "baseline_verified": true}))
+    Ok(json!({"task": task_response_value(&task), "baseline_verified": true}))
 }
 
 fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
@@ -293,7 +313,7 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
         let (task, change) = finalize_verifying_task(ctx, &current)?;
         let summary = stored_change_summary(ctx, &task, &change)?;
         return Ok(json!({
-            "task": task,
+            "task": task_response_value(&task),
             "summary": change.reason.text,
             "change_id": change.id,
             "change_summary": summary,
@@ -327,7 +347,7 @@ fn finish_task(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError>
     }
     let summary = stored_change_summary(ctx, &task, &change)?;
     Ok(json!({
-        "task": task,
+        "task": task_response_value(&task),
         "summary": change.reason.text,
         "change_id": change.id,
         "change_summary": summary
@@ -774,6 +794,59 @@ mod tests {
         assert_eq!(rolled_back["task"]["status"], "rolled_back");
         assert_eq!(rolled_back["baseline_verified"], true);
         assert!(ctx.harness.current_task().expect("current task").is_none());
+    }
+
+    #[test]
+    fn task_lifecycle_response_bounds_large_baseline_without_mutating_task() {
+        let entries = (0..10_000)
+            .map(|index| BaselineEntry {
+                path: format!("generated/{index:05}.txt"),
+                exists: true,
+                is_binary: false,
+                sha256: "0".repeat(64),
+                bytes: 1,
+            })
+            .collect::<Vec<_>>();
+        let task = TaskSession {
+            id: "task".into(),
+            workspace_id: "workspace".into(),
+            scope_id: None,
+            scope_root: None,
+            objective: "Bound task lifecycle response".into(),
+            status: TaskStatus::Active,
+            baseline: ProjectBaseline {
+                branch: Some("main".into()),
+                head: Some("0".repeat(40)),
+                worktree_fingerprint: "0".repeat(64),
+                entries,
+                captured_at: "0".into(),
+            },
+            expected_fingerprint: "0".repeat(64),
+            completed_steps: Vec::new(),
+            pending_steps: Vec::new(),
+            latest_change_id: None,
+            latest_verification_id: None,
+            created_at: "0".into(),
+            updated_at: "0".into(),
+        };
+
+        let value = task_response_value(&task);
+        assert_eq!(value["baseline_entry_count"], 10_000);
+        assert_eq!(value["baseline_entries_truncated"], true);
+        assert_eq!(
+            value["baseline"]["entries"]
+                .as_array()
+                .expect("bounded entries")
+                .len(),
+            TASK_RESPONSE_BASELINE_ENTRY_LIMIT
+        );
+        assert_eq!(task.baseline.entries.len(), 10_000);
+        assert!(
+            serde_json::to_vec(&value)
+                .expect("serialize bounded task")
+                .len()
+                < 128 * 1024
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ import { appendOutput } from './output.js';
 
 const DURABLE_SCHEMA_VERSION = 1;
 const DURABLE_MONITOR_MS = 250;
+const DURABLE_RESULT_EXIT_GRACE_MS = 5_000;
 const DURABLE_READ_CHUNK_BYTES = 1024 * 1024;
 
 interface DurableLaunchManifest {
@@ -42,6 +43,7 @@ interface DurableSessionSnapshot {
   timeoutContract?: ProcessSession['timeoutContract'];
   processDeadlineMs?: number;
   firstOutputAt?: number;
+  lastOutputAt?: number;
   endedAt?: number;
   finalizedAt?: number;
   exitCode?: number | null;
@@ -139,6 +141,7 @@ function snapshotFor(session: ProcessSession): DurableSessionSnapshot {
     timeoutContract: session.timeoutContract,
     processDeadlineMs: session.processDeadlineMs,
     firstOutputAt: session.firstOutputAt,
+    lastOutputAt: session.lastOutputAt,
     endedAt: session.endedAt,
     finalizedAt: session.finalizedAt,
     exitCode: session.exitCode,
@@ -218,7 +221,7 @@ function pidAlive(pid: number | undefined): boolean {
   catch { return false; }
 }
 
-async function syncDurableSession(ctx: ToolContext, session: ProcessSession): Promise<DurableWorkerResult | undefined> {
+export async function syncDurableSession(ctx: ToolContext, session: ProcessSession): Promise<DurableWorkerResult | undefined> {
   if (!session.durableDirectory) return undefined;
   const paths = durablePaths(ctx, session.folderId, session.id);
   const runtime = await readJson<DurableWorkerRuntime>(paths.runtime);
@@ -235,17 +238,36 @@ async function syncDurableSession(ctx: ToolContext, session: ProcessSession): Pr
   const stderrChanged = await syncStream(ctx, session, 'stderr', paths.stderr);
   const result = await readJson<DurableWorkerResult>(paths.result);
   if ((stdoutChanged || stderrChanged || runtimeChanged) && !result) await persistDurableSession(session);
-  if (result) return result;
+  if (result) {
+    session.durableWorkerExitObservedAt = undefined;
+    return result;
+  }
   if (session.durableWorkerPid && !pidAlive(session.durableWorkerPid)) {
+    // Close the TOCTOU window first: result.json can be renamed into place after the
+    // first read above but before the worker PID is observed as exited.
+    const lateResult = await readJson<DurableWorkerResult>(paths.result);
+    if (lateResult) {
+      session.durableWorkerExitObservedAt = undefined;
+      return lateResult;
+    }
+
+    const now = Date.now();
+    const firstObservedAt = session.durableWorkerExitObservedAt ?? now;
+    session.durableWorkerExitObservedAt = firstObservedAt;
+    if (now - firstObservedAt < DURABLE_RESULT_EXIT_GRACE_MS) return undefined;
+
+    // Keep retrying for a bounded grace period before synthesizing a crash. This
+    // covers transient Windows/AV filesystem visibility after the worker exits.
     return {
       version: DURABLE_SCHEMA_VERSION,
       exitCode: null,
       signal: null,
       terminationReason: session.terminationReason === 'killed' ? 'killed' : 'crashed',
-      error: 'Durable worker exited without writing a result.',
-      endedAt: Date.now()
+      error: 'Durable worker exited without a readable result after the result retry grace period.',
+      endedAt: now
     };
   }
+  session.durableWorkerExitObservedAt = undefined;
   return undefined;
 }
 
@@ -342,6 +364,7 @@ function restoredSession(snapshot: DurableSessionSnapshot, dir: string): Process
     timeoutContract: snapshot.timeoutContract,
     processDeadlineMs: snapshot.processDeadlineMs,
     firstOutputAt: snapshot.firstOutputAt,
+    lastOutputAt: snapshot.lastOutputAt,
     endedAt: snapshot.endedAt,
     finalizedAt: snapshot.finalizedAt,
     exitCode: snapshot.exitCode,

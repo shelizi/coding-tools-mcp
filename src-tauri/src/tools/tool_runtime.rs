@@ -147,6 +147,7 @@ pub(crate) fn descriptor(name: &str) -> ToolRuntimeDescriptor {
         "conversation_bootstrap"
         | "history_session_bootstrap"
         | "history_session_checkpoint"
+        | "history_search"
         | "history_session_validate" => HISTORY_LOCK,
         "apply_patch" | "edit" | "file_ops" | "format_files" => WORKSPACE_CONTENT_LOCK,
         "git_restore" | "git_worktree" => GIT_AND_WORKSPACE_LOCK,

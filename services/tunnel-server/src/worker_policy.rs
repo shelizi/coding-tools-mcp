@@ -139,6 +139,60 @@ impl WorkerPolicyStore {
     }
 }
 
+fn migrate_untouched_legacy_default(
+    connection: &Connection,
+    service: TunnelService,
+) -> Result<(), WorkerPolicyError> {
+    let policy = WorkerPolicy::default_for(service);
+    connection.execute(
+        "UPDATE worker_policies
+         SET start_workers = ?2,
+             min_idle_workers = ?3,
+             max_idle_workers = ?4,
+             max_workers = ?5,
+             max_requests_per_worker = ?6,
+             max_lifetime_seconds = ?7,
+             recycle_jitter_percent = ?8,
+             max_connecting_workers = ?9,
+             scale_down_step = ?10,
+             burst_warm_workers = ?11,
+             burst_warm_seconds = ?12,
+             revision = revision + 1
+         WHERE service = ?1
+           AND start_workers = 4
+           AND min_idle_workers = 2
+           AND max_idle_workers = 4
+           AND max_workers = 16
+           AND max_requests_per_worker = 500
+           AND max_lifetime_seconds = 3600
+           AND scale_down_delay_seconds = 60
+           AND recycle_jitter_percent = 10
+           AND max_pending_requests = 32
+           AND worker_acquire_timeout_ms = 10000
+           AND max_connecting_workers = 0
+           AND connecting_capacity_grace_ms = 1000
+           AND scale_down_step = 4
+           AND burst_warm_workers = 0
+           AND burst_warm_seconds = 120
+           AND revision = 1",
+        params![
+            service.as_str(),
+            policy.start_workers,
+            policy.min_idle_workers,
+            policy.max_idle_workers,
+            policy.max_workers,
+            policy.max_requests_per_worker,
+            policy.max_lifetime_seconds,
+            policy.recycle_jitter_percent,
+            policy.max_connecting_workers,
+            policy.scale_down_step,
+            policy.burst_warm_workers,
+            policy.burst_warm_seconds,
+        ],
+    )?;
+    Ok(())
+}
+
 fn initialize_schema(connection: &Connection) -> Result<(), WorkerPolicyError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS worker_policies (
@@ -193,6 +247,7 @@ fn initialize_schema(connection: &Connection) -> Result<(), WorkerPolicyError> {
         "INTEGER NOT NULL DEFAULT 120",
     )?;
     for service in [TunnelService::Mcp, TunnelService::Actions] {
+        migrate_untouched_legacy_default(connection, service)?;
         let policy = WorkerPolicy::default_for(service);
         connection.execute(
             "INSERT OR IGNORE INTO worker_policies
@@ -315,6 +370,7 @@ mod tests {
         changed.start_workers = 6;
         changed.max_idle_workers = 8;
         changed.max_workers = 24;
+        changed.burst_warm_workers = 8;
         let saved = store
             .update(TunnelService::Mcp, changed)
             .expect("update policy");
@@ -326,6 +382,71 @@ mod tests {
             reopened.current(TunnelService::Actions),
             WorkerPolicy::default_for(TunnelService::Actions)
         );
+    }
+
+    #[test]
+    fn upgrades_untouched_legacy_defaults_but_preserves_custom_policy() {
+        let directory = tempdir().expect("policy tempdir");
+        let path = directory.path().join("legacy-defaults.db");
+        let connection = Connection::open(&path).expect("legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE worker_policies (
+                    service TEXT PRIMARY KEY,
+                    start_workers INTEGER NOT NULL,
+                    min_idle_workers INTEGER NOT NULL,
+                    max_idle_workers INTEGER NOT NULL,
+                    max_workers INTEGER NOT NULL,
+                    max_requests_per_worker INTEGER NOT NULL,
+                    max_lifetime_seconds INTEGER NOT NULL,
+                    scale_down_delay_seconds INTEGER NOT NULL,
+                    recycle_jitter_percent INTEGER NOT NULL,
+                    max_pending_requests INTEGER NOT NULL DEFAULT 32,
+                    worker_acquire_timeout_ms INTEGER NOT NULL DEFAULT 10000,
+                    max_connecting_workers INTEGER NOT NULL DEFAULT 0,
+                    connecting_capacity_grace_ms INTEGER NOT NULL DEFAULT 1000,
+                    scale_down_step INTEGER NOT NULL DEFAULT 4,
+                    burst_warm_workers INTEGER NOT NULL DEFAULT 0,
+                    burst_warm_seconds INTEGER NOT NULL DEFAULT 120,
+                    revision INTEGER NOT NULL
+                 );
+                 INSERT INTO worker_policies VALUES
+                    ('mcp', 4, 2, 4, 16, 500, 3600, 60, 10, 32, 10000, 0, 1000, 4, 0, 120, 1),
+                    ('actions', 4, 2, 4, 16, 500, 3600, 60, 10, 32, 10000, 0, 1000, 4, 0, 120, 2);",
+            )
+            .expect("legacy defaults");
+        drop(connection);
+
+        let store = WorkerPolicyStore::open(&path).expect("migrated policy store");
+        let migrated = store.current(TunnelService::Mcp);
+        let expected = WorkerPolicy::default_for(TunnelService::Mcp);
+        assert_eq!(migrated.start_workers, expected.start_workers);
+        assert_eq!(migrated.min_idle_workers, expected.min_idle_workers);
+        assert_eq!(migrated.max_idle_workers, expected.max_idle_workers);
+        assert_eq!(migrated.max_workers, expected.max_workers);
+        assert_eq!(
+            migrated.max_requests_per_worker,
+            expected.max_requests_per_worker
+        );
+        assert_eq!(migrated.max_lifetime_seconds, expected.max_lifetime_seconds);
+        assert_eq!(
+            migrated.recycle_jitter_percent,
+            expected.recycle_jitter_percent
+        );
+        assert_eq!(
+            migrated.max_connecting_workers,
+            expected.max_connecting_workers
+        );
+        assert_eq!(migrated.scale_down_step, expected.scale_down_step);
+        assert_eq!(migrated.burst_warm_workers, expected.burst_warm_workers);
+        assert_eq!(migrated.burst_warm_seconds, expected.burst_warm_seconds);
+        assert_eq!(migrated.revision, 2);
+
+        let custom = store.current(TunnelService::Actions);
+        assert_eq!(custom.start_workers, 4);
+        assert_eq!(custom.max_workers, 16);
+        assert_eq!(custom.max_lifetime_seconds, 3_600);
+        assert_eq!(custom.revision, 2);
     }
 
     #[test]

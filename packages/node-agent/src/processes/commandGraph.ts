@@ -16,6 +16,7 @@ export const EXEC_MANY_TRANSPORT_SAFE_YIELD_MS = 20_000;
 export const EXEC_MANY_REATTACH_YIELD_MS = EXEC_MANY_TRANSPORT_SAFE_YIELD_MS;
 const CHILD_PROCESS_ADMISSION_TIMEOUT_MS = 30_000;
 const IO_HEAVY_ADMISSION_LIMIT = 1;
+const MAX_PARALLEL_OBSERVATIONS = 128;
 const ioHeavyAdmission = new Semaphore(IO_HEAVY_ADMISSION_LIMIT);
 
 interface RetainedCommandGraphRecord {
@@ -182,6 +183,183 @@ function commandGraphConfiguration(ctx: ToolContext, commands: Array<JsonObject 
   const defaultParallel = mode === 'sequential' ? 1 : Math.min(8, ctx.config.limits.processConcurrency);
   const maxParallel = Math.max(1, Math.min(Number(args.max_parallel ?? defaultParallel), 256));
   return { requestedMode, mode, stopOnError, maxParallel };
+}
+
+function commandGraphProgram(command: JsonObject): string {
+  const raw = typeof command.program === 'string' ? command.program.trim() : '';
+  const basename = raw.split(/[\\/]/).at(-1)?.replace(/\.[^.]+$/, '') ?? '';
+  const normalized = basename.toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 64);
+  if (!normalized) return 'opaque';
+  if (['cargo', 'rustc', 'git', 'npm', 'pnpm', 'yarn', 'bun', 'python', 'python3', 'node', 'pwsh', 'powershell', 'sh', 'cmd'].includes(normalized)) return normalized;
+  return `custom-${createHash('sha256').update(normalized).digest('hex').slice(0, 12)}`;
+}
+
+function commandGraphArgs(command: JsonObject): string[] {
+  return Array.isArray(command.args) ? command.args.map(value => String(value)) : [];
+}
+
+function commandGraphHasVersionFlag(command: JsonObject): boolean {
+  return commandGraphArgs(command).some(argument => ['--version', '-V', '-v', 'version'].includes(argument));
+}
+
+function commandGraphVerb(command: JsonObject, program: string): string {
+  if (commandGraphHasVersionFlag(command)) return 'version';
+  if (!['cargo', 'rustc', 'git', 'npm', 'pnpm', 'yarn', 'bun'].includes(program)) {
+    return ['python', 'python3', 'node', 'pwsh', 'powershell', 'sh', 'cmd'].includes(program) ? 'script' : 'default';
+  }
+  const first = commandGraphArgs(command)[0] ?? '';
+  const normalized = first.replace(/^-+/, '').replace(/[^a-z0-9-]/gi, '').slice(0, 32).toLowerCase();
+  return normalized || 'default';
+}
+
+function commandGraphParallelSignature(command: JsonObject): string {
+  const program = commandGraphProgram(command);
+  const verb = commandGraphVerb(command, program);
+  const workdir = typeof command.workdir === 'string' ? command.workdir : '.';
+  const digest = createHash('sha256').update(workdir).digest('hex').slice(0, 12);
+  return `${program}:${verb}@${digest}`;
+}
+
+function commandGraphReadOnlyHint(command: JsonObject): boolean {
+  const shell = typeof command.shell === 'string' ? command.shell : 'none';
+  if (shell !== 'none') return false;
+  if (commandGraphHasVersionFlag(command)) return true;
+  const program = commandGraphProgram(command);
+  const verb = commandGraphVerb(command, program);
+  return program === 'git' && ['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'cat-file'].includes(verb);
+}
+
+function commandGraphPairKey(left: string, right: string): string {
+  return left <= right ? `${left}|${right}` : `${right}|${left}`;
+}
+
+function commandGraphLockGroup(command: JsonObject): string | undefined {
+  const value = typeof command.lock_group === 'string' ? command.lock_group.trim() : '';
+  return value || undefined;
+}
+
+function commandGraphResultLockGroup(result: JsonObject): string | undefined {
+  const value = typeof result.resource_lock_group === 'string' ? result.resource_lock_group.trim() : '';
+  return value || undefined;
+}
+
+function normalizedWriteScope(result: JsonObject): string | undefined {
+  const raw = typeof result.resource_lock_target === 'string' ? result.resource_lock_target.trim() : '';
+  if (!raw) return undefined;
+  const normalized = raw.replaceAll('\\', '/').replace(/\/+$/, '');
+  const platformNormalized = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  return platformNormalized || '/';
+}
+
+function commandGraphWriteScopesOverlap(left: JsonObject, right: JsonObject): boolean {
+  const leftScope = normalizedWriteScope(left);
+  const rightScope = normalizedWriteScope(right);
+  if (!leftScope || !rightScope) return false;
+  if (leftScope === rightScope) return true;
+  return leftScope.startsWith(`${rightScope}/`) || rightScope.startsWith(`${leftScope}/`);
+}
+
+function commandGraphExecutionInterval(result: JsonObject): [number, number] | undefined {
+  const start = Number(result.started_ts_ms);
+  if (!Number.isFinite(start)) return undefined;
+  const ended = Number(result.ended_ts_ms ?? result.finalized_ts_ms);
+  const elapsed = Number(result.elapsed_ms ?? 0);
+  const end = Number.isFinite(ended) && ended > 0 ? ended : start + Math.max(0, Number.isFinite(elapsed) ? elapsed : 0);
+  return [start, Math.max(start, end)];
+}
+
+function commandGraphOverlapMs(left: JsonObject, right: JsonObject): number {
+  const leftInterval = commandGraphExecutionInterval(left);
+  const rightInterval = commandGraphExecutionInterval(right);
+  if (!leftInterval || !rightInterval) return 0;
+  return Math.max(0, Math.min(leftInterval[1], rightInterval[1]) - Math.max(leftInterval[0], rightInterval[0]));
+}
+
+function commandGraphLockWaitMs(result: JsonObject): number {
+  const waits = [result.resource_lock_wait_ms, result.io_heavy_admission_wait_ms]
+    .map(value => Number(value))
+    .filter(Number.isFinite);
+  return waits.reduce((total, value) => total + Math.max(0, value), 0);
+}
+
+function commandGraphConflictMarker(result: JsonObject): boolean {
+  const error = result.error && typeof result.error === 'object' && !Array.isArray(result.error) ? result.error : undefined;
+  const text = JSON.stringify({ error, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }).toLowerCase().slice(0, 16_384);
+  return ['resource busy', 'file in use', 'sharing violation', 'already locked', 'device or resource busy', 'resource temporarily unavailable']
+    .some(marker => text.includes(marker));
+}
+
+function collectCommandGraphParallelismObservations(graph: RetainedCommandGraph): { observations: JsonObject[]; truncated: boolean } {
+  if (graph.completedAt === undefined || graph.commands.length < 2) return { observations: [], truncated: false };
+  const observations: JsonObject[] = [];
+  const totalPairs = graph.commands.length * (graph.commands.length - 1) / 2;
+  for (let left = 0; left < graph.commands.length; left += 1) {
+    for (let right = left + 1; right < graph.commands.length; right += 1) {
+      if (observations.length === MAX_PARALLEL_OBSERVATIONS) return { observations, truncated: true };
+      const leftCommand = graph.commands[left]!;
+      const rightCommand = graph.commands[right]!;
+      const leftResult = graph.results.get(leftCommand.id);
+      const rightResult = graph.results.get(rightCommand.id);
+      if (!leftResult || !rightResult || leftResult.skipped === true || rightResult.skipped === true) continue;
+      const leftSignature = commandGraphParallelSignature(leftCommand);
+      const rightSignature = commandGraphParallelSignature(rightCommand);
+      const pair = commandGraphPairKey(leftSignature, rightSignature);
+      const overlapMs = commandGraphOverlapMs(leftResult, rightResult);
+      const lockWaitMs = commandGraphLockWaitMs(leftResult) + commandGraphLockWaitMs(rightResult);
+      const leftExplicitLock = commandGraphLockGroup(leftCommand);
+      const rightExplicitLock = commandGraphLockGroup(rightCommand);
+      const explicitSameLockGroup = Boolean(leftExplicitLock && leftExplicitLock === rightExplicitLock);
+      const leftLock = leftExplicitLock ?? commandGraphResultLockGroup(leftResult);
+      const rightLock = rightExplicitLock ?? commandGraphResultLockGroup(rightResult);
+      const sameLockGroup = Boolean(leftLock && leftLock === rightLock);
+      const readOnlyPair = commandGraphReadOnlyHint(leftCommand) && commandGraphReadOnlyHint(rightCommand);
+      const overlappingWriteScope = commandGraphWriteScopesOverlap(leftResult, rightResult) && !readOnlyPair;
+      const bothIoHeavy = leftCommand.resource_class === 'io_heavy' && rightCommand.resource_class === 'io_heavy';
+      const explicitParallel = graph.requestedMode === 'parallel' && graph.mode === 'parallel';
+      let outcome = 'candidate';
+      let evidenceSource = 'sequential_candidate';
+      let candidateKind = 'unknown_pair';
+      if (explicitParallel) {
+        const leftOk = leftResult.command_ok === true;
+        const rightOk = rightResult.command_ok === true;
+        if (overlapMs === 0 && (sameLockGroup || bothIoHeavy || lockWaitMs > 0)) outcome = 'serialized';
+        else if (overlapMs > 0 && (commandGraphConflictMarker(leftResult) || commandGraphConflictMarker(rightResult))) outcome = 'conflict';
+        else if (overlapMs > 0 && leftOk && rightOk) outcome = 'success';
+        else if (overlapMs > 0) outcome = 'failure';
+        else outcome = 'not_overlapped';
+        evidenceSource = outcome === 'serialized' ? 'resource_lock_serialization' : 'explicit_parallel';
+        candidateKind = 'none';
+      } else if (explicitSameLockGroup || bothIoHeavy || lockWaitMs > 0) {
+        evidenceSource = 'resource_conflict_hint';
+        candidateKind = 'conflict_hint';
+      } else if (overlappingWriteScope || (sameLockGroup && !readOnlyPair)) {
+        evidenceSource = 'filesystem_write_scope_conflict';
+        candidateKind = 'conflict_hint';
+      } else if (readOnlyPair) {
+        evidenceSource = 'read_only_shadow_safe';
+        candidateKind = 'read_only_safe_hint';
+      } else if (graph.mode === 'dag' && overlapMs > 0) {
+        evidenceSource = 'dag_overlap_candidate';
+        candidateKind = 'overlap_hint';
+      }
+      const observationId = createHash('sha256').update(`${graph.id}\0${pair}\0${graph.mode}\0${outcome}\0${candidateKind}`).digest('hex');
+      observations.push({
+        observation_id: observationId,
+        pair,
+        left: leftSignature,
+        right: rightSignature,
+        outcome,
+        evidence_source: evidenceSource,
+        candidate_kind: candidateKind,
+        safety_sample: explicitParallel && ['success', 'conflict'].includes(outcome),
+        overlap_ms: overlapMs,
+        lock_wait_ms: lockWaitMs,
+        same_lock_group: sameLockGroup,
+        overlapping_write_scope: overlappingWriteScope
+      });
+    }
+  }
+  return { observations, truncated: totalPairs > MAX_PARALLEL_OBSERVATIONS };
 }
 
 type CommandRunIf = 'success' | 'failure' | 'always';
@@ -665,6 +843,8 @@ function commandGraphSnapshot(
   const graphProgressOk = failed.length === 0 && !graph.schedulerError;
   const graphExecutionOk = graphCompleted ? graphProgressOk && blockingSkipped.length === 0 && !cancelRequested : null;
   const controlOk = graphAction !== 'run';
+  const parallelism = collectCommandGraphParallelismObservations(graph);
+  const parallelCandidateObservationCount = parallelism.observations.filter(observation => observation.outcome === 'candidate').length;
   return {
     // Child command failures are expected in TDD/debugging workflows. Keep
     // them in graph_execution_ok/failed_command_ids instead of promoting a
@@ -729,6 +909,10 @@ function commandGraphSnapshot(
       error_message: firstFailureError?.message ?? null
     } : null,
     scheduler_error: graph.schedulerError ?? null,
+    parallel_observation_count: parallelism.observations.length,
+    parallel_candidate_observation_count: parallelCandidateObservationCount,
+    parallelism_observation_truncated: parallelism.truncated,
+    parallelism_observations: parallelism.observations,
     recovery_actions: recoveryActions,
     next_actions: nextActions,
     results

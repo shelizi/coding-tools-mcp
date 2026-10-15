@@ -178,6 +178,17 @@ test('scoped OAuth PKCE and MCP workspace flow', async t => {
   };
   evolutionKnowledge.id = knowledgeRecordId(evolutionKnowledge);
   const storedKnowledge = await folderRuntime.knowledgeStore.upsert(evolutionKnowledge);
+  const strategyKnowledge = {
+    ...evolutionKnowledge,
+    id: '',
+    target: 'tool_strategy',
+    trigger: { tool: 'search_text', variant: 'http-strategy' },
+    hypothesis: 'Use the semantics-preserving exact-total fast tail when applicable.',
+    recommendedAction: { semantic_preserving_implementation: 'search_exact_total_fast_tail' },
+    metadata: undefined
+  };
+  strategyKnowledge.id = knowledgeRecordId(strategyKnowledge);
+  await folderRuntime.knowledgeStore.upsert(strategyKnowledge);
   const evolutionProposal = await folderRuntime.toolEvolutionProposalStore.plan(storedKnowledge, 'a'.repeat(40), 105);
   const evolutionUri = `tool-evolution://coding-tools/repo/${evolutionProposal.proposalId}`;
   const resourceList = await rpc(endpoint, token, { jsonrpc: '2.0', id: 32, method: 'resources/list', params: {} });
@@ -262,6 +273,45 @@ test('scoped OAuth PKCE and MCP workspace flow', async t => {
   assert.ok(bootstrapped.result.structuredContent.project_skills.skillset_revision);
   assert.equal(bootstrapped.result.structuredContent.startup_flow, 'workspace_and_history_bootstrapped');
   assert.ok(bootstrapped.result.structuredContent.current_path);
+  const learning = bootstrapped.result.structuredContent.learning;
+  assert.ok(learning);
+  assert.equal(learning.knowledge_funnel.total, 2);
+  assert.equal(learning.knowledge_funnel.candidate, 2);
+  assert.equal(learning.knowledge_funnel.shadow, 0);
+  assert.deepEqual(learning.validation_gate, {
+    evaluated: 0,
+    ready: 0,
+    blocked: 0,
+    blockers: [],
+    blockers_truncated: 0
+  });
+  assert.deepEqual(learning.runtime_ingestion, learning.ingestion);
+  assert.equal(learning.counter_scopes.ingestion, 'runtime_process');
+  assert.equal(learning.counter_scopes.runtime_ingestion, 'runtime_process');
+  assert.equal(learning.counter_scopes.knowledge_funnel, 'durable_knowledge_store');
+  assert.equal(learning.counter_scopes.validation_gate, 'durable_knowledge_and_impact_store_snapshot');
+  assert.equal(learning.counter_scopes.durable_lifetime, 'durable_knowledge_impact_and_experience_state');
+  assert.equal(learning.counter_scopes.learning_snapshot, 'bounded_durable_learning_explanation');
+  assert.deepEqual(learning.durable_lifetime.knowledge_funnel, learning.learning_snapshot.funnel);
+  assert.equal(learning.learning_snapshot.funnel.total, 2);
+  assert.equal(learning.learning_snapshot.funnel.candidate, 2);
+  assert.deepEqual(learning.learning_snapshot.top_blockers, []);
+  assert.equal(learning.learning_snapshot.top_blockers_truncated, 0);
+  assert.equal(learning.learning_snapshot.strategies.length, 1);
+  assert.equal(learning.learning_snapshot.strategies_truncated, 0);
+  assert.equal(learning.learning_snapshot.strategies[0].id, strategyKnowledge.id);
+  assert.equal(learning.learning_snapshot.strategies[0].status, 'candidate');
+  assert.equal(learning.learning_snapshot.strategies[0].implementation, 'search_exact_total_fast_tail');
+  assert.equal(learning.learning_snapshot.strategies[0].validation_class, 'semantics_preserving');
+  assert.equal(learning.learning_snapshot.strategies[0].observations, 5);
+  assert.equal(learning.learning_snapshot.strategies[0].shadow_matches, 0);
+  assert.equal(learning.learning_snapshot.strategies[0].validation_blocker, null);
+  assert.equal(learning.learning_snapshot.strategies[0].durations_ms.shadow.distribution_available, false);
+  assert.equal(learning.learning_snapshot.strategies[0].durations_ms.shadow.p50, null);
+  assert.equal(learning.learning_snapshot.strategies[0].durations_ms.shadow.p95, null);
+  assert.equal(learning.learning_snapshot.experience.ledger_events, learning.durable_ingestion.ledgerEvents);
+  assert.equal(learning.learning_snapshot.experience.replay_complete, learning.durable_ingestion.replayComplete);
+  assert.match(learning.learning_snapshot.experience.compiler_revision, /^[a-f0-9]{64}$/);
 
   const hookBlocked = await rpc(endpoint, token, {
     jsonrpc: '2.0', id: 35, method: 'tools/call',

@@ -2,12 +2,14 @@ mod attachment;
 mod construction;
 mod control;
 mod lifecycle;
+mod operation_persistence;
 mod output;
 mod process_lifecycle;
 mod registry;
 mod snapshot;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,7 +35,7 @@ use output::{
 
 const SESSION_EVENT_BYTES: usize = 1_048_576;
 pub const DEFAULT_ACTIVE_SESSION_LIMIT: usize = 512;
-pub(crate) const WAIT_COMMAND_TRANSPORT_SAFE_MS: u64 = 20_000;
+pub(crate) const WAIT_COMMAND_TRANSPORT_SAFE_MS: u64 = 8_000;
 pub(crate) const WAIT_COMMAND_TIMEOUT_DEFAULT_MS: u64 = WAIT_COMMAND_TRANSPORT_SAFE_MS;
 pub(crate) const WAIT_COMMAND_TIMEOUT_MAX_MS: u64 = 60 * 60_000;
 const MAX_RETAINED_FINALIZED_SESSIONS: usize = 128;
@@ -54,6 +56,7 @@ pub struct SessionStore {
     registry: Mutex<SessionRegistry>,
     active_slots: Arc<Semaphore>,
     active_session_limit: usize,
+    operation_record_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -113,6 +116,7 @@ pub struct ExecSession {
     process_deadline_ts_ms: Option<u64>,
     process_deadline: Option<Instant>,
     operation_id: Option<String>,
+    operation_record_path: Mutex<Option<PathBuf>>,
     harness_operations: Mutex<Vec<HarnessOperationTracking>>,
     harness_operation_recorded: Mutex<HashSet<String>>,
     command_fingerprint: Option<String>,

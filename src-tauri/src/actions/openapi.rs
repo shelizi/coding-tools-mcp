@@ -140,6 +140,10 @@ pub fn build_openapi(tools: &[Value], public_base_url: &str, auth_type: &str) ->
 }
 
 fn action_input_schema(tool_name: &str, mut schema: Value) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.remove("conversation_handle");
+        properties.remove("create_conversation_handle");
+    }
     if tool_name == "list_workspace_folders" {
         return schema;
     }
@@ -176,10 +180,23 @@ fn action_input_schema(tool_name: &str, mut schema: Value) -> Value {
     schema
 }
 
+#[cfg(test)]
+#[test]
+fn actions_never_publish_mcp_conversation_handle_arguments() {
+    for name in ["list_workspace_folders", "read_file"] {
+        let schema = action_input_schema(name, crate::tools::registry::input_schema(name));
+        assert!(schema["properties"].get("conversation_handle").is_none());
+        assert!(schema["properties"]
+            .get("create_conversation_handle")
+            .is_none());
+    }
+}
+
 fn workspace_folder_id_optional(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "list_workspace_folders"
+            | "server_info"
             | "wait_command"
             | "send_input"
             | "kill_session"
@@ -310,14 +327,18 @@ mod tests {
     fn session_control_can_route_without_explicit_folder_id() {
         let tools = crate::tools::list_tools_for_profile("full");
         let schema = build_openapi(&tools, "https://actions.example.com", "none");
-        let request_schema = &schema["paths"]["/actions/wait_command"]["post"]["requestBody"]
-            ["content"]["application/json"]["schema"];
+        for tool_name in ["wait_command", "server_info"] {
+            let request_schema = &schema["paths"][format!("/actions/{tool_name}")]["post"]
+                ["requestBody"]["content"]["application/json"]["schema"];
 
-        assert!(request_schema["properties"]["workspace_folder_id"].is_object());
-        assert!(!request_schema["required"]
-            .as_array()
-            .expect("required fields")
-            .contains(&Value::String("workspace_folder_id".into())));
+            assert!(request_schema["properties"]["workspace_folder_id"].is_object());
+            assert!(!request_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(
+                    |required| required.contains(&Value::String("workspace_folder_id".into()))
+                ));
+        }
     }
 
     #[test]

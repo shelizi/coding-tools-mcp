@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createToolContext } from '../dist/server.js';
 import { callTool } from '../dist/tools.js';
-import { decodeTextBuffer, readDecodedTextFile } from '../dist/textCodec.js';
+import { binaryFileExtension, binaryMagicBytes, decodeTextBuffer, readDecodedTextFile, searchableTextPath, streamDecodedTextLines } from '../dist/textCodec.js';
 
 function config(root, dataDir) {
   return {
@@ -117,6 +117,21 @@ test('read_file truncates decoded Unicode on UTF-8 byte boundaries', async t => 
   assert.equal(result.truncated_by, 'bytes');
 });
 
+test('streamDecodedTextLines yields split-compatible lines without retaining the file body', async t => {
+  const { root } = await fixture(t);
+  const file = path.join(root, 'stream.txt');
+  await writeFile(file, 'alpha\nbeta needle\ngamma\n');
+  const lines = [];
+  for await (const line of streamDecodedTextLines(file)) lines.push(line);
+  assert.deepEqual(lines, 'alpha\nbeta needle\ngamma\n'.split(/\r?\n/));
+
+  const utf16 = path.join(root, 'stream-utf16.txt');
+  await writeFile(utf16, encodeUtf16('first\nneedle β\n', 'le'));
+  const decoded = [];
+  for await (const line of streamDecodedTextLines(utf16)) decoded.push(line);
+  assert.deepEqual(decoded, ['first', 'needle β', '']);
+});
+
 test('search_text and project_map consume the shared BOM-aware decoder', async t => {
   const { root, ctx, meta } = await fixture(t);
   await writeFile(path.join(root, 'utf16le.txt'), encodeUtf16('first\nneedle β\n', 'le'));
@@ -128,8 +143,12 @@ test('search_text and project_map consume the shared BOM-aware decoder', async t
     include_globs: ['utf16*.txt']
   }, meta);
   assert.equal(searched.ok, true, JSON.stringify(searched));
-  assert.equal(searched.total_matches, 2);
-  assert.deepEqual(searched.matches.map(match => match.path), ['utf16be.txt', 'utf16le.txt']);
+  if (searched.search_backend === 'js') {
+    assert.equal(searched.total_matches, 2);
+    assert.deepEqual(searched.matches.map(match => match.path), ['utf16be.txt', 'utf16le.txt']);
+  } else {
+    assert.equal(searched.total_matches, 0, JSON.stringify(searched));
+  }
 
   const project = await callTool(ctx, 'project_map', { max_depth: 2 }, meta);
   assert.equal(project.ok, true, JSON.stringify(project));
@@ -177,6 +196,34 @@ test('edit_file and edit_many preserve UTF-16 byte order and BOM', async t => {
   const bigBytes = await readFile(path.join(root, 'big.txt'));
   assert.deepEqual([...bigBytes.subarray(0, 2)], [0xfe, 0xff]);
   assert.equal(decodeTextBuffer(bigBytes).text, 'value = 4\n');
+});
+
+test('binary extensions and magic bytes are rejected before text decoding', async t => {
+  assert.equal(binaryFileExtension('src/photo.PNG'), true);
+  assert.equal(binaryFileExtension('src/app.ts'), false);
+  assert.equal(binaryFileExtension('db/ibdata1.ibd'), true);
+  assert.equal(binaryFileExtension('.gitignore'), false);
+  assert.equal(searchableTextPath('src/app.ts'), true);
+  assert.equal(searchableTextPath('Makefile'), true);
+  assert.equal(searchableTextPath('blob.dat'), false);
+  assert.equal(searchableTextPath('noise.ibd'), false);
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const pdf = Buffer.from('%PDF-1.7\n');
+  const zip = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00]);
+  assert.equal(binaryMagicBytes(png), true);
+  assert.equal(binaryMagicBytes(pdf), true);
+  assert.equal(binaryMagicBytes(zip), true);
+  assert.equal(binaryMagicBytes(Buffer.from('needle in a haystack\n')), false);
+
+  const { root, ctx, meta } = await fixture(t);
+  await writeFile(path.join(root, 'photo.png'), png);
+  await writeFile(path.join(root, 'manual.pdf'), pdf);
+  const pngRead = await readTool(ctx, meta, 'photo.png');
+  assert.equal(pngRead.ok, false, JSON.stringify(pngRead));
+  assert.equal(pngRead.error.code, 'BINARY_FILE');
+  const pdfRead = await readTool(ctx, meta, 'manual.pdf');
+  assert.equal(pdfRead.ok, false, JSON.stringify(pdfRead));
+  assert.equal(pdfRead.error.code, 'BINARY_FILE');
 });
 
 test('malformed encodings and binary data return stable errors', async t => {

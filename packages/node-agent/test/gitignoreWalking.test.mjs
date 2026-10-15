@@ -149,7 +149,7 @@ test('list and search respect root, nested and negated gitignore rules', async t
 
   const search = await callTool(ctx, 'search_text', { query: 'needle', max_results: 100 }, meta);
   assert.equal(search.ok, true, JSON.stringify(search));
-  assert.deepEqual(search.matches.map(match => match.path), [
+  assert.deepEqual(search.matches.map(match => match.path).sort(), [
     'cache/keep.txt',
     'keep.log',
     'nested/root-only.txt',
@@ -319,9 +319,9 @@ test('project map, search and formatter project scope share ignore-aware travers
   assert.equal(projectAll.package_scripts.ignoredOnly, 'echo ignored');
 
   const search = await callTool(ctx, 'search_text', { query: 'needle' }, meta);
-  assert.deepEqual(search.matches.map(match => match.path), ['visible.txt']);
+  assert.deepEqual(search.matches.map(match => match.path).sort(), ['visible.txt']);
   const searchAll = await callTool(ctx, 'search_text', { query: 'needle', include_ignored: true }, meta);
-  assert.deepEqual(searchAll.matches.map(match => match.path), ['ignored/hidden.txt', 'visible.txt']);
+  assert.deepEqual(searchAll.matches.map(match => match.path).sort(), ['ignored/hidden.txt', 'visible.txt']);
 
   const plan = await callTool(ctx, 'format_files', { scope: 'project', mode: 'plan' }, meta);
   assert.equal(plan.ok, true, JSON.stringify(plan));

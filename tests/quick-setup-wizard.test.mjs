@@ -38,7 +38,7 @@ test("the first step keeps all providers for desktop and gates unsupported Node 
   assert.match(wizard, /type TunnelProvider = "builtin" \| "frp" \| "cloudflare"/);
   assert.match(wizard, /const capabilities = getBackend\(\)\.capabilities/);
   assert.match(wizard, /const frpAvailable = capabilities\.frpManagement && capabilities\.softwareManagement/);
-  assert.match(wizard, /const cloudflareAvailable = capabilities\.softwareManagement/);
+  assert.match(wizard, /const cloudflareAvailable = capabilities\.softwareManagement && capabilities\.host === "desktop"/);
   assert.match(wizard, /chooseProvider\("builtin"\)/);
   assert.match(wizard, /chooseProvider\("frp"\)/);
   assert.match(wizard, /chooseProvider\("cloudflare"\)/);

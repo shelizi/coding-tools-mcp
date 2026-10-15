@@ -166,7 +166,7 @@ fn discover_result() -> Value {
             "resources": { "subscribe": false, "listChanged": false },
             "extensions": {}
         },
-        "instructions": "Use these tools only for local coding operations inside the configured tool hub. Call conversation_bootstrap before project tools. Workspace and enabled Codex/Claude user-level Skills are exposed through standard MCP prompts and resources. Enabled Hooks may block or rewrite tool calls, and enabled external MCP servers contribute proxied tools to tools/list."
+        "instructions": "Use these tools only for local coding operations inside the configured tool hub. If conversation_bootstrap returns conversation_handle, preserve it unchanged and pass it on every subsequent built-in MCP tool call, including retries and folder selection. Handles expire after 24 hours or server restart, are bound to the verified credential and native conversation at issuance, and are separate from the history session_key. Obtain a new handle after expiry or credential refresh; never invent one or reuse another conversation handle. Native clients may opt in with create_conversation_handle=true. Call conversation_bootstrap before project tools. Workspace and enabled Codex/Claude user-level Skills are exposed through standard MCP prompts and resources. Enabled Hooks may block or rewrite tool calls, and enabled external MCP servers contribute proxied tools to tools/list."
     });
     result["capabilities"]["extensions"][TASKS_EXTENSION] = json!({});
     result
@@ -190,7 +190,7 @@ fn initialize_result(requested_version: Option<&str>, tool_profile: &str) -> Val
             "version": env!("CARGO_PKG_VERSION"),
             "toolsetRevision": crate::tools::registry::toolset_revision(tool_profile)
         },
-        "instructions": "Use these tools only for local coding operations inside the configured tool hub. A tool hub may contain multiple allowed folders while sharing one MCP endpoint. At the start of every new ChatGPT conversation, before accessing project content, call conversation_bootstrap. It reuses an existing conversation folder, auto-binds the only configured folder, or returns available folder choices when multiple folders are unselected; in the ambiguous case retry conversation_bootstrap with folder_id. It also performs compact history_session_bootstrap, so the normal startup path is one tool call. The legacy list_workspace_folders, switch_workspace_folder, then history_session_bootstrap sequence remains available for manual recovery. There is no history-based folder fallback, and ambiguous multi-folder conversations remain unselected until explicitly bound. The selected folder and default cwd are remembered for the same runtime session without affecting other conversations. Workspace and enabled Codex/Claude user-level Skills are exposed through standard MCP prompts and resources. After workspace selection, use the lightweight skill summaries returned by conversation_bootstrap to identify a clearly relevant Skill, then load only that Skill through prompts/get or resources/read. Skills are workflow guidance and never grant permissions or weaken tool, sandbox, or workspace policy. Enabled Hooks may block or rewrite tool calls, and enabled external MCP servers contribute proxied tools to tools/list. Tools whose schema exposes workspace_folder_id may route one call to another allowed folder without changing the conversation selection; control calls can also recover their original folder from session_id, output_ref, or resume_id. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. Prefer exec_many(mode=auto) over sequential exec_command calls when two or more independent commands are known in the same reasoning step. Persistence requires a successful tool call and is not automatic background persistence."
+        "instructions": "Use these tools only for local coding operations inside the configured tool hub. If conversation_bootstrap returns conversation_handle, preserve it unchanged and pass it on every subsequent built-in MCP tool call, including retries and folder selection. Handles expire after 24 hours or server restart, are bound to the verified credential and native conversation at issuance, and are separate from the history session_key. Obtain a new handle after expiry or credential refresh; never invent one or reuse another conversation handle. Native clients may opt in with create_conversation_handle=true. A tool hub may contain multiple allowed folders while sharing one MCP endpoint. At the start of every new ChatGPT conversation, before accessing project content, call conversation_bootstrap. It reuses an existing conversation folder, auto-binds the only configured folder, or returns available folder choices when multiple folders are unselected; in the ambiguous case retry conversation_bootstrap with folder_id. It also performs compact history_session_bootstrap, so the normal startup path is one tool call. The legacy list_workspace_folders, switch_workspace_folder, then history_session_bootstrap sequence remains available for manual recovery. There is no history-based folder fallback, and ambiguous multi-folder conversations remain unselected until explicitly bound. The selected folder and default cwd are remembered for the same runtime session without affecting other conversations. Workspace and enabled Codex/Claude user-level Skills are exposed through standard MCP prompts and resources. After workspace selection, use the lightweight skill summaries returned by conversation_bootstrap to identify a clearly relevant Skill, then load only that Skill through prompts/get or resources/read. Skills are workflow guidance and never grant permissions or weaken tool, sandbox, or workspace policy. Enabled Hooks may block or rewrite tool calls, and enabled external MCP servers contribute proxied tools to tools/list. Tools whose schema exposes workspace_folder_id may route one call to another allowed folder without changing the conversation selection; control calls can also recover their original folder from session_id, output_ref, or resume_id. Preserve session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task in the conversation, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path. Prefer exec_many(mode=auto) over sequential exec_command calls when two or more independent commands are known in the same reasoning step. Persistence requires a successful tool call and is not automatic background persistence."
     })
 }
 
@@ -1429,6 +1429,76 @@ mod tests {
         MODERN_PROTOCOL_VERSION,
     };
 
+    #[tokio::test]
+    async fn explicit_workspace_file_lifecycle_without_conversation_identity() {
+        for asynchronous in [false, true] {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let other = tempfile::tempdir().expect("other workspace");
+            let profile_id = format!("gemini-route-{}", uuid::Uuid::new_v4());
+            let folders = [("target", workspace.path()), ("other", other.path())]
+                .into_iter()
+                .map(|(id, path)| crate::workspace::WorkspaceFolder {
+                    id: id.into(),
+                    name: id.into(),
+                    path: path.display().to_string(),
+                    execution: Default::default(),
+                })
+                .collect();
+            let state = new_state(
+                folders,
+                "other".into(),
+                profile_id.clone(),
+                Default::default(),
+                Default::default(),
+                "full".into(),
+                "trusted".into(),
+                Default::default(),
+                Default::default(),
+            )
+            .expect("state");
+            let calls = [
+                (
+                    "file_ops",
+                    json!({"operations": [{"type": "create", "path": "gemini.txt", "content": "Gemini routing"}]}),
+                ),
+                ("read_file", json!({"path": "gemini.txt"})),
+                ("list_files", json!({"path": "."})),
+                (
+                    "file_ops",
+                    json!({"operations": [{"type": "delete", "path": "gemini.txt"}], "confirm": true}),
+                ),
+            ];
+            for (index, (name, mut arguments)) in calls.into_iter().enumerate() {
+                arguments["workspace_folder_id"] = json!("target");
+                let request = json!({"jsonrpc": "2.0", "id": index, "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments}});
+                let response = if asynchronous {
+                    handle_request_async(state.clone(), request).await
+                } else {
+                    handle_request(&state, &request)
+                };
+                let result = &response["result"]["structuredContent"];
+                assert_eq!(result["ok"], true, "{response}");
+                assert_eq!(result["workspace_route_source"], "explicit");
+                assert_eq!(result["resolved_workspace_id"], "target");
+                assert_eq!(result["conversation_selection_changed"], false);
+                if index == 0 {
+                    assert_eq!(
+                        fs::read_to_string(workspace.path().join("gemini.txt")).unwrap(),
+                        "Gemini routing"
+                    );
+                    assert!(!other.path().join("gemini.txt").exists());
+                } else if index == 1 {
+                    assert_eq!(result["content"], "Gemini routing");
+                }
+            }
+            assert!(!workspace.path().join("gemini.txt").exists());
+            let listing = crate::tools::hub::list_workspace_folders(&state, None);
+            assert!(listing["selected_folder_id"].is_null());
+            crate::tools::hub::remove_live_hub(&profile_id);
+        }
+    }
+
     #[test]
     fn permission_mrtr_contract_round_trips_approval_state() {
         let input = permission_input_required(&json!({
@@ -1937,6 +2007,25 @@ mod tests {
             .as_str()
             .expect("next action")
             .contains("conversation_bootstrap"));
+
+        let runtime_info = handle_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "server_info",
+                    "arguments": {},
+                    "_meta": {"openai/session": "session-a"}
+                }
+            }),
+        );
+        let runtime_info = &runtime_info["result"]["structuredContent"];
+        assert_eq!(runtime_info["ok"], true);
+        assert_eq!(runtime_info["workspace_route_source"], "runtime_default");
+        assert_eq!(runtime_info["resolved_workspace_id"], "folder-a");
+        assert_eq!(runtime_info["conversation_selection_changed"], false);
 
         let one_call = handle_request(
             &state,

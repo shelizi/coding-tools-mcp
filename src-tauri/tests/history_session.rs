@@ -218,8 +218,8 @@ fn inherited_summary_is_bounded_and_reports_omitted_sessions() {
         json!({"session_key": "bounded-summary"}),
     );
     let boot = assert_ok(&boot);
-    assert_eq!(boot["history_loaded_count"], 12);
-    assert_eq!(boot["history_omitted_count"], 8);
+    assert_eq!(boot["history_loaded_count"], 5);
+    assert_eq!(boot["history_omitted_count"], 15);
     assert_eq!(boot["payload_bounded"], true);
     let content = fs::read_to_string(dir.join("21.md")).expect("read bounded summary");
     assert!(content.contains("个较早会话未展开"));
@@ -264,7 +264,11 @@ fn prepare_history(root: &std::path::Path) {
 #[test]
 fn history_tools_are_exposed_with_public_schemas() {
     let tools = list_tools_for_profile("core");
-    for name in ["history_session_bootstrap", "history_session_checkpoint"] {
+    for name in [
+        "history_session_bootstrap",
+        "history_session_checkpoint",
+        "history_search",
+    ] {
         let tool = tools
             .iter()
             .find(|tool| tool["name"] == name)
@@ -298,6 +302,10 @@ fn history_tools_are_exposed_with_public_schemas() {
     assert_eq!(
         bootstrap["inputSchema"]["properties"]["response_mode"]["default"],
         "compact"
+    );
+    assert_eq!(
+        bootstrap["inputSchema"]["properties"]["recall_query"]["minLength"],
+        1
     );
     let checkpoint_description = tools
         .iter()
@@ -427,7 +435,8 @@ fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
     assert_eq!(
         first["required_next_actions"],
         json!([
-            "read_all_history_summary",
+            "read_recent_history_summary",
+            "read_relevant_history_summaries",
             "read_latest_handoff",
             "verify_workspace_state",
             "execute_user_task",
@@ -445,6 +454,10 @@ fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
         .as_str()
         .unwrap_or("")
         .contains("决定-第一阶段"));
+    assert_eq!(
+        first["recent_history_summary"],
+        first["all_history_summary"]
+    );
     assert_eq!(
         first["latest_handoff"],
         history_file(2, "old-session-2", "第二阶段")
@@ -634,6 +647,66 @@ fn validate_reports_gaps_and_can_rebuild_a_missing_index() {
     .expect("valid index json");
     assert_eq!(index["sessions"]["gap-one"]["number"], 1);
     assert_eq!(index["sessions"]["gap-three"]["number"], 3);
+}
+
+#[test]
+fn history_search_and_bootstrap_recall_query_recover_older_relevant_session() {
+    let (workspace, _harness, ctx) = test_context();
+    let dir = workspace.path().join("docs/history-session");
+    fs::create_dir_all(&dir).expect("create history dir");
+    fs::write(
+        dir.join("1.md"),
+        history_file(
+            1,
+            "old-terminal",
+            "終端持久化 durable session SQLite liveness",
+        ),
+    )
+    .expect("write relevant history");
+    for number in 2..=12 {
+        fs::write(
+            dir.join(format!("{number}.md")),
+            history_file(
+                number,
+                &format!("recent-{number}"),
+                &format!("近期設定頁 UI {number}"),
+            ),
+        )
+        .expect("write recent history");
+    }
+
+    let search_result = invoke(
+        &ctx,
+        "history_search",
+        json!({"query": "終端持久化 durable session", "top_k": 3}),
+    );
+    let search = assert_ok(&search_result);
+    assert_eq!(search["results"][0]["session_number"], 1);
+    assert_eq!(search["index_source"], "scan_fallback");
+
+    let boot_result = invoke(
+        &ctx,
+        "history_session_bootstrap",
+        json!({
+            "session_key": "recall-current",
+            "recall_query": "終端持久化 durable session"
+        }),
+    );
+    let boot = assert_ok(&boot_result);
+    assert_eq!(boot["history_loaded_count"], 5);
+    assert_eq!(boot["history_omitted_count"], 7);
+    assert_eq!(boot["recall_query"], "終端持久化 durable session");
+    assert_eq!(boot["relevant_history_summaries"][0]["number"], 1);
+    assert!(boot["relevant_history_summaries"][0]["summary"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("終端持久化"));
+    assert_eq!(boot["history_retrieval_source"], "scan_fallback");
+    assert_eq!(boot["recent_history_summary"], boot["all_history_summary"]);
+    assert!(boot["assistant_instructions"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("recent_history_summary"));
 }
 
 #[test]

@@ -206,7 +206,7 @@ fn default_tool_profile() -> String {
     "core".into()
 }
 fn default_permission_mode() -> String {
-    "trusted".into()
+    "safe".into()
 }
 
 impl Default for CanonicalPolicy {
@@ -396,12 +396,20 @@ fn map_u64(map: &Map<String, Value>, key: &str, fallback: u64) -> u64 {
     map.get(key).and_then(Value::as_u64).unwrap_or(fallback)
 }
 
-fn policy_from_map(map: &Map<String, Value>) -> SecurityPolicy {
-    let defaults = SecurityPolicy::default();
+fn policy_from_map(
+    map: &Map<String, Value>,
+    permission_mode: &str,
+    tool_profile: &str,
+) -> SecurityPolicy {
+    let defaults = SecurityPolicy::legacy(permission_mode, tool_profile);
     let flag =
         |key: &str, fallback: bool| map.get(key).and_then(Value::as_bool).unwrap_or(fallback);
     SecurityPolicy {
         restrict_tool_catalog: flag("restrictToolCatalog", defaults.restrict_tool_catalog),
+        advertise_read_only_annotations: flag(
+            "advertiseReadOnlyAnnotations",
+            defaults.advertise_read_only_annotations,
+        ),
         enforce_command_allowlist: flag(
             "enforceCommandAllowlist",
             defaults.enforce_command_allowlist,
@@ -463,6 +471,10 @@ fn policy_to_map(policy: &SecurityPolicy) -> Map<String, Value> {
     let mut map = Map::new();
     let fields = [
         ("restrictToolCatalog", policy.restrict_tool_catalog),
+        (
+            "advertiseReadOnlyAnnotations",
+            policy.advertise_read_only_annotations,
+        ),
         ("enforceCommandAllowlist", policy.enforce_command_allowlist),
         (
             "requireDangerousConfirmation",
@@ -721,7 +733,7 @@ pub fn canonical_from_node_v1(
             "oauthTokenTtlSeconds": oauth.get("tokenTtlSeconds").and_then(Value::as_u64).unwrap_or_else(default_oauth_token_ttl_seconds)
         },
         "toolProfile": object.get("toolProfile").and_then(Value::as_str).unwrap_or("core"),
-        "permissionMode": object.get("permissionMode").and_then(Value::as_str).unwrap_or("trusted"),
+        "permissionMode": object.get("permissionMode").and_then(Value::as_str).unwrap_or("safe"),
         "securityPolicy": object.get("securityPolicy").cloned().unwrap_or(Value::Object(Map::new())),
         "policy": object.get("policy").cloned().unwrap_or(Value::Object(Map::new())),
         "sandbox": object.get("sandbox").cloned().unwrap_or(Value::Object(Map::new())),
@@ -835,7 +847,11 @@ pub fn desktop_profile_from_canonical(document: &CanonicalWorkspace) -> Workspac
             security_policy: if document.security_policy.is_empty() {
                 None
             } else {
-                Some(policy_from_map(&document.security_policy))
+                Some(policy_from_map(
+                    &document.security_policy,
+                    &document.permission_mode,
+                    &document.tool_profile,
+                ))
             },
             runtime_command: map_str(&desktop, "runtimeCommand").unwrap_or_default(),
             allowed_commands: document.policy.allowed_commands.join(","),

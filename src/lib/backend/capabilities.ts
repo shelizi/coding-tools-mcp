@@ -49,7 +49,7 @@ export const NODE_CAPABILITIES: FrontendCapabilities = {
   actions: false,
   frpManagement: false,
   nativeDirectoryPicker: false,
-  softwareManagement: false,
+  softwareManagement: true,
   rawRuntimeLogs: false,
   agentRestart: true,
   staticBearerAuth: false,

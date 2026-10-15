@@ -9,6 +9,7 @@ import { EvolvedSkillCanaryEngine } from './knowledge/evolvedSkillCanary.js';
 import { KnowledgeIngestor } from './knowledge/ingestor.js';
 import { KnowledgeImpactStore } from './knowledge/impact.js';
 import { KnowledgeStore } from './knowledge/store.js';
+import { replayKnowledgeRuntimes } from './knowledge/replay.js';
 import {
   ToolEvolutionCandidateClaimer,
   ToolEvolutionExperimentStore,
@@ -202,6 +203,7 @@ export async function applyWorkspaceFolderConfiguration(
   if (!ctx.folderRuntimes.size) throw new Error('at least one workspace folder is required');
 
   if (runtimesToInitialize.length) {
+    await replayKnowledgeRuntimes([...new Set(runtimesToInitialize)], ctx.usageStore);
     await syncToolEvolutionRuntimes(
       [...new Set(runtimesToInitialize)],
       ctx.usageStore,

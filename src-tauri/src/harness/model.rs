@@ -54,6 +54,10 @@ impl TaskStatus {
         )
     }
 
+    pub fn occupies_current_task_slot(self) -> bool {
+        matches!(self, Self::Active | Self::Verifying | Self::Failed)
+    }
+
     pub fn can_transition_to(self, next: Self) -> bool {
         matches!(
             (self, next),

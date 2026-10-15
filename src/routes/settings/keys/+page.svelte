@@ -9,6 +9,7 @@
     type SharedSecretKey,
   } from "$lib/api/secrets";
   import { t, type MessageKey } from "$lib/i18n";
+  import { watchRotatingSecrets } from "$lib/runtime/secret-refresh";
 
   const MCP_KEYS: { key: SharedSecretKey; label: MessageKey }[] = [
     { key: "oauth_client_id", label: "MCP OAuth Client ID" },
@@ -91,7 +92,30 @@
     }
   }
 
-  onMount(loadAll);
+  const ROTATING_KEYS: SharedSecretKey[] = ["oauth_password", "actions_oauth_password"];
+
+  async function refreshRotatingSecrets() {
+    for (const key of ROTATING_KEYS) {
+      if (secrets[key] !== originals[key]) continue;
+      let value: string;
+      try {
+        value = (await getSharedSecret(key)) ?? "";
+      } catch {
+        continue;
+      }
+      if (loading || saving || regenerating || secrets[key] !== originals[key]) continue;
+      secrets[key] = value;
+      originals[key] = value;
+    }
+  }
+
+  onMount(() => {
+    void loadAll();
+    return watchRotatingSecrets(() => {
+      if (loading || saving || regenerating) return;
+      void refreshRotatingSecrets();
+    });
+  });
 </script>
 
 <section class="page-scroll">

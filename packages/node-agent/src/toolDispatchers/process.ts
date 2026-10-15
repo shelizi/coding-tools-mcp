@@ -8,6 +8,7 @@ import {
   processStatus,
   pruneProcessSessions,
   readSessionOutput,
+  retainedNextActions,
   removeProcessSession,
   requireProcessSession,
   runCommandGraph,
@@ -20,7 +21,7 @@ import {
 } from '../processes.js';
 import { toolErrorResult } from '../toolContract.js';
 import type { ToolDispatchRequest, ToolHandlerMap } from '../toolDispatch/contract.js';
-import type { JsonObject } from '../types.js';
+import type { JsonObject, ProcessSession } from '../types.js';
 import { rootAndCwd } from '../workspace.js';
 import { parseWslUncPath } from '../wsl.js';
 import { normalizedSandboxConfig, sandboxUsesPortableCommand } from '../sandbox.js';
@@ -114,6 +115,15 @@ async function execHealthCheck({ ctx, key }: ToolDispatchRequest): Promise<JsonO
   }
 }
 
+function recommendedWaitMs(session: ProcessSession, currentWaitMs: number, requestTimedOut: boolean): number {
+  if (!requestTimedOut) return Math.min(Math.max(currentWaitMs, 1), WAIT_COMMAND_TRANSPORT_SAFE_MS);
+  if (['build', 'test', 'cargo_test', 'cargo_check'].includes(session.telemetryCommandKind)) {
+    return WAIT_COMMAND_TRANSPORT_SAFE_MS;
+  }
+  const floor = session.lastOutputAt !== undefined && Date.now() - session.lastOutputAt < 5_000 ? 2_000 : 5_000;
+  return Math.min(WAIT_COMMAND_TRANSPORT_SAFE_MS, Math.max(floor, currentWaitMs * 2));
+}
+
 async function waitCommand({ ctx, key, args }: ToolDispatchRequest): Promise<JsonObject> {
   const runtime = currentFolderRuntime(ctx, key);
   const registryStarted = Date.now();
@@ -131,8 +141,22 @@ async function waitCommand({ ctx, key, args }: ToolDispatchRequest): Promise<Jso
   const requestTimedOut = !waited.changed;
   const processCompleted = session.finalizedAt !== undefined;
   const terminal = processCompleted;
+  const observationTimedOut = requestTimedOut && !processCompleted;
+  const observationState = processCompleted
+    ? 'completed'
+    : session.endedAt !== undefined
+      ? 'verifying'
+      : requestTimedOut
+        ? 'working'
+        : 'progress';
   const progressSinceLastWait = session.sequence > cursor || Boolean(session.endedAt) || processCompleted;
-  const nextWaitMs = terminal ? null : (waitTimeoutMs === 0 ? WAIT_COMMAND_TIMEOUT_DEFAULT_MS : Math.min(waitTimeoutMs, WAIT_COMMAND_TRANSPORT_SAFE_MS));
+  const eventCount = Math.max(0, session.sequence - cursor);
+  const currentWaitMs = waitTimeoutMs === 0 ? WAIT_COMMAND_TIMEOUT_DEFAULT_MS : Math.min(waitTimeoutMs, WAIT_COMMAND_TRANSPORT_SAFE_MS);
+  const recommendedWait = terminal ? null : recommendedWaitMs(session, currentWaitMs, requestTimedOut);
+  const nextWaitMs = recommendedWait;
+  const waitReturnedEmpty = requestTimedOut && eventCount === 0 && !processCompleted;
+  const waitTransportCapReached = waitReturnedEmpty && waited.effectiveWaitMs >= WAIT_COMMAND_TRANSPORT_SAFE_MS;
+  const sinceLastOutputMs = session.lastOutputAt === undefined ? null : Math.max(0, Date.now() - session.lastOutputAt);
   const eventDetail = String(args.event_detail ?? 'compact').trim().toLowerCase() === 'full' ? 'full' : 'compact';
   const result = processResult(session, {
     ...args,
@@ -146,30 +170,45 @@ async function waitCommand({ ctx, key, args }: ToolDispatchRequest): Promise<Jso
     heartbeat: waited.heartbeat,
     request_timed_out: requestTimedOut,
     wait_timed_out: requestTimedOut,
+    observation_timed_out: observationTimedOut,
+    observation_state: observationState,
     wait_completed: waited.changed || requestTimedOut,
     process_completed: processCompleted,
     terminal,
     progress_since_last_wait: progressSinceLastWait,
     next_wait_ms: nextWaitMs,
+    recommended_wait_ms: recommendedWait,
+    recommended_until: waitUntil,
+    since_last_output_ms: sinceLastOutputMs,
+    wait_returned_empty: waitReturnedEmpty,
+    wait_returned_output: eventCount > 0,
+    wait_returned_terminal: processCompleted,
+    wait_transport_cap_reached: waitTransportCapReached,
+    transport_safe_wait_ms: WAIT_COMMAND_TRANSPORT_SAFE_MS,
     wait_timeout_ms: waitTimeoutMs,
     effective_wait_ms: waited.effectiveWaitMs,
     heartbeat_ms: heartbeatMs,
     wait_until: waitUntil
   });
   if (session.finalizedAt === undefined) {
-    result.next_actions = [{
-      tool: 'wait_command',
-      arguments: {
-        session_id: session.id,
-        cursor: result.latest_cursor,
-        timeout_ms: waitTimeoutMs === 0 ? WAIT_COMMAND_TIMEOUT_DEFAULT_MS : Math.min(waitTimeoutMs, WAIT_COMMAND_TRANSPORT_SAFE_MS),
-        until: waitUntil,
-        output_mode: 'delta',
-        event_detail: eventDetail
-      }
-    }];
+    const retained = retainedNextActions(session, recommendedWait ?? WAIT_COMMAND_TIMEOUT_DEFAULT_MS);
+    if (retained[0]?.tool === 'resolve_operation') {
+      result.next_actions = retained;
+    } else {
+      result.next_actions = [{
+        tool: 'wait_command',
+        arguments: {
+          session_id: session.id,
+          cursor: result.latest_cursor,
+          timeout_ms: recommendedWait ?? WAIT_COMMAND_TIMEOUT_DEFAULT_MS,
+          until: waitUntil,
+          output_mode: 'delta',
+          event_detail: eventDetail
+        }
+      }];
+    }
   }
-  if (requestTimedOut && !processCompleted) result.suggestion = 'Wait window ended without process completion; process is still running. Continue with next_actions.';
+  if (requestTimedOut && !processCompleted) result.suggestion = 'Observation window ended; the retained process is still running. Continue with next_actions instead of restarting the command.';
   else if (!processCompleted) result.suggestion = 'Process made progress but is not complete; continue with next_actions.';
   else if (result.termination_reason === 'exited') result.suggestion = '进程已结束；检查 process_exit_code 与 post_checks';
   return result;
@@ -191,7 +230,7 @@ function resolveOperation({ ctx, key, args }: ToolDispatchRequest): JsonObject {
     });
   }
   touchSessionAttachment(resolved.session);
-  return {
+  const result: JsonObject = {
     ...processResult(resolved.session, {
       ...args,
       deduplicated: true,
@@ -199,6 +238,9 @@ function resolveOperation({ ctx, key, args }: ToolDispatchRequest): JsonObject {
     }),
     resolved_by: resolved.resolvedBy
   };
+  const nextActions = retainedNextActions(resolved.session, WAIT_COMMAND_TIMEOUT_DEFAULT_MS);
+  if (nextActions.length) result.next_actions = nextActions;
+  return result;
 }
 
 function listSessions({ ctx, key, args }: ToolDispatchRequest): JsonObject {

@@ -5,6 +5,7 @@
   import { getSecret, regenerateSecret, getSharedSecret, regenerateSharedSecret } from "$lib/api/secrets";
   import type { ActionsAuthDraft } from "$lib/types";
   import { t } from "$lib/i18n";
+  import { watchRotatingSecrets } from "$lib/runtime/secret-refresh";
 
   export const ACTIONS_AUTH_OPTIONS = [
     { value: "api_key", label: "API Key / Bearer" },
@@ -94,6 +95,24 @@
     draftUseShared;
     void loadSecrets();
   });
+
+  $effect(() =>
+    watchRotatingSecrets(() => {
+      if (suppressSecretsReload || saving || regeneratingOAuthPassword || loadingOAuthPassword) return;
+      if (oauthPassword !== loadedOauthPassword) return;
+      void refreshOAuthPassword();
+    }),
+  );
+
+  async function refreshOAuthPassword() {
+    const seq = secretsLoadSeq;
+    const password = await (draftUseShared
+      ? getSharedSecret("actions_oauth_password")
+      : getSecret(workspaceId, "actions_oauth_password"));
+    if (seq !== secretsLoadSeq || oauthPassword !== loadedOauthPassword) return;
+    oauthPassword = password ?? "";
+    loadedOauthPassword = password ?? "";
+  }
 
   async function loadSecrets() {
     const seq = ++secretsLoadSeq;

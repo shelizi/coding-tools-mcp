@@ -16,7 +16,7 @@ use self::model::{HistoryDocument, IndexEntry};
 
 pub use ui::{list_for_ui, read_for_ui};
 
-const HISTORY_SUMMARY_WINDOW: usize = 12;
+const HISTORY_SUMMARY_WINDOW: usize = 5;
 const HISTORY_NUMBER_WINDOW: usize = 256;
 const MAX_SESSION_SUMMARY_CHARS: usize = 3_000;
 const MAX_ALL_HISTORY_SUMMARY_CHARS: usize = 24_000;
@@ -334,9 +334,9 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         Vec::<&str>::new()
     };
     let assistant_instructions = if response_mode == "full" {
-        "Read all_history_summary, latest_handoff, and inherited_summary before continuing the project. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path."
+        "Read recent_history_summary, relevant_history_summaries, latest_handoff, and inherited_summary before continuing the project. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path."
     } else {
-        "Use the compact all_history_summary and latest_handoff to restore context. Request history_session_bootstrap again with response_mode=\"full\" only when deeper prior-session detail is materially needed. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path."
+        "Use recent_history_summary and relevant_history_summaries to restore context, plus latest_handoff for immediate continuity. Request history_session_bootstrap again with response_mode=\"full\" only when deeper prior-session detail is materially needed. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path."
     };
     let mut digest = Sha256::new();
     for entry in &summary_entries {
@@ -346,6 +346,48 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         digest.update(entry.content_sha256.as_bytes());
         digest.update(entry.content_bytes.to_le_bytes());
     }
+
+    let recall_query = args
+        .get("recall_query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (relevant_history_summaries, history_retrieval_source) = if let Some(query) = recall_query {
+        let mut recall_args = args.clone();
+        if let Some(object) = recall_args.as_object_mut() {
+            object.insert("query".into(), Value::String(query.to_string()));
+            object.insert("top_k".into(), Value::from(8));
+            object.insert("recent_boost".into(), Value::from(0.05));
+            object.insert("include_excerpt".into(), Value::Bool(true));
+        }
+        let recall = search(ctx, &recall_args)?;
+        let relevant = recall
+            .get("results")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|hit| hit.get("session_number").and_then(Value::as_u64) != Some(current_number))
+            .take(8)
+            .map(|hit| {
+                json!({
+                    "number": hit.get("session_number").cloned().unwrap_or(Value::Null),
+                    "path": hit.get("path").cloned().unwrap_or(Value::Null),
+                    "score": hit.get("score").cloned().unwrap_or(Value::Null),
+                    "matched_fields": hit.get("matched_fields").cloned().unwrap_or_else(|| json!([])),
+                    "summary": hit.get("excerpt").and_then(Value::as_str).map(|value| truncate_chars(value, MAX_SESSION_SUMMARY_CHARS)).unwrap_or_default()
+                })
+            })
+            .collect::<Vec<_>>();
+        (
+            relevant,
+            recall
+                .get("index_source")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        )
+    } else {
+        (Vec::new(), None)
+    };
 
     let mut payload = json!({
         "is_new_session": created,
@@ -367,7 +409,11 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "resumed": resumed,
         "sequence_valid": sequence_valid,
         "response_mode": response_mode,
-        "all_history_summary": all_history_summary
+        "all_history_summary": all_history_summary.clone(),
+        "recent_history_summary": all_history_summary,
+        "relevant_history_summaries": relevant_history_summaries,
+        "recall_query": recall_query,
+        "history_retrieval_source": history_retrieval_source
     });
     let remainder = json!({
         "inherited_summary": inherited_summary_response,
@@ -386,7 +432,8 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "persistence_mode": "model_mediated_tool_calls",
         "assistant_instructions": assistant_instructions,
         "required_next_actions": [
-            "read_all_history_summary",
+            "read_recent_history_summary",
+            "read_relevant_history_summaries",
             "read_latest_handoff",
             "verify_workspace_state",
             "execute_user_task",
@@ -591,6 +638,140 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "warnings": warnings
     })))
 }
+pub fn search(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            history_error(
+                "INVALID_ARGUMENT",
+                "query must be a non-empty string",
+                "validation",
+                false,
+                json!({"argument": "query"}),
+            )
+        })?;
+    let history_dir = resolve_dir(ctx, args)?;
+    let report = storage::scan(&ctx.workspace, &history_dir)?;
+    let top_k = args
+        .get("top_k")
+        .and_then(Value::as_u64)
+        .unwrap_or(8)
+        .clamp(1, 20) as usize;
+    let recent_boost = args
+        .get("recent_boost")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.05)
+        .clamp(0.0, 1.0);
+    let include_excerpt = args
+        .get("include_excerpt")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let query_normalized = query.to_lowercase();
+    let mut terms = query_normalized
+        .split_whitespace()
+        .filter(|term| term.chars().count() >= 2)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let chars = query_normalized.chars().collect::<Vec<_>>();
+    for size in [2_usize, 3_usize] {
+        if chars.len() >= size {
+            for start in 0..=chars.len() - size {
+                let gram = chars[start..start + size].iter().collect::<String>();
+                if !gram.chars().all(char::is_whitespace) && !terms.contains(&gram) {
+                    terms.push(gram);
+                }
+            }
+        }
+    }
+    if !terms.contains(&query_normalized) {
+        terms.push(query_normalized.clone());
+    }
+    let max_number = report
+        .documents
+        .iter()
+        .map(|document| document.number)
+        .max()
+        .unwrap_or(1) as f64;
+    let mut hits = report
+        .documents
+        .iter()
+        .filter_map(|document| {
+            let haystack = document.content.to_lowercase();
+            let title = markdown::document_title(&document.content, document.number);
+            let title_normalized = title.to_lowercase();
+            let mut score = 0.0_f64;
+            if haystack.contains(&query_normalized) {
+                score += 20.0;
+            }
+            if title_normalized.contains(&query_normalized) {
+                score += 20.0;
+            }
+            for term in &terms {
+                if haystack.contains(term) {
+                    score += 1.0;
+                }
+                if title_normalized.contains(term) {
+                    score += 2.0;
+                }
+            }
+            if score <= 0.0 {
+                return None;
+            }
+            score += recent_boost * (document.number as f64 / max_number);
+            let mut result = json!({
+                "session_number": document.number,
+                "path": document.path,
+                "updated_at": document.updated_at,
+                "title": title,
+                "score": (score * 1_000_000.0).round() / 1_000_000.0,
+                "matched_fields": ["summary"]
+            });
+            if include_excerpt {
+                result["excerpt"] = Value::String(truncate_chars(&document.content, 2_000));
+            }
+            Some(result)
+        })
+        .collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        let left_score = left
+            .get("score")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        let right_score = right
+            .get("score")
+            .and_then(Value::as_f64)
+            .unwrap_or_default();
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let left_number = left
+                    .get("session_number")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let right_number = right
+                    .get("session_number")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                right_number.cmp(&left_number)
+            })
+    });
+    hits.truncate(top_k);
+    Ok(tool_ok(json!({
+        "query": query,
+        "top_k": top_k,
+        "recent_boost": recent_boost,
+        "include_excerpt": include_excerpt,
+        "result_count": hits.len(),
+        "index_source": "scan_fallback",
+        "index_document_count": report.documents.len(),
+        "results": hits
+    })))
+}
+
 pub fn validate(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
     let history_dir = resolve_dir(ctx, args)?;
     let repair = args.get("repair").and_then(Value::as_bool).unwrap_or(false);

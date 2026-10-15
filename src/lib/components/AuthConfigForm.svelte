@@ -3,6 +3,7 @@
   import SecretInput from "$lib/components/SecretInput.svelte";
   import {
     getWorkspaceSecret,
+    setWorkspaceSecret,
     regenerateWorkspaceSecret,
     getSharedSecret,
     setSharedSecret,
@@ -13,6 +14,7 @@
   import { getBackend, readSecretIfAvailable, workspaceAuthSecretKeys } from "$lib/backend";
   import type { AuthConfig } from "$lib/types";
   import { t, translate, type MessageKey } from "$lib/i18n";
+  import { watchRotatingSecrets } from "$lib/runtime/secret-refresh";
 
   export interface SaveAuthOptions {
     skipRuntimeRestart?: boolean;
@@ -48,6 +50,14 @@
   let regenerating = $state<WorkspaceSecretKey | null>(null);
   let secretsLoadSeq = 0;
   let suppressSecretsReload = $state(false);
+
+  const canEditWorkspaceOauthPassword = $derived(capabilities.host === "node");
+  const workspaceOauthPasswordChanged = $derived(
+    capabilities.host === "node" &&
+      draft.type === "oauth" &&
+      !draft.use_shared_secrets &&
+      (secrets.oauth_password ?? "") !== (loadedSecrets.oauth_password ?? ""),
+  );
 
   const secretsDirty = $derived(
     (Object.keys(secrets) as WorkspaceSecretKey[]).some(
@@ -97,6 +107,13 @@
     void loadSecrets(id, authType, useShared);
   });
 
+  $effect(() =>
+    watchRotatingSecrets(() => {
+      if (suppressSecretsReload || saving || regenerating || dirty) return;
+      void loadSecrets(workspaceId, draft.type, draft.use_shared_secrets ?? false);
+    }),
+  );
+
   async function loadSecrets(id: string, authType: string, useShared: boolean) {
     const seq = ++secretsLoadSeq;
     const sharedClientId =
@@ -137,6 +154,7 @@
     suppressSecretsReload = true;
     try {
       let sharedSecretChanged = false;
+      const oauthPassword = secrets.oauth_password ?? "";
       const clientId =
         draft.type === "oauth" && draft.use_shared_secrets
           ? draft.oauth_client_id.trim()
@@ -163,13 +181,16 @@
               ? draftOauthTokenTtlDays * SECONDS_PER_DAY
               : draft.oauth_token_ttl_seconds,
         },
-        { skipRuntimeRestart: sharedSecretChanged },
+        { skipRuntimeRestart: sharedSecretChanged || workspaceOauthPasswordChanged },
       );
       if (sharedSecretChanged) {
         await setSharedSecret("oauth_client_id", clientId);
         loadedSharedOauthClientId = clientId;
       }
-      // Auth save only persists profile fields; secrets are already stored by regenerate.
+      if (workspaceOauthPasswordChanged) {
+        await setWorkspaceSecret(workspaceId, "oauth_password", oauthPassword);
+      }
+      // Regenerated secrets are already persisted; editable Node-host secrets are persisted above.
       loadedSecrets = { ...secrets };
     } catch (error) {
       await message(String(error), { title: $t("Failed to save"), kind: "error" });
@@ -274,9 +295,9 @@
     <div class="grid gap-1">
       <span class="text-xs text-[var(--color-text-muted)]">{$t("Authorization password")}</span>
       <SecretInput
-        value={secrets.oauth_password ?? ""}
+        bind:value={secrets.oauth_password}
         placeholder={$t("Enter this password when ChatGPT authorizes for the first time")}
-        readonly
+        readonly={!canEditWorkspaceOauthPassword}
         onRegenerate={() => void regenerate("oauth_password")}
         regenerating={regenerating === "oauth_password"}
       />

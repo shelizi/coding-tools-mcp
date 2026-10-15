@@ -25,6 +25,113 @@ use super::model::AppData;
 
 static DATA_FILE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Secret writes made directly against the data file (for example a running listener
+/// rotating its one-time OAuth password) bypass the long-lived cached `DataStore` held by
+/// the app state. They are journaled here so the cache can catch up before it is read or
+/// persisted; otherwise the UI shows a stale value and the next cache save reverts it.
+static EXTERNAL_SECRET_WRITES: Mutex<ExternalSecretJournal> = Mutex::new(ExternalSecretJournal {
+    revision: 0,
+    entries: Vec::new(),
+});
+const EXTERNAL_SECRET_JOURNAL_LIMIT: usize = 256;
+
+#[derive(Debug, Clone)]
+enum ExternalSecretWrite {
+    Workspace {
+        profile_id: String,
+        key: String,
+        value: String,
+    },
+    Shared {
+        key: String,
+        value: String,
+    },
+    App {
+        scope: String,
+        item_id: String,
+        value: String,
+    },
+}
+
+#[derive(Debug)]
+struct ExternalSecretJournal {
+    revision: u64,
+    entries: Vec<(u64, ExternalSecretWrite)>,
+}
+
+fn external_secret_journal() -> std::sync::MutexGuard<'static, ExternalSecretJournal> {
+    EXTERNAL_SECRET_WRITES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Must be called while holding the data file lock so ordering matches the file contents.
+fn record_external_secret_write(write: ExternalSecretWrite) {
+    let mut journal = external_secret_journal();
+    journal.revision += 1;
+    let revision = journal.revision;
+    journal.entries.push((revision, write));
+    if journal.entries.len() > EXTERNAL_SECRET_JOURNAL_LIMIT {
+        let overflow = journal.entries.len() - EXTERNAL_SECRET_JOURNAL_LIMIT;
+        journal.entries.drain(..overflow);
+    }
+}
+
+fn current_external_secret_revision() -> u64 {
+    external_secret_journal().revision
+}
+
+/// Applies journaled writes newer than `seen` to `data`. Returns the new revision, or
+/// `None` when entries were trimmed and the caller must reload secrets from disk instead.
+fn apply_external_secret_writes(data: &mut AppData, seen: u64) -> Option<u64> {
+    let journal = external_secret_journal();
+    if journal.revision == seen {
+        return Some(seen);
+    }
+    let oldest = journal.entries.first().map(|(revision, _)| *revision);
+    if oldest.map_or(true, |oldest| oldest > seen + 1) {
+        return None;
+    }
+    for (_, write) in journal
+        .entries
+        .iter()
+        .filter(|(revision, _)| *revision > seen)
+    {
+        match write {
+            ExternalSecretWrite::Workspace {
+                profile_id,
+                key,
+                value,
+            } => {
+                data.workspace_secrets
+                    .entry(profile_id.clone())
+                    .or_default()
+                    .insert(key.clone(), value.clone());
+            }
+            ExternalSecretWrite::Shared { key, value } => {
+                data.shared_secrets.insert(key.clone(), value.clone());
+            }
+            ExternalSecretWrite::App {
+                scope,
+                item_id,
+                value,
+            } => {
+                data.app_secrets
+                    .entry(scope.clone())
+                    .or_default()
+                    .insert(item_id.clone(), value.clone());
+            }
+        }
+    }
+    Some(journal.revision)
+}
+
+fn copy_secret_maps(target: &mut AppData, source: AppData) {
+    target.workspace_secrets = source.workspace_secrets;
+    target.shared_secrets = source.shared_secrets;
+    target.app_secrets = source.app_secrets;
+}
+
 const SHARED_KEYS: &[&str] = &[
     "oauth_client_id",
     "bearer_token",
@@ -49,6 +156,7 @@ struct RuntimeHandoffState {
 #[derive(Debug)]
 pub struct DataStore {
     data: AppData,
+    external_secret_revision: u64,
 }
 
 impl DataStore {
@@ -74,7 +182,10 @@ impl DataStore {
                 || changed
         });
         let shared_changed = sync_shared_live_store(&mut data)?;
-        let store = Self { data };
+        let store = Self {
+            data,
+            external_secret_revision: current_external_secret_revision(),
+        };
         if !existed_before || imported > 0 || normalized || shared_changed {
             store.persist_unlocked()?;
         }
@@ -88,14 +199,6 @@ impl DataStore {
         let _guard = lock_data_file()?;
         let data = load_or_migrate()?;
         f(&data)
-    }
-
-    pub fn update_file<R>(f: impl FnOnce(&mut AppData) -> AppResult<R>) -> AppResult<R> {
-        let _guard = lock_data_file()?;
-        let mut data = load_or_migrate()?;
-        let result = f(&mut data)?;
-        save(&data)?;
-        Ok(result)
     }
 
     pub fn read_workspace_secret_latest(profile_id: &str, key: &str) -> AppResult<Option<String>> {
@@ -112,7 +215,57 @@ impl DataStore {
         let _guard = lock_data_file()?;
         let mut data = load_or_migrate()?;
         update_workspace_secret_value(&mut data, profile_id, key, value)?;
-        save(&data)
+        save(&data)?;
+        record_external_secret_write(ExternalSecretWrite::Workspace {
+            profile_id: profile_id.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+        Ok(())
+    }
+
+    pub fn write_shared_secret_latest(key: &str, value: &str) -> AppResult<()> {
+        let _guard = lock_data_file()?;
+        let mut data = load_or_migrate()?;
+        data.shared_secrets
+            .insert(key.to_string(), value.to_string());
+        save(&data)?;
+        record_external_secret_write(ExternalSecretWrite::Shared {
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+        Ok(())
+    }
+
+    pub fn write_app_secret_latest(scope: &str, item_id: &str, value: &str) -> AppResult<()> {
+        let _guard = lock_data_file()?;
+        let mut data = load_or_migrate()?;
+        data.app_secrets
+            .entry(scope.to_string())
+            .or_default()
+            .insert(item_id.to_string(), value.to_string());
+        save(&data)?;
+        record_external_secret_write(ExternalSecretWrite::App {
+            scope: scope.to_string(),
+            item_id: item_id.to_string(),
+            value: value.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Brings the cached secret maps up to date with writes made directly to the data file.
+    pub fn sync_external_secret_writes(&mut self) -> AppResult<()> {
+        if let Some(revision) =
+            apply_external_secret_writes(&mut self.data, self.external_secret_revision)
+        {
+            self.external_secret_revision = revision;
+            return Ok(());
+        }
+        let _guard = lock_data_file()?;
+        let revision = current_external_secret_revision();
+        copy_secret_maps(&mut self.data, load_or_migrate()?);
+        self.external_secret_revision = revision;
+        Ok(())
     }
 
     pub fn data(&self) -> &AppData {
@@ -125,7 +278,16 @@ impl DataStore {
     }
 
     fn persist_unlocked(&self) -> AppResult<()> {
-        save(&self.data)
+        if current_external_secret_revision() == self.external_secret_revision {
+            return save(&self.data);
+        }
+        // A secret was written directly to the file after this cache last synced; carry it
+        // into the persisted copy instead of reverting it with the cached value.
+        let mut data = self.data.clone();
+        if apply_external_secret_writes(&mut data, self.external_secret_revision).is_none() {
+            copy_secret_maps(&mut data, load_or_migrate()?);
+        }
+        save(&data)
     }
 
     pub fn settings(&self) -> AppSettings {
@@ -1023,6 +1185,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn external_secret_writes_catch_up_cached_secret_maps() {
+        let seen = current_external_secret_revision();
+        let profile_id = format!("external-{}", uuid::Uuid::new_v4());
+        let mut data = AppData::default();
+        data.workspace_secrets.insert(
+            profile_id.clone(),
+            std::collections::HashMap::from([("oauth_password".into(), "used".into())]),
+        );
+        data.shared_secrets
+            .insert("oauth_password".into(), "shared-used".into());
+        {
+            let _guard = lock_data_file().expect("lock");
+            record_external_secret_write(ExternalSecretWrite::Workspace {
+                profile_id: profile_id.clone(),
+                key: "oauth_password".into(),
+                value: "rotated".into(),
+            });
+            record_external_secret_write(ExternalSecretWrite::Shared {
+                key: format!("{profile_id}-shared"),
+                value: "shared-rotated".into(),
+            });
+        }
+
+        let revision = apply_external_secret_writes(&mut data, seen).expect("journal retained");
+        assert!(revision >= seen + 2);
+        assert_eq!(
+            data.workspace_secrets[&profile_id]
+                .get("oauth_password")
+                .map(String::as_str),
+            Some("rotated")
+        );
+        assert_eq!(
+            data.shared_secrets
+                .get(&format!("{profile_id}-shared"))
+                .map(String::as_str),
+            Some("shared-rotated")
+        );
+        assert_eq!(
+            data.shared_secrets
+                .get("oauth_password")
+                .map(String::as_str),
+            Some("shared-used")
+        );
+    }
+
+    #[test]
     fn workspace_secret_roundtrip() {
         let id = uuid::Uuid::new_v4().to_string().replace('-', "");
         let mut store = DataStore::load().expect("load");
@@ -1093,7 +1301,10 @@ mod tests {
             "deleted-workspace".into(),
             second.id.clone(),
         ];
-        let store = DataStore { data };
+        let store = DataStore {
+            data,
+            external_secret_revision: 0,
+        };
 
         assert!(!store.mcp_runtime_enabled(&first.id));
         assert!(store.mcp_runtime_enabled(&second.id));
@@ -1113,7 +1324,10 @@ mod tests {
             "deleted-workspace".into(),
             second.id.clone(),
         ];
-        let store = DataStore { data };
+        let store = DataStore {
+            data,
+            external_secret_revision: 0,
+        };
 
         assert!(!store.actions_runtime_enabled(&first.id));
         assert!(store.actions_runtime_enabled(&second.id));

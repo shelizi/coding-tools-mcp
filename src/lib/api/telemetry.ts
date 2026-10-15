@@ -1,4 +1,5 @@
 import { getBackend } from "$lib/backend";
+import type { TelemetryQueryOptions } from "$lib/backend/types";
 
 export interface TelemetryRecord {
   event?: string;
@@ -44,6 +45,16 @@ export interface TelemetryAggregate {
   tools: TelemetryToolStat[];
 }
 
+export type StatisticsPeriod = "minute" | "hour" | "day";
+
+export interface TelemetryStatistics {
+  period: StatisticsPeriod;
+  interval_ms: number;
+  start_ts_ms: number;
+  until_ts_ms: number;
+  buckets: Array<{ started_ts_ms: number; calls: number; errors: number }>;
+}
+
 export interface TelemetryResult {
   workspace_id: string;
   log_dir: string;
@@ -53,13 +64,15 @@ export interface TelemetryResult {
   invalid_complete_lines: number;
   records: TelemetryRecord[];
   aggregate: TelemetryAggregate | null;
+  statistics?: TelemetryStatistics | null;
   performance: Record<string, unknown> | null;
   warnings: string[];
 }
 
 export async function readWorkspaceTelemetry(
   workspaceId: string,
-  options: { limit?: number; errorsOnly?: boolean; minDurationMs?: number; sinceTsMs?: number } = {},
+  options: TelemetryQueryOptions = {},
+  signal?: AbortSignal,
 ): Promise<TelemetryResult> {
-  return getBackend().telemetry.query(workspaceId, options);
+  return getBackend().telemetry.query(workspaceId, options, signal);
 }

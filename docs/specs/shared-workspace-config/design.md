@@ -31,7 +31,7 @@ JSON object, camelCase (align with Node files users already edit), `schemaVersio
   "publicBaseUrl": "",
   "auth": { "type": "oauth", "oauthClientId": "chatgpt" },
   "toolProfile": "core",
-  "permissionMode": "trusted",
+  "permissionMode": "safe",
   "securityPolicy": { "restrictToolCatalog": true },
   "policy": {
     "allowedCommands": [],

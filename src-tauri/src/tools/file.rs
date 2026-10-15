@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -532,6 +533,7 @@ pub fn search_text_with_options(
         include_hidden,
         include_ignored,
         include_generated,
+        !(files_only && queries.is_empty()) && include_globs.is_empty(),
     );
     let mut matches = Vec::new();
     let mut files = Vec::new();
@@ -544,6 +546,7 @@ pub fn search_text_with_options(
     let mut scanned_files = 0usize;
     let mut matched_files = 0usize;
     let mut skipped_large_files = 0usize;
+    let mut skipped_binary_files = 0usize;
     let mut skipped = 0usize;
     let mut truncated = false;
     let mut stopped_early = false;
@@ -569,6 +572,12 @@ pub fn search_text_with_options(
             .as_ref()
             .is_some_and(|matcher| matcher.is_match(&rel));
         if filename_matcher.is_some() && !filename_matches {
+            continue;
+        }
+        if !queries.is_empty() && binary_file_extension(&rel) {
+            continue;
+        }
+        if !queries.is_empty() && include_globs.is_empty() && !searchable_text_path(&rel) {
             continue;
         }
         files_considered += 1;
@@ -601,21 +610,81 @@ pub fn search_text_with_options(
             skipped_large_files += 1;
             continue;
         }
-        let bytes = match fs::read(&p) {
-            Ok(bytes) if !bytes.contains(&0) => bytes,
-            _ => continue,
-        };
-        let content = match std::str::from_utf8(&bytes) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
-        scanned_files += 1;
-        let lines: Vec<&str> = content.lines().collect();
         let mut file_match_count = 0usize;
         let mut file_recorded = false;
+        let mut scanned_this_file = false;
         for (query_index, query) in queries.iter().enumerate() {
-            for (idx, line) in lines.iter().enumerate() {
-                for found in query.matcher.find_iter(line) {
+            let mut reader = match utf8_search_reader(&p) {
+                Some(reader) => reader,
+                None => {
+                    skipped_binary_files += 1;
+                    continue 'files;
+                }
+            };
+            if !scanned_this_file {
+                scanned_this_file = true;
+                scanned_files += 1;
+            }
+            let mut before: Vec<String> = Vec::new();
+            let mut pending: Vec<(Value, Vec<String>, bool)> = Vec::new();
+            let mut idx = 0usize;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if line.ends_with('\n') {
+                            line.pop();
+                            if line.ends_with('\r') {
+                                line.pop();
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+                if context_lines > 0 {
+                    for pending_item in pending.iter_mut() {
+                        if pending_item.1.len() >= context_lines {
+                            continue;
+                        }
+                        let (value, truncated) =
+                            truncate_utf8_prefix(&line, context_line_bytes_limit);
+                        pending_item.1.push(value);
+                        pending_item.2 |= truncated;
+                    }
+                    let mut kept = Vec::new();
+                    for (mut item, after, context_truncated) in pending.drain(..) {
+                        if after.len() < context_lines {
+                            kept.push((item, after, context_truncated));
+                            continue;
+                        }
+                        item["after"] = json!(after);
+                        if context_truncated {
+                            item["context_truncated"] = json!(true);
+                        }
+                        if !push_search_match(
+                            &mut matches,
+                            item,
+                            &mut response_bytes_estimate,
+                            response_bytes_limit,
+                            &mut truncated,
+                            &mut response_limit_reached,
+                            &mut stopped_early,
+                            calculate_total,
+                            options.exact_total_fast_tail,
+                            &mut exact_total_fast_tail_skipped_match_details,
+                        ) {
+                            stopped_early = true;
+                            break 'files;
+                        }
+                    }
+                    pending = kept;
+                    if response_limit_reached && !calculate_total {
+                        break 'files;
+                    }
+                }
+                for found in query.matcher.find_iter(&line) {
                     query_counts[query_index] += 1;
                     file_match_count += 1;
                     if !file_recorded {
@@ -658,7 +727,7 @@ pub fn search_text_with_options(
                         }
                         continue;
                     }
-                    if matches.len() >= max_results {
+                    if matches.len() + pending.len() >= max_results {
                         truncated = true;
                         if calculate_total {
                             if options.exact_total_fast_tail {
@@ -684,7 +753,7 @@ pub fn search_text_with_options(
                         "query_index": query_index,
                         "query": bounded_query,
                         "match": bounded_match,
-                        "preview": preview_around_match(line, found.start(), found.end(), max_preview)
+                        "preview": preview_around_match(&line, found.start(), found.end(), max_preview)
                     });
                     if query_truncated {
                         item["query_truncated"] = json!(true);
@@ -693,10 +762,8 @@ pub fn search_text_with_options(
                         item["match_truncated"] = json!(true);
                     }
                     if context_lines > 0 {
-                        let start = idx.saturating_sub(context_lines);
-                        let end = (idx + 1 + context_lines).min(lines.len());
                         let mut context_truncated = false;
-                        let before = lines[start..idx]
+                        let before_lines = before
                             .iter()
                             .map(|line| {
                                 let (value, truncated) =
@@ -705,54 +772,51 @@ pub fn search_text_with_options(
                                 value
                             })
                             .collect::<Vec<_>>();
-                        let after = lines[idx + 1..end]
-                            .iter()
-                            .map(|line| {
-                                let (value, truncated) =
-                                    truncate_utf8_prefix(line, context_line_bytes_limit);
-                                context_truncated |= truncated;
-                                value
-                            })
-                            .collect::<Vec<_>>();
-                        item["before"] = json!(before);
-                        item["after"] = json!(after);
-                        if context_truncated {
-                            item["context_truncated"] = json!(true);
-                        }
-                    }
-                    let mut item_bytes = serde_json::to_vec(&item)
-                        .map(|value| value.len())
-                        .unwrap_or(0);
-                    if matches.is_empty()
-                        && item_bytes > response_bytes_limit
-                        && (item.get("before").is_some() || item.get("after").is_some())
-                    {
-                        if let Some(object) = item.as_object_mut() {
-                            object.remove("before");
-                            object.remove("after");
-                            object.insert(
-                                "context_omitted_due_to_response_limit".to_string(),
-                                json!(true),
-                            );
-                        }
-                        item_bytes = serde_json::to_vec(&item)
-                            .map(|value| value.len())
-                            .unwrap_or(0);
-                    }
-                    if response_bytes_estimate.saturating_add(item_bytes) > response_bytes_limit {
-                        truncated = true;
-                        response_limit_reached = true;
-                        if calculate_total {
-                            if options.exact_total_fast_tail {
-                                exact_total_fast_tail_skipped_match_details += 1;
-                            }
-                            continue;
-                        }
-                        stopped_early = true;
+                        item["before"] = json!(before_lines);
+                        pending.push((item, Vec::new(), context_truncated));
+                    } else if !push_search_match(
+                        &mut matches,
+                        item,
+                        &mut response_bytes_estimate,
+                        response_bytes_limit,
+                        &mut truncated,
+                        &mut response_limit_reached,
+                        &mut stopped_early,
+                        calculate_total,
+                        options.exact_total_fast_tail,
+                        &mut exact_total_fast_tail_skipped_match_details,
+                    ) {
                         break 'files;
                     }
-                    response_bytes_estimate = response_bytes_estimate.saturating_add(item_bytes);
-                    matches.push(item);
+                }
+                if context_lines > 0 {
+                    before.push(line.clone());
+                    if before.len() > context_lines {
+                        before.remove(0);
+                    }
+                }
+                idx += 1;
+            }
+            if context_lines > 0 {
+                for (mut item, after, context_truncated) in pending {
+                    item["after"] = json!(after);
+                    if context_truncated {
+                        item["context_truncated"] = json!(true);
+                    }
+                    if !push_search_match(
+                        &mut matches,
+                        item,
+                        &mut response_bytes_estimate,
+                        response_bytes_limit,
+                        &mut truncated,
+                        &mut response_limit_reached,
+                        &mut stopped_early,
+                        calculate_total,
+                        options.exact_total_fast_tail,
+                        &mut exact_total_fast_tail_skipped_match_details,
+                    ) {
+                        break 'files;
+                    }
                 }
             }
         }
@@ -830,6 +894,7 @@ pub fn search_text_with_options(
         "files_considered": files_considered,
         "scanned_files": scanned_files,
         "skipped_large_files": skipped_large_files,
+        "skipped_binary_files": skipped_binary_files,
         "cursor": cursor,
         "next_cursor": next_cursor,
         "scan_completed": !stopped_early,
@@ -944,11 +1009,269 @@ fn build_matcher(
         .map_err(|error| WorkspaceError::invalid_argument(format!("Invalid regex: {error}")))
 }
 
+fn binary_file_extension(path: &str) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "heic", "avif", "mp4",
+        "m4v", "mov", "mkv", "webm", "avi", "wmv", "mp3", "wav", "flac", "aac", "ogg", "m4a",
+        "opus", "zip", "tar", "gz", "tgz", "7z", "rar", "bz2", "xz", "zst", "pdf", "doc", "docx",
+        "xls", "xlsx", "ppt", "pptx", "ttf", "otf", "woff", "woff2", "eot", "exe", "dll", "so",
+        "dylib", "o", "obj", "a", "lib", "wasm", "class", "jar", "war", "pyc", "pyo", "sqlite",
+        "sqlite3", "bin", "iso", "dmg", "pt", "pth", "onnx", "gguf", "parquet", "ibd", "frm",
+        "myd", "myi", "mdb", "ldb", "sst", "wal", "apk", "deb", "rpm", "img", "qcow2", "vmdk",
+    ];
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let dot = match name.rfind('.') {
+        Some(index) if index > 0 && index + 1 < name.len() => index,
+        _ => return false,
+    };
+    EXTENSIONS
+        .iter()
+        .any(|extension| name[dot + 1..].eq_ignore_ascii_case(extension))
+}
+
+fn searchable_text_path(path: &str) -> bool {
+    const EXTENSIONS: &[&str] = &[
+        "ts",
+        "tsx",
+        "js",
+        "jsx",
+        "mjs",
+        "cjs",
+        "mts",
+        "cts",
+        "json",
+        "jsonc",
+        "json5",
+        "md",
+        "markdown",
+        "mdx",
+        "rst",
+        "txt",
+        "text",
+        "log",
+        "tmp",
+        "py",
+        "pyi",
+        "rb",
+        "php",
+        "go",
+        "rs",
+        "java",
+        "kt",
+        "kts",
+        "scala",
+        "c",
+        "h",
+        "cc",
+        "cpp",
+        "cxx",
+        "hpp",
+        "hxx",
+        "cs",
+        "fs",
+        "swift",
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "ps1",
+        "psm1",
+        "bat",
+        "cmd",
+        "yml",
+        "yaml",
+        "toml",
+        "ini",
+        "cfg",
+        "conf",
+        "cnf",
+        "env",
+        "xml",
+        "html",
+        "htm",
+        "xhtml",
+        "css",
+        "scss",
+        "sass",
+        "less",
+        "vue",
+        "svelte",
+        "astro",
+        "graphql",
+        "gql",
+        "sql",
+        "prisma",
+        "svg",
+        "csv",
+        "tsv",
+        "properties",
+        "gradle",
+        "r",
+        "lua",
+        "pl",
+        "pm",
+        "ex",
+        "exs",
+        "erl",
+        "hrl",
+        "hs",
+        "elm",
+        "clj",
+        "cljs",
+        "edn",
+        "nim",
+        "zig",
+        "proto",
+        "thrift",
+        "gitignore",
+        "gitattributes",
+        "dockerignore",
+        "editorconfig",
+        "npmrc",
+        "nvmrc",
+        "tf",
+        "tfvars",
+        "hcl",
+        "lock",
+    ];
+    const BASENAMES: &[&str] = &[
+        "dockerfile",
+        "makefile",
+        "gnumakefile",
+        "license",
+        "copying",
+        "authors",
+        "notice",
+        "changelog",
+        "gemfile",
+        "procfile",
+        "jenkinsfile",
+        "vagrantfile",
+        "rakefile",
+        "brewfile",
+        "caddyfile",
+        "justfile",
+        "taskfile",
+        "readme",
+    ];
+    if binary_file_extension(path) {
+        return false;
+    }
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let dot = match name.rfind('.') {
+        Some(index) if index > 0 && index + 1 < name.len() => index,
+        _ => return BASENAMES.iter().any(|base| name.eq_ignore_ascii_case(base)),
+    };
+    EXTENSIONS
+        .iter()
+        .any(|extension| name[dot + 1..].eq_ignore_ascii_case(extension))
+}
+
+fn has_prefix(data: &[u8], prefix: &[u8], offset: usize) -> bool {
+    data.get(offset..)
+        .is_some_and(|slice| slice.starts_with(prefix))
+}
+
+fn binary_magic_bytes(data: &[u8]) -> bool {
+    if data.len() < 2 {
+        return false;
+    }
+    has_prefix(data, &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], 0)
+        || has_prefix(data, &[0xFF, 0xD8, 0xFF], 0)
+        || has_prefix(data, b"GIF87a", 0)
+        || has_prefix(data, b"GIF89a", 0)
+        || (has_prefix(data, b"RIFF", 0) && data.len() >= 12)
+        || has_prefix(data, b"BM", 0)
+        || has_prefix(data, &[0x00, 0x00, 0x01, 0x00], 0)
+        || has_prefix(data, &[0x49, 0x49, 0x2A, 0x00], 0)
+        || has_prefix(data, &[0x4D, 0x4D, 0x00, 0x2A], 0)
+        || (has_prefix(data, b"PK", 0) && data.len() >= 4 && matches!(data[2], 0x03 | 0x05 | 0x07))
+        || has_prefix(data, &[0x1F, 0x8B], 0)
+        || has_prefix(data, &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C], 0)
+        || has_prefix(data, b"Rar!", 0)
+        || has_prefix(data, &[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00], 0)
+        || has_prefix(data, b"BZh", 0)
+        || has_prefix(data, b"%PDF-", 0)
+        || has_prefix(data, &[0x7F, 0x45, 0x4C, 0x46], 0)
+        || has_prefix(data, &[0xCF, 0xFA, 0xED, 0xFE], 0)
+        || has_prefix(data, &[0xCE, 0xFA, 0xED, 0xFE], 0)
+        || has_prefix(data, &[0xFE, 0xED, 0xFA, 0xCF], 0)
+        || has_prefix(data, &[0xFE, 0xED, 0xFA, 0xCE], 0)
+        || has_prefix(data, b"MZ", 0)
+        || has_prefix(data, &[0x00, 0x61, 0x73, 0x6D], 0)
+        || has_prefix(data, b"SQLite format 3", 0)
+        || has_prefix(data, &[0xCA, 0xFE, 0xBA, 0xBE], 0)
+        || (data.len() >= 8 && has_prefix(data, b"ftyp", 4))
+        || has_prefix(data, b"OggS", 0)
+        || has_prefix(data, b"fLaC", 0)
+        || has_prefix(data, &[0x1A, 0x45, 0xDF, 0xA3], 0)
+}
+
+fn utf8_search_reader(path: &Path) -> Option<BufReader<File>> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let prefix = reader.fill_buf().ok()?;
+    let probe = &prefix[..prefix.len().min(4096)];
+    if binary_magic_bytes(probe) || probe.contains(&0) {
+        return None;
+    }
+    Some(reader)
+}
+
+fn push_search_match(
+    matches: &mut Vec<Value>,
+    mut item: Value,
+    response_bytes_estimate: &mut usize,
+    response_bytes_limit: usize,
+    truncated: &mut bool,
+    response_limit_reached: &mut bool,
+    stopped_early: &mut bool,
+    calculate_total: bool,
+    exact_total_fast_tail: bool,
+    exact_total_fast_tail_skipped_match_details: &mut usize,
+) -> bool {
+    let mut item_bytes = serde_json::to_vec(&item)
+        .map(|value| value.len())
+        .unwrap_or(0);
+    if matches.is_empty()
+        && item_bytes > response_bytes_limit
+        && (item.get("before").is_some() || item.get("after").is_some())
+    {
+        if let Some(object) = item.as_object_mut() {
+            object.remove("before");
+            object.remove("after");
+            object.insert(
+                "context_omitted_due_to_response_limit".to_string(),
+                json!(true),
+            );
+        }
+        item_bytes = serde_json::to_vec(&item)
+            .map(|value| value.len())
+            .unwrap_or(0);
+    }
+    if response_bytes_estimate.saturating_add(item_bytes) > response_bytes_limit {
+        *truncated = true;
+        *response_limit_reached = true;
+        if calculate_total {
+            if exact_total_fast_tail {
+                *exact_total_fast_tail_skipped_match_details += 1;
+            }
+            return true;
+        }
+        *stopped_early = true;
+        return false;
+    }
+    *response_bytes_estimate = response_bytes_estimate.saturating_add(item_bytes);
+    matches.push(item);
+    true
+}
+
 fn search_file_paths(
     path: &Path,
     include_hidden: bool,
     include_ignored: bool,
     include_generated: bool,
+    text_only: bool,
 ) -> Vec<PathBuf> {
     if path.is_file() {
         return vec![path.to_path_buf()];
@@ -979,6 +1302,19 @@ fn search_file_paths(
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
         .map(|entry| entry.into_path())
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
+            if binary_file_extension(name) {
+                return false;
+            }
+            if text_only && !searchable_text_path(name) {
+                return false;
+            }
+            true
+        })
         .collect()
 }
 
@@ -1051,7 +1387,7 @@ fn decode_text(data: &[u8]) -> Result<(String, &'static str, bool), WorkspaceErr
             .map(|text| (text, "utf-16be", true))
             .map_err(|_| unsupported_encoding());
     }
-    if data.iter().take(4096).any(|byte| *byte == 0) {
+    if binary_magic_bytes(data) || data.iter().take(4096).any(|byte| *byte == 0) {
         return Err(WorkspaceError::Tool {
             code: "BINARY_FILE",
             message: "Binary file read blocked for text tool.".into(),

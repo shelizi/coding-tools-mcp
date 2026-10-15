@@ -165,7 +165,6 @@ const systemClock: StartupClock = {
     };
     const onAbort = () => finish(waitError('cancelled'));
     const timer = setTimeout(() => finish(), Math.max(0, ms));
-    timer.unref();
     signal?.addEventListener('abort', onAbort, { once: true });
   })
 };

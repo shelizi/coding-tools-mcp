@@ -14,6 +14,7 @@ const MAX_ACTION_CHARS: usize = 120;
 static NEXT_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SESSION_STATES: OnceLock<Mutex<HashMap<(String, String), SessionActivityState>>> =
     OnceLock::new();
+static WORKSPACE_LAST_ACCESS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct ActiveRequest {
@@ -162,6 +163,30 @@ pub(crate) fn now_ms() -> u64 {
     unix_timestamp_ms()
 }
 
+/// Record an authenticated MCP request for a workspace regardless of session
+/// key or RPC method. Used by the overview to show the last access time.
+pub(crate) fn record_workspace_access(profile_id: &str, ts_ms: u128) {
+    let profile_id = profile_id.trim();
+    let ts_ms = bounded_timestamp(ts_ms);
+    if profile_id.is_empty() || ts_ms == 0 {
+        return;
+    }
+    let states = WORKSPACE_LAST_ACCESS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut states = states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = states.entry(profile_id.to_string()).or_insert(0);
+    *entry = (*entry).max(ts_ms);
+}
+
+pub(crate) fn workspace_last_access_ms(profile_id: &str) -> Option<u64> {
+    let states = WORKSPACE_LAST_ACCESS.get_or_init(|| Mutex::new(HashMap::new()));
+    let states = states
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    states.get(profile_id).copied().filter(|ts| *ts > 0)
+}
+
 fn finish_request(
     profile_id: &str,
     session_key: &str,
@@ -246,7 +271,22 @@ fn unix_timestamp_ms() -> u64 {
 mod tests {
     use serde_json::json;
 
-    use super::{begin, snapshot, ACTIVE_WINDOW_MS};
+    use super::{
+        begin, record_workspace_access, snapshot, workspace_last_access_ms, ACTIVE_WINDOW_MS,
+    };
+
+    #[test]
+    fn workspace_access_tracks_latest_timestamp() {
+        let profile = "workspace-access-profile";
+        assert_eq!(workspace_last_access_ms(profile), None);
+        record_workspace_access(profile, 1_000);
+        record_workspace_access(profile, 500);
+        record_workspace_access(profile, 2_000);
+        assert_eq!(workspace_last_access_ms(profile), Some(2_000));
+        record_workspace_access(" ", 9_999);
+        record_workspace_access(profile, 0);
+        assert_eq!(workspace_last_access_ms(profile), Some(2_000));
+    }
 
     #[test]
     fn reports_running_active_and_inactive_states() {

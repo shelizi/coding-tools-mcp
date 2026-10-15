@@ -15,6 +15,7 @@ import { legacySecurityPolicy } from './securityPolicy.js';
 import { disposeProcessSessions, restoreProcessSessions } from './processes.js';
 import { preflightSandboxConfiguration } from './sandbox.js';
 import { ToolUsageStore } from './toolUsage.js';
+import { replayKnowledgeRuntimes } from './knowledge/replay.js';
 import { allFolderRuntimes, createFolderRuntime, syncToolEvolutionRuntimes } from './folderRuntime.js';
 import { ExtensionRegistry } from './extensions/registry.js';
 import { canonicalizeWorkspaceFolders } from './workspace.js';
@@ -46,6 +47,7 @@ export async function createToolContext(config: AgentConfig): Promise<ToolContex
   const usageStore = new ToolUsageStore(config.dataDir, { redactTelemetry: config.securityPolicy.redactTelemetry });
   const folderRuntimes = new Map(config.folders.map(folder => [folder.id, createFolderRuntime(config, folder)]));
   if (!folderRuntimes.size) throw new Error('at least one workspace folder is required');
+  await replayKnowledgeRuntimes([...folderRuntimes.values()], usageStore);
   await syncToolEvolutionRuntimes([...folderRuntimes.values()], usageStore, 'tool_evolution_startup');
   const extensions = new ExtensionRegistry({
     folders: config.folders,

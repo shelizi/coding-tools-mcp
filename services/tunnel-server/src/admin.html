@@ -174,8 +174,9 @@
     <section class="metrics" aria-label="伺服器健康度摘要">
       <div class="metric"><span class="muted">健康度</span><strong id="health-status" class="health">載入中</strong></div>
       <div class="metric"><span class="muted">已連線 Client</span><strong id="connected-clients">—</strong></div>
-      <div class="metric"><span class="muted">連線 Worker</span><strong id="connected-workers">—</strong></div>
-      <div class="metric"><span class="muted">Idle / Busy</span><strong id="worker-balance">—</strong></div>
+      <div class="metric"><span class="muted">Legacy Worker</span><strong id="connected-workers">—</strong></div>
+      <div class="metric"><span class="muted">Multiplex / Split Route</span><strong id="connected-connections">—</strong></div>
+      <div class="metric"><span class="muted">Worker Idle / Busy</span><strong id="worker-balance">—</strong></div>
       <div class="metric"><span class="muted">處理中請求</span><strong id="in-flight">—</strong></div>
       <div class="metric"><span class="muted">排隊中 / 峰值</span><strong id="queue-balance">—</strong></div>
       <div class="metric"><span class="muted">平均 / 最長排隊</span><strong id="queue-wait">—</strong></div>
@@ -187,7 +188,7 @@
     <div class="overview-grid">
       <section class="panel compact-table">
         <div class="toolbar">
-          <div class="toolbar-copy"><h2>即時 Worker 狀況</h2><span class="muted">跨 Client 的目前連線與負載</span></div>
+          <div class="toolbar-copy"><h2>Legacy Worker 狀況</h2><span class="muted">舊版 Worker transport 的目前負載；新版連線請至 Clients 查看</span></div>
           <span id="worker-count" class="muted"></span>
         </div>
         <div class="table-wrap"><table><thead><tr><th>Worker</th><th>Client / Service</th><th>狀態</th><th>完成請求</th><th>最後活動</th><th>最後錯誤</th></tr></thead><tbody id="workers"></tbody></table></div>
@@ -214,18 +215,23 @@
           <div class="client-heading">
             <div class="client-title">
               <h2 id="client-title">選擇 Client</h2>
-              <span id="client-subtitle" class="muted">查看連線、Worker 與專屬 Log</span>
+              <span id="client-subtitle" class="muted">查看連線資源、服務與專屬 Log</span>
             </div>
             <span id="client-status-badge" class="badge offline">離線</span>
           </div>
           <div class="metrics client-metrics">
-            <div class="metric"><span class="muted">連線 Worker</span><strong id="client-worker-count">—</strong></div>
-            <div class="metric"><span class="muted">Idle / Busy</span><strong id="client-worker-balance">—</strong></div>
+            <div class="metric"><span class="muted">連線資源</span><strong id="client-worker-count">—</strong></div>
+            <div class="metric"><span class="muted">Worker Idle / Busy</span><strong id="client-worker-balance">—</strong></div>
             <div class="metric"><span class="muted">可用服務</span><strong id="client-services">—</strong></div>
             <div class="metric"><span class="muted">註冊裝置</span><strong id="client-device-count">—</strong></div>
             <div class="metric"><span class="muted">最後活動</span><strong id="client-last-seen">—</strong></div>
             <div class="metric"><span class="muted">Node Agent 版本</span><strong id="client-agent-version">—</strong></div>
             <div class="metric"><span class="muted">更新狀態</span><strong id="client-update-state">—</strong></div>
+            <div class="metric"><span class="muted">WSS Transport</span><strong id="client-transport">—</strong></div>
+            <div class="metric"><span class="muted">Control</span><strong id="client-control">—</strong></div>
+            <div class="metric"><span class="muted">Data Connections</span><strong id="client-data-connections">—</strong></div>
+            <div class="metric"><span class="muted">Streams</span><strong id="client-streams">—</strong></div>
+            <div class="metric"><span class="muted">Queue / Desired</span><strong id="client-queue-demand">—</strong></div>
           </div>
         </section>
 
@@ -242,8 +248,13 @@
         </section>
 
         <section class="panel compact-table">
-          <div class="toolbar"><div class="toolbar-copy"><h2>Client Worker</h2><span class="muted">只顯示目前選取 Client</span></div></div>
-          <div class="table-wrap"><table><thead><tr><th>Worker</th><th>Service</th><th>狀態</th><th>版本 / Build</th><th>更新</th><th>完成請求</th><th>連線時間</th><th>最後活動</th><th>最後錯誤</th></tr></thead><tbody id="client-workers"></tbody></table></div>
+          <div class="toolbar"><div class="toolbar-copy"><h2>Client 連線資源</h2><span class="muted">同時顯示 Legacy Worker 與 Multiplex / Split route</span></div></div>
+          <div class="table-wrap"><table><thead><tr><th>資源</th><th>Transport</th><th>Service</th><th>Device</th><th>狀態</th><th>版本 / Build</th><th>更新</th><th>完成請求</th><th>連線時間</th><th>最後活動</th><th>最後錯誤</th></tr></thead><tbody id="client-workers"></tbody></table></div>
+        </section>
+
+        <section class="panel compact-table">
+          <div class="toolbar"><div class="toolbar-copy"><h2>WSS Session</h2><span class="muted">Split control/data 與 stream capacity 即時狀態</span></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Session</th><th>Route</th><th>Service</th><th>Control</th><th>Data</th><th>Streams</th><th>Capacity</th><th>Queue</th><th>Desired</th></tr></thead><tbody id="client-sessions"></tbody></table></div>
         </section>
 
         <section class="panel" id="client-log-search">
@@ -363,7 +374,7 @@
   const $ = (id) => document.getElementById(id);
   const formatTime = (value) => value ? new Date(value).toLocaleString() : "—";
   const formatShortTime = (value) => value ? new Date(value).toLocaleString([], { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "—";
-  const state = { page: "overview", devices: [], workers: [], clients: [], activeClientId: null };
+  const state = { page: "overview", devices: [], workers: [], connections: [], sessions: [], clients: [], activeClientId: null };
   let csrfToken = "";
 
   const policyFields = [
@@ -452,7 +463,9 @@
       const row = document.createElement("tr");
       cell(row, worker.worker_id);
       if (clientView) {
+        cell(row, "legacy-worker");
         cell(row, worker.service);
+        cell(row, worker.device_id);
       } else {
         cell(row, `${worker.client_id} / ${worker.service}`);
       }
@@ -471,10 +484,37 @@
       cell(row, worker.last_error || "—");
       body.appendChild(row);
     }
-    if (!workers.length) {
+    if (!workers.length && !clientView) {
       const row = document.createElement("tr");
-      const empty = cell(row, clientView ? "此 Client 目前沒有已連線 Worker" : "目前沒有已連線 Worker");
-      empty.colSpan = clientView ? 9 : 6;
+      const empty = cell(row, "目前沒有已連線 Legacy Worker");
+      empty.colSpan = 6;
+      body.appendChild(row);
+    }
+  }
+
+  function renderClientResources(client) {
+    renderWorkerRows("client-workers", client?.workers || [], true);
+    const body = $("client-workers");
+    for (const connection of client?.connections || []) {
+      const row = document.createElement("tr");
+      cell(row, connection.connection_key);
+      cell(row, connection.transport);
+      cell(row, connection.service);
+      cell(row, connection.device_id);
+      const status = cell(row, "");
+      status.appendChild(badge("connected", "online"));
+      cell(row, "—");
+      cell(row, "—");
+      cell(row, "—");
+      cell(row, formatTime(connection.connected_at_unix_ms));
+      cell(row, formatTime(connection.last_seen_at_unix_ms));
+      cell(row, "—");
+      body.appendChild(row);
+    }
+    if (!(client?.workers.length || client?.connections.length)) {
+      const row = document.createElement("tr");
+      const empty = cell(row, "此 Client 目前沒有已連線資源");
+      empty.colSpan = 11;
       body.appendChild(row);
     }
   }
@@ -501,9 +541,10 @@
   function rebuildClients() {
     const clients = new Map();
     const ensure = (clientId) => {
-      if (!clients.has(clientId)) clients.set(clientId, { clientId, devices: [], workers: [], services: new Set(), lastSeen: 0 });
+      if (!clients.has(clientId)) clients.set(clientId, { clientId, devices: [], workers: [], connections: [], sessions: [], services: new Set(), lastSeen: 0 });
       return clients.get(clientId);
     };
+    const isOnline = (client) => client.workers.length > 0 || client.connections.length > 0;
     for (const device of state.devices) {
       const client = ensure(device.client_id);
       client.devices.push(device);
@@ -517,15 +558,28 @@
       client.services.add(worker.service);
       client.lastSeen = Math.max(client.lastSeen, worker.last_seen_at_unix_ms || 0);
     }
+    for (const connection of state.connections) {
+      const client = ensure(connection.client_id);
+      client.connections.push(connection);
+      client.services.add(connection.service);
+      client.lastSeen = Math.max(client.lastSeen, connection.last_seen_at_unix_ms || connection.connected_at_unix_ms || 0);
+    }
+    for (const session of state.sessions) {
+      for (const route of session.routes || []) {
+        const client = ensure(route.client_id);
+        client.sessions.push({ ...session, route });
+        client.services.add(route.service);
+      }
+    }
     state.clients = [...clients.values()].sort((left, right) => {
-      const online = Number(right.workers.length > 0) - Number(left.workers.length > 0);
+      const online = Number(isOnline(right)) - Number(isOnline(left));
       return online || left.clientId.localeCompare(right.clientId);
     });
     if (!state.clients.some((client) => client.clientId === state.activeClientId)) state.activeClientId = state.clients[0]?.clientId || null;
     renderClientTabs();
     renderClientDetail();
     $("client-count").textContent = `${state.clients.length} 個 Client`;
-    $("connected-clients").textContent = new Set(state.workers.map((worker) => worker.client_id)).size;
+    $("connected-clients").textContent = state.clients.filter(isOnline).length;
   }
 
   function renderClientTabs() {
@@ -541,8 +595,9 @@
       const name = document.createElement("span");
       name.textContent = client.clientId;
       const dot = document.createElement("span");
-      dot.className = `client-dot${client.workers.length ? " online" : ""}`;
-      dot.title = client.workers.length ? "已連線" : "離線";
+      const online = client.workers.length > 0 || client.connections.length > 0;
+      dot.className = `client-dot${online ? " online" : ""}`;
+      dot.title = online ? "已連線" : "離線";
       button.append(name, dot);
       button.addEventListener("click", async () => {
         state.activeClientId = client.clientId;
@@ -567,20 +622,23 @@
       $("client-subtitle").textContent = "請先在管理設定建立註冊連結";
       $("client-status-badge").className = "badge offline";
       $("client-status-badge").textContent = "未設定";
-      for (const id of ["client-worker-count", "client-worker-balance", "client-services", "client-device-count", "client-last-seen", "client-agent-version", "client-update-state"]) $(id).textContent = "—";
+      for (const id of ["client-worker-count", "client-worker-balance", "client-services", "client-device-count", "client-last-seen", "client-agent-version", "client-update-state", "client-transport", "client-control", "client-data-connections", "client-streams", "client-queue-demand"]) $(id).textContent = "—";
       $("client-update-submit").disabled = true;
-      renderWorkerRows("client-workers", [], true);
+      renderClientResources(null);
+      renderClientSessions(null);
       renderLogs("client-logs", [], "選擇 Client 後顯示專屬 Log");
       return;
     }
     const idle = client.workers.filter((worker) => worker.state === "idle").length;
     const busy = client.workers.filter((worker) => worker.state === "busy").length;
+    const online = client.workers.length > 0 || client.connections.length > 0;
     $("client-title").textContent = client.clientId;
     $("client-subtitle").textContent = `${client.devices.length} 個裝置 · ${[...client.services].map((value) => value.toUpperCase()).join(" + ") || "尚無服務"}`;
-    $("client-status-badge").className = `badge ${client.workers.length ? "online" : "offline"}`;
-    $("client-status-badge").textContent = client.workers.length ? "已連線" : "離線";
-    $("client-worker-count").textContent = client.workers.length;
-    $("client-worker-balance").textContent = `${idle} / ${busy}`;
+    $("client-status-badge").className = `badge ${online ? "online" : "offline"}`;
+    $("client-status-badge").textContent = online ? "已連線" : "離線";
+    const resourceCount = client.workers.length + client.connections.length;
+    $("client-worker-count").textContent = `${resourceCount} (${client.workers.length} worker / ${client.connections.length} connection)`;
+    $("client-worker-balance").textContent = client.workers.length ? `${idle} / ${busy}` : "不適用";
     $("client-services").textContent = [...client.services].map((value) => value.toUpperCase()).join(" + ") || "—";
     $("client-device-count").textContent = client.devices.length;
     $("client-last-seen").textContent = formatShortTime(client.lastSeen);
@@ -590,7 +648,40 @@
     const updateStates = [...new Set(nodeWorkers.filter((worker) => worker.update_state).map((worker) => `${worker.update_state}${worker.update_target_version ? ` → ${worker.update_target_version}` : ""}`))];
     $("client-update-state").textContent = updateStates.length ? updateStates.join(", ") : "—";
     $("client-update-submit").disabled = !client.workers.some((worker) => worker.service === "mcp");
-    renderWorkerRows("client-workers", client.workers, true);
+    const transports = [...new Set(client.connections.map((connection) => connection.transport))];
+    $("client-transport").textContent = transports.join(" + ") || (client.workers.length ? "legacy" : "—");
+    const splitSessions = client.sessions;
+    $("client-control").textContent = splitSessions.length ? `${splitSessions.filter((session) => session.control_attached).length} connected` : "—";
+    $("client-data-connections").textContent = splitSessions.length ? `${Math.max(...splitSessions.map((session) => session.data_connections))} / ${Math.max(...splitSessions.map((session) => session.max_connections))}` : "—";
+    $("client-streams").textContent = splitSessions.length ? `${Math.max(...splitSessions.map((session) => session.active_streams))} active / ${Math.max(...splitSessions.map((session) => session.stream_capacity))} capacity` : "—";
+    $("client-queue-demand").textContent = splitSessions.length ? `${Math.max(...splitSessions.map((session) => session.queued_requests))} / ${Math.max(...splitSessions.map((session) => session.desired_connections))}` : "—";
+    renderClientResources(client);
+    renderClientSessions(client);
+  }
+
+  function renderClientSessions(client) {
+    const body = $("client-sessions");
+    body.replaceChildren();
+    for (const session of client?.sessions || []) {
+      const row = document.createElement("tr");
+      cell(row, session.session_id);
+      cell(row, session.route.route_id);
+      cell(row, session.route.service);
+      const control = cell(row, "");
+      control.appendChild(badge(session.control_attached ? "connected" : "detached", session.control_attached ? "online" : "warning"));
+      cell(row, `${session.data_connections} / ${session.max_connections}`);
+      cell(row, session.active_streams);
+      cell(row, `${session.available_stream_slots} free / ${session.stream_capacity}`);
+      cell(row, session.queued_requests ? `${session.queued_requests} (${session.oldest_queue_wait_ms} ms)` : "0");
+      cell(row, session.desired_connections);
+      body.appendChild(row);
+    }
+    if (!(client?.sessions.length)) {
+      const row = document.createElement("tr");
+      const empty = cell(row, "此 Client 目前沒有 Split WSS session；Legacy / unsplit multiplex 仍可在上方連線資源查看。");
+      empty.colSpan = 9;
+      body.appendChild(row);
+    }
   }
 
   function renderLogs(targetId, logs, emptyText) {
@@ -631,13 +722,16 @@
 
   async function loadObservability() {
     try {
-      const [dashboard, workersPayload, activityPayload] = await Promise.all([
-        api("/api/dashboard"), api("/api/workers"), api("/api/activity?limit=24")
+      const [dashboard, workersPayload, connectionsPayload, sessionsPayload, activityPayload] = await Promise.all([
+        api("/api/dashboard"), api("/api/workers"), api("/api/connections"), api("/api/multiplex-sessions"), api("/api/activity?limit=24")
       ]);
       state.workers = workersPayload.workers;
+      state.connections = connectionsPayload.connections;
+      state.sessions = sessionsPayload.sessions;
       $("health-status").textContent = dashboard.status === "healthy" ? "正常" : "需注意";
       $("health-status").className = `health${dashboard.status === "healthy" ? "" : " degraded"}`;
       $("connected-workers").textContent = dashboard.connected_workers;
+      $("connected-connections").textContent = dashboard.connected_connections;
       $("worker-balance").textContent = `${dashboard.idle_workers} / ${dashboard.busy_workers}`;
       $("in-flight").textContent = dashboard.in_flight_requests;
       $("queue-balance").textContent = `${dashboard.queued_requests} / ${dashboard.peak_queued_requests}`;
@@ -646,7 +740,7 @@
       $("total-requests").textContent = dashboard.total_requests.toLocaleString();
       $("error-rate").textContent = `${dashboard.error_rate_percent.toFixed(1)}%`;
       $("uptime").textContent = `運行 ${formatDuration(dashboard.uptime_seconds)}`;
-      $("worker-count").textContent = `${workersPayload.workers.length} 個已連線`;
+      $("worker-count").textContent = `${workersPayload.workers.length} 個 Legacy Worker`;
       renderWorkerRows("workers", workersPayload.workers);
       renderActivities(activityPayload.activities);
       rebuildClients();

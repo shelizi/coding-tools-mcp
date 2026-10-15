@@ -118,7 +118,9 @@ test('command execution schemas expose the timeout ceilings and deprecate applic
   assert.equal(execMany.inputSchema.properties.yield_time_ms.default, 20_000);
   assert.equal(execMany.inputSchema.properties.yield_time_ms.maximum, 300_000);
   assert.equal(wait.inputSchema.properties.timeout_ms.maximum, 60 * 60_000);
-  assert.equal(wait.inputSchema.properties.timeout_ms.default, 20_000);
+  assert.equal(wait.inputSchema.properties.timeout_ms.default, 8_000);
+  const resolve = tools.find(tool => tool.name === 'resolve_operation');
+  assert.equal(resolve.inputSchema.properties.event_detail.default, 'compact');
   assert.match(wait.inputSchema.properties.heartbeat_ms.description, /deprecated.*ignored.*transport/i);
 });
 
@@ -420,7 +422,8 @@ test('read_many, search_text, list_files and project_map follow the Rust read co
     query: 'needle',
     path: 'large-search.txt',
     max_results: 1000,
-    max_preview_bytes: 4096
+    max_preview_bytes: 4096,
+    max_file_bytes: 8 * 1024 * 1024
   }, meta);
   assert.equal(boundedPayload.response_limit_reached, true);
   assert.equal(boundedPayload.truncated, true);
@@ -437,6 +440,7 @@ test('read_many, search_text, list_files and project_map follow the Rust read co
     path: 'large-search.txt',
     max_results: 1000,
     max_preview_bytes: 4096,
+    max_file_bytes: 8 * 1024 * 1024,
     cursor: boundedPayload.next_cursor
   }, meta);
   assert.equal(boundedPayloadNext.matches[0].line, boundedPayload.returned_count + 1);
@@ -446,6 +450,7 @@ test('read_many, search_text, list_files and project_map follow the Rust read co
     path: 'large-search.txt',
     max_results: 1000,
     max_preview_bytes: 4096,
+    max_file_bytes: 8 * 1024 * 1024,
     calculate_total: true
   }, meta);
   assert.equal(exactPayload.response_limit_reached, true);
@@ -464,6 +469,52 @@ test('read_many, search_text, list_files and project_map follow the Rust read co
   }, meta);
   assert.deepEqual(filenameOnly.files.map(item => item.path), ['nested/test.txt']);
 
+  const lastLine = await callTool(ctx, 'search_text', {
+    query: 'delta',
+    path: 'hello.txt',
+    context_lines: 2,
+    max_results: 1
+  }, meta);
+  assert.equal(lastLine.matches[0].line, 4);
+  assert.deepEqual(lastLine.matches[0].before, ['beta needle', 'gamma needle']);
+  assert.deepEqual(lastLine.matches[0].after ?? [], []);
+
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, ...Buffer.from('needle')]);
+  await writeFile(path.join(root, 'photo.png'), png);
+  await writeFile(path.join(root, 'disguised.txt'), Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    Buffer.from('needle hidden in png bytes\n')
+  ]));
+  await writeFile(path.join(root, 'manual.pdf'), Buffer.from('%PDF-1.4\nneedle in pdf\n'));
+  const skippedBinary = await callTool(ctx, 'search_text', {
+    query: 'needle',
+    path: '.',
+    include_globs: ['hello.txt', 'photo.png', 'disguised.txt', 'manual.pdf', 'nested/test.txt']
+  }, meta);
+  assert.equal(skippedBinary.ok, true, JSON.stringify(skippedBinary));
+  assert.equal(skippedBinary.total_matches, 3);
+  assert.ok(!skippedBinary.matches.some(match => ['photo.png', 'disguised.txt', 'manual.pdf'].includes(match.path)));
+  assert.ok(skippedBinary.skipped_binary_files >= 1);
+
+  await mkdir(path.join(root, 'mariadb', 'data'), { recursive: true });
+  await writeFile(path.join(root, 'mariadb', 'data', 'dump.sql'), 'needle in mariadb\n');
+  await writeFile(path.join(root, 'noise.ibd'), 'needle in innodb\n');
+  await writeFile(path.join(root, 'blob.dat'), 'needle in dat\n');
+  await writeFile(path.join(root, 'huge.txt'), Buffer.concat([
+    Buffer.from('needle huge\n'),
+    Buffer.alloc(9 * 1024 * 1024, 0x78)
+  ]));
+  const defaultTextOnly = await callTool(ctx, 'search_text', {
+    query: 'needle',
+    path: '.',
+    exclude_globs: ['large-search.txt'],
+    max_results: 1000
+  }, meta);
+  assert.equal(defaultTextOnly.ok, true, JSON.stringify(defaultTextOnly));
+  assert.ok(defaultTextOnly.matches.some(match => match.path === 'mariadb/data/dump.sql'));
+  assert.ok(!defaultTextOnly.matches.some(match => match.path.endsWith('.ibd') || match.path.endsWith('.dat') || match.path === 'huge.txt'));
+  assert.ok(defaultTextOnly.matches.some(match => match.path === 'hello.txt'));
+
   const counted = await callTool(ctx, 'search_text', {
     query: 'needle',
     count_only: true,
@@ -478,7 +529,7 @@ test('read_many, search_text, list_files and project_map follow the Rust read co
   assert.ok(listed.entries.every(entry => entry.type !== 'directory'));
   assert.ok(listed.entries.some(entry => entry.path === 'hello.txt' && typeof entry.size_bytes === 'number'));
   const directories = await callTool(ctx, 'list_files', { path: '.', recursive: false, entry_types: ['directory'] }, meta);
-  assert.deepEqual(directories.entries.map(entry => entry.path), ['nested']);
+  assert.deepEqual(directories.entries.map(entry => entry.path).sort(), ['mariadb', 'nested']);
 
   const project = await callTool(ctx, 'project_map', { max_depth: 3 }, meta);
   assert.ok(project.manifests.some(item => item.path === 'package.json' && item.kind === 'npm'));
@@ -559,6 +610,76 @@ test('validated search canary preserves exact totals while skipping tail match-d
   assert.equal(impact.knowledgeId, strategy.id);
   assert.equal(impact.controlCalls, 1);
   assert.equal(impact.interventionCalls, 1);
+});
+
+test('semantics-preserving search strategy validates from real shadow equivalence evidence without task outcomes', async () => {
+  const { root, ctx } = await context();
+  const runtime = ctx.folderRuntimes.get('repo');
+  assert.ok(runtime);
+  const lines = Array.from({ length: 80 }, (_, index) => `needle ${String(index).padStart(3, '0')} ${'x'.repeat(80)}`);
+  await writeFile(path.join(root, 'shadow-equivalence-search.txt'), `${lines.join('\n')}\n`);
+  const strategy = await runtime.knowledgeStore.upsert({
+    id: '',
+    schemaVersion: 1,
+    scope: 'runtime',
+    target: 'tool_strategy',
+    status: 'shadow',
+    trigger: { tool: 'search_text', calculate_total: true },
+    hypothesis: 'Exact total fast-tail can preserve result semantics while skipping discarded detail work.',
+    recommendedAction: {
+      recommendation: 'prefer_bounded_search',
+      semantic_preserving_implementation: 'search_exact_total_fast_tail'
+    },
+    evidence: {
+      observations: 20,
+      successes: 20,
+      failures: 0,
+      totalDurationMs: 20_000,
+      totalRequestBytes: 2_000,
+      totalResponseBytes: 4_000,
+      firstSeenAtMs: 1,
+      lastSeenAtMs: 20
+    },
+    confidence: 0.8,
+    sourceEventIds: Array.from({ length: 20 }, (_, index) => `shadow-seed-${index}`),
+    counterexampleEventIds: [],
+    createdAtMs: 1,
+    updatedAtMs: 20
+  });
+  const args = {
+    query: 'needle',
+    path: 'shadow-equivalence-search.txt',
+    max_results: 1,
+    calculate_total: true
+  };
+  const metas = [
+    { 'openai/session': 'shadow-equivalence-a' },
+    { 'openai/session': 'shadow-equivalence-b' }
+  ];
+  await select(ctx, metas[0]);
+  await select(ctx, metas[1]);
+
+  for (let index = 0; index < 20; index += 1) {
+    const result = await callTool(ctx, 'search_text', args, metas[index % metas.length]);
+    assert.equal(result.total_matches, 80);
+    assert.equal(result.total_matches_exact, true);
+    assert.equal(result.exact_total_forced_full_scan, true);
+    assert.equal(result.exact_total_fast_tail, false, 'shadow validation must not apply the implementation before validation');
+    assert.equal('knowledge_shadow_equivalence_implementation' in result, false, 'learning-only evidence must not leak into tool responses');
+  }
+  await runtime.knowledgeIngestor.flush();
+
+  const learned = await runtime.knowledgeStore.get(strategy.id);
+  assert.equal(learned.status, 'validated');
+  const impact = (await runtime.knowledgeImpactStore.list()).find(item => item.knowledgeId === strategy.id);
+  assert.ok(impact);
+  assert.equal(impact.taskVerifiedSuccesses, 0);
+  assert.equal(impact.taskUnverifiedSuccesses, 0);
+  assert.equal(impact.taskFailures, 0);
+  assert.equal(impact.taskRollbacks, 0);
+  assert.ok(impact.semanticEquivalenceChecks >= 10);
+  assert.equal(impact.semanticEquivalenceFailures, 0);
+  assert.ok(impact.matchedConversationContextIds.length >= 2);
 });
 
 test('format_files plans safely and applies guarded builtin JSON formatting', async () => {
@@ -2259,11 +2380,20 @@ test('wait_command separates wait timeout from process completion', async () => 
   assert.equal(waited.ok, true);
   assert.equal(waited.request_timed_out, true);
   assert.equal(waited.wait_timed_out, true);
+  assert.equal(waited.observation_timed_out, true);
+  assert.equal(waited.observation_state, 'working');
+  assert.equal(waited.transport_safe_wait_ms, 8_000);
   assert.equal(waited.wait_completed, true);
   assert.equal(waited.process_completed, false);
   assert.equal(waited.terminal, false);
   assert.equal(waited.progress_since_last_wait, false);
-  assert.equal(waited.next_wait_ms, 20);
+  assert.equal(waited.next_wait_ms, 5_000);
+  assert.equal(waited.recommended_wait_ms, 5_000);
+  assert.equal(waited.recommended_until, 'finalized');
+  assert.equal(waited.wait_returned_empty, true);
+  assert.equal(waited.wait_returned_output, false);
+  assert.equal(waited.wait_returned_terminal, false);
+  assert.equal(waited.wait_transport_cap_reached, false);
   assert.equal(waited.process_timed_out, false);
   assert.equal(waited.process_still_running, true);
   assert.match(waited.suggestion, /still running/i);
@@ -2278,7 +2408,11 @@ test('wait_command separates wait timeout from process completion', async () => 
   assert.equal(finalized.process_completed, true);
   assert.equal(finalized.terminal, true);
   assert.equal(finalized.next_wait_ms, null);
+  assert.equal(finalized.recommended_wait_ms, null);
+  assert.equal(finalized.wait_returned_terminal, true);
   assert.equal(finalized.request_timed_out, false);
+  assert.equal(finalized.observation_timed_out, false);
+  assert.equal(finalized.observation_state, 'completed');
 });
 
 test('production WSS E2E runner refuses to run without explicit credentials', async () => {
@@ -2291,6 +2425,40 @@ test('production WSS E2E runner refuses to run without explicit credentials', as
       return true;
     }
   );
+});
+
+test('paused durable tasks release the current slot without allowing concurrent active resumes', async () => {
+  const { ctx, meta } = await context();
+  await select(ctx, meta);
+
+  const first = await callTool(ctx, 'start_task', { objective: 'First task' }, meta);
+  assert.equal(first.ok, true);
+  const firstId = first.task.id;
+
+  const pausedFirst = await callTool(ctx, 'pause_task', { task_id: firstId }, meta);
+  assert.equal(pausedFirst.task.status, 'paused');
+
+  const second = await callTool(ctx, 'start_task', { objective: 'Second task' }, meta);
+  assert.equal(second.ok, true);
+  assert.notEqual(second.task.id, firstId);
+
+  const selected = await callTool(ctx, 'task_context', {}, meta);
+  assert.equal(selected.task.id, second.task.id);
+  const retained = await callTool(ctx, 'task_context', { task_id: firstId }, meta);
+  assert.equal(retained.task.status, 'paused');
+
+  const blocked = await callTool(ctx, 'resume_task', { task_id: firstId }, meta);
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error.code, 'TASK_ALREADY_ACTIVE');
+  assert.equal(blocked.error.details.active_task_id, second.task.id);
+  assert.equal(blocked.error.details.paused_task_id, firstId);
+
+  await callTool(ctx, 'pause_task', { task_id: second.task.id }, meta);
+  const resumed = await callTool(ctx, 'resume_task', { task_id: firstId }, meta);
+  assert.equal(resumed.ok, true);
+  assert.equal(resumed.task.status, 'active');
+  const reselected = await callTool(ctx, 'task_context', {}, meta);
+  assert.equal(reselected.task.id, firstId);
 });
 
 test('history and durable task state survive tool calls', async () => {

@@ -24,6 +24,10 @@ async function fixture(t) {
   const ctx = await createToolContext(config(root, dataDir));
   t.after(async () => {
     await ctx.usageStore.flush();
+    await Promise.all([...ctx.folderRuntimes.values()].flatMap(runtime => [
+      runtime.knowledgeIngestor.flush(),
+      runtime.toolEvolutionBenchmarkCollector.flush()
+    ]));
     await rm(root, { recursive: true, force: true });
     await rm(dataDir, { recursive: true, force: true });
   });

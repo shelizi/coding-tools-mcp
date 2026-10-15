@@ -31,7 +31,9 @@ pub use software::{
     get_download_config, install_software, list_software, set_download_config, uninstall_software,
 };
 pub use telemetry::read_workspace_telemetry;
-pub use tunnel::{get_frp_snippet, restart_tunnel, start_tunnel, stop_tunnel, test_tunnel};
+pub use tunnel::{
+    get_frp_snippet, get_tunnel_status, restart_tunnel, start_tunnel, stop_tunnel, test_tunnel,
+};
 pub use workspace::{
     add_workspace_folder, add_wsl_workspace_folder, create_workspace, delete_workspace,
     export_shared_workspace, export_workspace_pack, import_workspace_pack, list_workspaces,

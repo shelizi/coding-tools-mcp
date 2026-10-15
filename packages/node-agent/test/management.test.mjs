@@ -259,7 +259,7 @@ test('management UI is loopback-only, token protected and never returns configur
   const status = await statusResponse.json();
   assert.equal(status.configuredToolProfile, 'core');
   assert.equal(status.toolProfile, 'trusted-core');
-  assert.equal(status.tools, 37);
+  assert.equal(status.tools, 38);
   assert.match(status.toolsetRevision, /^[0-9a-f]{16}$/);
 });
 
@@ -333,6 +333,14 @@ test('management can start and stop built-in WSS for a workspace', async t => {
   assert.equal(startedPayload.state, 'running');
   assert.match(startedPayload.publicUrl, /^https:\/\//);
 
+  const current = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/tunnel/status`, { headers });
+  assert.equal(current.status, 200);
+  const currentPayload = await current.json();
+  assert.equal(currentPayload.state, 'running');
+  assert.match(currentPayload.publicUrl, /^https:\/\//);
+  assert.ok('transportMode' in currentPayload);
+  assert.ok('serverOrigin' in currentPayload);
+
   const stopped = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/tunnel/stop`, {
     method: 'POST',
     headers,
@@ -351,13 +359,24 @@ test('workspace registry can add and remove a secondary workspace', async t => {
   await writeFile(configPath, `${JSON.stringify(document(root, dataDir), null, 2)}\n`);
   const application = await loadApplication(configPath);
   const store = new ApplicationConfigStore(application);
+  const started = [];
+  const stopped = [];
+  store.setRuntimeLifecycle({
+    async start(id) { started.push(id); },
+    async stop(id) { stopped.push(id); }
+  });
   const created = await store.addWorkspace(extra, 'Extra');
   assert.equal(created.ok, true);
-  assert.equal(created.restartRequired, true);
+  assert.equal(created.restartRequired, false);
+  assert.deepEqual(started, [created.id]);
+  assert.equal(store.workspace(created.id).store.current.permissionMode, 'guarded');
+  assert.equal(store.workspace(created.id).store.current.securityPolicy.blockNetworkCommands, true);
   assert.equal(store.entries().length, 2);
   assert.equal(store.workspace(created.id).name, 'Extra');
   const removed = await store.deleteWorkspace(created.id);
   assert.equal(removed.ok, true);
+  assert.equal(removed.restartRequired, false);
+  assert.deepEqual(stopped, [created.id]);
   assert.equal(store.entries().length, 1);
   await assert.rejects(() => store.deleteWorkspace(store.primaryWorkspaceId), /primary workspace cannot be deleted/);
 });

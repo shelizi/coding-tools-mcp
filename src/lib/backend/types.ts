@@ -67,6 +67,8 @@ export interface TelemetryQueryOptions {
   errorsOnly?: boolean;
   minDurationMs?: number;
   sinceTsMs?: number;
+  statisticsPeriod?: "minute" | "hour" | "day";
+  statisticsUntilTsMs?: number;
   scope?: "current_runtime" | "current_version" | "all";
   sortBy?: string;
 }
@@ -156,6 +158,7 @@ export interface SoftwareBackend {
 
 export interface TunnelBackend {
   getFrpSnippet(id: string, service: TunnelService): Promise<string>;
+  status(id: string, service: TunnelService): Promise<TunnelStatus>;
   start(id: string, service: TunnelService): Promise<TunnelStatus>;
   stop(id: string, service: TunnelService): Promise<TunnelStatus>;
   test(id: string, service: TunnelService): Promise<TunnelTestResult>;

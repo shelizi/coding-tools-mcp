@@ -15,6 +15,8 @@ const noUi = process.argv.includes('--no-ui');
 const application = await loadApplication(configPath);
 const workspaceStore = new ApplicationConfigStore(application);
 const runtimeRegistry = new Map<string, WorkspaceRuntimeRecord>();
+const sharedDeviceIdentities = new Map();
+const sharedSplitHubs = new Map<string, BuiltinTunnelManager>();
 
 const RESTART_EXIT_CODE = 75;
 const restartSupervised = restartSupervisedFromArgv(process.argv, process.env);
@@ -53,25 +55,33 @@ const requestRestart = restartSupervised ? () => {
 
 const acceptedUpdateIds = new Set<string>();
 
-try {
-  for (const workspace of application.workspaces) {
-    const primary = workspace.id === workspaceStore.primaryWorkspaceId;
-    const config = structuredClone(workspace.loaded.config);
-    config.management.enabled = primary && !noUi && config.management.enabled;
-    if (config.oauth.password === 'change-me') {
-      console.warn(`[${workspace.name}] Warning: CTMCP_OAUTH_PASSWORD is using the development default.`);
-    }
-    const configStore = workspaceStore.workspace(workspace.id).store;
-    const runtime = await createAgentRuntime(config, {
-      secretResolver: reference => configStore.secretValue(reference),
-      persistOAuthPassword: password => configStore.rotateOAuthPassword(password),
-      ...(primary ? { configStore, workspaceStore } : {}),
+async function startWorkspace(workspaceId: string): Promise<void> {
+  if (running.some(item => item.id === workspaceId)) {
+    throw new Error(`Workspace runtime is already running: ${workspaceId}`);
+  }
+  const workspace = workspaceStore.workspace(workspaceId);
+  const primary = workspaceId === workspaceStore.primaryWorkspaceId;
+  const config = structuredClone(workspace.store.current);
+  config.management.enabled = primary && !noUi && config.management.enabled;
+  if (config.oauth.password === 'change-me') {
+    console.warn(`[${workspace.name}] Warning: CTMCP_OAUTH_PASSWORD is using the development default.`);
+  }
+
+  let runtime: AgentRuntime | undefined;
+  let tunnel: BuiltinTunnelManager | undefined;
+  try {
+    runtime = await createAgentRuntime(config, {
+      secretResolver: reference => workspace.store.secretValue(reference),
+      persistOAuthPassword: password => workspace.store.rotateOAuthPassword(password),
+      ...(primary ? { configStore: workspace.store, workspaceStore } : {}),
       ...(primary && requestRestart ? { requestRestart } : {}),
       runtimeRegistry
     });
-    const tunnel = new BuiltinTunnelManager(config, runtime.context, {
+    tunnel = new BuiltinTunnelManager(config, runtime.context, {
+      sharedDeviceIdentities,
+      sharedSplitHubs,
       onEndpointResolved: endpoint => workspaceStore.applyResolvedBuiltinTunnel(
-        workspace.id,
+        workspaceId,
         endpoint.publicUrl,
         endpoint.enrollmentCompleted
       ),
@@ -87,14 +97,14 @@ try {
           if (!restartSupervised) throw new Error('Node Agent live update requires the portable restart supervisor');
           if (acceptedUpdateIds.has(updateId)) return;
           acceptedUpdateIds.add(updateId);
-          runtime.context.tunnelStatus!.updateId = updateId;
-          runtime.context.tunnelStatus!.updateTargetVersion = targetVersion;
-          runtime.context.tunnelStatus!.updateState = 'downloading';
-          runtime.context.tunnelStatus!.updateError = undefined;
+          runtime!.context.tunnelStatus!.updateId = updateId;
+          runtime!.context.tunnelStatus!.updateTargetVersion = targetVersion;
+          runtime!.context.tunnelStatus!.updateState = 'downloading';
+          runtime!.context.tunnelStatus!.updateError = undefined;
           await sendStatus({ update_id: updateId, version: targetVersion, state: 'downloading' });
           try {
             const prepared = await prepareNodeUpdatePackage(control, config.dataDir);
-            runtime.context.tunnelStatus!.updateState = 'verified';
+            runtime!.context.tunnelStatus!.updateState = 'verified';
             await sendStatus({
               update_id: updateId,
               version: targetVersion,
@@ -102,26 +112,26 @@ try {
               message: prepared.gitCommit
             });
             await scheduleNodeUpdateHandoff(prepared, config.dataDir);
-            runtime.context.tunnelStatus!.updateState = 'scheduled';
+            runtime!.context.tunnelStatus!.updateState = 'scheduled';
             await sendStatus({ update_id: updateId, version: targetVersion, state: 'scheduled' });
           } catch (error) {
             acceptedUpdateIds.delete(updateId);
-            runtime.context.tunnelStatus!.updateState = 'failed';
-            runtime.context.tunnelStatus!.updateError = error instanceof Error ? error.message : String(error);
+            runtime!.context.tunnelStatus!.updateState = 'failed';
+            runtime!.context.tunnelStatus!.updateError = error instanceof Error ? error.message : String(error);
             throw error;
           }
         }
       } : {})
     });
-    const runtimeRecord = runtimeRegistry.get(workspace.id);
+    const runtimeRecord = runtimeRegistry.get(workspaceId);
     if (runtimeRecord) runtimeRecord.tunnel = tunnel;
-    const item = { id: workspace.id, name: workspace.name, primary, runtime, tunnel };
+    const item: RunningWorkspace = { id: workspaceId, name: workspace.name, primary, runtime, tunnel };
     running.push(item);
 
     await new Promise<void>((resolve, reject) => {
-      runtime.server.once('error', reject);
-      runtime.server.listen(config.port, config.host, () => {
-        runtime.server.off('error', reject);
+      runtime!.server.once('error', reject);
+      runtime!.server.listen(config.port, config.host, () => {
+        runtime!.server.off('error', reject);
         resolve();
       });
     });
@@ -133,7 +143,32 @@ try {
       console.error(`[${workspace.name}] Built-in WSS failed to start: ${message}`);
       console.error(`[${workspace.name}] Local MCP remains available so the tunnel configuration can be corrected.`);
     }
+  } catch (error) {
+    const item = running.find(candidate => candidate.id === workspaceId);
+    if (item) {
+      running.splice(running.indexOf(item), 1);
+      await closeRuntime(item).catch(cleanupError => console.error(cleanupError));
+    } else if (runtime) {
+      await runtime.close().catch(cleanupError => console.error(cleanupError));
+    }
+    runtimeRegistry.delete(workspaceId);
+    throw error;
   }
+}
+
+async function stopWorkspace(workspaceId: string): Promise<void> {
+  const index = running.findIndex(item => item.id === workspaceId);
+  if (index < 0) return;
+  const item = running[index];
+  if (!item) return;
+  await closeRuntime(item);
+  running.splice(index, 1);
+}
+
+workspaceStore.setRuntimeLifecycle({ start: startWorkspace, stop: stopWorkspace });
+
+try {
+  for (const workspace of application.workspaces) await startWorkspace(workspace.id);
 } catch (error) {
   await stop().catch(stopError => console.error(stopError));
   throw error;

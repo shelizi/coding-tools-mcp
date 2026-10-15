@@ -36,7 +36,7 @@ test("工作區頂層分頁保存於 URL 並按需載入", async () => {
 
   assert.match(
     source,
-    /type WorkspaceTab = "overview" \| "history" \| "telemetry" \| "logs" \| "health" \| "features" \| "mcp" \| "actions" \| "settings"/,
+    /type WorkspaceTab = "overview" \| "history" \| "telemetry" \| "statistics" \| "logs" \| "health" \| "features" \| "mcp" \| "actions" \| "settings"/,
   );
   assert.match(source, /searchParams\.set\("tab", tab\)/);
   assert.match(source, /searchParams\.set\("section", mcpSection\)/);
@@ -109,11 +109,15 @@ test("Tabs 支援方向鍵、Home End 與完整 ARIA 關聯", async () => {
   assert.match(source, /aria-orientation="horizontal"/);
 });
 
-test("快速驗證會平行執行前端檢查與測試，完整 build 保持獨立", async () => {
+test("快速驗證會依序執行前端檢查與測試，完整 build 保持獨立", async () => {
   const pkg = JSON.parse(await read(packagePath));
 
   assert.equal(pkg.scripts["verify:fast"], "node scripts/verify-frontend.mjs");
   assert.equal(pkg.scripts.verify, "pnpm run verify:fast && pnpm run build");
+  assert.equal(
+    pkg.scripts.build,
+    "node packages/node-agent/scripts/with-dist-lock.mjs pnpm exec vite build",
+  );
 });
 
 test("GPT 配置卡片不再重複展示會話恢復入口", async () => {

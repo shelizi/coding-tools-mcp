@@ -1,10 +1,12 @@
-name: Publish Tunnel Server
+name: Publish Coding Tools Artifacts
 
 on:
   push:
     # Production tunnel-server auto-build follows the main branch.
     branches:
       - main
+    tags:
+      - 'node-agent-v*-portable-v*'
     paths:
       - crates/tunnel-protocol/**
       - services/tunnel-server/**
@@ -19,6 +21,7 @@ concurrency:
 jobs:
   publish:
     runs-on: self-hosted
+    if: ${{ !startsWith(gitea.ref, 'refs/tags/node-agent-v') }}
     env:
       IMAGE_REPOSITORY: coding-tools-tunnel-server
       SOURCE_SHA: ${{ gitea.sha }}
@@ -88,3 +91,147 @@ jobs:
               "$image")
             test "$revision" = "$expected_revision"
           done
+
+  publish-node-agent:
+    if: ${{ startsWith(gitea.ref, 'refs/tags/node-agent-v') }}
+    runs-on: node-agent-release
+    permissions:
+      code: read
+      releases: write
+    env:
+      SOURCE_SHA: ${{ gitea.sha }}
+      SOURCE_REF: ${{ gitea.ref }}
+      GITEA_SERVER_URL: ${{ gitea.server_url }}
+      GITEA_REPOSITORY: ${{ gitea.repository }}
+      GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+
+    steps:
+      - name: Require Windows x64 release runner
+        shell: powershell
+        run: |
+          if ($env:OS -ne 'Windows_NT' -or [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne 'X64') {
+            throw 'Node Agent portable release requires a Windows x64 self-hosted Gitea runner.'
+          }
+
+      - name: Checkout tagged source
+        uses: https://gitea.com/actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore annotated release tag
+        shell: powershell
+        run: |
+          $tag = $env:SOURCE_REF.Substring('refs/tags/'.Length)
+          git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to restore annotated release tag $tag." }
+          $tagType = (git cat-file -t "refs/tags/$tag" | Out-String).Trim()
+          if ($tagType -ne 'tag') { throw "Release tag $tag must remain annotated after checkout; got $tagType." }
+          $peeled = (git rev-parse "refs/tags/${tag}^{}" | Out-String).Trim()
+          if ($peeled -ne $env:SOURCE_SHA) { throw "Release tag $tag peels to $peeled instead of $env:SOURCE_SHA." }
+
+      - name: Setup Node.js 22
+        uses: https://gitea.com/actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate release prerequisites
+        shell: powershell
+        run: |
+          if ($env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$') { throw 'Gitea did not provide a full lowercase source SHA.' }
+          if ($env:SOURCE_REF -notmatch '^refs/tags/(node-agent-v.+-portable-v.+)$') { throw 'Unexpected Node Agent release ref.' }
+          if (-not $env:NODE_AGENT_UPDATE_PRIVATE_KEY_FILE -or -not (Test-Path -LiteralPath $env:NODE_AGENT_UPDATE_PRIVATE_KEY_FILE -PathType Leaf)) { throw 'NODE_AGENT_UPDATE_PRIVATE_KEY_FILE must point to the runner-local Ed25519 PKCS#8 signing key.' }
+          if ($env:GITEA_SERVER_URL -notmatch '^https://') { throw 'GITEA_SERVER_URL must be HTTPS.' }
+          if ($env:GITEA_REPOSITORY -ne 'neo/coding-tools-mcp') { throw "Unexpected GITEA_REPOSITORY: $env:GITEA_REPOSITORY" }
+          if (-not $env:GITEA_TOKEN) { throw 'Built-in GITEA_TOKEN is required for release publication.' }
+          $probeHeaders = @{ Authorization = "token $env:GITEA_TOKEN"; Accept = 'application/json' }
+          $probe = Invoke-WebRequest -UseBasicParsing -Method Get -Headers $probeHeaders -Uri "$env:GITEA_SERVER_URL/api/v1/repos/$env:GITEA_REPOSITORY/releases?limit=1"
+          if ([int]$probe.StatusCode -ne 200) { throw "Gitea release API preflight returned HTTP $($probe.StatusCode)." }
+          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { throw 'cargo is required on the Windows release runner.' }
+          node --version
+          npm --version
+          cargo --version
+
+      - name: Setup isolated pnpm 12
+        shell: powershell
+        run: |
+          $pnpmHome = Join-Path $env:RUNNER_TEMP 'pnpm-12.0.0'
+          npm install --global --prefix $pnpmHome pnpm@12.0.0
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to install isolated pnpm 12.0.0.' }
+          $pnpmCmd = Join-Path $pnpmHome 'pnpm.cmd'
+          if (-not (Test-Path -LiteralPath $pnpmCmd -PathType Leaf)) { throw "pnpm executable was not installed at $pnpmCmd" }
+          $version = (& $pnpmCmd --version | Out-String).Trim()
+          if ($version -ne '12.0.0') { throw "Unexpected isolated pnpm version: $version" }
+
+      - name: Install dependencies
+        shell: powershell
+        run: |
+          $pnpmHome = Join-Path $env:RUNNER_TEMP 'pnpm-12.0.0'
+          $pnpmCmd = Join-Path $pnpmHome 'pnpm.cmd'
+          $env:PATH = "$pnpmHome;$env:PATH"
+          & $pnpmCmd install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'pnpm install failed.' }
+
+      - name: Run Node Agent regression suite
+        shell: powershell
+        run: |
+          $pnpmHome = Join-Path $env:RUNNER_TEMP 'pnpm-12.0.0'
+          $pnpmCmd = Join-Path $pnpmHome 'pnpm.cmd'
+          $env:PATH = "$pnpmHome;$env:PATH"
+          & $pnpmCmd --dir packages/node-agent run test:full:unlocked
+          if ($LASTEXITCODE -ne 0) { throw 'Node Agent regression suite failed.' }
+
+      - name: Build both portable editions
+        shell: powershell
+        run: |
+          $pnpmHome = Join-Path $env:RUNNER_TEMP 'pnpm-12.0.0'
+          $env:PATH = "$pnpmHome;$env:PATH"
+          New-Item -ItemType Directory -Path release-node-agent -Force | Out-Null
+          powershell -NoProfile -ExecutionPolicy Bypass -File packages/node-agent/scripts/build-portable.ps1 -OutputDirectory release-node-agent
+          if ($LASTEXITCODE -ne 0) { throw 'Portable build failed.' }
+
+      - name: Sign artifacts and create release manifest
+        shell: powershell
+        run: |
+          $tag = $env:SOURCE_REF.Substring('refs/tags/'.Length)
+          $agentVersion = (Get-Content packages/node-agent/package.json -Raw | ConvertFrom-Json).version
+          $portableVersion = (Get-Content packages/node-agent/portable-version.json -Raw | ConvertFrom-Json).version
+          $bundled = Join-Path $PWD "release-node-agent/ctnode-$agentVersion-p$portableVersion-win64.zip"
+          $system = Join-Path $PWD "release-node-agent/ctnode-$agentVersion-p$portableVersion-sys-win64.zip"
+          $manifest = Join-Path $PWD 'release-node-agent/node-agent-update.json'
+          $privateKey = Join-Path $env:RUNNER_TEMP 'node-agent-update-private-key.pem'
+          Copy-Item -LiteralPath $env:NODE_AGENT_UPDATE_PRIVATE_KEY_FILE -Destination $privateKey -Force
+          node scripts/create-node-agent-update-manifest.mjs `
+            --release-tag $tag `
+            --git-commit $env:SOURCE_SHA `
+            --bundled $bundled `
+            --system $system `
+            --private-key $privateKey `
+            --output $manifest
+
+      - name: Publish immutable Gitea release
+        shell: powershell
+        run: |
+          $tag = $env:SOURCE_REF.Substring('refs/tags/'.Length)
+          $agentVersion = (Get-Content packages/node-agent/package.json -Raw | ConvertFrom-Json).version
+          $portableVersion = (Get-Content packages/node-agent/portable-version.json -Raw | ConvertFrom-Json).version
+          $bundled = Join-Path $PWD "release-node-agent/ctnode-$agentVersion-p$portableVersion-win64.zip"
+          $system = Join-Path $PWD "release-node-agent/ctnode-$agentVersion-p$portableVersion-sys-win64.zip"
+          $manifest = Join-Path $PWD 'release-node-agent/node-agent-update.json'
+          $publishArgs = @(
+            'scripts/publish-gitea-node-agent-release.mjs',
+            '--gitea-url', $env:GITEA_SERVER_URL,
+            '--repository', $env:GITEA_REPOSITORY,
+            '--tag', $tag,
+            '--asset', $bundled,
+            '--asset', $system,
+            '--asset', $manifest
+          )
+          & node @publishArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Remove temporary signing key
+        if: ${{ always() }}
+        shell: powershell
+        run: |
+          $privateKey = Join-Path $env:RUNNER_TEMP 'node-agent-update-private-key.pem'
+          if (Test-Path -LiteralPath $privateKey) { Remove-Item -LiteralPath $privateKey -Force }

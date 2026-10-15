@@ -2,6 +2,7 @@ import type { PermissionMode, SecurityPolicy, ToolProfileSetting } from './types
 
 export const securityPolicyKeys = [
   'restrictToolCatalog',
+  'advertiseReadOnlyAnnotations',
   'enforceCommandAllowlist',
   'requireDangerousConfirmation',
   'requireShellConfirmation',
@@ -21,13 +22,14 @@ export const securityPolicyKeys = [
 ] as const satisfies readonly (keyof SecurityPolicy)[];
 
 export function legacySecurityPolicy(
-  permissionMode: PermissionMode | string = 'trusted',
+  permissionMode: PermissionMode | string = 'guarded',
   toolProfile: ToolProfileSetting | string = 'core'
 ): SecurityPolicy {
   const mode = String(permissionMode);
   const profile = String(toolProfile);
   return {
     restrictToolCatalog: !['advanced', 'compat-readonly-all'].includes(profile),
+    advertiseReadOnlyAnnotations: profile === 'compat-readonly-all',
     enforceCommandAllowlist: true,
     requireDangerousConfirmation: mode !== 'dangerous',
     requireShellConfirmation: mode !== 'dangerous',
@@ -49,7 +51,7 @@ export function legacySecurityPolicy(
 
 export function normalizeSecurityPolicy(
   value: Partial<SecurityPolicy> | undefined,
-  permissionMode: PermissionMode | string = 'trusted',
+  permissionMode: PermissionMode | string = 'guarded',
   toolProfile: ToolProfileSetting | string = 'core'
 ): SecurityPolicy {
   const defaults = legacySecurityPolicy(permissionMode, toolProfile);
@@ -70,5 +72,6 @@ export function compatibilityPermissionMode(policy: SecurityPolicy): PermissionM
 }
 
 export function compatibilityToolProfile(policy: SecurityPolicy): ToolProfileSetting {
-  return policy.restrictToolCatalog ? 'trusted-core' : 'advanced';
+  if (policy.restrictToolCatalog) return 'trusted-core';
+  return policy.advertiseReadOnlyAnnotations ? 'compat-readonly-all' : 'advanced';
 }

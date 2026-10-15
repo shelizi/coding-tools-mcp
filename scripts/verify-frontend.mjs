@@ -3,7 +3,16 @@ import { spawn } from "node:child_process";
 function commandFor(script) {
   const packageManagerCli = process.env.npm_execpath;
   if (packageManagerCli) {
-    return { command: process.execPath, args: [packageManagerCli, "run", script] };
+    if (/\.[cm]?js$/i.test(packageManagerCli)) {
+      return { command: process.execPath, args: [packageManagerCli, "run", script] };
+    }
+    if (process.platform === "win32" && /\.cmd$/i.test(packageManagerCli)) {
+      return {
+        command: "cmd.exe",
+        args: ["/d", "/s", "/c", `"${packageManagerCli}" run ${script}`],
+      };
+    }
+    return { command: packageManagerCli, args: ["run", script] };
   }
   return {
     command: process.platform === "win32" ? "cmd.exe" : "pnpm",
@@ -35,5 +44,9 @@ function run(script) {
   });
 }
 
-const results = await Promise.all([run("check"), run("test")]);
-process.exitCode = results.some((code) => code !== 0) ? 1 : 0;
+const checkResult = await run("check");
+if (checkResult !== 0) {
+  process.exitCode = checkResult;
+} else {
+  process.exitCode = await run("test");
+}

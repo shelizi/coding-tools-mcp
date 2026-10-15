@@ -384,6 +384,8 @@ test('exec_many server restart preserves an already-started durable child sessio
   const meta1 = { 'openai/session': `durable-graph-a-${Date.now()}` };
   const childOperationId = `durable-graph-child-${Date.now()}-${Math.random()}`;
   const graphOperationId = `durable-graph-${Date.now()}-${Math.random()}`;
+  const restartGate = path.join(root, 'restart-gate');
+  const durableGraphArgs = ['-e', `const fs = require('node:fs'); const gate = ${JSON.stringify(path.join(root, 'restart-gate'))}; console.log('graph-before-restart'); const deadline = Date.now() + 60_000; const timer = setInterval(() => { if (fs.existsSync(gate)) { clearInterval(timer); console.log('graph-after-restart'); } else if (Date.now() >= deadline) { clearInterval(timer); process.exitCode = 2; } }, 50);`];
   let ctx2 = ctx1;
   let sessionId;
   t.after(async () => {
@@ -408,9 +410,9 @@ test('exec_many server restart preserves an already-started durable child sessio
     commands: [{
       id: 'durable-child',
       program: nodeProgram,
-      args: ['-e', `console.log('graph-before-restart'); setTimeout(() => console.log('graph-after-restart'), 1600);`],
+      args: durableGraphArgs,
       operation_id: childOperationId,
-      job_timeout_ms: 15_000,
+      job_timeout_ms: 90_000,
       yield_time_ms: 0
     }]
   }, meta1);
@@ -446,13 +448,14 @@ test('exec_many server restart preserves an already-started durable child sessio
 
   const byOperation = await callTool(ctx2, 'exec_command', {
     program: nodeProgram,
-    args: ['-e', `console.log('graph-before-restart'); setTimeout(() => console.log('graph-after-restart'), 1600);`],
+    args: durableGraphArgs,
     operation_id: childOperationId,
-    job_timeout_ms: 15_000,
+    job_timeout_ms: 90_000,
     yield_time_ms: 0
   }, meta2);
   assert.equal(byOperation.session_id, sessionId);
   assert.equal(byOperation.deduplicated, true);
+  await writeFile(restartGate, 'continue', 'utf8');
 
   let final;
   const finalDeadline = Date.now() + 30_000;
@@ -878,7 +881,7 @@ test('wait_command caps a long requested wait to the transport-safe chunk', asyn
     timeout_ms: 10_000,
     output_mode: 'none'
   }, state.meta);
-  assert.equal(started.next_actions[0].arguments.timeout_ms, 20_000);
+  assert.equal(started.next_actions[0].arguments.timeout_ms, 8_000);
 
   const waitedAt = Date.now();
   const waited = await callTool(state.ctx, 'wait_command', {
@@ -890,7 +893,8 @@ test('wait_command caps a long requested wait to the transport-safe chunk', asyn
   }, state.meta);
   assert.ok(Date.now() - waitedAt < 5_000, JSON.stringify(waited));
   assert.equal(waited.wait_timeout_ms, 60 * 60_000);
-  assert.equal(waited.effective_wait_ms, 20_000);
+  assert.equal(waited.effective_wait_ms, 8_000);
+  assert.equal(waited.transport_safe_wait_ms, 8_000);
   assert.equal(waited.process_still_running, false);
 });
 test('wait_command ignores the legacy heartbeat interval and uses the bounded server wait window', async t => {
@@ -902,7 +906,7 @@ test('wait_command ignores the legacy heartbeat interval and uses the bounded se
     timeout_ms: 10_000
   }, state.meta);
   assert.equal(started.operation_id, null);
-  assert.equal(started.next_actions[0].arguments.timeout_ms, 20_000);
+  assert.equal(started.next_actions[0].arguments.timeout_ms, 8_000);
   assert.equal(started.next_actions[0].arguments.until, 'output_or_exit');
 
   const waited = await callTool(state.ctx, 'wait_command', {
@@ -915,11 +919,17 @@ test('wait_command ignores the legacy heartbeat interval and uses the bounded se
   }, state.meta);
   assert.equal(waited.heartbeat, false, JSON.stringify(waited));
   assert.equal(waited.request_timed_out, true);
+  assert.equal(waited.observation_timed_out, true);
+  assert.equal(waited.observation_state, 'working');
   assert.equal(waited.effective_wait_ms, 600);
   assert.ok(waited.actual_wait_ms >= 500, JSON.stringify(waited));
   assert.equal(waited.process_still_running, true);
   assert.ok(Array.isArray(waited.next_actions));
-  assert.equal(waited.next_actions[0].arguments.timeout_ms, 600);
+  assert.equal(waited.next_wait_ms, 5_000);
+  assert.equal(waited.recommended_wait_ms, 5_000);
+  assert.equal(waited.wait_returned_empty, true);
+  assert.equal(waited.wait_transport_cap_reached, false);
+  assert.equal(waited.next_actions[0].arguments.timeout_ms, 5_000);
   assert.equal(Object.hasOwn(waited.next_actions[0].arguments, 'heartbeat_ms'), false);
   assert.equal(waited.wait_until, 'finalized');
   assert.equal(typeof waited.session_registry_wait_ms, 'number');

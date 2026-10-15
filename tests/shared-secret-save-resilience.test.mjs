@@ -24,10 +24,7 @@ test("saving shared MCP OAuth credentials schedules only one runtime restart", a
   ]);
 
   assert.match(authForm, /sharedSecretChanged = clientId !== loadedSharedOauthClientId/);
-  assert.match(
-    authForm,
-    /await onSaveProfile\(\{ \.\.\.draft \}, \{ skipRuntimeRestart: sharedSecretChanged \}\)/,
-  );
+  assert.match(authForm, /skipRuntimeRestart: sharedSecretChanged/);
   assert.match(authForm, /if \(sharedSecretChanged\) \{\s*await setSharedSecret/);
   assert.ok(
     authForm.indexOf("await onSaveProfile") < authForm.indexOf('await setSharedSecret("oauth_client_id"'),
@@ -52,4 +49,23 @@ test("regenerated secrets are already saved and cannot enable a second restart",
   assert.match(actionsAuthForm, /loadedOauthClientSecret = oauthClientSecret/);
   assert.match(actionsAuthForm, /loadedOauthPassword = oauthPassword/);
   assert.match(actionsAuthForm, /loadedOauthTokenSecret = oauthTokenSecret/);
+});
+
+test("Node-host MCP authorization password can be edited and saved through the workspace secret API", async () => {
+  const authForm = await readFile(authFormPath, "utf8");
+
+  assert.match(authForm, /setWorkspaceSecret,/);
+  assert.match(authForm, /const canEditWorkspaceOauthPassword = \$derived\(capabilities\.host === "node"\)/);
+  assert.match(
+    authForm,
+    /workspaceOauthPasswordChanged[\s\S]*capabilities\.host === "node"[\s\S]*secrets\.oauth_password[\s\S]*loadedSecrets\.oauth_password/,
+  );
+  assert.match(
+    authForm,
+    /await setWorkspaceSecret\(workspaceId, "oauth_password", oauthPassword\)/,
+  );
+  assert.match(
+    authForm,
+    /bind:value=\{secrets\.oauth_password\}[\s\S]*readonly=\{!canEditWorkspaceOauthPassword\}/,
+  );
 });

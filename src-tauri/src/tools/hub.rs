@@ -107,6 +107,21 @@ pub fn remove_live_hub(profile_id: &str) {
     lock_hubs().remove(profile_id);
 }
 
+/// Expiry only forgets handle-owned routing metadata; it never kills commands.
+pub(crate) fn forget_handle_conversation(profile_id: &str, session_key: &str) {
+    if !session_key.starts_with("ctmcp-handle:") {
+        return;
+    }
+    let Some(router) = lock_hubs().get(profile_id).cloned() else {
+        return;
+    };
+    let mut state = lock_state(&router);
+    state.session_folders.remove(session_key);
+    state
+        .saved_cwds
+        .retain(|key, _| key.split_once('\0').map(|(_, session)| session) != Some(session_key));
+}
+
 pub fn sync_live_hub(profile: &WorkspaceProfile) -> Result<bool, String> {
     let router = lock_hubs().get(&profile.id).cloned();
     let Some(router) = router else {
@@ -280,6 +295,30 @@ impl HubRouter {
         tool_name: &str,
         arguments: &Value,
     ) -> Result<McpRoutedContext, String> {
+        // A one-call selector does not bind a conversation. Clients without
+        // platform identity metadata can still address an allowed workspace.
+        if host_session_key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .is_none()
+        {
+            if let Some(folder_id) = explicit_folder_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                let folder_id = {
+                    let state = lock_state(self);
+                    folder_id_if_allowed(&state.folders, folder_id)?
+                };
+                let context = self.context_for_folder(&folder_id, None)?;
+                return Ok(McpRoutedContext {
+                    folder_id,
+                    selected_folder_id: None,
+                    route_source: "explicit",
+                    context,
+                });
+            }
+        }
         let session_key = host_session_key
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -332,12 +371,36 @@ impl HubRouter {
                     })?;
                     (folder_id, selected, "resume_id")
                 } else {
-                    let folder_id = selected.clone().ok_or_else(|| {
-                        "WORKSPACE_FOLDER_NOT_SELECTED: request_permissions 没有可推导的 resume_id，且 conversation 尚未绑定资料夹。"
+                    let inferred = unique_conversation_context_match(
+                        &state,
+                        session_key,
+                        |context| !context.pending_operations.resume_ids().is_empty(),
+                        "pending permission operation",
+                    )?;
+                    if let Some(folder_id) = inferred {
+                        (folder_id, selected, "pending_permission")
+                    } else {
+                        let folder_id = selected.clone().ok_or_else(|| {
+                            "WORKSPACE_FOLDER_NOT_SELECTED: request_permissions 没有可推导的 resume_id、pending operation 或已绑定资料夹。"
+                                .to_string()
+                        })?;
+                        (folder_id, selected, "conversation")
+                    }
+                }
+            } else if tool_name == "server_info" {
+                let folder_id = selected
+                    .clone()
+                    .or_else(|| state.folders.first().map(|folder| folder.id.clone()))
+                    .ok_or_else(|| {
+                        "WORKSPACE_FOLDER_NOT_SELECTED: 没有可用于 runtime metadata 的资料夹。"
                             .to_string()
                     })?;
-                    (folder_id, selected, "conversation")
-                }
+                let route_source = if selected.is_some() {
+                    "conversation"
+                } else {
+                    "runtime_default"
+                };
+                (folder_id, selected, route_source)
             } else {
                 let folder_id = selected.clone().ok_or_else(|| {
                     "WORKSPACE_FOLDER_NOT_SELECTED: 此 session 尚未选取资料夹；请先呼叫 conversation_bootstrap，或为支援的工具提供 workspace_folder_id。"
@@ -395,12 +458,15 @@ impl HubRouter {
                             "找不到 resume_id 对应的资料夹上下文：{resume_id}；请确认 ID 或明确提供 workspace_folder_id。"
                         )
                     })?,
-                None => {
-                    return Err(
-                        "WORKSPACE_FOLDER_NOT_SELECTED: request_permissions 必須提供可識別資料夾的 resume_id，或明確提供 workspace_folder_id。"
-                            .into(),
-                    )
-                }
+                None => unique_context_match(
+                    &state,
+                    |context| !context.pending_operations.resume_ids().is_empty(),
+                    "pending permission operation",
+                )?
+                .ok_or_else(|| {
+                    "WORKSPACE_FOLDER_NOT_SELECTED: request_permissions 沒有可推導的 pending operation；請提供 resume_id 或 workspace_folder_id。"
+                        .to_string()
+                })?,
             }
         } else {
             return Err(
@@ -829,9 +895,14 @@ fn prune_conversation_contexts_locked(state: &mut RoutingState) {
     candidates.sort_by_key(|(_, last_used)| *last_used);
     for (cache_key, _) in candidates.into_iter().take(remove_count) {
         if let Some(context) = state.contexts.remove(&cache_key) {
-            state
-                .saved_cwds
-                .insert(cache_key.clone(), context.default_cwd_path());
+            let expired_handle = cache_key.split_once('\0').is_some_and(|(_, key)| {
+                key.starts_with("ctmcp-handle:") && !state.session_folders.contains_key(key)
+            });
+            if !expired_handle {
+                state
+                    .saved_cwds
+                    .insert(cache_key.clone(), context.default_cwd_path());
+            }
         }
         state.context_last_used.remove(&cache_key);
     }
@@ -1053,6 +1124,63 @@ mod tests {
             limits: ExecutionLimits::default(),
             execution_resource_namespace: namespace.into(),
         }
+    }
+
+    #[test]
+    fn explicit_mcp_route_without_identity_does_not_bind_a_conversation() {
+        let first = tempfile::tempdir().expect("first folder");
+        let second = tempfile::tempdir().expect("second folder");
+        let folders = [("first", first.path()), ("second", second.path())]
+            .into_iter()
+            .map(|(id, path)| WorkspaceFolder {
+                id: id.into(),
+                name: id.into(),
+                path: path.display().to_string(),
+                execution: Default::default(),
+            })
+            .collect();
+        let router = HubRouter::new(
+            "identityless-route-test".into(),
+            folders,
+            test_config("identityless-route-test"),
+        )
+        .expect("router");
+        router
+            .switch("first", Some("chatgpt"))
+            .expect("existing binding");
+        for identity in [None, Some("  ")] {
+            let routed = router
+                .resolve_tool_context(
+                    identity,
+                    Some(" second "),
+                    "read_file",
+                    &json!({"path": "marker.txt"}),
+                )
+                .expect("explicit route without identity");
+            assert_eq!(routed.folder_id, "second");
+            assert_eq!(routed.route_source, "explicit");
+            assert_eq!(routed.selected_folder_id, None);
+            assert_eq!(
+                routed.context.workspace.root(),
+                second.path().canonicalize().unwrap()
+            );
+            assert!(router
+                .resolve_tool_context(identity, None, "read_file", &json!({}))
+                .is_err());
+            assert!(router
+                .resolve_tool_context(identity, Some("unknown"), "read_file", &json!({}))
+                .is_err());
+            assert!(router.switch("second", identity).is_err());
+        }
+        assert_eq!(
+            router.folder_listing(None).unwrap()["selected_folder_id"],
+            Value::Null
+        );
+        assert_eq!(
+            router.folder_listing(Some("chatgpt")).unwrap()["selected_folder_id"],
+            "first"
+        );
+        assert_eq!(lock_state(&router).session_folders.len(), 1);
     }
 
     #[test]
@@ -1495,6 +1623,14 @@ mod tests {
             "test",
             std::time::Duration::from_secs(60),
         );
+        let inferred_resume_action = router
+            .resolve_action_context(
+                None,
+                "request_permissions",
+                &json!({"approve": true, "confirm": true}),
+            )
+            .expect("infer pending permission action routing");
+        assert_eq!(inferred_resume_action.folder_id, "second");
         let resumed_action = router
             .resolve_action_context(
                 None,

@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { lstat, readFile, readdir, readlink, realpath } from 'node:fs/promises';
 import path from 'node:path';
@@ -171,6 +172,27 @@ async function gitBaselinePaths(root: string): Promise<string[] | undefined> {
   ])].sort(comparePaths);
 }
 
+async function gitTaskBaselinePaths(root: string): Promise<string[] | undefined> {
+  const [unstaged, staged, untracked, worktrees] = await Promise.all([
+    git(root, ['diff', '--name-only', '-z', '--no-ext-diff', '--no-renames']),
+    git(root, ['diff', '--cached', '--name-only', '-z', '--no-ext-diff', '--no-renames']),
+    git(root, ['ls-files', '--others', '--exclude-standard', '-z']),
+    git(root, ['worktree', 'list', '--porcelain', '-z'])
+  ]);
+  if (unstaged.code !== 0 || staged.code !== 0 || untracked.code !== 0) return undefined;
+  const excludedPrefixes = worktrees.code === 0
+    ? worktreeContainerPrefixesFromPorcelain(root, worktrees.stdout)
+    : [];
+  const outsideManagedWorktreeContainer = (relative: string): boolean => !excludedPrefixes.some(prefix =>
+    relative === prefix || relative.startsWith(`${prefix}/`)
+  );
+  return [...new Set([
+    ...gitPathList(unstaged.stdout),
+    ...gitPathList(staged.stdout),
+    ...gitPathList(untracked.stdout)
+  ].filter(outsideManagedWorktreeContainer))].sort(comparePaths);
+}
+
 async function baselineEntry(root: string, relative: string): Promise<ProjectBaseline['entries'][number] | undefined> {
   const full = path.join(root, relative);
   try {
@@ -258,6 +280,36 @@ export async function captureBaseline(root: string): Promise<ProjectBaseline> {
   };
 }
 
+export async function captureTaskBaseline(root: string): Promise<ProjectBaseline> {
+  const [paths, identity] = await Promise.all([
+    gitTaskBaselinePaths(root),
+    gitIdentity(root)
+  ]);
+  if (!paths || !identity.head) return captureBaseline(root);
+  const presentEntries = await baselineEntriesForPaths(root, paths);
+  const presentByPath = new Map(presentEntries.map(entry => [entry.path, entry]));
+  const entries = paths.map(relative => presentByPath.get(relative) ?? {
+    path: relative,
+    exists: false,
+    is_binary: false,
+    sha256: '',
+    bytes: 0
+  });
+  return {
+    ...identity,
+    baseline_mode: 'git_status_v2',
+    worktree_fingerprint: worktreeFingerprint(entries),
+    entries,
+    captured_at: now()
+  };
+}
+
+async function captureComparableTaskBaseline(root: string, task: TaskRecord): Promise<ProjectBaseline> {
+  return task.baseline.baseline_mode === 'git_status_v2'
+    ? captureTaskBaseline(root)
+    : captureBaseline(root);
+}
+
 function requireTask(ctx: ToolContext, folderId: string, taskId: unknown): TaskRecord {
   const id = String(taskId ?? '').trim();
   if (!id) throw new HarnessError('INVALID_ARGUMENT', 'task_id is required');
@@ -288,7 +340,7 @@ export async function checkTaskBaseline(
   root: string,
   task: TaskRecord
 ): Promise<{ matches: boolean; current: ProjectBaseline; changes: string[] }> {
-  const current = await captureBaseline(root);
+  const current = await captureComparableTaskBaseline(root, task);
   const changes: string[] = [];
   if (current.branch !== task.baseline.branch || current.head !== task.baseline.head) {
     changes.push('git_identity');
@@ -303,7 +355,7 @@ export async function checkTaskOriginalBaseline(
   root: string,
   task: TaskRecord
 ): Promise<{ matches: boolean; current: ProjectBaseline; changes: string[] }> {
-  const current = await captureBaseline(root);
+  const current = await captureComparableTaskBaseline(root, task);
   const changes: string[] = [];
   if (current.branch !== task.baseline.branch || current.head !== task.baseline.head) {
     changes.push('git_identity');
@@ -316,7 +368,7 @@ export async function checkTaskOriginalBaseline(
 
 export async function refreshExpectedState(ctx: ToolContext, folderId: string, root: string, taskId: string): Promise<TaskRecord> {
   const task = requireTask(ctx, folderId, taskId);
-  const current = await captureBaseline(root);
+  const current = await captureComparableTaskBaseline(root, task);
   task.baseline.branch = current.branch;
   task.baseline.head = current.head;
   task.expected_fingerprint = current.worktree_fingerprint;
@@ -338,7 +390,7 @@ async function harnessStatusValue(
   let current: ProjectBaseline | undefined;
   if (baselineCheckPerformed) {
     const baselineStartedAt = performance.now();
-    current = await captureBaseline(taskRoot);
+    current = await captureComparableTaskBaseline(taskRoot, task!);
     baselineCaptureMs = elapsedPhaseMs(baselineStartedAt);
   }
   const identity = current
@@ -479,19 +531,40 @@ export async function operationLog(ctx: ToolContext, key: string, args: JsonObje
 export async function projectState(ctx: ToolContext, key: string, args: JsonObject = {}): Promise<JsonObject> {
   const { workspaceId, scopeId, taskRoot } = await workspaceContext(ctx, key);
   const maxFiles = Math.max(1, Math.min(10_000, Math.trunc(Number(args.max_files ?? 200)) || 200));
-  const baselineStartedAt = performance.now();
-  const current = await captureBaseline(taskRoot);
-  const baselineCaptureMs = elapsedPhaseMs(baselineStartedAt);
   const task = ctx.state.task(scopeId);
+  const baselineStartedAt = performance.now();
+  const current = task?.baseline.baseline_mode === 'git_status_v2'
+    ? await captureTaskBaseline(taskRoot)
+    : await captureBaseline(taskRoot);
+  const baselineCaptureMs = elapsedPhaseMs(baselineStartedAt);
   const baselineMap = new Map((task?.baseline.entries ?? []).map(entry => [entry.path, entry]));
   const currentMap = new Map(current.entries.map(entry => [entry.path, entry]));
-  const paths = [...new Set([...baselineMap.keys(), ...currentMap.keys()])].sort(comparePaths);
-  const allFiles = paths.map(filePath => {
+  const v2Changes = task?.baseline.baseline_mode === 'git_status_v2'
+    ? await changeFilesForTask(taskRoot, task, current)
+    : undefined;
+  const v2ChangeMap = new Map((v2Changes ?? []).map(file => [String(file.path), file]));
+  const v2Paths = task?.baseline.baseline_mode === 'git_status_v2'
+    ? await gitBaselinePaths(taskRoot)
+    : undefined;
+  const paths = task?.baseline.baseline_mode === 'git_status_v2'
+    ? [...new Set([...(v2Paths ?? []), ...baselineMap.keys(), ...currentMap.keys(), ...v2ChangeMap.keys()])].sort(comparePaths)
+    : [...new Set([...baselineMap.keys(), ...currentMap.keys()])].sort(comparePaths);
+  const visiblePaths = paths.slice(0, maxFiles);
+  const visibleCurrentEntries = task?.baseline.baseline_mode === 'git_status_v2'
+    ? await baselineEntriesForPaths(
+      taskRoot,
+      visiblePaths.filter(filePath => !currentMap.has(filePath))
+    )
+    : [];
+  const visibleCurrentMap = new Map(visibleCurrentEntries.map(entry => [entry.path, entry]));
+  const files = visiblePaths.map(filePath => {
     const before = baselineMap.get(filePath);
-    const entry = currentMap.get(filePath);
-    const status = before && entry
-      ? before.sha256 === entry.sha256 ? 'unchanged' : 'modified'
-      : before ? 'deleted' : entry ? 'added' : 'unknown';
+    const entry = currentMap.get(filePath) ?? visibleCurrentMap.get(filePath);
+    const status = task?.baseline.baseline_mode === 'git_status_v2'
+      ? String(v2ChangeMap.get(filePath)?.status ?? 'unchanged')
+      : before && entry
+        ? before.sha256 === entry.sha256 ? 'unchanged' : 'modified'
+        : before ? 'deleted' : entry ? 'added' : 'unknown';
     return {
       path: filePath,
       status,
@@ -499,8 +572,13 @@ export async function projectState(ctx: ToolContext, key: string, args: JsonObje
       bytes: entry?.bytes ?? 0
     };
   });
-  const clean = allFiles.every(file => file.status === 'unchanged');
-  const files = allFiles.slice(0, maxFiles);
+  const clean = task?.baseline.baseline_mode === 'git_status_v2'
+    ? (v2Changes?.length ?? 0) === 0
+    : paths.every(filePath => {
+      const before = baselineMap.get(filePath);
+      const entry = currentMap.get(filePath);
+      return before && entry ? before.sha256 === entry.sha256 : !before && !entry;
+    });
   return {
     ok: true,
     schema_version: 1,
@@ -511,16 +589,16 @@ export async function projectState(ctx: ToolContext, key: string, args: JsonObje
     head: current.head ?? null,
     clean,
     files,
-    total_files: allFiles.length,
-    truncated: allFiles.length > maxFiles,
+    total_files: paths.length,
+    truncated: paths.length > maxFiles,
     active_task_id: task?.id ?? null,
-    task: task ?? null,
+    task: task ? taskResponseValue(task) : null,
     recent_events: task ? ctx.state.taskEvents(task.id).slice(0, 100).length : 0,
     phase_durations_ms: { baseline_capture_ms: baselineCaptureMs }
   };
 }
 
-function changeFiles(task: TaskRecord, current: ProjectBaseline): JsonObject[] {
+function changeFilesLegacy(task: TaskRecord, current: ProjectBaseline): JsonObject[] {
   const baselineMap = new Map(task.baseline.entries.map(entry => [entry.path, entry]));
   const currentMap = new Map(current.entries.map(entry => [entry.path, entry]));
   const paths = [...new Set([...baselineMap.keys(), ...currentMap.keys()])].sort(comparePaths);
@@ -537,6 +615,80 @@ function changeFiles(task: TaskRecord, current: ProjectBaseline): JsonObject[] {
       after_sha256: after?.sha256 ?? null
     };
   }).filter(file => file.status !== 'unchanged');
+}
+
+async function gitBlobEntry(
+  root: string,
+  revision: string | undefined,
+  relative: string
+): Promise<ProjectBaseline['entries'][number] | undefined> {
+  if (!revision) return undefined;
+  return new Promise(resolve => {
+    const stdout: Buffer[] = [];
+    const child = spawn('git', ['cat-file', 'blob', `${revision}:${relative}`], {
+      cwd: root,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore']
+    });
+    child.stdout.on('data', (chunk: Buffer) => stdout.push(Buffer.from(chunk)));
+    child.once('error', () => resolve(undefined));
+    child.once('close', code => {
+      if (code !== 0) return resolve(undefined);
+      const bytes = Buffer.concat(stdout);
+      resolve({
+        path: relative.replaceAll('\\', '/'),
+        exists: true,
+        is_binary: bytes.includes(0),
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+        bytes: bytes.length
+      });
+    });
+  });
+}
+
+async function changeFilesForTask(
+  root: string,
+  task: TaskRecord,
+  currentBaseline?: ProjectBaseline
+): Promise<JsonObject[]> {
+  if (task.baseline.baseline_mode !== 'git_status_v2') {
+    return changeFilesLegacy(task, currentBaseline ?? await captureBaseline(root));
+  }
+  const current = currentBaseline ?? await captureTaskBaseline(root);
+  const baselineMap = new Map(task.baseline.entries.map(entry => [entry.path, entry]));
+  const currentMap = new Map(current.entries.map(entry => [entry.path, entry]));
+  const currentDirtyPaths = current.entries.map(entry => entry.path);
+  const paths = [...new Set([...baselineMap.keys(), ...currentDirtyPaths])].sort(comparePaths);
+  const files = new Array<JsonObject | undefined>(paths.length);
+  let nextIndex = 0;
+  const worker = async (): Promise<void> => {
+    while (nextIndex < paths.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const filePath = paths[index];
+      const baselineEntryAtStart = baselineMap.get(filePath);
+      const before = baselineEntryAtStart?.exists === false
+        ? undefined
+        : baselineEntryAtStart ?? await gitBlobEntry(root, task.baseline.head, filePath);
+      const currentEntry = currentMap.get(filePath);
+      const after = currentEntry?.exists === false
+        ? undefined
+        : currentEntry ?? await baselineEntry(root, filePath);
+      const status = before && after
+        ? before.sha256 === after.sha256 ? 'unchanged' : 'modified'
+        : before ? 'deleted' : after ? 'added' : 'unchanged';
+      files[index] = {
+        path: filePath,
+        status,
+        before_sha256: before?.sha256 ?? null,
+        after_sha256: after?.sha256 ?? null
+      };
+    }
+  };
+  const workerCount = Math.min(BASELINE_READ_CONCURRENCY, paths.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return files.filter((file): file is JsonObject => file !== undefined && file.status !== 'unchanged');
 }
 
 function finishReason(task: TaskRecord, args: JsonObject): { text: string; source: string } {
@@ -561,6 +713,22 @@ function normalizedOptionalString(value: unknown, field: string): string | undef
   const normalized = value.trim();
   if (!normalized) throw new HarnessError('INVALID_ARGUMENT', `${field} must not be empty`);
   return normalized;
+}
+
+const TASK_RESPONSE_BASELINE_ENTRY_LIMIT = 256;
+
+function taskResponseValue(task: TaskRecord): JsonObject {
+  const entryCount = task.baseline.entries.length;
+  if (entryCount <= TASK_RESPONSE_BASELINE_ENTRY_LIMIT) return task as unknown as JsonObject;
+  return {
+    ...task,
+    baseline: {
+      ...task.baseline,
+      entries: task.baseline.entries.slice(0, TASK_RESPONSE_BASELINE_ENTRY_LIMIT)
+    },
+    baseline_entry_count: entryCount,
+    baseline_entries_truncated: true
+  };
 }
 
 function changeSummaryValue(task: TaskRecord, change: ChangeSet | undefined, files: JsonObject[], events: TaskEvent[]): JsonObject {
@@ -608,7 +776,7 @@ async function finalizeVerifyingTask(ctx: ToolContext, workspaceId: string, task
   await ctx.state.setTask(task.scope_id ?? workspaceId, task, finalizedEvent);
   return {
     ok: true,
-    task,
+    task: taskResponseValue(task),
     summary: change.reason.text,
     change_id: change.id,
     change_summary: changeSummaryValue(task, change, change.files, ctx.state.taskEvents(task.id)),
@@ -668,7 +836,7 @@ export async function startTask(ctx: ToolContext, key: string, args: JsonObject)
     );
   }
   const baselineStartedAt = performance.now();
-  const baseline = await captureBaseline(taskRoot);
+  const baseline = await captureTaskBaseline(taskRoot);
   const baselineCaptureMs = elapsedPhaseMs(baselineStartedAt);
   const timestamp = now();
   const task: TaskRecord = {
@@ -688,7 +856,7 @@ export async function startTask(ctx: ToolContext, key: string, args: JsonObject)
   await ctx.state.setTask(scopeId, task, event(workspaceId, task.id, 'task_started'));
   return {
     ok: true,
-    task,
+    task: taskResponseValue(task),
     next: ['project_state', 'task_context'],
     ...(recoveredTaskId ? { recovered_task_id: recoveredTaskId } : {}),
     phase_durations_ms: { baseline_capture_ms: baselineCaptureMs }
@@ -711,12 +879,29 @@ export async function updateTask(ctx: ToolContext, key: string, args: JsonObject
 }
 
 export async function setTaskStatus(ctx: ToolContext, key: string, status: TaskStatus, args: JsonObject): Promise<JsonObject> {
-  const { workspaceId } = await workspaceContext(ctx, key);
+  const { workspaceId, scopeId } = await workspaceContext(ctx, key);
   const task = requireTask(ctx, workspaceId, args.task_id);
   if (!canTransition(task.status, status)) throw new HarnessError('INVALID_TASK_TRANSITION', `Cannot transition ${task.status} to ${status}`);
+  if (status === 'active') {
+    const current = ctx.state.task(scopeId);
+    if (current && current.id !== task.id) {
+      throw new HarnessError(
+        'TASK_ALREADY_ACTIVE',
+        `Workspace already has active task ${current.id}`,
+        false,
+        {
+          retry_mode: 'after_state_change',
+          blocking_condition: 'active_task_exists',
+          active_task_id: current.id,
+          paused_task_id: task.id,
+          suggestion: 'Pause or finish the current task before resuming this task.'
+        }
+      );
+    }
+  }
   task.status = status;
   task.updated_at = now();
-  await ctx.state.setTask(workspaceId, task, event(workspaceId, task.id, 'task_status_changed', { status }));
+  await ctx.state.setTask(scopeId, task, event(workspaceId, task.id, 'task_status_changed', { status }));
   return { ok: true, task };
 }
 
@@ -786,14 +971,14 @@ export async function finishTask(ctx: ToolContext, key: string, args: JsonObject
   finishedEvent.reason = reason;
   finishedEvent.created_at = timestamp;
   const baselineStartedAt = performance.now();
-  const current = await captureBaseline(taskRootFor(task, taskRoot));
+  const files = await changeFilesForTask(taskRootFor(task, taskRoot), task);
   const baselineCaptureMs = elapsedPhaseMs(baselineStartedAt);
   const change: ChangeSet = {
     id: changeId,
     task_id: task.id,
     objective: task.objective,
     reason,
-    files: changeFiles(task, current),
+    files,
     command_ids: [...sourceEvents.map(item => item.operation_id), finishedEvent.operation_id],
     verification_ids: [],
     risks: [],
@@ -805,7 +990,7 @@ export async function finishTask(ctx: ToolContext, key: string, args: JsonObject
   await ctx.state.setTaskAndChange(workspaceId, task, change, finishedEvent);
   return {
     ok: true,
-    task,
+    task: taskResponseValue(task),
     summary: reason.text,
     change_id: change.id,
     change_summary: changeSummaryValue(task, change, change.files, [...sourceEvents, finishedEvent]),
@@ -923,8 +1108,8 @@ export async function changeSummary(ctx: ToolContext, key: string, args: JsonObj
     return changeSummaryValue(task, change, change.files, ctx.state.taskEvents(task.id));
   }
   const baselineStartedAt = performance.now();
-  const current = await captureBaseline(taskRootFor(task, taskRoot));
-  const summary = changeSummaryValue(task, undefined, changeFiles(task, current), ctx.state.taskEvents(task.id));
+  const files = await changeFilesForTask(taskRootFor(task, taskRoot), task);
+  const summary = changeSummaryValue(task, undefined, files, ctx.state.taskEvents(task.id));
   addPhaseDuration(summary, 'baseline_capture_ms', elapsedPhaseMs(baselineStartedAt));
   return summary;
 }
@@ -991,6 +1176,30 @@ async function refreshEditExpectedStateIncremental(
   const baseline = tracking.baselineBeforeWrite;
   const entries = new Map(baseline.entries.map(entry => [entry.path, entry]));
   const workspaceRoot = rootAndCwd(ctx, key).root;
+  if (baseline.baseline_mode === 'git_status_v2') {
+    for (const proof of proofs) {
+      let relative: string;
+      try {
+        const absolute = resolveInside(workspaceRoot, proof.path);
+        relative = relativeInside(tracking.taskRoot, absolute).replaceAll('\\', '/');
+      } catch {
+        return { refreshed: false, fileCount: 0 };
+      }
+      if (!relative || relative === '.') continue;
+      const updated = await baselineEntry(tracking.taskRoot, relative);
+      if (!updated || updated.sha256.toLowerCase() !== proof.afterSha256.toLowerCase()) {
+        return { refreshed: false, fileCount: 0 };
+      }
+    }
+    const current = await captureTaskBaseline(tracking.taskRoot);
+    const task = requireTask(ctx, tracking.workspaceId, tracking.taskId);
+    task.baseline.branch = current.branch;
+    task.baseline.head = current.head;
+    task.expected_fingerprint = current.worktree_fingerprint;
+    task.updated_at = now();
+    await ctx.state.setTask(task.scope_id ?? tracking.workspaceId, task);
+    return { refreshed: true, fileCount: proofs.length };
+  }
   let refreshedFiles = 0;
   for (const proof of proofs) {
     let relative: string;

@@ -107,7 +107,8 @@ function validateEnrollmentUrl(publicUrl: string, value: string): URL {
 export async function loadOrEnroll(
   config: AgentConfig,
   endpoint: TunnelEndpoint,
-  enrollmentFetch: typeof fetch
+  enrollmentFetch: typeof fetch,
+  preferredDeviceIdentity?: DeviceIdentity
 ): Promise<{ identity: DeviceIdentity; enrollmentCompleted: boolean }> {
   if (!config.tunnel) throw new Error('built-in tunnel is not configured');
   const enrollmentUrl = config.tunnel.enrollmentUrl?.trim();
@@ -116,7 +117,9 @@ export async function loadOrEnroll(
     return { identity: stored, enrollmentCompleted: false };
   }
 
-  let identity = stored ?? newIdentity(endpoint.clientId);
+  let identity = stored ?? (preferredDeviceIdentity
+    ? { ...preferredDeviceIdentity, clientId: endpoint.clientId, enrolled: false }
+    : newIdentity(endpoint.clientId));
   if (!enrollmentUrl) {
     await saveIdentity(config.tunnel.stateFile, identity, config.oauth.tokenSecret);
     if (identity.enrolled && !hasPinnedServerIdentity(identity)) {

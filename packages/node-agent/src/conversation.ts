@@ -285,6 +285,7 @@ export class ConversationStore implements ConversationStoreContract {
     if (snapshot?.version !== 1 || !Array.isArray(snapshot.contexts) || !Array.isArray(snapshot.selections)) return;
     for (const item of snapshot.contexts.slice(0, MAX_PERSISTED_CONVERSATION_CONTEXTS)) {
       if (!item || !validPersistedConversationKey(item.conversationKey) || !validPersistedConversationKey(item.folderId)) continue;
+      if (item.conversationKey.startsWith('ctmcp-handle:')) continue;
       if (this.allowedFolderIds && !this.allowedFolderIds.has(item.folderId)) continue;
       if (!validPersistedCwd(item.cwd)) continue;
       const lastUsed = Number.isFinite(item.lastUsed) && item.lastUsed >= 0 ? Math.floor(item.lastUsed) : 0;
@@ -295,6 +296,7 @@ export class ConversationStore implements ConversationStoreContract {
       if (!Array.isArray(selection) || selection.length !== 2) continue;
       const [conversationKey, folderId] = selection;
       if (!validPersistedConversationKey(conversationKey) || !validPersistedConversationKey(folderId)) continue;
+      if (conversationKey.startsWith('ctmcp-handle:')) continue;
       if (this.allowedFolderIds && !this.allowedFolderIds.has(folderId)) continue;
       this.selections.set(conversationKey, folderId);
     }
@@ -337,6 +339,7 @@ export class ConversationStore implements ConversationStoreContract {
         lastUsed: context.lastUsed
       }))
     ]
+      .filter(context => !context.conversationKey.startsWith('ctmcp-handle:'))
       .sort((left, right) => right.lastUsed - left.lastUsed || left.folderId.localeCompare(right.folderId) || left.conversationKey.localeCompare(right.conversationKey))
       .slice(0, MAX_PERSISTED_CONVERSATION_CONTEXTS);
     const retained = new Set(contexts.map(context => contextKey(context.conversationKey, context.folderId)));

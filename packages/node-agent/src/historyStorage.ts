@@ -8,9 +8,11 @@ import {
   type HistoryDocument, type HistoryIndex, type HistoryIndexEntry, type HistoryScanReport
 } from './historyModel.js';
 import { metadata } from './historyMarkdown.js';
+import type { HistoryRetrievalIndex } from './historyRetrieval.js';
 
 export const DEFAULT_HISTORY_DIR = 'docs/history-session';
 export const HISTORY_INDEX_FILE = 'index.json';
+export const HISTORY_RETRIEVAL_INDEX_FILE = 'retrieval-index.json';
 export const HISTORY_LOCK_DIR = '.history.lock.d';
 export const HISTORY_LOCK_TIMEOUT_MS = 5_000;
 export const HISTORY_LOCK_RETRY_MS = 10;
@@ -115,6 +117,23 @@ export async function writeHistoryIndex(historyDir: string, index: HistoryIndex)
   await atomicWrite(path.join(historyDir, HISTORY_INDEX_FILE), Buffer.from(JSON.stringify(normalized, null, 2)));
 }
 
+export async function writeHistoryRetrievalIndex(historyDir: string, index: HistoryRetrievalIndex): Promise<void> {
+  await atomicWrite(path.join(historyDir, HISTORY_RETRIEVAL_INDEX_FILE), Buffer.from(`${JSON.stringify(index, null, 2)}\n`));
+}
+
+export async function readHistoryRetrievalIndex(historyDir: string): Promise<HistoryRetrievalIndex | undefined> {
+  try {
+    const value = JSON.parse(await readFile(path.join(historyDir, HISTORY_RETRIEVAL_INDEX_FILE), 'utf8')) as HistoryRetrievalIndex;
+    if (value?.version !== 1 || !Array.isArray(value.documents) || value.documentCount !== value.documents.length || !/^[0-9a-f]{64}$/.test(value.sourceDigest)) {
+      throw new Error('retrieval index shape is invalid');
+    }
+    return value;
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return undefined;
+    throw new HistoryError('HISTORY_RETRIEVAL_INDEX_INVALID', 'History retrieval index is invalid.', 'validation', true);
+  }
+}
+
 export async function writeHistoryMarkdown(file: string, content: string): Promise<void> {
   await atomicWrite(file, Buffer.from(content));
 }
@@ -186,7 +205,7 @@ export async function scanHistory(root: string, historyDir: string): Promise<His
   for (const entry of entries) {
     if (!entry.isFile()) continue;
     const name = entry.name;
-    if (name === 'README.md' || name === HISTORY_INDEX_FILE || name === '.history.lock' || name.startsWith(HISTORY_TEMP_PREFIX)) continue;
+    if (name === 'README.md' || name === HISTORY_INDEX_FILE || name === HISTORY_RETRIEVAL_INDEX_FILE || name === '.history.lock' || name.startsWith(HISTORY_TEMP_PREFIX)) continue;
     const match = /^([1-9]\d*)\.md$/.exec(name);
     if (!match || String(Number(match[1])) !== match[1]) {
       report.invalid_files.push(name);

@@ -125,11 +125,11 @@ async function authorize(localBase) {
 
 test('generated profile catalogs match Rust counts, membership and revisions', () => {
   const expectedCounts = {
-    advanced: 62,
-    'read-only': 18,
-    'compat-readonly-all': 62,
-    'guarded-core': 38,
-    'trusted-core': 37
+    advanced: 63,
+    'read-only': 19,
+    'compat-readonly-all': 63,
+    'guarded-core': 39,
+    'trusted-core': 38
   };
   for (const [profile, count] of Object.entries(expectedCounts)) {
     const tools = toolsForProfile(profile);
@@ -201,6 +201,11 @@ test('configuration defaults to core and environment overrides the saved profile
   assert.equal(guarded.toolProfile, 'core');
   assert.equal(guarded.activeToolProfile, 'guarded-core');
 
+  const rustSafe = normalizeConfig({ ...document, permissionMode: 'safe', toolProfile: 'core' }, secrets, {});
+  assert.equal(rustSafe.permissionMode, 'guarded');
+  assert.equal(rustSafe.activeToolProfile, 'guarded-core');
+  assert.equal(rustSafe.securityPolicy.blockNetworkCommands, true);
+
   const overridden = normalizeConfig({ ...document, toolProfile: 'read-only' }, secrets, {
     CTMCP_TOOL_PROFILE: 'advanced',
     CTMCP_PERMISSION_MODE: 'read-only'
@@ -223,14 +228,14 @@ test('direct callTool rejects hidden tools before workspace side effects', async
   assert.equal(hidden.error.code, 'UNKNOWN_TOOL');
   assert.equal(hidden.error.category, 'catalog');
   assert.equal(hidden.error.details.tool_profile, 'read-only');
-  assert.equal(hidden.error.details.available_tools.length, 18);
+  assert.equal(hidden.error.details.available_tools.length, 19);
   await assert.rejects(access(target));
 
   const info = await callTool(ctx, 'server_info', {}, meta);
   assert.equal(info.ok, true);
   assert.equal(info.tool_profile, 'read-only');
   assert.equal(info.configured_tool_profile, 'read-only');
-  assert.equal(info.tool_count, 18);
+  assert.equal(info.tool_count, 19);
   assert.deepEqual(info.tools, toolNamesForProfile('read-only'));
   assert.equal(info.toolset_revision, toolsetRevisionForProfile('read-only'));
 });
@@ -322,4 +327,29 @@ test('HTTP tools/list, server_info and mcp/info expose one profile contract', as
   assert.equal(hiddenAgain.error.code, -32602);
   assert.equal(hiddenAgain.error.data.toolset_revision, toolsetRevisionForProfile('read-only'));
   assert.deepEqual(hiddenAgain.error.data.available_tools, toolNamesForProfile('read-only'));
+});
+
+test('explicit security policy can advertise every tool as read-only', () => {
+  const document = {
+    schema_version: 1,
+    dataDir: path.join(tmpdir(), 'ctmcp-profile-advertise'),
+    folders: [{ id: 'repo', name: 'Repo', path: tmpdir() }]
+  };
+  const secrets = { oauthPassword: 'password', oauthTokenSecret: 'token' };
+  const base = normalizeConfig({ ...document, permissionMode: 'trusted' }, secrets, {});
+  const advertised = normalizeConfig({
+    ...document,
+    securityPolicy: { ...base.securityPolicy, restrictToolCatalog: false, advertiseReadOnlyAnnotations: true }
+  }, secrets, {});
+  assert.equal(advertised.activeToolProfile, 'compat-readonly-all');
+  assert.ok(toolsForProfile(advertised.activeToolProfile).every(tool =>
+    tool.annotations.readOnlyHint === true && tool.annotations.destructiveHint === false));
+
+  const restricted = normalizeConfig({
+    ...document,
+    securityPolicy: { ...base.securityPolicy, restrictToolCatalog: true, advertiseReadOnlyAnnotations: true }
+  }, secrets, {});
+  assert.equal(restricted.activeToolProfile, 'trusted-core');
+  assert.equal(normalizeConfig({ ...document, toolProfile: 'compat-readonly-all' }, secrets, {})
+    .securityPolicy.advertiseReadOnlyAnnotations, true);
 });

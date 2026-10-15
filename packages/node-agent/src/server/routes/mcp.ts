@@ -1,4 +1,6 @@
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { recordIdentityDiagnostics } from '../mcp/identityDiagnostics.js';
+import { prepareConversationHandle, decorateHandleResult } from '../mcp/conversationHandles.js';
 import type { AgentConfig, JsonObject, ToolContext } from '../../types.js';
 import type { OAuthRuntime } from '../../oauth.js';
 import { protectedResourceMetadataUrl, sendJson } from '../../oauth.js';
@@ -193,6 +195,11 @@ export async function handleMcpRoute(
       sendTransportIssue(mirroredHeaderIssue, method);
       return true;
     }
+    recordIdentityDiagnostics(context, req.headers, request);
+    // verifyBearer succeeded above; only that credential can own a handle.
+    const credential = String(req.headers.authorization ?? '').slice('Bearer '.length).trim();
+    const handleResponse = prepareConversationHandle(context, credential || undefined, request);
+    context.lastMcpAccessAtMs = Date.now();
     const missingElicitationIssue = requestedTool
       ? missingElicitationPreflight(config, request, method)
       : undefined;
@@ -273,13 +280,14 @@ export async function handleMcpRoute(
         request,
         startedAt
       });
+      const handledResult = decorateHandleResult(result, handleResponse);
       const wireResult = protocolVersion === MODERN_MCP_PROTOCOL_VERSION
-        ? decorateModernMcpResult(result, method, {
+        ? decorateModernMcpResult(handledResult, method, {
             name: 'coding-tools-mcp-node',
             title: 'Coding Tools MCP Node Agent',
             version: AGENT_VERSION
           })
-        : result;
+        : handledResult;
       rpcResponse = { jsonrpc: '2.0', id: requestId, result: wireResult };
       lifecycle?.complete();
     } catch (error) {

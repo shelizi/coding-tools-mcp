@@ -57,7 +57,7 @@ test('workspace UI retains Rust-aligned shared observability surfaces without de
     read('docs/todo/node-agent-ui-parity/CHECKLIST.md'),
     read('src/lib/backend/capabilities.ts')
   ]);
-  assert.match(workspacePage, /type WorkspaceTab = "overview" \| "history" \| "telemetry" \| "logs" \| "health" \| "features" \| "mcp" \| "actions" \| "settings"/);
+  assert.match(workspacePage, /type WorkspaceTab = "overview" \| "history" \| "telemetry" \| "statistics" \| "logs" \| "health" \| "features" \| "mcp" \| "actions" \| "settings"/);
   for (const marker of ['HistoryViewer', 'TelemetryViewer', 'OperationLogViewer', 'HealthPanel']) {
     assert.match(workspacePage, new RegExp(marker));
   }

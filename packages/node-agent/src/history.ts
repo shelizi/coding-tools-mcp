@@ -13,11 +13,12 @@ import {
 } from './historyModel.js';
 import {
   acquireHistoryLock, canonicalPath, DEFAULT_HISTORY_DIR, historySha256,
-  readHistoryDocument, readHistoryIndex, rebuildHistoryIndex, relativeDisplay,
-  scanHistory, writeHistoryIndex, writeHistoryMarkdown
+  readHistoryDocument, readHistoryIndex, readHistoryRetrievalIndex, rebuildHistoryIndex, relativeDisplay,
+  scanHistory, writeHistoryIndex, writeHistoryMarkdown, writeHistoryRetrievalIndex
 } from './historyStorage.js';
+import { buildHistoryRetrievalIndex, searchHistoryRetrievalIndex } from './historyRetrieval.js';
 
-const HISTORY_SUMMARY_WINDOW = 12;
+const HISTORY_SUMMARY_WINDOW = 5;
 const HISTORY_NUMBER_WINDOW = 256;
 const MAX_SESSION_SUMMARY_CHARS = 3_000;
 const MAX_ALL_HISTORY_SUMMARY_CHARS = 24_000;
@@ -212,6 +213,59 @@ function historyDigest(documents: readonly HistoryDocument[]): { digest: string;
   return { digest: hash.digest('hex'), bytes };
 }
 
+async function syncHistoryRetrievalIndex(root: string, historyDir: string): Promise<ReturnType<typeof buildHistoryRetrievalIndex>> {
+  const report = await scanHistory(root, historyDir);
+  const retrieval = buildHistoryRetrievalIndex(report.documents);
+  await writeHistoryRetrievalIndex(historyDir, retrieval);
+  return retrieval;
+}
+
+async function loadHistoryRetrievalIndex(root: string, historyDir: string, expectedDocuments?: number) {
+  try {
+    const persisted = await readHistoryRetrievalIndex(historyDir);
+    if (persisted && (expectedDocuments === undefined || persisted.documentCount === expectedDocuments)) {
+      return { index: persisted, source: 'derived_index' } as const;
+    }
+  } catch {
+    // A corrupt derived index never blocks canonical Markdown history reads.
+  }
+  const report = await scanHistory(root, historyDir);
+  return { index: buildHistoryRetrievalIndex(report.documents), source: 'scan_fallback' } as const;
+}
+
+export async function searchHistory(ctx: ToolContext, key: string, args: JsonObject): Promise<JsonObject> {
+  const query = typeof args.query === 'string' ? args.query.trim() : '';
+  if (!query) throw new HistoryError('INVALID_ARGUMENT', 'query must be a non-empty string', 'validation', false, { argument: 'query' });
+  const location = await historyLocation(ctx, key, args);
+  const canonicalIndex = await readHistoryIndex(location.dir).catch(() => undefined);
+  const expectedDocuments = canonicalIndex ? Object.keys(canonicalIndex.sessions).length : undefined;
+  const loaded = await loadHistoryRetrievalIndex(location.root, location.dir, expectedDocuments);
+  const topK = Math.max(1, Math.min(20, Number.isFinite(Number(args.top_k)) ? Math.trunc(Number(args.top_k)) : 8));
+  const recentBoost = Math.max(0, Math.min(1, Number.isFinite(Number(args.recent_boost)) ? Number(args.recent_boost) : 0.05));
+  const includeExcerpt = args.include_excerpt !== false;
+  const hits = searchHistoryRetrievalIndex(loaded.index, query, { topK, recentBoost }).map(hit => ({
+    session_number: hit.sessionNumber,
+    path: hit.path,
+    updated_at: hit.updatedAt,
+    title: hit.title,
+    score: hit.score,
+    matched_fields: hit.matchedFields,
+    ...(includeExcerpt ? { excerpt: truncateChars(hit.summary, 2_000) } : {})
+  }));
+  return {
+    ok: true,
+    query,
+    top_k: topK,
+    recent_boost: recentBoost,
+    include_excerpt: includeExcerpt,
+    result_count: hits.length,
+    index_source: loaded.source,
+    index_document_count: loaded.index.documentCount,
+    index_source_digest: loaded.index.sourceDigest,
+    results: hits
+  };
+}
+
 export async function bootstrapHistory(ctx: ToolContext, key: string, args: JsonObject): Promise<JsonObject> {
   const resolvedSession = resolveSessionKey(args);
   const sessionKey = resolvedSession.key;
@@ -325,6 +379,7 @@ export async function bootstrapHistory(ctx: ToolContext, key: string, args: Json
       created = true;
     }
     if (indexRebuilt && !created) await writeHistoryIndex(location.dir, index);
+    if (created || indexRebuilt) await syncHistoryRetrievalIndex(location.root, location.dir);
 
     const responseMode = args.response_mode === 'full' ? 'full' : 'compact';
     const sessionSummaries = priorDocuments.map(document => ({
@@ -344,6 +399,23 @@ export async function bootstrapHistory(ctx: ToolContext, key: string, args: Json
     const inherited = inheritedSummary(currentContent) ?? null;
     const compactSectionsOmitted = responseMode === 'compact' && (sessionSummaries.length > 0 || inherited !== null);
     const digest = historyDigest(priorDocuments);
+    const recallQuery = typeof args.recall_query === 'string' ? args.recall_query.trim() : '';
+    let relevantHistorySummaries: JsonObject[] = [];
+    let historyRetrievalSource: string | null = null;
+    if (recallQuery) {
+      const loaded = await loadHistoryRetrievalIndex(location.root, location.dir, Object.keys(index.sessions).length);
+      historyRetrievalSource = loaded.source;
+      relevantHistorySummaries = searchHistoryRetrievalIndex(loaded.index, recallQuery, { topK: 8, recentBoost: 0.05 })
+        .filter(hit => hit.sessionNumber !== currentNumber)
+        .slice(0, 8)
+        .map(hit => ({
+          number: hit.sessionNumber,
+          path: hit.path,
+          score: hit.score,
+          matched_fields: hit.matchedFields,
+          summary: truncateChars(hit.summary, MAX_SESSION_SUMMARY_CHARS)
+        }));
+    }
 
     return {
       ok: true,
@@ -368,6 +440,10 @@ export async function bootstrapHistory(ctx: ToolContext, key: string, args: Json
       sequence_valid: sequenceValid,
       response_mode: responseMode,
       all_history_summary: allHistorySummary,
+      recent_history_summary: allHistorySummary,
+      relevant_history_summaries: relevantHistorySummaries,
+      recall_query: recallQuery || null,
+      history_retrieval_source: historyRetrievalSource,
       inherited_summary: responseMode === 'full' ? inherited : null,
       session_summaries: responseMode === 'full' ? sessionSummaries : [],
       lazy_sections: responseMode === 'compact' ? ['inherited_summary', 'session_summaries'] : [],
@@ -383,10 +459,10 @@ export async function bootstrapHistory(ctx: ToolContext, key: string, args: Json
       history_digest: digest.digest,
       persistence_mode: 'model_mediated_tool_calls',
       assistant_instructions: responseMode === 'full'
-        ? 'Read all_history_summary, latest_handoff, and inherited_summary before continuing the project. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.'
-        : 'Use the compact all_history_summary and latest_handoff to restore context. Request history_session_bootstrap again with response_mode="full" only when deeper prior-session detail is materially needed. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.',
+        ? 'Read recent_history_summary, relevant_history_summaries, latest_handoff, and inherited_summary before continuing the project. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.'
+        : 'Use recent_history_summary and relevant_history_summaries to restore context, plus latest_handoff for immediate continuity. Request history_session_bootstrap again with response_mode="full" only when deeper prior-session detail is materially needed. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.',
       required_next_actions: [
-        'read_all_history_summary', 'read_latest_handoff', 'verify_workspace_state',
+        'read_recent_history_summary', 'read_relevant_history_summaries', 'read_latest_handoff', 'verify_workspace_state',
         'execute_user_task', 'checkpoint_after_each_completed_task'
       ],
       checkpoint_policy: {
@@ -499,7 +575,9 @@ export async function checkpointHistory(ctx: ToolContext, key: string, args: Jso
     index.sessions[sessionKey] = entry;
     await writeHistoryIndex(location.dir, index);
 
+    await syncHistoryRetrievalIndex(location.root, location.dir);
     const warnings: string[] = [];
+
     if (redacted) warnings.push('检测到疑似敏感信息，归档内容已脱敏。');
     if (hostMismatch) warnings.push('宿主会话标识已变化；本次仍使用 bootstrap 返回的稳定目标，未切换历史文件。');
     return {
@@ -542,6 +620,7 @@ export async function validateHistory(ctx: ToolContext, key: string, args: JsonO
     try {
       const lockedReport = await scanHistory(location.root, location.dir);
       await writeHistoryIndex(location.dir, rebuildHistoryIndex(lockedReport));
+      await writeHistoryRetrievalIndex(location.dir, buildHistoryRetrievalIndex(lockedReport.documents));
       repaired = true;
     } finally {
       await historyLock.release();
@@ -561,6 +640,7 @@ export async function validateHistory(ctx: ToolContext, key: string, args: JsonO
     latest_path: latestPath,
     index_status: indexStatus,
     repaired,
+    retrieval_index_rebuilt: repaired,
     history_lock_wait_ms: historyLockWaitMs,
     warnings
   };

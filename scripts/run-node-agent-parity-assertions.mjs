@@ -108,7 +108,10 @@ export async function runBehavioralAssertions({ root = defaultRoot, registry, bu
       results.push({ id: assertion.id, item_ids: assertion.item_ids, status: 'skipped', message: 'no test_files declared' });
       continue;
     }
-    const outcome = await run(process.execPath, ['--test', ...files], packageRoot);
+    const outcome = await run(process.execPath, [
+      '--import', pathToFileURL(path.resolve(packageRoot, 'test', 'setup.mjs')).href,
+      '--test', '--test-concurrency=4', ...files
+    ], packageRoot);
     const detail = outputTail(outcome.stderr || outcome.stdout);
     results.push({
       id: assertion.id,

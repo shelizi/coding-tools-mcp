@@ -13,10 +13,32 @@ export interface TunnelStatus {
   recycledWorkers: number | null;
   policyRevision: number | null;
   lastError: string | null;
+  serverOrigin?: string | null;
+  websocketUrl?: string | null;
+  serverId?: string | null;
+  deviceId?: string | null;
+  transportMode?: string | null;
+  controlConnected?: boolean | null;
+  sharedSession?: boolean | null;
+  sessionId?: string | null;
+  routeId?: number | null;
+  streamLimit?: number | null;
+  dataConnections?: number | null;
+  maxDataConnections?: number | null;
+  streamsPerConnection?: number | null;
+  activeStreams?: number | null;
+  streamCapacity?: number | null;
+  availableStreamSlots?: number | null;
+  queuedRequests?: number | null;
+  desiredDataConnections?: number | null;
 }
 
 export async function getFrpSnippet(id: string, service: TunnelService): Promise<string> {
   return getBackend().tunnel.getFrpSnippet(id, service);
+}
+
+export async function getTunnelStatus(id: string, service: TunnelService): Promise<TunnelStatus> {
+  return getBackend().tunnel.status(id, service);
 }
 
 export async function startTunnel(id: string, service: TunnelService): Promise<TunnelStatus> {

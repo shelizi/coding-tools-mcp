@@ -107,6 +107,7 @@ function telemetryView(queried: JsonObject): JsonObject {
     slowest: Array.isArray(queried.slowest) ? queried.slowest.map(safeTelemetryRecord) : [],
     largest: Array.isArray(queried.largest) ? queried.largest.map(safeTelemetryRecord) : [],
     aggregate: queried.aggregate ?? null,
+    ...(queried.statistics ? { statistics: queried.statistics } : {}),
     optimization: queried.optimization ?? null,
     formatting: queried.formatting ?? null,
     search: queried.search ?? null,
@@ -125,8 +126,17 @@ export async function managementTelemetryPayload(ctx: ToolContext, searchParams:
   if (!TELEMETRY_SORTS.has(requestedSort)) {
     throw new ManagementObservabilityError(400, 'INVALID_QUERY', 'Unsupported telemetry sort field.');
   }
+  const statisticsPeriod = searchParams.get('statisticsPeriod');
+  if (statisticsPeriod !== null && !['minute', 'hour', 'day'].includes(statisticsPeriod)) {
+    throw new ManagementObservabilityError(400, 'INVALID_QUERY', 'Unsupported statistics period.');
+  }
+  const statisticsUntil = searchParams.get('statisticsUntilTsMs');
   const queried = await ctx.usageStore.query({
-    scope: requestedScope,
+    scope: statisticsPeriod ? 'all' : requestedScope,
+    statistics_period: statisticsPeriod,
+    statistics_until_ts_ms: statisticsUntil === null ? undefined
+      : integer(statisticsUntil, Date.now(), 1, 8_640_000_000_000_000),
+    since_ts_ms: integer(searchParams.get('sinceTsMs'), 0, 0, 8_640_000_000_000_000),
     limit: integer(searchParams.get('limit'), 100, 1, 200),
     top: 50,
     errors_only: searchParams.get('errorsOnly') === 'true',

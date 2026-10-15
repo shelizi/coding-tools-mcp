@@ -15,7 +15,7 @@ use super::output::{
 #[cfg(windows)]
 use super::process_lifecycle::terminate_process;
 use super::{
-    SessionStore, FINALIZED_SESSION_RETENTION, WAIT_COMMAND_TIMEOUT_DEFAULT_MS,
+    ExecSession, SessionStore, FINALIZED_SESSION_RETENTION, WAIT_COMMAND_TIMEOUT_DEFAULT_MS,
     WAIT_COMMAND_TIMEOUT_MAX_MS, WAIT_COMMAND_TRANSPORT_SAFE_MS,
 };
 
@@ -100,6 +100,78 @@ pub(super) async fn run_read_output_async(
     })))
 }
 
+const MANAGED_JOB_POLL_FAST_MS: u64 = 2_000;
+const MANAGED_JOB_POLL_SHORT_MS: u64 = 5_000;
+const MANAGED_JOB_POLL_MEDIUM_MS: u64 = 15_000;
+const MANAGED_JOB_POLL_LONG_MS: u64 = 30_000;
+
+fn managed_job_poll_after_ms(session: &ExecSession, made_progress: bool) -> u64 {
+    if session.is_finalized() {
+        return 0;
+    }
+    if made_progress {
+        return MANAGED_JOB_POLL_FAST_MS;
+    }
+    match session.started_at.elapsed().as_millis() as u64 {
+        0..=29_999 => MANAGED_JOB_POLL_SHORT_MS,
+        30_000..=119_999 => MANAGED_JOB_POLL_MEDIUM_MS,
+        _ => MANAGED_JOB_POLL_LONG_MS,
+    }
+}
+
+fn recovered_operation_payload(operation_id: &str, record: &Value) -> Value {
+    let current_boot_id = crate::mcp::runtime_boot_id();
+    let previous_boot_id = record
+        .get("runtime_boot_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let finalized = record
+        .get("finalized")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut payload = record.get("snapshot").cloned().unwrap_or_else(|| json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("operation_id".into(), json!(operation_id));
+        object.insert("resolved_by".into(), json!("durable_operation_record"));
+        object.insert("deduplicated".into(), Value::Bool(true));
+        object.insert("attached_to_session_id".into(), Value::Null);
+        object.insert("restored_from_disk".into(), Value::Bool(true));
+        object.insert("runtime_session_available".into(), Value::Bool(false));
+        object.insert("previous_runtime_boot_id".into(), json!(previous_boot_id));
+        object.insert("current_runtime_boot_id".into(), json!(current_boot_id));
+        object.insert("output_refs".into(), Value::Null);
+        object.insert("events".into(), json!([]));
+        object.insert("stdout".into(), Value::String(String::new()));
+        object.insert("stderr".into(), Value::String(String::new()));
+        object.insert("next_actions".into(), json!([]));
+        if finalized {
+            object.insert(
+                "suggestion".into(),
+                json!("Recovered finalized managed-job metadata after runtime restart. Raw retained output is unavailable after restart."),
+            );
+        } else {
+            let reason = if previous_boot_id == current_boot_id {
+                "session_registry_evicted"
+            } else {
+                "server_restart"
+            };
+            object.insert("status".into(), json!("runtime_restarted"));
+            object.insert("termination_reason".into(), json!(reason));
+            object.insert("process_still_running".into(), Value::Bool(false));
+            object.insert("recoverable".into(), Value::Bool(true));
+            object.insert("retry_allowed".into(), Value::Bool(true));
+            object.insert("execution_ok".into(), Value::Null);
+            object.insert("verification_ok".into(), Value::Null);
+            object.insert("command_ok".into(), Value::Null);
+            object.insert(
+                "suggestion".into(),
+                json!("The prior runtime ended before this managed job finalized. Inspect workspace state, then start a replacement operation with a new operation_id and optionally correlate it with recovery_of_operation_id."),
+            );
+        }
+    }
+    payload
+}
+
 pub(super) fn run_resolve_operation(
     store: &SessionStore,
     args: &Value,
@@ -122,22 +194,48 @@ pub(super) async fn run_resolve_operation_async(
             "operation_id or command_fingerprint is required",
         ));
     };
-    let session = session.ok_or_else(|| WorkspaceError::ToolDetails {
-        code: "OPERATION_NOT_FOUND",
-        message: "No retained command session matches the requested operation.".into(),
-        category: "not_found",
-        retryable: false,
-        details: json!({
-            "operation_id": operation_id,
-            "command_fingerprint": fingerprint,
-            "retention_seconds": FINALIZED_SESSION_RETENTION.as_secs(),
-            "suggestion": "Use list_sessions to inspect retained commands before starting a replacement process."
-        }),
-    })?;
+    let session = match session {
+        Some(session) => session,
+        None => {
+            if let Some(operation_id) = operation_id {
+                if let Some(record) = store.load_persisted_operation(operation_id) {
+                    return Ok(tool_ok(recovered_operation_payload(operation_id, &record)));
+                }
+            }
+            return Err(WorkspaceError::ToolDetails {
+                code: "OPERATION_NOT_FOUND",
+                message: "No retained command session matches the requested operation.".into(),
+                category: "not_found",
+                retryable: false,
+                details: json!({
+                    "operation_id": operation_id,
+                    "command_fingerprint": fingerprint,
+                    "retention_seconds": FINALIZED_SESSION_RETENTION.as_secs(),
+                    "suggestion": "Use list_sessions to inspect retained commands before starting a replacement process."
+                }),
+            });
+        }
+    };
     session.touch_attachment();
     session.refresh_status().await;
     let mut payload =
         session.snapshot_with_options(OutputOptions::from_args(args, OutputMode::Tail));
+    let managed_job_operation = if !session.is_finalized()
+        && payload.get("execution_mode").and_then(Value::as_str) == Some("job")
+    {
+        session.operation_id().map(str::to_string)
+    } else {
+        None
+    };
+    let next_cursor = payload
+        .get("next_cursor")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let requested_cursor = args.get("cursor").and_then(Value::as_u64).unwrap_or(0);
+    let made_progress = next_cursor > requested_cursor;
+    let recommended_poll_after_ms = managed_job_operation
+        .as_ref()
+        .map(|_| managed_job_poll_after_ms(&session, made_progress));
     if let Some(object) = payload.as_object_mut() {
         object.insert("resolved_by".into(), json!(resolved_by));
         object.insert("deduplicated".into(), Value::Bool(true));
@@ -145,6 +243,30 @@ pub(super) async fn run_resolve_operation_async(
             "attached_to_session_id".into(),
             Value::String(session.session_id.clone()),
         );
+        if let Some(operation_id) = managed_job_operation {
+            object.insert(
+                "next_actions".into(),
+                json!([{
+                    "tool": "resolve_operation",
+                    "after_ms": recommended_poll_after_ms.unwrap_or(MANAGED_JOB_POLL_SHORT_MS),
+                    "arguments": {
+                        "operation_id": operation_id,
+                        "cursor": next_cursor,
+                        "output_mode": "delta",
+                        "event_detail": "compact"
+                    }
+                }]),
+            );
+            object.insert(
+                "recommended_poll_after_ms".into(),
+                json!(recommended_poll_after_ms.unwrap_or(MANAGED_JOB_POLL_SHORT_MS)),
+            );
+            object.insert("poll_strategy".into(), json!("managed_job_backoff"));
+            object.insert(
+                "suggestion".into(),
+                json!("Managed job is still active; wait recommended_poll_after_ms, then use next_actions for a non-blocking snapshot."),
+            );
+        }
     }
     Ok(tool_ok(payload))
 }
@@ -234,11 +356,39 @@ pub(super) async fn run_wait_command_async(
             .get("process_still_running")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let post_checks_pending = object
+            .get("post_checks_pending")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let observation_pending = process_still_running || post_checks_pending;
+        let observation_timed_out = request_timed_out && observation_pending;
+        let observation_state = if !observation_pending {
+            "completed"
+        } else if post_checks_pending {
+            "verifying"
+        } else if request_timed_out {
+            "working"
+        } else {
+            "progress"
+        };
+        let managed_job_operation =
+            if object.get("execution_mode").and_then(Value::as_str) == Some("job") {
+                object
+                    .get("operation_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            };
         let heartbeat = false;
         let next_cursor = object
             .get("next_cursor")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let made_progress = next_cursor > options.cursor;
+        let recommended_poll_after_ms = managed_job_operation
+            .as_ref()
+            .map(|_| managed_job_poll_after_ms(&session, made_progress));
         object.insert(
             "session_registry_wait_ms".into(),
             json!(session_registry_wait_ms),
@@ -247,14 +397,37 @@ pub(super) async fn run_wait_command_async(
         object.insert("snapshot_ms".into(), json!(snapshot_ms));
         object.insert("heartbeat".into(), Value::Bool(heartbeat));
         object.insert("request_timed_out".into(), Value::Bool(request_timed_out));
+        object.insert(
+            "observation_timed_out".into(),
+            Value::Bool(observation_timed_out),
+        );
+        object.insert("observation_state".into(), json!(observation_state));
+        object.insert(
+            "transport_safe_wait_ms".into(),
+            json!(WAIT_COMMAND_TRANSPORT_SAFE_MS),
+        );
         object.insert("wait_timeout_ms".into(), json!(timeout_ms));
         object.insert("effective_wait_ms".into(), json!(effective_wait_ms));
         object.insert("heartbeat_ms".into(), json!(heartbeat_ms));
         object.insert("wait_until".into(), json!(until));
-        if process_still_running {
-            object.insert(
-                "next_actions".into(),
-                json!([{
+        if let Some(poll_after_ms) = recommended_poll_after_ms {
+            object.insert("recommended_poll_after_ms".into(), json!(poll_after_ms));
+            object.insert("poll_strategy".into(), json!("managed_job_backoff"));
+        }
+        if observation_pending {
+            let next_action = if let Some(operation_id) = managed_job_operation.as_deref() {
+                json!({
+                    "tool": "resolve_operation",
+                    "after_ms": recommended_poll_after_ms.unwrap_or(MANAGED_JOB_POLL_SHORT_MS),
+                    "arguments": {
+                        "operation_id": operation_id,
+                        "cursor": next_cursor,
+                        "output_mode": "delta",
+                        "event_detail": "compact"
+                    }
+                })
+            } else {
+                json!({
                     "tool": "wait_command",
                     "arguments": {
                         "session_id": session_id,
@@ -264,15 +437,20 @@ pub(super) async fn run_wait_command_async(
                         "output_mode": "delta",
                         "event_detail": options.event_detail.as_str()
                     }
-                }]),
-            );
+                })
+            };
+            object.insert("next_actions".into(), json!([next_action]));
         }
         object.insert(
             "suggestion".into(),
-            json!(if !changed {
-                "本次等待没有新事件；沿用 next_actions 继续既有 session，不要重新调用 exec_command"
+            json!(if request_timed_out && managed_job_operation.is_some() {
+                "本次观察窗口结束；长任务仍在执行，后续沿用 next_actions 的 resolve_operation 做非阻塞快照"
+            } else if request_timed_out && observation_pending {
+                "本次观察窗口结束，但既有 session 仍在执行；沿用 next_actions，不要重新调用 exec_command"
             } else if process_still_running {
                 "已收到增量输出；沿用 next_actions 继续既有 session"
+            } else if post_checks_pending {
+                "进程已退出但验证尚未完成；沿用 next_actions 等待 finalized"
             } else {
                 "进程已结束；检查 process_exit_code 与 post_checks"
             }),

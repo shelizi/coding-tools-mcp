@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+mod multiplex;
+pub use multiplex::*;
+
 pub const PROTOCOL_VERSION: u16 = 4;
 pub const WS_PATH: &str = "/_tunnel/v1";
 pub const ENROLL_PATH_PREFIX: &str = "/_tunnel/enroll";
@@ -24,6 +27,7 @@ pub const MCP_READ_ONLY_TOOL_NAMES: &[&str] = &[
     "operation_log",
     "server_info",
     "query_tool_usage",
+    "history_search",
     "exec_health_check",
     "read_file",
     "read_many",
@@ -131,21 +135,21 @@ const fn default_burst_warm_seconds() -> u64 {
 impl WorkerPolicy {
     pub fn default_for(_service: TunnelService) -> Self {
         Self {
-            start_workers: 4,
-            min_idle_workers: 2,
-            max_idle_workers: 4,
-            max_workers: 16,
-            max_requests_per_worker: 500,
-            max_lifetime_seconds: 3_600,
+            start_workers: 1,
+            min_idle_workers: 1,
+            max_idle_workers: 2,
+            max_workers: 8,
+            max_requests_per_worker: 5_000,
+            max_lifetime_seconds: 86_400,
             scale_down_delay_seconds: 60,
-            recycle_jitter_percent: 10,
+            recycle_jitter_percent: 20,
             max_pending_requests: default_max_pending_requests(),
             worker_acquire_timeout_ms: default_worker_acquire_timeout_ms(),
-            max_connecting_workers: 0,
+            max_connecting_workers: 2,
             connecting_capacity_grace_ms: default_connecting_capacity_grace_ms(),
-            scale_down_step: default_scale_down_step(),
-            burst_warm_workers: 0,
-            burst_warm_seconds: default_burst_warm_seconds(),
+            scale_down_step: 2,
+            burst_warm_workers: 2,
+            burst_warm_seconds: 60,
             revision: 1,
         }
     }
@@ -612,21 +616,21 @@ mod tests {
         );
 
         let policy = WorkerPolicy::default_for(TunnelService::Mcp);
-        assert_eq!(policy.start_workers, 4);
-        assert_eq!(policy.min_idle_workers, 2);
-        assert_eq!(policy.max_idle_workers, 4);
-        assert_eq!(policy.max_workers, 16);
-        assert_eq!(policy.max_requests_per_worker, 500);
-        assert_eq!(policy.max_lifetime_seconds, 3_600);
+        assert_eq!(policy.start_workers, 1);
+        assert_eq!(policy.min_idle_workers, 1);
+        assert_eq!(policy.max_idle_workers, 2);
+        assert_eq!(policy.max_workers, 8);
+        assert_eq!(policy.max_requests_per_worker, 5_000);
+        assert_eq!(policy.max_lifetime_seconds, 86_400);
         assert_eq!(policy.scale_down_delay_seconds, 60);
-        assert_eq!(policy.recycle_jitter_percent, 10);
+        assert_eq!(policy.recycle_jitter_percent, 20);
         assert_eq!(policy.max_pending_requests, 32);
         assert_eq!(policy.worker_acquire_timeout_ms, 10_000);
-        assert_eq!(policy.max_connecting_workers, 0);
+        assert_eq!(policy.max_connecting_workers, 2);
         assert_eq!(policy.connecting_capacity_grace_ms, 1_000);
-        assert_eq!(policy.scale_down_step, 4);
-        assert_eq!(policy.burst_warm_workers, 0);
-        assert_eq!(policy.burst_warm_seconds, 120);
+        assert_eq!(policy.scale_down_step, 2);
+        assert_eq!(policy.burst_warm_workers, 2);
+        assert_eq!(policy.burst_warm_seconds, 60);
         assert_eq!(policy.revision, 1);
 
         let message = ControlMessage::HelloAck {
@@ -732,5 +736,239 @@ mod tests {
                 &serde_json::to_vec(&request).unwrap()
             ));
         }
+    }
+
+    #[test]
+    fn multiplex_split_control_and_data_contract_is_explicit_and_session_bound() {
+        assert_eq!(
+            MULTIPLEX_CONTROL_WS_SUBPROTOCOL,
+            "coding-tools-tunnel-v5-control"
+        );
+        assert_eq!(MULTIPLEX_DATA_WS_SUBPROTOCOL, "coding-tools-tunnel-v5-data");
+        assert_eq!(SESSION_ID_HEADER, "x-coding-tools-session-id");
+
+        let control = SplitSessionAuthProof {
+            hello: SplitSessionHello {
+                protocol_version: MULTIPLEX_PROTOCOL_VERSION,
+                connection_role: MultiplexConnectionRole::Control,
+                connection_id: "control-1".into(),
+                session_id: None,
+            },
+            device_id: "device-1".into(),
+            signature: String::new(),
+        };
+        let data = SplitSessionAuthProof {
+            hello: SplitSessionHello {
+                protocol_version: MULTIPLEX_PROTOCOL_VERSION,
+                connection_role: MultiplexConnectionRole::Data,
+                connection_id: "data-1".into(),
+                session_id: Some("session-1".into()),
+            },
+            device_id: "device-1".into(),
+            signature: String::new(),
+        };
+        assert_eq!(
+            String::from_utf8(split_session_auth_signing_payload("nonce-a", &control)).unwrap(),
+            r#"{"protocol_version":5,"nonce":"nonce-a","connection_role":"control","device_id":"device-1","connection_id":"control-1"}"#
+        );
+        assert_eq!(
+            String::from_utf8(split_session_auth_signing_payload("nonce-b", &data)).unwrap(),
+            r#"{"protocol_version":5,"nonce":"nonce-b","connection_role":"data","device_id":"device-1","connection_id":"data-1","session_id":"session-1"}"#
+        );
+
+        let policy = MultiplexConnectionPolicy::default();
+        let ready = MultiplexControlMessage::SessionReady {
+            protocol_version: MULTIPLEX_PROTOCOL_VERSION,
+            connection_role: MultiplexConnectionRole::Control,
+            session_id: "session-1".into(),
+            connection_policy: policy.clone(),
+            server_id: "server-1".into(),
+            server_signature: "sig".into(),
+        };
+        let capacity = MultiplexControlMessage::CapacityUpdate {
+            demand: MultiplexDemand {
+                queued_requests: 2,
+                oldest_queue_wait_ms: 30,
+                active_streams: 12,
+                available_stream_slots: 4,
+                desired_connections: 3,
+            },
+        };
+        for message in [ready, capacity] {
+            let encoded = serde_json::to_string(&message).unwrap();
+            assert_eq!(
+                serde_json::from_str::<MultiplexControlMessage>(&encoded).unwrap(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn multiplex_v5_reserves_device_shared_wire_contract_without_switching_v4_runtime() {
+        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(WS_SUBPROTOCOL, "coding-tools-tunnel-v4");
+        assert_eq!(MULTIPLEX_PROTOCOL_VERSION, 5);
+        assert_eq!(MULTIPLEX_WS_SUBPROTOCOL, "coding-tools-tunnel-v5");
+        assert_eq!(CONNECTION_ID_HEADER, "x-coding-tools-connection-id");
+        assert_eq!(DEFAULT_MULTIPLEX_STREAMS_PER_CONNECTION, 16);
+        assert_eq!(MAX_MULTIPLEX_STREAMS_PER_CONNECTION, 64);
+    }
+
+    #[test]
+    fn multiplex_route_control_messages_round_trip_with_route_and_stream_identity() {
+        let register = MultiplexControlMessage::RouteRegister {
+            registration_id: "workspace-a-mcp".into(),
+            client_id: "workspace-a".into(),
+            service: TunnelService::Mcp,
+        };
+        let request = MultiplexControlMessage::RequestHead {
+            route_id: 7,
+            stream_id: 42,
+            method: "POST".into(),
+            path_and_query: "/mcp".into(),
+            headers: vec![HeaderPair {
+                name: "content-type".into(),
+                value: "application/json".into(),
+            }],
+            demand: None,
+        };
+
+        for message in [register, request] {
+            let encoded = serde_json::to_string(&message).expect("multiplex control encode");
+            assert_eq!(
+                serde_json::from_str::<MultiplexControlMessage>(&encoded)
+                    .expect("multiplex control decode"),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn multiplex_binary_frames_demultiplex_same_stream_number_across_routes() {
+        let first = encode_multiplex_binary_frame(
+            MultiplexBinaryFrameKind::RequestBody,
+            11,
+            3,
+            b"workspace-a",
+        )
+        .expect("encode first frame");
+        let second = encode_multiplex_binary_frame(
+            MultiplexBinaryFrameKind::ResponseBody,
+            12,
+            3,
+            b"workspace-b",
+        )
+        .expect("encode second frame");
+
+        assert_eq!(
+            decode_multiplex_binary_frame(&first).expect("decode first frame"),
+            MultiplexBinaryFrame {
+                kind: MultiplexBinaryFrameKind::RequestBody,
+                route_id: 11,
+                stream_id: 3,
+                payload: b"workspace-a".to_vec(),
+            }
+        );
+        assert_eq!(
+            decode_multiplex_binary_frame(&second).expect("decode second frame"),
+            MultiplexBinaryFrame {
+                kind: MultiplexBinaryFrameKind::ResponseBody,
+                route_id: 12,
+                stream_id: 3,
+                payload: b"workspace-b".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn multiplex_binary_frames_reject_invalid_headers_and_zero_ids() {
+        assert!(decode_multiplex_binary_frame(&[MULTIPLEX_PROTOCOL_VERSION as u8]).is_err());
+        assert!(encode_multiplex_binary_frame(
+            MultiplexBinaryFrameKind::RequestBody,
+            0,
+            1,
+            b"body"
+        )
+        .is_err());
+        assert!(encode_multiplex_binary_frame(
+            MultiplexBinaryFrameKind::RequestBody,
+            1,
+            0,
+            b"body"
+        )
+        .is_err());
+
+        let mut frame =
+            encode_multiplex_binary_frame(MultiplexBinaryFrameKind::RequestBody, 1, 1, b"body")
+                .expect("valid frame");
+        frame[0] = 99;
+        assert!(decode_multiplex_binary_frame(&frame).is_err());
+    }
+
+    #[test]
+    fn device_session_signing_is_device_scoped_not_workspace_scoped() {
+        let proof = DeviceSessionAuthProof {
+            hello: DeviceSessionHello {
+                protocol_version: MULTIPLEX_PROTOCOL_VERSION,
+                connection_id: "connection-1".into(),
+            },
+            device_id: "device-1".into(),
+            signature: String::new(),
+        };
+        assert_eq!(
+            String::from_utf8(device_session_auth_signing_payload("nonce-1", &proof)).unwrap(),
+            r#"{"protocol_version":5,"nonce":"nonce-1","device_id":"device-1","connection_id":"connection-1"}"#
+        );
+    }
+
+    #[test]
+    fn multiplex_connection_policy_matches_shared_burst_design() {
+        let policy = MultiplexConnectionPolicy::default();
+        assert_eq!(policy.start_connections, 1);
+        assert_eq!(policy.min_connections, 1);
+        assert_eq!(policy.max_idle_connections, 2);
+        assert_eq!(policy.max_connections, 8);
+        assert_eq!(policy.streams_per_connection, 16);
+        assert_eq!(policy.scale_up_threshold_percent, 75);
+        assert_eq!(policy.scale_up_step, 2);
+        assert_eq!(policy.burst_scale_up_step, 4);
+        assert_eq!(policy.scale_down_delay_seconds, 90);
+        assert_eq!(policy.revision, 1);
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn multiplex_connection_policy_rejects_invalid_capacity() {
+        let mut policy = MultiplexConnectionPolicy::default();
+        policy.streams_per_connection = 0;
+        assert!(policy.validate().is_err());
+
+        policy = MultiplexConnectionPolicy::default();
+        policy.max_connections = 1;
+        policy.max_idle_connections = 2;
+        assert!(policy.validate().is_err());
+
+        policy = MultiplexConnectionPolicy::default();
+        policy.scale_up_threshold_percent = 100;
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn multiplex_auth_control_messages_round_trip() {
+        let proof = DeviceSessionAuthProof {
+            hello: DeviceSessionHello {
+                protocol_version: MULTIPLEX_PROTOCOL_VERSION,
+                connection_id: "connection-2".into(),
+            },
+            device_id: "device-2".into(),
+            signature: "signature".into(),
+        };
+        let message = MultiplexControlMessage::Authenticate(proof);
+        let encoded = serde_json::to_string(&message).expect("multiplex auth encode");
+        assert_eq!(
+            serde_json::from_str::<MultiplexControlMessage>(&encoded)
+                .expect("multiplex auth decode"),
+            message
+        );
     }
 }

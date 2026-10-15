@@ -61,13 +61,14 @@
 
   async function finishAddWorkspace(selected: string) {
     const profile = await createWorkspace(selected);
-    if (capabilities.agentRestart) {
+    if (capabilities.agentRestart && capabilities.host !== "node") {
       showToast($t("Workspace added. Restart the Agent to start its MCP listener."), { kind: "success" });
       await getBackend().agent.restart();
       window.setTimeout(() => window.location.reload(), 2500);
       return;
     }
     await refreshWorkspaces();
+    showToast($t("Workspace added."), { kind: "success" });
     goto(appUrl(`/workspace/${profile.id}`));
   }
 

@@ -1,10 +1,29 @@
 import { createHash } from 'node:crypto';
 import { KnowledgeImpactStore, type KnowledgeImpactRecord } from './impact.js';
 import { KnowledgeStore } from './store.js';
+import { declaredToolStrategyImplementation } from './strategyImplementations.js';
 import type { ExperienceObservation, KnowledgeRecord } from './types.js';
 
 function toolFor(record: KnowledgeRecord): string {
   return typeof record.trigger.tool === 'string' ? record.trigger.tool : '';
+}
+
+function contextDigest(kind: string, value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+  return createHash('sha256').update(`${kind}\0${normalized}`).digest('hex');
+}
+
+function contextIds(
+  observations: readonly ExperienceObservation[],
+  kind: string,
+  value: (observation: ExperienceObservation) => string | undefined
+): string[] {
+  return [...new Set(observations
+    .map(observation => contextDigest(kind, value(observation)))
+    .filter((item): item is string => Boolean(item)))]
+    .sort()
+    .slice(0, 256);
 }
 
 function evolvedSkillTriggerMatches(record: KnowledgeRecord, observation: ExperienceObservation): boolean {
@@ -26,6 +45,9 @@ function triggerMatches(record: KnowledgeRecord, observation: ExperienceObservat
     if (observation.features?.[key] !== expected) return false;
   }
   if (record.recommendedAction.recommendation === 'prefer_bounded_search') {
+    const implementation = declaredToolStrategyImplementation(record);
+    if (implementation?.validationClass === 'semantics_preserving'
+      && observation.features?.knowledge_shadow_equivalence_implementation === implementation.id) return true;
     return Number(observation.features?.files_considered ?? 0) >= 500 || observation.durationMs >= 1_000;
   }
   if (record.recommendedAction.proposal === 'incremental_or_cached_baseline') {
@@ -38,6 +60,10 @@ function delta(record: KnowledgeRecord, observations: readonly ExperienceObserva
   const relevant = observations.filter(observation => observation.tool === toolFor(record));
   if (!relevant.length) return undefined;
   const matched = relevant.filter(observation => triggerMatches(record, observation));
+  const implementation = declaredToolStrategyImplementation(record);
+  const semanticEquivalence = implementation?.validationClass === 'semantics_preserving'
+    ? matched.filter(observation => observation.features?.knowledge_shadow_equivalence_implementation === implementation.id)
+    : [];
   const firstSeenAtMs = Math.min(...relevant.map(observation => observation.timestampMs));
   const lastSeenAtMs = Math.max(...relevant.map(observation => observation.timestampMs));
   return {
@@ -47,7 +73,11 @@ function delta(record: KnowledgeRecord, observations: readonly ExperienceObserva
     tool: toolFor(record),
     sourceEventIds: relevant.map(observation => observation.eventId).sort(),
     matchedTaskIds: [...new Set(matched.map(observation => observation.taskId).filter((value): value is string => Boolean(value)))].sort(),
+    matchedConversationContextIds: contextIds(matched, 'conversation', observation => observation.conversationContextId),
+    matchedRuntimeBootContextIds: contextIds(matched, 'runtime-boot', observation => observation.runtimeBootId),
     creditedTaskIds: [],
+    semanticEquivalenceChecks: semanticEquivalence.length,
+    semanticEquivalenceFailures: semanticEquivalence.filter(observation => observation.features?.knowledge_shadow_equivalence_passed !== true).length,
     considered: relevant.length,
     matched: matched.length,
     actualSuccesses: matched.filter(item => item.outcome === 'success').length,
@@ -61,6 +91,7 @@ function delta(record: KnowledgeRecord, observations: readonly ExperienceObserva
     taskFailures: 0,
     taskRollbacks: 0,
     totalObservedDurationMs: matched.reduce((total, item) => total + item.durationMs, 0),
+    durationSamplesMs: matched.map(item => Math.max(0, item.durationMs)),
     totalObservedRequestBytes: matched.reduce((total, item) => total + (item.requestBytes ?? 0), 0),
     totalObservedResponseBytes: matched.reduce((total, item) => total + (item.responseBytes ?? 0), 0),
     firstSeenAtMs,

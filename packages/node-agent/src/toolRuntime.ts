@@ -91,6 +91,7 @@ const TOOL_RUNTIME_MODULES: readonly ToolRuntimeModule[] = [
     tools: {
       history_session_bootstrap: {},
       history_session_checkpoint: {},
+      history_search: {},
       history_session_validate: {}
     }
   },

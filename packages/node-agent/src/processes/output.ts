@@ -51,7 +51,9 @@ function retainOutput(current: string, chunk: Buffer, maxBytes: number): string 
 
 export function appendOutput(ctx: ToolContext, session: ProcessSession, stream: 'stdout' | 'stderr', chunk: Buffer): void {
   const offset = stream === 'stdout' ? session.stdoutBytes : session.stderrBytes;
-  if (session.firstOutputAt === undefined) session.firstOutputAt = Date.now();
+  const outputAt = Date.now();
+  if (session.firstOutputAt === undefined) session.firstOutputAt = outputAt;
+  session.lastOutputAt = outputAt;
   const text = chunk.toString('utf8');
   session.sequence += 1;
   const outputEvent: ProcessOutputEvent = { sequence: session.sequence, stream, offset, data: text };
@@ -79,6 +81,17 @@ export function terminationReason(session: ProcessSession): string {
 
 export function retainedNextActions(session: ProcessSession, waitTimeoutMaxMs: number): JsonObject[] {
   if (session.finalizedAt) return [];
+  if (session.timeoutContract?.executionMode === 'job' && session.operationId) {
+    return [{
+      tool: 'resolve_operation',
+      arguments: {
+        operation_id: session.operationId,
+        cursor: session.sequence,
+        output_mode: 'delta',
+        event_detail: 'compact'
+      }
+    }];
+  }
   return [{
     tool: 'wait_command',
     arguments: {

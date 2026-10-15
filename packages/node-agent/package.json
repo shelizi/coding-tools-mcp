@@ -1,10 +1,10 @@
 {
   "name": "@coding-tools/node-agent",
-  "version": "0.29.35",
+  "version": "0.29.46",
   "private": true,
   "type": "module",
   "codingTools": {
-    "clientVersion": "0.1.59"
+    "clientVersion": "0.1.63"
   },
   "files": [
     "dist",
@@ -25,11 +25,11 @@
     "build:unlocked": "pnpm run build:server:unlocked && pnpm run build:ui",
     "start": "node dist/cli.js",
     "test": "node scripts/with-dist-lock.mjs pnpm run test:unlocked",
-    "test:unlocked": "pnpm run build:server:unlocked && node --import ./test/setup.mjs --test --test-force-exit test/*.test.mjs",
+    "test:unlocked": "pnpm run build:server:unlocked && node --import ./test/setup.mjs --test --test-concurrency=4 test/*.test.mjs",
     "test:process-lifecycle": "node scripts/with-dist-lock.mjs pnpm run test:process-lifecycle:unlocked",
     "test:process-lifecycle:unlocked": "pnpm run build:server:unlocked && node --import ./test/setup.mjs --test test/processLifecycle.test.mjs",
     "test:full": "node scripts/with-dist-lock.mjs pnpm run test:full:unlocked",
-    "test:full:unlocked": "pnpm run build:unlocked && node --import ./test/setup.mjs --test --test-force-exit test/*.test.mjs",
+    "test:full:unlocked": "pnpm run build:unlocked && node --import ./test/setup.mjs --test --test-concurrency=4 test/*.test.mjs",
     "test:ui": "pnpm run build:ui",
     "test:wss:production": "node scripts/with-dist-lock.mjs pnpm run test:wss:production:unlocked",
     "test:wss:production:unlocked": "pnpm run build:server:unlocked && node scripts/test-production-wss.mjs",
@@ -46,6 +46,10 @@
     "verify:unlocked": "pnpm run test:full:unlocked && pnpm run check:native",
     "verify:repo": "node scripts/with-dist-lock.mjs pnpm run verify:repo:unlocked",
     "verify:repo:unlocked": "pnpm run verify:unlocked && pnpm run check:rust-contract && pnpm run check:client-version && pnpm run check:parity-todos -- --skip-build && pnpm run check:ui-parity",
+    "benchmark:reflection-learning": "node scripts/benchmark-reflection-learning.mjs",
+    "benchmark:reflection-learning:search": "node scripts/benchmark-search-reflection-learning.mjs",
+    "benchmark:reflection-learning:history": "node scripts/benchmark-history-reflection-learning.mjs",
+    "benchmark:reflection-learning:learning": "node scripts/benchmark-learning-reflection-learning.mjs",
     "portable": "node scripts/with-dist-lock.mjs powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1",
     "portable:bundled": "node scripts/with-dist-lock.mjs powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1 -Edition bundled-node",
     "portable:system": "node scripts/with-dist-lock.mjs powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1 -Edition system-node",

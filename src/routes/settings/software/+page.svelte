@@ -10,6 +10,9 @@
     setDownloadConfig,
   } from "$lib/api/software";
   import { t } from "$lib/i18n";
+  import { getBackend } from "$lib/backend";
+
+  const capabilities = getBackend().capabilities;
 
   let software = $state<SoftwareStatus[]>([]);
   let loading = $state(true);
@@ -23,6 +26,7 @@
   });
   let configChanged = $state(false);
 
+  const searchSoftware = $derived(software.filter((item) => item.group === "search"));
   const tunnelSoftware = $derived(software.filter((item) => (item.group ?? "tunnel") === "tunnel"));
   const sandboxSoftware = $derived(software.filter((item) => item.group === "sandbox"));
 
@@ -82,9 +86,15 @@
     <p class="page-kicker">{$t("Global settings")}</p>
     <h2 class="page-title">{$t("Software management")}</h2>
     <p class="mt-2 max-w-2xl text-sm text-[var(--color-text-muted)]">
-      {$t(
-        "Install tunnel clients and sandbox CLIs. Cache-managed tunnel binaries can be uninstalled here; sandbox tools use the official package manager.",
-      )}
+      {#if capabilities.host === "node"}
+        {$t(
+          "Install ripgrep for faster search_text. If ripgrep and grep are missing, search falls back to built-in Node.js.",
+        )}
+      {:else}
+        {$t(
+          "Install tunnel clients and sandbox CLIs. Cache-managed tunnel binaries can be uninstalled here; sandbox tools use the official package manager.",
+        )}
+      {/if}
     </p>
   </header>
 
@@ -97,6 +107,7 @@
       {:else if software.length === 0}
         <p class="mt-4 text-sm text-[var(--color-text-muted)]">{$t("No information available.")}</p>
       {:else}
+        {@render softwareGroup($t("Search tools"), searchSoftware)}
         {@render softwareGroup($t("Tunnel clients"), tunnelSoftware)}
         {@render softwareGroup($t("Sandbox tools"), sandboxSoftware)}
       {/if}

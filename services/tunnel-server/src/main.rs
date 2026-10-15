@@ -1,16 +1,17 @@
 mod admin;
 mod database;
 mod device_auth;
+mod node_update;
 mod observability;
 mod server_identity;
 mod worker_policy;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
@@ -23,12 +24,18 @@ use axum::Json;
 use axum::Router;
 use bytes::Bytes;
 use coding_tools_tunnel_protocol::{
-    expected_routes, is_hop_by_hop_header, is_retry_safe_mcp_request, is_retry_safe_tool_name,
-    route_matches, server_ack_signing_payload, server_challenge_signing_payload, valid_client_id,
-    ClientHello, ControlMessage, EnrollmentRequest, HeaderPair, NodeUpdateOffer, NodeUpdateState,
-    TunnelService, WorkerDemand, WorkerPolicy, CLIENT_ID_HEADER, DEVICE_ID_HEADER,
-    ENROLL_PATH_PREFIX, MAX_REQUEST_BODY_BYTES, PROTOCOL_VERSION, SERVICE_HEADER, WORKER_ID_HEADER,
-    WS_PATH, WS_SUBPROTOCOL,
+    decode_multiplex_binary_frame, encode_multiplex_binary_frame, expected_routes,
+    is_hop_by_hop_header, is_retry_safe_mcp_request, is_retry_safe_tool_name,
+    multiplex_server_ack_signing_payload, multiplex_server_challenge_signing_payload,
+    route_matches, server_ack_signing_payload, server_challenge_signing_payload,
+    split_server_ack_signing_payload, valid_client_id, ClientHello, ControlMessage,
+    EnrollmentRequest, HeaderPair, MultiplexBinaryFrameKind, MultiplexConnectionPolicy,
+    MultiplexConnectionRole, MultiplexControlMessage, MultiplexDemand, NodeUpdateOffer,
+    NodeUpdateState, SplitSessionAuthProof, TunnelService, WorkerDemand, WorkerPolicy,
+    CLIENT_ID_HEADER, CONNECTION_ID_HEADER, DEVICE_ID_HEADER, ENROLL_PATH_PREFIX,
+    MAX_REQUEST_BODY_BYTES, MULTIPLEX_CONTROL_WS_SUBPROTOCOL, MULTIPLEX_DATA_WS_SUBPROTOCOL,
+    MULTIPLEX_PROTOCOL_VERSION, MULTIPLEX_WS_SUBPROTOCOL, PROTOCOL_VERSION, SERVICE_HEADER,
+    SESSION_ID_HEADER, WORKER_ID_HEADER, WS_PATH, WS_SUBPROTOCOL,
 };
 use database::DatabaseWriter;
 use device_auth::{unix_ms, AllowedServices, DeviceAuthError, DeviceRegistry};
@@ -36,7 +43,7 @@ use observability::Observability;
 use server_identity::ServerIdentity;
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::{interval, sleep, timeout, timeout_at, Instant, MissedTickBehavior};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
@@ -64,10 +71,360 @@ struct AppState {
     policies: WorkerPolicyStore,
     observability: Observability,
     server_identity: ServerIdentity,
+    node_updates: node_update::NodeUpdateCatalog,
+    multiplex_sessions: SplitSessionRegistry,
     max_request_body_bytes: usize,
     response_head_timeout: Duration,
     reconnect_grace_timeout: Duration,
     worker_liveness_timeout: Duration,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SplitSessionRegistry {
+    inner: Arc<Mutex<HashMap<String, Arc<SplitSessionState>>>>,
+}
+
+struct SplitSessionState {
+    session_id: String,
+    device_id: String,
+    policy: MultiplexConnectionPolicy,
+    routes: Mutex<HashMap<u32, SplitRouteState>>,
+    next_route_id: AtomicUsize,
+    next_stream_id: AtomicU64,
+    active_data_connections: AtomicUsize,
+    active_streams: AtomicUsize,
+    control_attached: AtomicBool,
+    control_generation: AtomicU64,
+    control_revision: watch::Sender<u64>,
+    route_revision: watch::Sender<u64>,
+    shutdown: watch::Sender<bool>,
+}
+
+struct SplitRouteState {
+    key: ClientKey,
+    pool: ClientPool,
+    _presence_guard: observability::ClientConnectionGuard,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct SplitSessionSnapshot {
+    pub session_id: String,
+    pub device_id: String,
+    pub control_attached: bool,
+    pub data_connections: usize,
+    pub active_streams: usize,
+    pub stream_capacity: usize,
+    pub available_stream_slots: usize,
+    pub queued_requests: usize,
+    pub oldest_queue_wait_ms: u64,
+    pub desired_connections: usize,
+    pub streams_per_connection: u16,
+    pub max_connections: u16,
+    pub routes: Vec<SplitRouteSnapshot>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct SplitRouteSnapshot {
+    pub route_id: u32,
+    pub client_id: String,
+    pub service: String,
+    pub pending_requests: usize,
+}
+
+impl SplitSessionRegistry {
+    async fn create(
+        &self,
+        device_id: String,
+        policy: MultiplexConnectionPolicy,
+    ) -> Arc<SplitSessionState> {
+        let session_id = Uuid::new_v4().simple().to_string();
+        let (control_revision, _) = watch::channel(0_u64);
+        let (route_revision, _) = watch::channel(0_u64);
+        let (shutdown, _) = watch::channel(false);
+        let session = Arc::new(SplitSessionState {
+            session_id: session_id.clone(),
+            device_id,
+            policy,
+            routes: Mutex::new(HashMap::new()),
+            next_route_id: AtomicUsize::new(1),
+            next_stream_id: AtomicU64::new(1),
+            active_data_connections: AtomicUsize::new(0),
+            active_streams: AtomicUsize::new(0),
+            control_attached: AtomicBool::new(true),
+            control_generation: AtomicU64::new(1),
+            control_revision,
+            route_revision,
+            shutdown,
+        });
+        self.inner.lock().await.insert(session_id, session.clone());
+        session
+    }
+
+    async fn get(&self, session_id: &str) -> Option<Arc<SplitSessionState>> {
+        self.inner.lock().await.get(session_id).cloned()
+    }
+
+    pub(crate) async fn snapshots(&self) -> Vec<SplitSessionSnapshot> {
+        let sessions = self
+            .inner
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut snapshots = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            let routes = session.routes.lock().await;
+            let route_snapshots = routes
+                .iter()
+                .map(|(route_id, route)| SplitRouteSnapshot {
+                    route_id: *route_id,
+                    client_id: route.key.client_id.clone(),
+                    service: route.key.service.as_str().to_string(),
+                    pending_requests: route.pool.pending_requests(),
+                })
+                .collect::<Vec<_>>();
+            let queued_requests = route_snapshots
+                .iter()
+                .map(|route| route.pending_requests)
+                .sum();
+            let oldest_queue_wait_ms = routes
+                .values()
+                .map(|route| route.pool.pending_queue.oldest_wait_ms())
+                .max()
+                .unwrap_or(0);
+            let data_connections = session.active_data_connections.load(Ordering::Acquire);
+            let active_streams = session.active_streams.load(Ordering::Acquire);
+            let streams_per_connection = session.policy.streams_per_connection;
+            let stream_capacity =
+                data_connections.saturating_mul(usize::from(streams_per_connection));
+            let desired_connections = active_streams
+                .saturating_add(queued_requests)
+                .div_ceil(usize::from(streams_per_connection))
+                .max(usize::from(session.policy.start_connections))
+                .min(usize::from(session.policy.max_connections));
+            snapshots.push(SplitSessionSnapshot {
+                session_id: session.session_id.clone(),
+                device_id: session.device_id.clone(),
+                control_attached: session.control_is_attached(),
+                data_connections,
+                active_streams,
+                stream_capacity,
+                available_stream_slots: stream_capacity.saturating_sub(active_streams),
+                queued_requests,
+                oldest_queue_wait_ms,
+                desired_connections,
+                streams_per_connection,
+                max_connections: session.policy.max_connections,
+                routes: route_snapshots,
+            });
+        }
+        snapshots.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        snapshots
+    }
+
+    async fn reattach(
+        &self,
+        session_id: &str,
+        device_id: &str,
+    ) -> Result<(Arc<SplitSessionState>, u64), String> {
+        let inner = self.inner.lock().await;
+        let session = inner
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| "split control session is unavailable".to_string())?;
+        if session.device_id != device_id {
+            return Err("split control session belongs to a different device".into());
+        }
+        let generation = session
+            .attach_control()
+            .ok_or_else(|| "split control session is already attached".to_string())?;
+        Ok((session, generation))
+    }
+
+    async fn remove_if_detached(&self, session_id: &str, generation: u64) {
+        let mut inner = self.inner.lock().await;
+        let should_remove = inner.get(session_id).is_some_and(|session| {
+            !session.control_is_attached()
+                && session.control_generation.load(Ordering::Acquire) == generation
+        });
+        if should_remove {
+            if let Some(session) = inner.remove(session_id) {
+                let _ = session.shutdown.send(true);
+            }
+        }
+    }
+
+    async fn remove(&self, session_id: &str) {
+        if let Some(session) = self.inner.lock().await.remove(session_id) {
+            let _ = session.shutdown.send(true);
+        }
+    }
+}
+
+impl SplitSessionState {
+    fn control_is_attached(&self) -> bool {
+        self.control_attached.load(Ordering::Acquire)
+    }
+
+    fn current_control_generation(&self) -> u64 {
+        self.control_generation.load(Ordering::Acquire)
+    }
+
+    fn attach_control(&self) -> Option<u64> {
+        if self
+            .control_attached
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        let generation = self
+            .control_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let next = route_revision_value(&self.control_revision).saturating_add(1);
+        self.control_revision.send_replace(next);
+        Some(generation)
+    }
+
+    fn detach_control(&self, generation: u64) -> bool {
+        if self.control_generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+        if self
+            .control_attached
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        let next = route_revision_value(&self.control_revision).saturating_add(1);
+        self.control_revision.send_replace(next);
+        true
+    }
+
+    async fn register_route(
+        &self,
+        registry: &Registry,
+        observability: &Observability,
+        key: ClientKey,
+    ) -> Result<(u32, bool), String> {
+        let mut routes = self.routes.lock().await;
+        if let Some((route_id, _)) = routes.iter().find(|(_, route)| route.key == key) {
+            return Ok((*route_id, false));
+        }
+        let pool = registry
+            .register_owned(key.clone(), &self.device_id)
+            .await?;
+        let data_connections = self.active_data_connections.load(Ordering::Acquire);
+        if data_connections > 0 {
+            pool.active_workers
+                .fetch_add(data_connections, Ordering::AcqRel);
+        }
+        let route_id = self.next_route_id.fetch_add(1, Ordering::AcqRel).max(1) as u32;
+        let presence_guard = observability.connect_client_route(
+            &format!("split:{}:{route_id}", self.session_id),
+            &self.device_id,
+            &key.client_id,
+            key.service.as_str(),
+            "split",
+        );
+        routes.insert(
+            route_id,
+            SplitRouteState {
+                key,
+                pool,
+                _presence_guard: presence_guard,
+            },
+        );
+        let next = route_revision_value(&self.route_revision).saturating_add(1);
+        self.route_revision.send_replace(next);
+        Ok((route_id, true))
+    }
+
+    async fn unregister_route(&self, route_id: u32) -> bool {
+        let mut routes = self.routes.lock().await;
+        let Some(route) = routes.remove(&route_id) else {
+            return false;
+        };
+        let data_connections = self.active_data_connections.load(Ordering::Acquire);
+        if data_connections > 0 {
+            route
+                .pool
+                .active_workers
+                .fetch_sub(data_connections, Ordering::AcqRel);
+        }
+        let next = route_revision_value(&self.route_revision).saturating_add(1);
+        self.route_revision.send_replace(next);
+        true
+    }
+
+    async fn route_snapshot(&self) -> Vec<(u32, ClientPool)> {
+        self.routes
+            .lock()
+            .await
+            .iter()
+            .map(|(id, route)| (*id, route.pool.clone()))
+            .collect()
+    }
+
+    async fn attach_data_connection(&self) -> bool {
+        if self
+            .active_data_connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < usize::from(self.policy.max_connections)).then_some(current + 1)
+            })
+            .is_err()
+        {
+            return false;
+        }
+        for (_, pool) in self.route_snapshot().await {
+            pool.active_workers.fetch_add(1, Ordering::AcqRel);
+        }
+        true
+    }
+
+    async fn detach_data_connection(&self) {
+        self.active_data_connections.fetch_sub(1, Ordering::AcqRel);
+        for (_, pool) in self.route_snapshot().await {
+            pool.active_workers.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    async fn demand(&self) -> MultiplexDemand {
+        let routes = self.route_snapshot().await;
+        let queued = routes
+            .iter()
+            .map(|(_, pool)| pool.pending_requests())
+            .sum::<usize>();
+        let oldest_queue_wait_ms = routes
+            .iter()
+            .map(|(_, pool)| pool.pending_queue.oldest_wait_ms())
+            .max()
+            .unwrap_or(0);
+        let active = self.active_streams.load(Ordering::Acquire);
+        let connections = self.active_data_connections.load(Ordering::Acquire);
+        let stream_limit = usize::from(self.policy.streams_per_connection);
+        let capacity = connections.saturating_mul(stream_limit);
+        let desired = active
+            .saturating_add(queued)
+            .div_ceil(stream_limit)
+            .max(usize::from(self.policy.start_connections))
+            .min(usize::from(self.policy.max_connections));
+        MultiplexDemand {
+            queued_requests: queued.min(usize::from(u16::MAX)) as u16,
+            oldest_queue_wait_ms,
+            active_streams: active.min(usize::from(u16::MAX)) as u16,
+            available_stream_slots: capacity.saturating_sub(active).min(usize::from(u16::MAX))
+                as u16,
+            desired_connections: desired as u16,
+        }
+    }
+}
+
+fn route_revision_value(sender: &watch::Sender<u64>) -> u64 {
+    *sender.borrow()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -85,6 +442,14 @@ struct ClientPool {
     active_workers: Arc<AtomicUsize>,
     control_pending_requests: Arc<AtomicUsize>,
     execution_pending_requests: Arc<AtomicUsize>,
+    pending_queue: Arc<PendingQueueTracker>,
+}
+
+impl ClientPool {
+    fn pending_requests(&self) -> usize {
+        self.control_pending_requests.load(Ordering::Acquire)
+            + self.execution_pending_requests.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Clone)]
@@ -100,9 +465,15 @@ struct RouteMatch {
     pool: ClientPool,
 }
 
+#[derive(Clone)]
+struct OwnedClientPool {
+    owner_device_id: Option<String>,
+    pool: ClientPool,
+}
+
 #[derive(Default)]
 struct RegistryInner {
-    pools: HashMap<ClientKey, ClientPool>,
+    pools: HashMap<ClientKey, OwnedClientPool>,
     routes: Vec<RouteEntry>,
 }
 
@@ -163,8 +534,48 @@ struct AssignmentInfo {
     queue_wait_ms: u64,
 }
 
+#[derive(Default)]
+struct PendingQueueTracker {
+    next_id: AtomicU64,
+    entries: StdMutex<BTreeMap<u64, Instant>>,
+    slot_available: Notify,
+}
+
+impl PendingQueueTracker {
+    fn enter(&self) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        self.entries
+            .lock()
+            .expect("pending queue tracker poisoned")
+            .insert(id, Instant::now());
+        id
+    }
+
+    fn exit(&self, id: u64) {
+        self.entries
+            .lock()
+            .expect("pending queue tracker poisoned")
+            .remove(&id);
+    }
+
+    fn oldest_wait_ms(&self) -> u64 {
+        let oldest = self
+            .entries
+            .lock()
+            .expect("pending queue tracker poisoned")
+            .values()
+            .min()
+            .copied();
+        oldest
+            .map(|started| started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
+    }
+}
+
 struct PendingRequestSlot {
     pending_requests: Arc<AtomicUsize>,
+    pending_queue: Arc<PendingQueueTracker>,
+    pending_id: u64,
     observability: Observability,
     released: bool,
 }
@@ -172,6 +583,7 @@ struct PendingRequestSlot {
 impl PendingRequestSlot {
     fn try_new(
         pending_requests: Arc<AtomicUsize>,
+        pending_queue: Arc<PendingQueueTracker>,
         maximum: usize,
         observability: Observability,
     ) -> Option<Self> {
@@ -180,21 +592,50 @@ impl PendingRequestSlot {
                 (current < maximum).then_some(current + 1)
             })
             .ok()?;
+        let pending_id = pending_queue.enter();
         observability.queue_enter();
         Some(Self {
             pending_requests,
+            pending_queue,
+            pending_id,
             observability,
             released: false,
         })
     }
 
+    async fn acquire_until(
+        pending_requests: Arc<AtomicUsize>,
+        pending_queue: Arc<PendingQueueTracker>,
+        maximum: usize,
+        observability: Observability,
+        deadline: Instant,
+    ) -> Option<Self> {
+        loop {
+            let notified = pending_queue.slot_available.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(slot) = Self::try_new(
+                pending_requests.clone(),
+                pending_queue.clone(),
+                maximum,
+                observability.clone(),
+            ) {
+                return Some(slot);
+            }
+            if timeout_at(deadline, notified).await.is_err() {
+                return None;
+            }
+        }
+    }
     fn release(&mut self) {
         if self.released {
             return;
         }
         self.released = true;
+        self.pending_queue.exit(self.pending_id);
         self.pending_requests.fetch_sub(1, Ordering::AcqRel);
         self.observability.queue_exit();
+        self.pending_queue.slot_available.notify_one();
     }
 }
 
@@ -209,13 +650,62 @@ struct ResponseHeadData {
     headers: Vec<HeaderPair>,
 }
 
+#[derive(Clone)]
+struct SharedWorkerClaim {
+    claimed: Arc<AtomicBool>,
+    generation: Arc<AtomicUsize>,
+    expected_generation: usize,
+}
+
+impl SharedWorkerClaim {
+    fn is_current(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == self.expected_generation
+    }
+
+    fn try_claim(&self) -> bool {
+        self.is_current()
+            && self
+                .claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            && self.is_current()
+    }
+
+    fn release(&self) {
+        if self.is_current() {
+            self.claimed.store(false, Ordering::Release);
+        }
+    }
+}
+
 struct AvailableWorker {
     assign: oneshot::Sender<ProxyJob>,
+    shared_claim: Option<SharedWorkerClaim>,
+}
+
+impl AvailableWorker {
+    fn try_claim(&self) -> bool {
+        self.shared_claim
+            .as_ref()
+            .is_none_or(SharedWorkerClaim::try_claim)
+    }
+
+    fn release_claim(&self) {
+        if let Some(claim) = &self.shared_claim {
+            claim.release();
+        }
+    }
 }
 
 fn discard_closed_workers(workers: &mut VecDeque<AvailableWorker>) -> usize {
     let before = workers.len();
-    workers.retain(|worker| !worker.assign.is_closed());
+    workers.retain(|worker| {
+        !worker.assign.is_closed()
+            && worker
+                .shared_claim
+                .as_ref()
+                .is_none_or(SharedWorkerClaim::is_current)
+    });
     before.saturating_sub(workers.len())
 }
 
@@ -241,12 +731,7 @@ impl Drop for ActiveWorkerGuard {
 }
 
 impl Registry {
-    async fn register(&self, key: ClientKey) -> ClientPool {
-        let mut inner = self.inner.lock().await;
-        if let Some(pool) = inner.pools.get(&key) {
-            return pool.clone();
-        }
-
+    fn new_pool() -> ClientPool {
         let (control_request_tx, control_request_rx) =
             mpsc::channel(CONTROL_REQUEST_QUEUE_CAPACITY);
         let (execution_request_tx, execution_request_rx) = mpsc::channel(REQUEST_QUEUE_CAPACITY);
@@ -260,25 +745,93 @@ impl Registry {
             active_workers: Arc::new(AtomicUsize::new(0)),
             control_pending_requests: Arc::new(AtomicUsize::new(0)),
             execution_pending_requests: Arc::new(AtomicUsize::new(0)),
+            pending_queue: Arc::new(PendingQueueTracker::default()),
         };
         tokio::spawn(dispatch_requests(
             control_request_rx,
             execution_request_rx,
             available_rx,
         ));
-
-        for prefix in expected_routes(&key.client_id, key.service) {
-            inner.routes.push(RouteEntry {
-                prefix,
-                key: key.clone(),
-                pool: pool.clone(),
-            });
-        }
-        inner
-            .routes
-            .sort_by_key(|route| std::cmp::Reverse(route.prefix.len()));
-        inner.pools.insert(key, pool.clone());
         pool
+    }
+
+    fn install_routes(inner: &mut RegistryInner, key: &ClientKey, pool: &ClientPool) {
+        let mut replaced = false;
+        for route in inner.routes.iter_mut().filter(|route| route.key == *key) {
+            route.pool = pool.clone();
+            replaced = true;
+        }
+        if !replaced {
+            for prefix in expected_routes(&key.client_id, key.service) {
+                inner.routes.push(RouteEntry {
+                    prefix,
+                    key: key.clone(),
+                    pool: pool.clone(),
+                });
+            }
+            inner
+                .routes
+                .sort_by_key(|route| std::cmp::Reverse(route.prefix.len()));
+        }
+    }
+
+    #[cfg(test)]
+    async fn register(&self, key: ClientKey) -> ClientPool {
+        let mut inner = self.inner.lock().await;
+        if let Some(entry) = inner.pools.get(&key) {
+            return entry.pool.clone();
+        }
+        let pool = Self::new_pool();
+        Self::install_routes(&mut inner, &key, &pool);
+        inner.pools.insert(
+            key,
+            OwnedClientPool {
+                owner_device_id: None,
+                pool: pool.clone(),
+            },
+        );
+        pool
+    }
+
+    async fn register_owned(&self, key: ClientKey, device_id: &str) -> Result<ClientPool, String> {
+        let mut inner = self.inner.lock().await;
+        if let Some(existing) = inner.pools.get(&key).cloned() {
+            match existing.owner_device_id.as_deref() {
+                Some(owner) if owner == device_id => return Ok(existing.pool),
+                Some(_) if existing.pool.active_workers.load(Ordering::Acquire) > 0 => {
+                    return Err("route is already owned by another device".into());
+                }
+                None => {
+                    if let Some(entry) = inner.pools.get_mut(&key) {
+                        entry.owner_device_id = Some(device_id.to_string());
+                        return Ok(entry.pool.clone());
+                    }
+                }
+                Some(_) => {
+                    let pool = Self::new_pool();
+                    Self::install_routes(&mut inner, &key, &pool);
+                    inner.pools.insert(
+                        key,
+                        OwnedClientPool {
+                            owner_device_id: Some(device_id.to_string()),
+                            pool: pool.clone(),
+                        },
+                    );
+                    return Ok(pool);
+                }
+            }
+        }
+
+        let pool = Self::new_pool();
+        Self::install_routes(&mut inner, &key, &pool);
+        inner.pools.insert(
+            key,
+            OwnedClientPool {
+                owner_device_id: Some(device_id.to_string()),
+                pool: pool.clone(),
+            },
+        );
+        Ok(pool)
     }
 
     async fn dispatch_node_update(&self, client_id: &str, offer: NodeUpdateOffer) -> usize {
@@ -287,11 +840,11 @@ impl Registry {
             client_id: client_id.to_string(),
             service: TunnelService::Mcp,
         };
-        let Some(pool) = inner.pools.get(&key) else {
+        let Some(entry) = inner.pools.get(&key) else {
             return 0;
         };
-        let targets = pool.active_workers.load(Ordering::Acquire);
-        pool.update_tx.send_replace(Some(offer));
+        let targets = entry.pool.active_workers.load(Ordering::Acquire);
+        entry.pool.update_tx.send_replace(Some(offer));
         targets
     }
 
@@ -301,16 +854,17 @@ impl Registry {
             client_id: client_id.to_string(),
             service: TunnelService::Mcp,
         };
-        let Some(pool) = inner.pools.get(&key) else {
+        let Some(entry) = inner.pools.get(&key) else {
             return false;
         };
-        let matches_current = pool
+        let matches_current = entry
+            .pool
             .update_tx
             .borrow()
             .as_ref()
             .is_some_and(|offer| offer.update_id == update_id);
         if matches_current {
-            pool.update_tx.send_replace(None);
+            entry.pool.update_tx.send_replace(None);
         }
         matches_current
     }
@@ -358,7 +912,15 @@ async fn dispatch_requests(
                 break;
             };
             let worker = workers.pop_front().expect("worker queue checked");
+            if !worker.try_claim() {
+                match job.lane {
+                    RequestLane::Control => control_jobs.push_front(job),
+                    RequestLane::Execution => execution_jobs.push_front(job),
+                }
+                continue;
+            }
             if job.abandoned() {
+                worker.release_claim();
                 workers.push_front(worker);
                 continue;
             }
@@ -388,6 +950,7 @@ async fn dispatch_requests(
             });
             let assigned = job.assigned.take();
             let mut pending_slot = job.pending_slot.take();
+            let shared_claim = worker.shared_claim.clone();
             match worker.assign.send(job) {
                 Ok(()) => {
                     if let Some(slot) = pending_slot.as_mut() {
@@ -398,6 +961,9 @@ async fn dispatch_requests(
                     }
                 }
                 Err(mut job) => {
+                    if let Some(claim) = &shared_claim {
+                        claim.release();
+                    }
                     job.assigned = assigned;
                     job.pending_slot = pending_slot;
                     match job.lane {
@@ -505,6 +1071,8 @@ async fn main() {
     };
     let public_origin = std::env::var("CODING_TOOLS_TUNNEL_PUBLIC_ORIGIN")
         .unwrap_or_else(|_| DEFAULT_PUBLIC_ORIGIN.into());
+    let node_updates = node_update::NodeUpdateCatalog::from_env(&public_origin)
+        .expect("failed to load Node Agent Gitea update configuration");
     let observability = Observability::from_database(database.clone())
         .expect("failed to initialize persistent observability logs");
     observability.log(
@@ -522,6 +1090,8 @@ async fn main() {
         policies: policies.clone(),
         observability: observability.clone(),
         server_identity,
+        node_updates: node_updates.clone(),
+        multiplex_sessions: SplitSessionRegistry::default(),
         max_request_body_bytes: std::env::var("CODING_TOOLS_TUNNEL_MAX_BODY_BYTES")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -540,6 +1110,8 @@ async fn main() {
     };
 
     let admin_registry = state.registry.clone();
+    node_updates.spawn_polling(observability.clone());
+    let admin_multiplex_sessions = state.multiplex_sessions.clone();
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -561,6 +1133,7 @@ async fn main() {
             policies,
             observability,
             admin_registry,
+            admin_multiplex_sessions,
             public_origin,
             admin_config,
         )
@@ -618,6 +1191,8 @@ async fn wait_for_shutdown(mut receiver: watch::Receiver<bool>) {
 fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route(node_update::LATEST_PATH, get(node_update::latest))
+        .route(node_update::DOWNLOAD_PATH, get(node_update::download))
         .route(WS_PATH, get(websocket_upgrade))
         .route("/_tunnel/enroll/{code}", post(enroll_device))
         .fallback(proxy_request)
@@ -750,6 +1325,59 @@ async fn websocket_upgrade(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response<Body> {
+    if header_offers_protocol(&headers, MULTIPLEX_CONTROL_WS_SUBPROTOCOL)
+        || header_offers_protocol(&headers, MULTIPLEX_DATA_WS_SUBPROTOCOL)
+        || header_offers_protocol(&headers, MULTIPLEX_WS_SUBPROTOCOL)
+    {
+        let Some(device_id) = header_text(&headers, DEVICE_ID_HEADER)
+            .filter(|value| valid_client_id(value))
+            .map(str::to_string)
+        else {
+            return status_response(StatusCode::BAD_REQUEST, "invalid device id header");
+        };
+        let Some(connection_id) = header_text(&headers, CONNECTION_ID_HEADER)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            .map(str::to_string)
+        else {
+            return status_response(StatusCode::BAD_REQUEST, "invalid connection id header");
+        };
+        if header_offers_protocol(&headers, MULTIPLEX_CONTROL_WS_SUBPROTOCOL) {
+            let requested_session_id = header_text(&headers, SESSION_ID_HEADER)
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .map(str::to_string);
+            return ws
+                .protocols([MULTIPLEX_CONTROL_WS_SUBPROTOCOL])
+                .on_upgrade(move |socket| {
+                    run_split_control_socket(
+                        socket,
+                        state,
+                        device_id,
+                        connection_id,
+                        requested_session_id,
+                    )
+                })
+                .into_response();
+        }
+        if header_offers_protocol(&headers, MULTIPLEX_DATA_WS_SUBPROTOCOL) {
+            let Some(session_id) = header_text(&headers, SESSION_ID_HEADER)
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .map(str::to_string)
+            else {
+                return status_response(StatusCode::BAD_REQUEST, "invalid session id header");
+            };
+            return ws
+                .protocols([MULTIPLEX_DATA_WS_SUBPROTOCOL])
+                .on_upgrade(move |socket| {
+                    run_split_data_socket(socket, state, device_id, connection_id, session_id)
+                })
+                .into_response();
+        }
+        return ws
+            .protocols([MULTIPLEX_WS_SUBPROTOCOL])
+            .on_upgrade(move |socket| run_multiplex_socket(socket, state, device_id, connection_id))
+            .into_response();
+    }
+
     let Some(client_id) = header_text(&headers, CLIENT_ID_HEADER) else {
         return status_response(StatusCode::BAD_REQUEST, "missing client id header");
     };
@@ -793,6 +1421,1010 @@ async fn websocket_upgrade(
             )
         })
         .into_response()
+}
+
+struct MultiplexRouteState {
+    key: ClientKey,
+    pool: ClientPool,
+    _connection_guard: ActiveWorkerGuard,
+    _presence_guard: observability::ClientConnectionGuard,
+}
+
+struct MultiplexSlotState {
+    generation: Arc<AtomicUsize>,
+    claimed: Arc<AtomicBool>,
+    active: bool,
+}
+
+struct MultiplexAssignment {
+    slot_index: usize,
+    route_id: u32,
+    job: ProxyJob,
+}
+
+struct MultiplexActiveStream {
+    slot_index: usize,
+    response_head: Option<oneshot::Sender<Result<ResponseHeadData, String>>>,
+    response_body: mpsc::Sender<Result<Bytes, io::Error>>,
+}
+
+async fn publish_multiplex_offer(
+    slot_index: usize,
+    route_id: u32,
+    pool: &ClientPool,
+    slot: &MultiplexSlotState,
+    assignment_tx: &mpsc::Sender<MultiplexAssignment>,
+) -> Result<(), String> {
+    if slot.active || slot.claimed.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let expected_generation = slot.generation.load(Ordering::Acquire);
+    let claim = SharedWorkerClaim {
+        claimed: slot.claimed.clone(),
+        generation: slot.generation.clone(),
+        expected_generation,
+    };
+    let (assign, assigned) = oneshot::channel();
+    pool.available_tx
+        .send(AvailableWorker {
+            assign,
+            shared_claim: Some(claim),
+        })
+        .await
+        .map_err(|_| "multiplex route dispatcher stopped".to_string())?;
+    let assignment_tx = assignment_tx.clone();
+    tokio::spawn(relay_multiplex_assignment(
+        slot_index,
+        route_id,
+        assigned,
+        assignment_tx,
+    ));
+    Ok(())
+}
+
+async fn relay_multiplex_assignment(
+    slot_index: usize,
+    route_id: u32,
+    mut assigned: oneshot::Receiver<ProxyJob>,
+    assignment_tx: mpsc::Sender<MultiplexAssignment>,
+) {
+    tokio::select! {
+        assigned = &mut assigned => {
+            if let Ok(job) = assigned {
+                let _ = assignment_tx
+                    .send(MultiplexAssignment { slot_index, route_id, job })
+                    .await;
+            }
+        }
+        _ = assignment_tx.closed() => {}
+    }
+}
+
+async fn publish_multiplex_slot(
+    slot_index: usize,
+    routes: &HashMap<u32, MultiplexRouteState>,
+    slots: &[MultiplexSlotState],
+    assignment_tx: &mpsc::Sender<MultiplexAssignment>,
+) -> Result<(), String> {
+    let slot = &slots[slot_index];
+    for (route_id, route) in routes {
+        publish_multiplex_offer(slot_index, *route_id, &route.pool, slot, assignment_tx).await?;
+    }
+    Ok(())
+}
+
+fn reset_multiplex_slot(slot: &mut MultiplexSlotState) {
+    slot.active = false;
+    slot.generation.fetch_add(1, Ordering::AcqRel);
+    slot.claimed.store(false, Ordering::Release);
+}
+
+async fn authenticate_split_socket(
+    socket: &mut WebSocket,
+    devices: &DeviceRegistry,
+    server_identity: &ServerIdentity,
+    expected_device_id: &str,
+    expected_connection_id: &str,
+    expected_role: MultiplexConnectionRole,
+    expected_session_id: Option<&str>,
+) -> Result<(String, SplitSessionAuthProof), String> {
+    let nonce = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let expires_at_unix_ms = unix_ms().saturating_add(AUTH_CHALLENGE_TIMEOUT.as_millis() as u64);
+    let server_signature = server_identity.sign(&multiplex_server_challenge_signing_payload(
+        &nonce,
+        expires_at_unix_ms,
+        server_identity.server_id(),
+        expected_device_id,
+        expected_connection_id,
+    ));
+    send_multiplex_control(
+        socket,
+        &MultiplexControlMessage::Challenge {
+            nonce: nonce.clone(),
+            expires_at_unix_ms,
+            server_id: server_identity.server_id().to_string(),
+            server_signature,
+        },
+    )
+    .await?;
+    let proof = match timeout(AUTH_CHALLENGE_TIMEOUT, receive_multiplex_control(socket)).await {
+        Ok(Ok(MultiplexControlMessage::SessionAuthenticate(proof))) => proof,
+        Ok(Ok(_)) => return Err("expected split session authentication proof".into()),
+        Ok(Err(error)) => return Err(error),
+        Err(_) => return Err("authentication challenge timed out".into()),
+    };
+    if proof.device_id != expected_device_id
+        || proof.hello.connection_id != expected_connection_id
+        || proof.hello.protocol_version != MULTIPLEX_PROTOCOL_VERSION
+        || proof.hello.connection_role != expected_role
+        || proof.hello.session_id.as_deref() != expected_session_id
+    {
+        return Err("split authentication proof does not match connection identity".into());
+    }
+    devices
+        .verify_split_session(nonce.clone(), expires_at_unix_ms, proof.clone())
+        .await
+        .map_err(|error| error.public_message().to_string())?;
+    Ok((nonce, proof))
+}
+
+async fn run_split_control_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    expected_device_id: String,
+    expected_connection_id: String,
+    requested_session_id: Option<String>,
+) {
+    let AppState {
+        registry,
+        devices,
+        server_identity,
+        multiplex_sessions: sessions,
+        observability,
+        reconnect_grace_timeout,
+        worker_liveness_timeout: liveness_timeout,
+        ..
+    } = state;
+    let (nonce, proof) = match authenticate_split_socket(
+        &mut socket,
+        &devices,
+        &server_identity,
+        &expected_device_id,
+        &expected_connection_id,
+        MultiplexConnectionRole::Control,
+        requested_session_id.as_deref(),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = send_multiplex_error(&mut socket, &error).await;
+            return;
+        }
+    };
+    let (session, control_generation, created) =
+        if let Some(session_id) = requested_session_id.as_deref() {
+            match sessions.reattach(session_id, &proof.device_id).await {
+                Ok((session, generation)) => (session, generation, false),
+                Err(error) => {
+                    let _ = send_multiplex_error(&mut socket, &error).await;
+                    return;
+                }
+            }
+        } else {
+            let session = sessions
+                .create(
+                    proof.device_id.clone(),
+                    MultiplexConnectionPolicy::default(),
+                )
+                .await;
+            let generation = session.current_control_generation();
+            (session, generation, true)
+        };
+    let policy = session.policy.clone();
+    let server_signature = server_identity.sign(&split_server_ack_signing_payload(
+        &nonce,
+        server_identity.server_id(),
+        &proof,
+        &session.session_id,
+        &policy,
+    ));
+    if send_multiplex_control(
+        &mut socket,
+        &MultiplexControlMessage::SessionReady {
+            protocol_version: MULTIPLEX_PROTOCOL_VERSION,
+            connection_role: MultiplexConnectionRole::Control,
+            session_id: session.session_id.clone(),
+            connection_policy: policy.clone(),
+            server_id: server_identity.server_id().to_string(),
+            server_signature,
+        },
+    )
+    .await
+    .is_err()
+    {
+        if created {
+            sessions.remove(&session.session_id).await;
+        } else {
+            schedule_split_session_cleanup(
+                sessions.clone(),
+                session.clone(),
+                control_generation,
+                reconnect_grace_timeout,
+            );
+        }
+        return;
+    }
+    observability.log(
+        "info",
+        "multiplex",
+        "split control session authenticated",
+        None,
+        None,
+        Some(&expected_connection_id),
+        None,
+    );
+    let mut demand_tick = interval(Duration::from_millis(250));
+    demand_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = demand_tick.tick() => {
+                if send_multiplex_control(&mut socket, &MultiplexControlMessage::CapacityUpdate { demand: session.demand().await }).await.is_err() { break; }
+            }
+            incoming = timeout(liveness_timeout, socket.recv()) => {
+                let incoming = match incoming { Ok(Some(Ok(message))) => message, _ => break };
+                match incoming {
+                    Message::Text(text) => {
+                        let control = match serde_json::from_str::<MultiplexControlMessage>(text.as_str()) {
+                            Ok(value) => value,
+                            Err(error) => { let _ = send_multiplex_error(&mut socket, &format!("invalid split control frame: {error}")).await; continue; }
+                        };
+                        match control {
+                            MultiplexControlMessage::RouteRegister { registration_id, client_id, service } => {
+                                if !valid_client_id(&client_id) || !devices.route_allowed(&proof.device_id, &client_id, service).unwrap_or(false) {
+                                    let _ = send_multiplex_error(&mut socket, "route is not authorized for this device").await;
+                                    continue;
+                                }
+                                let (route_id, _) = match session.register_route(&registry, &observability, ClientKey { client_id, service }).await {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        let _ = send_multiplex_error(&mut socket, &error).await;
+                                        continue;
+                                    }
+                                };
+                                if send_multiplex_control(&mut socket, &MultiplexControlMessage::RouteRegistered {
+                                    registration_id, route_id, stream_limit: policy.streams_per_connection,
+                                }).await.is_err() { break; }
+                            }
+                            MultiplexControlMessage::RouteUnregister { route_id } => { session.unregister_route(route_id).await; }
+                            MultiplexControlMessage::Error { message, .. } => warn!(session_id = %session.session_id, %message, "split control peer reported error"),
+                            _ => { let _ = send_multiplex_error(&mut socket, "unexpected frame on split control connection").await; }
+                        }
+                    }
+                    Message::Ping(payload) => { if socket.send(Message::Pong(payload)).await.is_err() { break; } }
+                    Message::Close(_) => break,
+                    Message::Pong(_) => {},
+                    Message::Binary(_) => { let _ = send_multiplex_error(&mut socket, "binary frames are not allowed on control connection").await; }
+                }
+            }
+        }
+    }
+    schedule_split_session_cleanup(
+        sessions,
+        session,
+        control_generation,
+        reconnect_grace_timeout,
+    );
+}
+
+fn schedule_split_session_cleanup(
+    sessions: SplitSessionRegistry,
+    session: Arc<SplitSessionState>,
+    control_generation: u64,
+    reconnect_grace_timeout: Duration,
+) {
+    if !session.detach_control(control_generation) {
+        return;
+    }
+    let session_id = session.session_id.clone();
+    tokio::spawn(async move {
+        sleep(reconnect_grace_timeout).await;
+        sessions
+            .remove_if_detached(&session_id, control_generation)
+            .await;
+    });
+}
+
+async fn publish_split_slot(
+    slot_index: usize,
+    session: &SplitSessionState,
+    slots: &[MultiplexSlotState],
+    assignment_tx: &mpsc::Sender<MultiplexAssignment>,
+) -> Result<(), String> {
+    if !session.control_is_attached() {
+        return Ok(());
+    }
+    let slot = &slots[slot_index];
+    for (route_id, pool) in session.route_snapshot().await {
+        publish_multiplex_offer(slot_index, route_id, &pool, slot, assignment_tx).await?;
+    }
+    Ok(())
+}
+
+async fn run_split_data_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    expected_device_id: String,
+    expected_connection_id: String,
+    expected_session_id: String,
+) {
+    let AppState {
+        devices,
+        server_identity,
+        multiplex_sessions: sessions,
+        observability,
+        worker_liveness_timeout: liveness_timeout,
+        ..
+    } = state;
+    let session = match sessions.get(&expected_session_id).await {
+        Some(session) if session.device_id == expected_device_id => session,
+        _ => {
+            let _ = send_multiplex_error(&mut socket, "control session is unavailable").await;
+            return;
+        }
+    };
+    let (nonce, proof) = match authenticate_split_socket(
+        &mut socket,
+        &devices,
+        &server_identity,
+        &expected_device_id,
+        &expected_connection_id,
+        MultiplexConnectionRole::Data,
+        Some(&expected_session_id),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = send_multiplex_error(&mut socket, &error).await;
+            return;
+        }
+    };
+    if !session.attach_data_connection().await {
+        let _ = send_multiplex_error(&mut socket, "data connection limit reached").await;
+        return;
+    }
+    let policy = session.policy.clone();
+    let server_signature = server_identity.sign(&split_server_ack_signing_payload(
+        &nonce,
+        server_identity.server_id(),
+        &proof,
+        &session.session_id,
+        &policy,
+    ));
+    if send_multiplex_control(
+        &mut socket,
+        &MultiplexControlMessage::SessionReady {
+            protocol_version: MULTIPLEX_PROTOCOL_VERSION,
+            connection_role: MultiplexConnectionRole::Data,
+            session_id: session.session_id.clone(),
+            connection_policy: policy.clone(),
+            server_id: server_identity.server_id().to_string(),
+            server_signature,
+        },
+    )
+    .await
+    .is_err()
+    {
+        session.detach_data_connection().await;
+        return;
+    }
+    observability.log(
+        "info",
+        "multiplex",
+        "split data connection authenticated",
+        None,
+        None,
+        Some(&expected_connection_id),
+        None,
+    );
+    let stream_limit = usize::from(policy.streams_per_connection);
+    let mut slots = (0..stream_limit)
+        .map(|_| MultiplexSlotState {
+            generation: Arc::new(AtomicUsize::new(1)),
+            claimed: Arc::new(AtomicBool::new(false)),
+            active: false,
+        })
+        .collect::<Vec<_>>();
+    let (assignment_tx, mut assignment_rx) = mpsc::channel::<MultiplexAssignment>(stream_limit * 2);
+    let (cancel_tx, mut cancel_rx) = mpsc::channel::<(u32, u64)>(stream_limit * 2);
+    let mut active_streams: HashMap<(u32, u64), MultiplexActiveStream> = HashMap::new();
+    let mut control_revision = session.control_revision.subscribe();
+    let mut route_revision = session.route_revision.subscribe();
+    let mut shutdown = session.shutdown.subscribe();
+    for slot_index in 0..slots.len() {
+        let _ = publish_split_slot(slot_index, &session, &slots, &assignment_tx).await;
+    }
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
+            changed = control_revision.changed() => {
+                if changed.is_err() { break; }
+                if session.control_is_attached() {
+                    for slot_index in 0..slots.len() {
+                        if !slots[slot_index].active && !slots[slot_index].claimed.load(Ordering::Acquire) {
+                            let _ = publish_split_slot(slot_index, &session, &slots, &assignment_tx).await;
+                        }
+                    }
+                } else {
+                    for slot in &mut slots {
+                        if !slot.active {
+                            slot.generation.fetch_add(1, Ordering::AcqRel);
+                            slot.claimed.store(false, Ordering::Release);
+                        }
+                    }
+                }
+            }
+            changed = route_revision.changed() => {
+                if changed.is_err() { break; }
+                for slot_index in 0..slots.len() {
+                    if !slots[slot_index].active && !slots[slot_index].claimed.load(Ordering::Acquire) {
+                        let _ = publish_split_slot(slot_index, &session, &slots, &assignment_tx).await;
+                    }
+                }
+            }
+            assignment = assignment_rx.recv() => {
+                let Some(MultiplexAssignment { slot_index, route_id, job }) = assignment else { break; };
+                if slot_index >= slots.len()
+                    || slots[slot_index].active
+                    || !session.control_is_attached()
+                    || session.routes.lock().await.get(&route_id).is_none()
+                {
+                    let _ = job.response_head.send(Err("split data stream slot is no longer available".into()));
+                    if slot_index < slots.len() && !slots[slot_index].active {
+                        reset_multiplex_slot(&mut slots[slot_index]);
+                    }
+                    continue;
+                }
+                slots[slot_index].active = true;
+                let stream_id = session.next_stream_id.fetch_add(1, Ordering::AcqRel).max(1);
+                session.active_streams.fetch_add(1, Ordering::AcqRel);
+                let ProxyJob { method, path_and_query, headers, body, response_head, response_body, mut cancelled, .. } = job;
+                if send_multiplex_control(&mut socket, &MultiplexControlMessage::RequestHead {
+                    route_id, stream_id, method, path_and_query, headers, demand: None,
+                }).await.is_err() { let _ = response_head.send(Err("split data connection disconnected".into())); break; }
+                if !body.is_empty() {
+                    match encode_multiplex_binary_frame(MultiplexBinaryFrameKind::RequestBody, route_id, stream_id, body.as_ref()) {
+                        Ok(frame) => if socket.send(Message::Binary(Bytes::from(frame))).await.is_err() { let _ = response_head.send(Err("split data connection disconnected".into())); break; },
+                        Err(error) => { let _ = response_head.send(Err(error)); reset_multiplex_slot(&mut slots[slot_index]); session.active_streams.fetch_sub(1, Ordering::AcqRel); let _ = publish_split_slot(slot_index, &session, &slots, &assignment_tx).await; continue; }
+                    }
+                }
+                if send_multiplex_control(&mut socket, &MultiplexControlMessage::RequestEnd { route_id, stream_id }).await.is_err() { let _ = response_head.send(Err("split data connection disconnected".into())); break; }
+                active_streams.insert((route_id, stream_id), MultiplexActiveStream { slot_index, response_head: Some(response_head), response_body });
+                let cancel_tx = cancel_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if *cancelled.borrow() {
+                            let _ = cancel_tx.send((route_id, stream_id)).await;
+                            break;
+                        }
+                        if cancelled.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            cancelled = cancel_rx.recv() => {
+                let Some((route_id, stream_id)) = cancelled else { break; };
+                if let Some(mut stream) = active_streams.remove(&(route_id, stream_id)) {
+                    let _ = send_multiplex_control(&mut socket, &MultiplexControlMessage::Cancel { route_id, stream_id }).await;
+                    if let Some(head) = stream.response_head.take() { let _ = head.send(Err("public request cancelled".into())); }
+                    reset_multiplex_slot(&mut slots[stream.slot_index]); session.active_streams.fetch_sub(1, Ordering::AcqRel);
+                    let _ = publish_split_slot(stream.slot_index, &session, &slots, &assignment_tx).await;
+                }
+            }
+            incoming = timeout(liveness_timeout, socket.recv()) => {
+                let incoming = match incoming { Ok(Some(Ok(message))) => message, _ => break };
+                match incoming {
+                    Message::Text(text) => {
+                        let control = match serde_json::from_str::<MultiplexControlMessage>(text.as_str()) { Ok(value) => value, Err(error) => { let _ = send_multiplex_error(&mut socket, &format!("invalid split data control frame: {error}")).await; continue; } };
+                        match control {
+                            MultiplexControlMessage::ResponseHead { route_id, stream_id, status, headers } => {
+                                let Some(stream) = active_streams.get_mut(&(route_id, stream_id)) else { let _ = send_multiplex_error(&mut socket, "response head references unknown split stream").await; continue; };
+                                let Some(head) = stream.response_head.take() else { let _ = send_multiplex_error(&mut socket, "duplicate response head").await; continue; };
+                                let _ = head.send(Ok(ResponseHeadData { status, headers }));
+                            }
+                            MultiplexControlMessage::ResponseEnd { route_id, stream_id } => {
+                                let Some(mut stream) = active_streams.remove(&(route_id, stream_id)) else { let _ = send_multiplex_error(&mut socket, "response end references unknown split stream").await; continue; };
+                                if let Some(head) = stream.response_head.take() { let _ = head.send(Err("response ended before headers".into())); }
+                                reset_multiplex_slot(&mut slots[stream.slot_index]); session.active_streams.fetch_sub(1, Ordering::AcqRel);
+                                let _ = publish_split_slot(stream.slot_index, &session, &slots, &assignment_tx).await;
+                            }
+                            MultiplexControlMessage::Error { route_id: Some(route_id), stream_id: Some(stream_id), message } => {
+                                if let Some(mut stream) = active_streams.remove(&(route_id, stream_id)) {
+                                    if let Some(head) = stream.response_head.take() { let _ = head.send(Err(message.clone())); } else { let _ = stream.response_body.send(Err(io::Error::other(message))).await; }
+                                    reset_multiplex_slot(&mut slots[stream.slot_index]); session.active_streams.fetch_sub(1, Ordering::AcqRel);
+                                    let _ = publish_split_slot(stream.slot_index, &session, &slots, &assignment_tx).await;
+                                }
+                            }
+                            _ => { let _ = send_multiplex_error(&mut socket, "unexpected frame on split data connection").await; }
+                        }
+                    }
+                    Message::Binary(frame) => {
+                        let frame = match decode_multiplex_binary_frame(frame.as_ref()) { Ok(frame) => frame, Err(error) => { let _ = send_multiplex_error(&mut socket, &error).await; continue; } };
+                        if frame.kind != MultiplexBinaryFrameKind::ResponseBody { let _ = send_multiplex_error(&mut socket, "split data connection may only send response bodies").await; continue; }
+                        let key = (frame.route_id, frame.stream_id);
+                        let Some(stream) = active_streams.get_mut(&key) else { let _ = send_multiplex_error(&mut socket, "response body references unknown split stream").await; continue; };
+                        if stream.response_head.is_some() { let _ = send_multiplex_error(&mut socket, "response body arrived before response head").await; continue; }
+                        if stream.response_body.send(Ok(Bytes::from(frame.payload))).await.is_err() {
+                            if let Some(stream) = active_streams.remove(&key) { reset_multiplex_slot(&mut slots[stream.slot_index]); session.active_streams.fetch_sub(1, Ordering::AcqRel); let _ = publish_split_slot(stream.slot_index, &session, &slots, &assignment_tx).await; }
+                        }
+                    }
+                    Message::Ping(payload) => { if socket.send(Message::Pong(payload)).await.is_err() { break; } }
+                    Message::Close(_) => break,
+                    Message::Pong(_) => {},
+                }
+            }
+        }
+    }
+    for (_, mut stream) in active_streams {
+        session.active_streams.fetch_sub(1, Ordering::AcqRel);
+        if let Some(head) = stream.response_head.take() {
+            let _ = head.send(Err("split data connection disconnected".into()));
+        } else {
+            let _ = stream
+                .response_body
+                .try_send(Err(io::Error::other("split data connection disconnected")));
+        }
+    }
+    session.detach_data_connection().await;
+}
+
+async fn run_multiplex_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    expected_device_id: String,
+    expected_connection_id: String,
+) {
+    let AppState {
+        registry,
+        devices,
+        server_identity,
+        observability,
+        worker_liveness_timeout: liveness_timeout,
+        ..
+    } = state;
+    let nonce = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let expires_at_unix_ms = unix_ms().saturating_add(AUTH_CHALLENGE_TIMEOUT.as_millis() as u64);
+    let server_signature = server_identity.sign(&multiplex_server_challenge_signing_payload(
+        &nonce,
+        expires_at_unix_ms,
+        server_identity.server_id(),
+        &expected_device_id,
+        &expected_connection_id,
+    ));
+    if send_multiplex_control(
+        &mut socket,
+        &MultiplexControlMessage::Challenge {
+            nonce: nonce.clone(),
+            expires_at_unix_ms,
+            server_id: server_identity.server_id().to_string(),
+            server_signature,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+
+    let proof = match timeout(
+        AUTH_CHALLENGE_TIMEOUT,
+        receive_multiplex_control(&mut socket),
+    )
+    .await
+    {
+        Ok(Ok(MultiplexControlMessage::Authenticate(proof))) => proof,
+        Ok(Ok(_)) => {
+            let _ =
+                send_multiplex_error(&mut socket, "expected device session authentication proof")
+                    .await;
+            return;
+        }
+        Ok(Err(error)) => {
+            warn!(device_id = %expected_device_id, connection_id = %expected_connection_id, %error, "multiplex authentication failed");
+            return;
+        }
+        Err(_) => {
+            let _ = send_multiplex_error(&mut socket, "authentication challenge timed out").await;
+            return;
+        }
+    };
+    if proof.device_id != expected_device_id
+        || proof.hello.connection_id != expected_connection_id
+        || proof.hello.protocol_version != MULTIPLEX_PROTOCOL_VERSION
+    {
+        let _ = send_multiplex_error(
+            &mut socket,
+            "authentication proof does not match physical connection identity",
+        )
+        .await;
+        return;
+    }
+    if let Err(error) = devices
+        .verify_device_session(nonce.clone(), expires_at_unix_ms, proof.clone())
+        .await
+    {
+        warn!(device_id = %proof.device_id, connection_id = %proof.hello.connection_id, %error, "multiplex device authentication rejected");
+        let _ = send_multiplex_error(&mut socket, error.public_message()).await;
+        return;
+    }
+
+    let connection_policy = MultiplexConnectionPolicy::default();
+    let server_signature = server_identity.sign(&multiplex_server_ack_signing_payload(
+        &nonce,
+        server_identity.server_id(),
+        &proof,
+        &connection_policy,
+    ));
+    if send_multiplex_control(
+        &mut socket,
+        &MultiplexControlMessage::HelloAck {
+            protocol_version: MULTIPLEX_PROTOCOL_VERSION,
+            connection_policy: connection_policy.clone(),
+            server_id: server_identity.server_id().to_string(),
+            server_signature,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+
+    info!(device_id = %proof.device_id, connection_id = %proof.hello.connection_id, "multiplex device connection authenticated");
+    observability.log(
+        "info",
+        "multiplex",
+        "device-shared tunnel connection authenticated",
+        None,
+        None,
+        Some(&proof.hello.connection_id),
+        None,
+    );
+
+    let stream_limit = usize::from(connection_policy.streams_per_connection);
+    let mut routes: HashMap<u32, MultiplexRouteState> = HashMap::new();
+    let mut next_route_id = 1_u32;
+    let mut next_stream_id = 1_u64;
+    let mut slots = (0..stream_limit)
+        .map(|_| MultiplexSlotState {
+            generation: Arc::new(AtomicUsize::new(1)),
+            claimed: Arc::new(AtomicBool::new(false)),
+            active: false,
+        })
+        .collect::<Vec<_>>();
+    let (assignment_tx, mut assignment_rx) = mpsc::channel::<MultiplexAssignment>(stream_limit * 2);
+    let (cancel_tx, mut cancel_rx) = mpsc::channel::<(u32, u64)>(stream_limit * 2);
+    let mut active_streams: HashMap<(u32, u64), MultiplexActiveStream> = HashMap::new();
+
+    loop {
+        tokio::select! {
+            assignment = assignment_rx.recv() => {
+                let Some(MultiplexAssignment { slot_index, route_id, job }) = assignment else {
+                    break;
+                };
+                if slot_index >= slots.len() || slots[slot_index].active || !routes.contains_key(&route_id) {
+                    let _ = job.response_head.send(Err("multiplex stream slot is no longer available".into()));
+                    continue;
+                }
+                slots[slot_index].active = true;
+                let stream_id = next_stream_id;
+                next_stream_id = next_stream_id.wrapping_add(1).max(1);
+                let active_count = slots.iter().filter(|slot| slot.active).count();
+                let route = routes.get(&route_id).expect("route checked");
+                let queued = route.pool.pending_requests();
+                let desired_connections = active_count
+                    .saturating_add(queued)
+                    .div_ceil(stream_limit)
+                    .max(1)
+                    .min(usize::from(connection_policy.max_connections));
+                let demand = Some(MultiplexDemand {
+                    queued_requests: queued.min(usize::from(u16::MAX)) as u16,
+                    oldest_queue_wait_ms: job.enqueued_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    active_streams: active_count.min(usize::from(u16::MAX)) as u16,
+                    available_stream_slots: stream_limit.saturating_sub(active_count).min(usize::from(u16::MAX)) as u16,
+                    desired_connections: desired_connections as u16,
+                });
+                let ProxyJob {
+                    method,
+                    path_and_query,
+                    headers,
+                    body,
+                    response_head,
+                    response_body,
+                    mut cancelled,
+                    ..
+                } = job;
+                if send_multiplex_control(
+                    &mut socket,
+                    &MultiplexControlMessage::RequestHead {
+                        route_id,
+                        stream_id,
+                        method,
+                        path_and_query,
+                        headers,
+                        demand,
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    let _ = response_head.send(Err("multiplex connection disconnected".into()));
+                    break;
+                }
+                if !body.is_empty() {
+                    let frame = match encode_multiplex_binary_frame(
+                        MultiplexBinaryFrameKind::RequestBody,
+                        route_id,
+                        stream_id,
+                        body.as_ref(),
+                    ) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            let _ = response_head.send(Err(error));
+                            reset_multiplex_slot(&mut slots[slot_index]);
+                            let _ = publish_multiplex_slot(slot_index, &routes, &slots, &assignment_tx).await;
+                            continue;
+                        }
+                    };
+                    if socket.send(Message::Binary(Bytes::from(frame))).await.is_err() {
+                        let _ = response_head.send(Err("multiplex connection disconnected".into()));
+                        break;
+                    }
+                }
+                if send_multiplex_control(
+                    &mut socket,
+                    &MultiplexControlMessage::RequestEnd { route_id, stream_id },
+                )
+                .await
+                .is_err()
+                {
+                    let _ = response_head.send(Err("multiplex connection disconnected".into()));
+                    break;
+                }
+                active_streams.insert(
+                    (route_id, stream_id),
+                    MultiplexActiveStream {
+                        slot_index,
+                        response_head: Some(response_head),
+                        response_body,
+                    },
+                );
+                let cancel_tx = cancel_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if *cancelled.borrow() {
+                            let _ = cancel_tx.send((route_id, stream_id)).await;
+                            break;
+                        }
+                        if cancelled.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            cancelled = cancel_rx.recv() => {
+                let Some((route_id, stream_id)) = cancelled else {
+                    break;
+                };
+                if let Some(mut stream) = active_streams.remove(&(route_id, stream_id)) {
+                    let _ = send_multiplex_control(
+                        &mut socket,
+                        &MultiplexControlMessage::Cancel { route_id, stream_id },
+                    )
+                    .await;
+                    if let Some(head) = stream.response_head.take() {
+                        let _ = head.send(Err("public request cancelled".into()));
+                    }
+                    reset_multiplex_slot(&mut slots[stream.slot_index]);
+                    let _ = publish_multiplex_slot(stream.slot_index, &routes, &slots, &assignment_tx).await;
+                }
+            }
+            incoming = timeout(liveness_timeout, socket.recv()) => {
+                let incoming = match incoming {
+                    Ok(Some(Ok(message))) => message,
+                    Ok(Some(Err(error))) => {
+                        warn!(device_id = %proof.device_id, connection_id = %proof.hello.connection_id, %error, "multiplex socket receive failed");
+                        break;
+                    }
+                    Ok(None) | Err(_) => break,
+                };
+                match incoming {
+                    Message::Text(text) => {
+                        let control = match serde_json::from_str::<MultiplexControlMessage>(text.as_str()) {
+                            Ok(control) => control,
+                            Err(error) => {
+                                let _ = send_multiplex_error(&mut socket, &format!("invalid multiplex control frame: {error}")).await;
+                                continue;
+                            }
+                        };
+                        match control {
+                            MultiplexControlMessage::RouteRegister { registration_id, client_id, service } => {
+                                if !valid_client_id(&client_id)
+                                    || !devices.route_allowed(&proof.device_id, &client_id, service).unwrap_or(false)
+                                {
+                                    let _ = send_multiplex_error(&mut socket, "route is not authorized for this device").await;
+                                    continue;
+                                }
+                                let existing = routes.iter().find_map(|(route_id, route)| {
+                                    (route.key.client_id == client_id && route.key.service == service).then_some(*route_id)
+                                });
+                                let route_id = if let Some(route_id) = existing {
+                                    route_id
+                                } else {
+                                    let key = ClientKey { client_id: client_id.clone(), service };
+                                    let pool = match registry.register_owned(key.clone(), &proof.device_id).await {
+                                        Ok(pool) => pool,
+                                        Err(error) => {
+                                            let _ = send_multiplex_error(&mut socket, &error).await;
+                                            continue;
+                                        }
+                                    };
+                                    let Some(connection_guard) = ActiveWorkerGuard::try_new(
+                                        pool.active_workers.clone(),
+                                        usize::from(connection_policy.max_connections),
+                                    ) else {
+                                        let _ = send_multiplex_error(&mut socket, "connection limit reached for this route").await;
+                                        continue;
+                                    };
+                                    let route_id = next_route_id;
+                                    next_route_id = next_route_id.saturating_add(1).max(1);
+                                    let presence_guard = observability.connect_client_route(
+                                        &format!("multiplex:{}:{route_id}", proof.hello.connection_id),
+                                        &proof.device_id,
+                                        &key.client_id,
+                                        key.service.as_str(),
+                                        "multiplex",
+                                    );
+                                    routes.insert(route_id, MultiplexRouteState {
+                                        key,
+                                        pool,
+                                        _connection_guard: connection_guard,
+                                        _presence_guard: presence_guard,
+                                    });
+                                    route_id
+                                };
+                                if send_multiplex_control(
+                                    &mut socket,
+                                    &MultiplexControlMessage::RouteRegistered {
+                                        registration_id,
+                                        route_id,
+                                        stream_limit: connection_policy.streams_per_connection,
+                                    },
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
+                                }
+                                if existing.is_none() {
+                                    let route = routes.get(&route_id).expect("new route registered");
+                                    for (slot_index, slot) in slots.iter().enumerate() {
+                                        if !slot.active && !slot.claimed.load(Ordering::Acquire) {
+                                            let _ = publish_multiplex_offer(
+                                                slot_index,
+                                                route_id,
+                                                &route.pool,
+                                                slot,
+                                                &assignment_tx,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
+                            }
+                            MultiplexControlMessage::RouteUnregister { route_id } => {
+                                if active_streams.keys().any(|(active_route_id, _)| *active_route_id == route_id) {
+                                    let _ = send_multiplex_error(&mut socket, "cannot unregister a route with active streams").await;
+                                } else {
+                                    routes.remove(&route_id);
+                                }
+                            }
+                            MultiplexControlMessage::ResponseHead { route_id, stream_id, status, headers } => {
+                                let Some(stream) = active_streams.get_mut(&(route_id, stream_id)) else {
+                                    let _ = send_multiplex_error(&mut socket, "response head references an unknown stream").await;
+                                    continue;
+                                };
+                                let Some(head) = stream.response_head.take() else {
+                                    let _ = send_multiplex_error(&mut socket, "duplicate response head").await;
+                                    continue;
+                                };
+                                let _ = head.send(Ok(ResponseHeadData { status, headers }));
+                            }
+                            MultiplexControlMessage::ResponseEnd { route_id, stream_id } => {
+                                let Some(mut stream) = active_streams.remove(&(route_id, stream_id)) else {
+                                    let _ = send_multiplex_error(&mut socket, "response end references an unknown stream").await;
+                                    continue;
+                                };
+                                if let Some(head) = stream.response_head.take() {
+                                    let _ = head.send(Err("response ended before headers".into()));
+                                }
+                                reset_multiplex_slot(&mut slots[stream.slot_index]);
+                                let _ = publish_multiplex_slot(stream.slot_index, &routes, &slots, &assignment_tx).await;
+                            }
+                            MultiplexControlMessage::Error { route_id: Some(route_id), stream_id: Some(stream_id), message } => {
+                                if let Some(mut stream) = active_streams.remove(&(route_id, stream_id)) {
+                                    if let Some(head) = stream.response_head.take() {
+                                        let _ = head.send(Err(message.clone()));
+                                    } else {
+                                        let _ = stream.response_body.send(Err(io::Error::other(message.clone()))).await;
+                                    }
+                                    reset_multiplex_slot(&mut slots[stream.slot_index]);
+                                    let _ = publish_multiplex_slot(stream.slot_index, &routes, &slots, &assignment_tx).await;
+                                }
+                            }
+                            MultiplexControlMessage::Error { message, .. } => {
+                                warn!(device_id = %proof.device_id, connection_id = %proof.hello.connection_id, %message, "multiplex peer reported connection error");
+                            }
+                            _ => {
+                                let _ = send_multiplex_error(&mut socket, "unexpected multiplex control frame from device").await;
+                            }
+                        }
+                    }
+                    Message::Binary(frame) => {
+                        let frame = match decode_multiplex_binary_frame(frame.as_ref()) {
+                            Ok(frame) => frame,
+                            Err(error) => {
+                                let _ = send_multiplex_error(&mut socket, &error).await;
+                                continue;
+                            }
+                        };
+                        if frame.kind != MultiplexBinaryFrameKind::ResponseBody {
+                            let _ = send_multiplex_error(&mut socket, "device may only send response body binary frames").await;
+                            continue;
+                        }
+                        let key = (frame.route_id, frame.stream_id);
+                        let Some(stream) = active_streams.get_mut(&key) else {
+                            let _ = send_multiplex_error(&mut socket, "response body references an unknown stream").await;
+                            continue;
+                        };
+                        if stream.response_head.is_some() {
+                            let _ = send_multiplex_error(&mut socket, "response body arrived before response head").await;
+                            continue;
+                        }
+                        if stream.response_body.send(Ok(Bytes::from(frame.payload))).await.is_err() {
+                            let stream = active_streams.remove(&key).expect("stream still present");
+                            let _ = send_multiplex_control(
+                                &mut socket,
+                                &MultiplexControlMessage::Cancel { route_id: key.0, stream_id: key.1 },
+                            )
+                            .await;
+                            reset_multiplex_slot(&mut slots[stream.slot_index]);
+                            let _ = publish_multiplex_slot(stream.slot_index, &routes, &slots, &assignment_tx).await;
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    Message::Pong(_) => {}
+                }
+            }
+        }
+    }
+
+    for (_, mut stream) in active_streams {
+        if let Some(head) = stream.response_head.take() {
+            let _ = head.send(Err("multiplex connection disconnected".into()));
+        } else {
+            let _ = stream
+                .response_body
+                .try_send(Err(io::Error::other("multiplex connection disconnected")));
+        }
+    }
 }
 
 async fn run_worker_socket(
@@ -874,7 +2506,13 @@ async fn run_worker_socket(
     }
 
     let hello = proof.hello.clone();
-    let pool = registry.register(key.clone()).await;
+    let pool = match registry.register_owned(key.clone(), &proof.device_id).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            let _ = send_error(&mut socket, None, &error).await;
+            return;
+        }
+    };
     let mut policy_updates = policies.subscribe(key.service);
     let worker_policy = policy_updates.borrow().clone();
     let server_signature = server_identity.sign(&server_ack_signing_payload(
@@ -974,7 +2612,10 @@ async fn run_worker_socket(
         let (assign, mut assigned) = oneshot::channel();
         if pool
             .available_tx
-            .send(AvailableWorker { assign })
+            .send(AvailableWorker {
+                assign,
+                shared_claim: None,
+            })
             .await
             .is_err()
         {
@@ -1466,18 +3107,27 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
                 usize::from(policy.max_pending_requests),
             ),
         };
-        let Some(pending_slot) = PendingRequestSlot::try_new(
+        let acquire_deadline =
+            Instant::now() + Duration::from_millis(policy.worker_acquire_timeout_ms);
+        let Some(pending_slot) = PendingRequestSlot::acquire_until(
             pending_requests.clone(),
+            pool.pending_queue.clone(),
             pending_limit,
             state.observability.clone(),
-        ) else {
+            acquire_deadline,
+        )
+        .await
+        else {
             state.observability.record_capacity_rejection();
+            state.observability.record_worker_acquire_timeout();
             state.observability.log(
                 "warn",
                 "capacity",
                 format!(
-                    "worker_capacity_exhausted lane={} pending={} limit={} active_workers={} control_reserve={}",
+                    "worker_acquire_timeout lane={} elapsed_ms={} timeout_ms={} pending={} limit={} active_workers={} control_reserve={}",
                     request_lane.as_str(),
+                    request_started.elapsed().as_millis(),
+                    policy.worker_acquire_timeout_ms,
                     pending_requests.load(Ordering::Acquire),
                     pending_limit,
                     pool.active_workers.load(Ordering::Acquire),
@@ -1491,17 +3141,14 @@ async fn proxy_request(State(state): State<AppState>, request: Request<Body>) ->
             request_guard.finish(StatusCode::SERVICE_UNAVAILABLE.as_u16());
             return with_tunnel_request_context(
                 capacity_response(
-                    "worker_capacity_exhausted",
-                    "tunnel worker capacity is exhausted",
+                    "worker_acquire_timeout",
+                    "no bounded queue capacity became available before the worker-acquire deadline",
                 ),
                 &request_id,
                 request_lane,
                 operation_hash.as_deref(),
             );
         };
-
-        let acquire_deadline =
-            Instant::now() + Duration::from_millis(policy.worker_acquire_timeout_ms);
         let (head_tx, head_rx) = oneshot::channel();
         let (body_tx, body_rx) = mpsc::channel(RESPONSE_BODY_CAPACITY);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -1868,6 +3515,51 @@ fn node_update_state_terminal(state: &NodeUpdateState) -> bool {
     matches!(state, NodeUpdateState::Scheduled | NodeUpdateState::Failed)
 }
 
+async fn receive_multiplex_control(
+    socket: &mut WebSocket,
+) -> Result<MultiplexControlMessage, String> {
+    loop {
+        match socket.recv().await {
+            Some(Ok(Message::Text(text))) => {
+                return serde_json::from_str(text.as_str()).map_err(|error| error.to_string());
+            }
+            Some(Ok(Message::Ping(payload))) => socket
+                .send(Message::Pong(payload))
+                .await
+                .map_err(|error| error.to_string())?,
+            Some(Ok(Message::Close(_))) | None => return Err("multiplex connection closed".into()),
+            Some(Ok(Message::Binary(_))) => {
+                return Err("binary stream frame received before dispatcher is active".into())
+            }
+            Some(Ok(_)) => {}
+            Some(Err(error)) => return Err(error.to_string()),
+        }
+    }
+}
+
+async fn send_multiplex_control(
+    socket: &mut WebSocket,
+    message: &MultiplexControlMessage,
+) -> Result<(), String> {
+    let encoded = serde_json::to_string(message).map_err(|error| error.to_string())?;
+    socket
+        .send(Message::Text(encoded.into()))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn send_multiplex_error(socket: &mut WebSocket, message: &str) -> Result<(), String> {
+    send_multiplex_control(
+        socket,
+        &MultiplexControlMessage::Error {
+            route_id: None,
+            stream_id: None,
+            message: message.to_string(),
+        },
+    )
+    .await
+}
+
 async fn receive_control(socket: &mut WebSocket) -> Result<ControlMessage, String> {
     loop {
         match socket.recv().await {
@@ -1915,6 +3607,11 @@ fn fail_response_head(
     if let Some(sender) = sender.take() {
         let _ = sender.send(Err(message));
     }
+}
+
+fn header_offers_protocol(headers: &HeaderMap, protocol: &str) -> bool {
+    header_text(headers, "sec-websocket-protocol")
+        .is_some_and(|value| value.split(',').any(|item| item.trim() == protocol))
 }
 
 fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -2016,6 +3713,120 @@ mod tests {
     }
 
     #[test]
+    fn pending_queue_tracker_advances_to_the_next_oldest_request() {
+        let tracker = PendingQueueTracker::default();
+        let now = Instant::now();
+        {
+            let mut entries = tracker.entries.lock().expect("pending queue tracker");
+            entries.insert(1, now - Duration::from_millis(80));
+            entries.insert(2, now - Duration::from_millis(20));
+        }
+
+        assert!(tracker.oldest_wait_ms() >= 70);
+        tracker.exit(1);
+        let next_wait = tracker.oldest_wait_ms();
+        assert!(next_wait >= 10);
+        assert!(next_wait < 70);
+        tracker.exit(2);
+        assert_eq!(tracker.oldest_wait_ms(), 0);
+    }
+
+    #[tokio::test]
+    async fn split_session_demand_reports_the_oldest_pending_route_wait() {
+        let registry = Registry::default();
+        let sessions = SplitSessionRegistry::default();
+        let session = sessions
+            .create(
+                "queue-demand-device".into(),
+                MultiplexConnectionPolicy::default(),
+            )
+            .await;
+        let key = ClientKey {
+            client_id: "queue-demand".into(),
+            service: TunnelService::Mcp,
+        };
+        let observability = Observability::new();
+        let (route_id, created) = session
+            .register_route(&registry, &observability, key)
+            .await
+            .expect("register split route");
+        assert!(created);
+        assert_eq!(observability.connections().len(), 1);
+        let pool = session
+            .routes
+            .lock()
+            .await
+            .get(&route_id)
+            .expect("registered split route")
+            .pool
+            .clone();
+        pool.execution_pending_requests.store(2, Ordering::Release);
+        let now = Instant::now();
+        {
+            let mut entries = pool
+                .pending_queue
+                .entries
+                .lock()
+                .expect("pending queue tracker");
+            entries.insert(1, now - Duration::from_millis(75));
+            entries.insert(2, now - Duration::from_millis(15));
+        }
+
+        let demand = session.demand().await;
+        assert_eq!(demand.queued_requests, 2);
+        assert!(demand.oldest_queue_wait_ms >= 65);
+
+        pool.pending_queue.exit(1);
+        let demand = session.demand().await;
+        assert!(demand.oldest_queue_wait_ms >= 5);
+        assert!(demand.oldest_queue_wait_ms < 65);
+
+        assert!(session.unregister_route(route_id).await);
+        assert!(observability.connections().is_empty());
+    }
+
+    #[test]
+    fn shared_multiplex_slot_has_one_winner_and_rejects_stale_offers_after_reset() {
+        let claimed = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicUsize::new(7));
+        let offer_a = SharedWorkerClaim {
+            claimed: claimed.clone(),
+            generation: generation.clone(),
+            expected_generation: 7,
+        };
+        let offer_b = offer_a.clone();
+
+        assert!(offer_a.try_claim());
+        assert!(!offer_b.try_claim());
+
+        generation.fetch_add(1, Ordering::AcqRel);
+        claimed.store(false, Ordering::Release);
+        assert!(!offer_a.try_claim());
+        assert!(!offer_b.try_claim());
+
+        let fresh = SharedWorkerClaim {
+            claimed,
+            generation,
+            expected_generation: 8,
+        };
+        assert!(fresh.try_claim());
+    }
+
+    #[tokio::test]
+    async fn multiplex_assignment_relay_closes_stale_offer_when_connection_stops() {
+        let (mut assign, assigned) = oneshot::channel::<ProxyJob>();
+        let (assignment_tx, assignment_rx) = mpsc::channel::<MultiplexAssignment>(1);
+        let relay = tokio::spawn(relay_multiplex_assignment(0, 1, assigned, assignment_tx));
+
+        drop(assignment_rx);
+        timeout(Duration::from_secs(1), assign.closed())
+            .await
+            .expect("stale worker offer should close when its data connection stops");
+        relay.await.expect("assignment relay task");
+        assert!(assign.is_closed());
+    }
+
+    #[test]
     fn dispatcher_discards_closed_worker_slots_before_assignment() {
         let (closed_assign, closed_receiver) = oneshot::channel::<ProxyJob>();
         drop(closed_receiver);
@@ -2023,9 +3834,11 @@ mod tests {
         let mut workers = VecDeque::from([
             AvailableWorker {
                 assign: closed_assign,
+                shared_claim: None,
             },
             AvailableWorker {
                 assign: live_assign,
+                shared_claim: None,
             },
         ]);
 
@@ -2046,6 +3859,8 @@ mod tests {
             policies,
             observability: Observability::new(),
             server_identity: test_server_identity(),
+            node_updates: node_update::NodeUpdateCatalog::disabled(),
+            multiplex_sessions: SplitSessionRegistry::default(),
             max_request_body_bytes: MAX_REQUEST_BODY_BYTES,
             response_head_timeout: RESPONSE_HEAD_TIMEOUT,
             reconnect_grace_timeout: RECONNECT_GRACE_TIMEOUT,
@@ -2074,6 +3889,8 @@ mod tests {
             policies,
             observability: Observability::new(),
             server_identity: test_server_identity(),
+            node_updates: node_update::NodeUpdateCatalog::disabled(),
+            multiplex_sessions: SplitSessionRegistry::default(),
             max_request_body_bytes: MAX_REQUEST_BODY_BYTES,
             response_head_timeout: RESPONSE_HEAD_TIMEOUT,
             reconnect_grace_timeout: RECONNECT_GRACE_TIMEOUT,
@@ -2106,6 +3923,8 @@ mod tests {
             policies,
             observability: Observability::new(),
             server_identity: test_server_identity(),
+            node_updates: node_update::NodeUpdateCatalog::disabled(),
+            multiplex_sessions: SplitSessionRegistry::default(),
             max_request_body_bytes: MAX_REQUEST_BODY_BYTES,
             response_head_timeout,
             reconnect_grace_timeout,
@@ -2285,7 +4104,804 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enrolls_and_proxies_http_over_a_signed_websocket_worker() {
+    async fn split_v5_keeps_control_independent_and_routes_requests_over_data_socket() {
+        use coding_tools_tunnel_protocol::{
+            split_session_auth_signing_payload, MultiplexConnectionRole, SplitSessionAuthProof,
+            SplitSessionHello,
+        };
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let devices =
+            DeviceRegistry::open(directory.path().join("devices.db")).expect("device registry");
+        let signing_key = SigningKey::from_bytes(&[53_u8; 32]);
+        let device_id = "device-split-v5";
+        let grant = devices
+            .create_enrollment("workspace-a", AllowedServices::Mcp, Some(60))
+            .expect("grant");
+        devices
+            .enroll(
+                grant.code,
+                EnrollmentRequest {
+                    device_id: device_id.into(),
+                    client_id: "workspace-a".into(),
+                    device_name: "split v5".into(),
+                    public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+                },
+            )
+            .await
+            .expect("enroll");
+        let (address, server) = start_test_server(devices, Registry::default()).await;
+
+        async fn split_connect(
+            address: SocketAddr,
+            signing_key: &SigningKey,
+            device_id: &str,
+            connection_id: &str,
+            role: MultiplexConnectionRole,
+            session_id: Option<&str>,
+        ) -> tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        > {
+            let protocol = match role {
+                MultiplexConnectionRole::Control => MULTIPLEX_CONTROL_WS_SUBPROTOCOL,
+                MultiplexConnectionRole::Data => MULTIPLEX_DATA_WS_SUBPROTOCOL,
+            };
+            let mut request = format!("ws://{address}{WS_PATH}")
+                .into_client_request()
+                .expect("request");
+            request
+                .headers_mut()
+                .insert(DEVICE_ID_HEADER, device_id.parse().unwrap());
+            request
+                .headers_mut()
+                .insert(CONNECTION_ID_HEADER, connection_id.parse().unwrap());
+            if let Some(session_id) = session_id {
+                request
+                    .headers_mut()
+                    .insert(SESSION_ID_HEADER, session_id.parse().unwrap());
+            }
+            request
+                .headers_mut()
+                .insert(SEC_WEBSOCKET_PROTOCOL, protocol.parse().unwrap());
+            let (mut socket, response) =
+                connect_async(request).await.expect("connect split socket");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(SEC_WEBSOCKET_PROTOCOL)
+                    .and_then(|v| v.to_str().ok()),
+                Some(protocol)
+            );
+            let challenge = socket.next().await.unwrap().unwrap();
+            let WsMessage::Text(challenge) = challenge else {
+                panic!("challenge text")
+            };
+            let MultiplexControlMessage::Challenge { nonce, .. } =
+                serde_json::from_str(challenge.as_ref()).unwrap()
+            else {
+                panic!("challenge")
+            };
+            let mut proof = SplitSessionAuthProof {
+                hello: SplitSessionHello {
+                    protocol_version: MULTIPLEX_PROTOCOL_VERSION,
+                    connection_role: role,
+                    connection_id: connection_id.into(),
+                    session_id: session_id.map(str::to_string),
+                },
+                device_id: device_id.into(),
+                signature: String::new(),
+            };
+            proof.signature = URL_SAFE_NO_PAD.encode(
+                signing_key
+                    .sign(&split_session_auth_signing_payload(&nonce, &proof))
+                    .to_bytes(),
+            );
+            socket
+                .send(WsMessage::Text(
+                    serde_json::to_string(&MultiplexControlMessage::SessionAuthenticate(proof))
+                        .unwrap()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+        }
+
+        let mut control = split_connect(
+            address,
+            &signing_key,
+            device_id,
+            "control-1",
+            MultiplexConnectionRole::Control,
+            None,
+        )
+        .await;
+        let session_id = loop {
+            let frame = timeout(Duration::from_secs(2), control.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let WsMessage::Text(text) = frame else {
+                continue;
+            };
+            match serde_json::from_str::<MultiplexControlMessage>(text.as_ref()).unwrap() {
+                MultiplexControlMessage::SessionReady {
+                    connection_role: MultiplexConnectionRole::Control,
+                    session_id,
+                    ..
+                } => break session_id,
+                other => panic!("unexpected control handshake frame: {other:?}"),
+            }
+        };
+        control
+            .send(WsMessage::Text(
+                serde_json::to_string(&MultiplexControlMessage::RouteRegister {
+                    registration_id: "route-a".into(),
+                    client_id: "workspace-a".into(),
+                    service: TunnelService::Mcp,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let route_id = loop {
+            let frame = timeout(Duration::from_secs(2), control.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let WsMessage::Text(text) = frame else {
+                continue;
+            };
+            match serde_json::from_str::<MultiplexControlMessage>(text.as_ref()).unwrap() {
+                MultiplexControlMessage::RouteRegistered {
+                    registration_id,
+                    route_id,
+                    ..
+                } if registration_id == "route-a" => break route_id,
+                MultiplexControlMessage::CapacityUpdate { .. } => {}
+                other => panic!("unexpected route control frame: {other:?}"),
+            }
+        };
+
+        let mut data = split_connect(
+            address,
+            &signing_key,
+            device_id,
+            "data-1",
+            MultiplexConnectionRole::Data,
+            Some(&session_id),
+        )
+        .await;
+        let ready = timeout(Duration::from_secs(2), data.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WsMessage::Text(ready) = ready else {
+            panic!("data ready text")
+        };
+        assert!(
+            matches!(serde_json::from_str::<MultiplexControlMessage>(ready.as_ref()).unwrap(),
+            MultiplexControlMessage::SessionReady { connection_role: MultiplexConnectionRole::Data, session_id: ref accepted, .. } if accepted == &session_id)
+        );
+
+        let public = tokio::spawn(async move {
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "http://{address}/builtin/clients/workspace-a/mcp?split=1"
+                ))
+                .body("hello-split")
+                .send()
+                .await
+                .expect("public request");
+            (response.status(), response.bytes().await.unwrap())
+        });
+
+        let mut stream_id = None;
+        let mut body = None;
+        let mut ended = false;
+        while !ended {
+            let frame = timeout(Duration::from_secs(2), data.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match frame {
+                WsMessage::Text(text) => {
+                    match serde_json::from_str::<MultiplexControlMessage>(text.as_ref()).unwrap() {
+                        MultiplexControlMessage::RequestHead {
+                            route_id: actual_route,
+                            stream_id: actual_stream,
+                            demand,
+                            path_and_query,
+                            ..
+                        } => {
+                            assert_eq!(actual_route, route_id);
+                            assert!(actual_stream > 0);
+                            assert!(demand.is_none());
+                            assert!(path_and_query.contains("split=1"));
+                            stream_id = Some(actual_stream);
+                        }
+                        MultiplexControlMessage::RequestEnd {
+                            route_id: actual_route,
+                            stream_id: actual_stream,
+                        } => {
+                            assert_eq!(actual_route, route_id);
+                            assert_eq!(Some(actual_stream), stream_id);
+                            ended = true;
+                        }
+                        other => panic!("unexpected data request frame: {other:?}"),
+                    }
+                }
+                WsMessage::Binary(frame) => {
+                    let frame = decode_multiplex_binary_frame(frame.as_ref()).unwrap();
+                    assert_eq!(frame.route_id, route_id);
+                    body = Some(frame.payload);
+                }
+                other => panic!("unexpected data websocket frame: {other:?}"),
+            }
+        }
+        assert_eq!(body.as_deref(), Some(b"hello-split".as_slice()));
+        let stream_id = stream_id.unwrap();
+
+        control.send(WsMessage::Close(None)).await.unwrap();
+        drop(control);
+        sleep(Duration::from_millis(100)).await;
+
+        let paused_public = tokio::spawn(async move {
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "http://{address}/builtin/clients/workspace-a/mcp?split=2"
+                ))
+                .body("after-rebind")
+                .send()
+                .await
+                .expect("paused public request");
+            (response.status(), response.bytes().await.unwrap())
+        });
+        assert!(
+            timeout(Duration::from_millis(150), data.next())
+                .await
+                .is_err(),
+            "data socket received a new assignment while split control was detached"
+        );
+
+        let mut control = split_connect(
+            address,
+            &signing_key,
+            device_id,
+            "control-2",
+            MultiplexConnectionRole::Control,
+            Some(&session_id),
+        )
+        .await;
+        let rebound_session = loop {
+            let frame = timeout(Duration::from_secs(2), control.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let WsMessage::Text(text) = frame else {
+                continue;
+            };
+            match serde_json::from_str::<MultiplexControlMessage>(text.as_ref()).unwrap() {
+                MultiplexControlMessage::SessionReady {
+                    connection_role: MultiplexConnectionRole::Control,
+                    session_id,
+                    ..
+                } => break session_id,
+                other => panic!("unexpected rebound control handshake frame: {other:?}"),
+            }
+        };
+        assert_eq!(rebound_session, session_id);
+        control
+            .send(WsMessage::Text(
+                serde_json::to_string(&MultiplexControlMessage::RouteRegister {
+                    registration_id: "route-rebind".into(),
+                    client_id: "workspace-a".into(),
+                    service: TunnelService::Mcp,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let rebound_route_id = loop {
+            let frame = timeout(Duration::from_secs(2), control.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let WsMessage::Text(text) = frame else {
+                continue;
+            };
+            match serde_json::from_str::<MultiplexControlMessage>(text.as_ref()).unwrap() {
+                MultiplexControlMessage::RouteRegistered {
+                    registration_id,
+                    route_id,
+                    ..
+                } if registration_id == "route-rebind" => break route_id,
+                MultiplexControlMessage::CapacityUpdate { .. } => {}
+                other => panic!("unexpected rebound route control frame: {other:?}"),
+            }
+        };
+        assert_eq!(rebound_route_id, route_id);
+
+        data.send(WsMessage::Text(
+            serde_json::to_string(&MultiplexControlMessage::ResponseHead {
+                route_id,
+                stream_id,
+                status: 207,
+                headers: vec![],
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        data.send(WsMessage::Binary(Bytes::from(
+            encode_multiplex_binary_frame(
+                MultiplexBinaryFrameKind::ResponseBody,
+                route_id,
+                stream_id,
+                b"split-ok",
+            )
+            .unwrap(),
+        )))
+        .await
+        .unwrap();
+        data.send(WsMessage::Text(
+            serde_json::to_string(&MultiplexControlMessage::ResponseEnd {
+                route_id,
+                stream_id,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+        let (status, response_body) = public.await.unwrap();
+        assert_eq!(status.as_u16(), 207);
+        assert_eq!(response_body.as_ref(), b"split-ok");
+
+        let mut rebound_stream_id = None;
+        let mut rebound_body = None;
+        let mut rebound_ended = false;
+        while !rebound_ended {
+            let frame = timeout(Duration::from_secs(2), data.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match frame {
+                WsMessage::Text(text) => {
+                    match serde_json::from_str::<MultiplexControlMessage>(text.as_ref()).unwrap() {
+                        MultiplexControlMessage::RequestHead {
+                            route_id: actual_route,
+                            stream_id: actual_stream,
+                            path_and_query,
+                            ..
+                        } => {
+                            assert_eq!(actual_route, route_id);
+                            assert_ne!(actual_stream, stream_id);
+                            assert!(path_and_query.contains("split=2"));
+                            rebound_stream_id = Some(actual_stream);
+                        }
+                        MultiplexControlMessage::RequestEnd {
+                            route_id: actual_route,
+                            stream_id: actual_stream,
+                        } => {
+                            assert_eq!(actual_route, route_id);
+                            assert_eq!(Some(actual_stream), rebound_stream_id);
+                            rebound_ended = true;
+                        }
+                        other => panic!("unexpected rebound data request frame: {other:?}"),
+                    }
+                }
+                WsMessage::Binary(frame) => {
+                    let frame = decode_multiplex_binary_frame(frame.as_ref()).unwrap();
+                    assert_eq!(frame.route_id, route_id);
+                    rebound_body = Some(frame.payload);
+                }
+                other => panic!("unexpected rebound data websocket frame: {other:?}"),
+            }
+        }
+        assert_eq!(rebound_body.as_deref(), Some(b"after-rebind".as_slice()));
+        let rebound_stream_id = rebound_stream_id.unwrap();
+        data.send(WsMessage::Text(
+            serde_json::to_string(&MultiplexControlMessage::ResponseHead {
+                route_id,
+                stream_id: rebound_stream_id,
+                status: 208,
+                headers: vec![],
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        data.send(WsMessage::Text(
+            serde_json::to_string(&MultiplexControlMessage::ResponseEnd {
+                route_id,
+                stream_id: rebound_stream_id,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let (rebound_status, rebound_response_body) = paused_public.await.unwrap();
+        assert_eq!(rebound_status.as_u16(), 208);
+        assert!(rebound_response_body.is_empty());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn multiplex_v5_authenticates_once_and_registers_multiple_workspace_routes() {
+        use coding_tools_tunnel_protocol::{
+            device_session_auth_signing_payload, DeviceSessionAuthProof, DeviceSessionHello,
+        };
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let devices =
+            DeviceRegistry::open(directory.path().join("devices.db")).expect("device registry");
+        let signing_key = SigningKey::from_bytes(&[41_u8; 32]);
+        let device_id = "device-shared-v5";
+        for (client_id, services) in [
+            ("workspace-a", AllowedServices::Mcp),
+            ("workspace-b", AllowedServices::Actions),
+        ] {
+            let grant = devices
+                .create_enrollment(client_id, services, Some(60))
+                .expect("route grant");
+            devices
+                .enroll(
+                    grant.code,
+                    EnrollmentRequest {
+                        device_id: device_id.into(),
+                        client_id: client_id.into(),
+                        device_name: "shared v5 device".into(),
+                        public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+                    },
+                )
+                .await
+                .expect("route enrollment");
+        }
+        let (address, server) = start_test_server(devices, Registry::default()).await;
+
+        let connection_id = "connection-v5-1";
+        let mut request = format!("ws://{address}{WS_PATH}")
+            .into_client_request()
+            .expect("websocket request");
+        request
+            .headers_mut()
+            .insert(DEVICE_ID_HEADER, device_id.parse().expect("device id"));
+        request.headers_mut().insert(
+            CONNECTION_ID_HEADER,
+            connection_id.parse().expect("connection id"),
+        );
+        request.headers_mut().insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            MULTIPLEX_WS_SUBPROTOCOL.parse().expect("v5 subprotocol"),
+        );
+        let (mut socket, response) = connect_async(request).await.expect("connect v5");
+        assert_eq!(
+            response
+                .headers()
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .and_then(|value| value.to_str().ok()),
+            Some(MULTIPLEX_WS_SUBPROTOCOL)
+        );
+
+        let challenge = socket
+            .next()
+            .await
+            .expect("challenge frame")
+            .expect("challenge");
+        let WsMessage::Text(challenge) = challenge else {
+            panic!("expected v5 challenge text");
+        };
+        let MultiplexControlMessage::Challenge {
+            nonce,
+            expires_at_unix_ms,
+            ..
+        } = serde_json::from_str::<MultiplexControlMessage>(challenge.as_ref())
+            .expect("v5 challenge json")
+        else {
+            panic!("expected v5 challenge");
+        };
+        assert!(expires_at_unix_ms >= unix_ms());
+
+        let mut proof = DeviceSessionAuthProof {
+            hello: DeviceSessionHello {
+                protocol_version: MULTIPLEX_PROTOCOL_VERSION,
+                connection_id: connection_id.into(),
+            },
+            device_id: device_id.into(),
+            signature: String::new(),
+        };
+        proof.signature = URL_SAFE_NO_PAD.encode(
+            signing_key
+                .sign(&device_session_auth_signing_payload(&nonce, &proof))
+                .to_bytes(),
+        );
+        socket
+            .send(WsMessage::Text(
+                serde_json::to_string(&MultiplexControlMessage::Authenticate(proof))
+                    .expect("v5 auth json")
+                    .into(),
+            ))
+            .await
+            .expect("send v5 auth");
+
+        let hello_ack = socket
+            .next()
+            .await
+            .expect("hello ack frame")
+            .expect("hello ack");
+        let WsMessage::Text(hello_ack) = hello_ack else {
+            panic!("expected v5 hello ack text");
+        };
+        let MultiplexControlMessage::HelloAck {
+            protocol_version,
+            connection_policy,
+            ..
+        } = serde_json::from_str::<MultiplexControlMessage>(hello_ack.as_ref())
+            .expect("v5 hello ack json")
+        else {
+            panic!("expected v5 hello ack");
+        };
+        assert_eq!(protocol_version, MULTIPLEX_PROTOCOL_VERSION);
+        assert_eq!(connection_policy.streams_per_connection, 16);
+        assert_eq!(connection_policy.burst_scale_up_step, 4);
+
+        let register = |registration_id: &str, client_id: &str, service: TunnelService| {
+            WsMessage::Text(
+                serde_json::to_string(&MultiplexControlMessage::RouteRegister {
+                    registration_id: registration_id.into(),
+                    client_id: client_id.into(),
+                    service,
+                })
+                .expect("route register json")
+                .into(),
+            )
+        };
+        socket
+            .send(register("route-a", "workspace-a", TunnelService::Mcp))
+            .await
+            .expect("register workspace a");
+        let route_a = socket
+            .next()
+            .await
+            .expect("route a frame")
+            .expect("route a");
+        let WsMessage::Text(route_a) = route_a else {
+            panic!("expected route a text");
+        };
+        let MultiplexControlMessage::RouteRegistered {
+            registration_id,
+            route_id: route_a_id,
+            stream_limit,
+        } = serde_json::from_str::<MultiplexControlMessage>(route_a.as_ref())
+            .expect("route a response")
+        else {
+            panic!("expected route a registration");
+        };
+        assert_eq!(registration_id, "route-a");
+        assert_eq!(stream_limit, 16);
+
+        socket
+            .send(register("route-b", "workspace-b", TunnelService::Actions))
+            .await
+            .expect("register workspace b");
+        let route_b = socket
+            .next()
+            .await
+            .expect("route b frame")
+            .expect("route b");
+        let WsMessage::Text(route_b) = route_b else {
+            panic!("expected route b text");
+        };
+        let MultiplexControlMessage::RouteRegistered {
+            route_id: route_b_id,
+            ..
+        } = serde_json::from_str::<MultiplexControlMessage>(route_b.as_ref())
+            .expect("route b response")
+        else {
+            panic!("expected route b registration");
+        };
+        assert_ne!(route_a_id, route_b_id);
+
+        socket
+            .send(register("bad-route", "workspace-b", TunnelService::Mcp))
+            .await
+            .expect("send unauthorized route");
+        let rejected = socket
+            .next()
+            .await
+            .expect("rejection frame")
+            .expect("rejection");
+        let WsMessage::Text(rejected) = rejected else {
+            panic!("expected rejection text");
+        };
+        assert!(matches!(
+            serde_json::from_str::<MultiplexControlMessage>(rejected.as_ref())
+                .expect("route rejection json"),
+            MultiplexControlMessage::Error { message, .. }
+                if message.contains("not authorized")
+        ));
+
+        let request_a = tokio::spawn(async move {
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "http://{address}/builtin/clients/workspace-a/mcp?probe=a"
+                ))
+                .body("alpha")
+                .send()
+                .await
+                .expect("workspace a public request");
+            let status = response.status();
+            let body = response.bytes().await.expect("workspace a response body");
+            (status, body)
+        });
+        let request_b = tokio::spawn(async move {
+            let response = reqwest::Client::new()
+                .post(format!(
+                    "http://{address}/builtin/actions/workspace-b/run?probe=b"
+                ))
+                .body("beta")
+                .send()
+                .await
+                .expect("workspace b public request");
+            let status = response.status();
+            let body = response.bytes().await.expect("workspace b response body");
+            (status, body)
+        });
+
+        let mut stream_a = None;
+        let mut stream_b = None;
+        let mut body_a = None;
+        let mut body_b = None;
+        let mut ended = 0_u8;
+        while ended < 2 {
+            let frame = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("multiplex request frame timeout")
+                .expect("multiplex request frame")
+                .expect("multiplex request frame result");
+            match frame {
+                WsMessage::Text(text) => {
+                    match serde_json::from_str::<MultiplexControlMessage>(text.as_ref())
+                        .expect("multiplex request control")
+                    {
+                        MultiplexControlMessage::RequestHead {
+                            route_id,
+                            stream_id,
+                            path_and_query,
+                            ..
+                        } if route_id == route_a_id => {
+                            assert!(path_and_query.contains("probe=a"));
+                            stream_a = Some(stream_id);
+                        }
+                        MultiplexControlMessage::RequestHead {
+                            route_id,
+                            stream_id,
+                            path_and_query,
+                            ..
+                        } if route_id == route_b_id => {
+                            assert!(path_and_query.contains("probe=b"));
+                            stream_b = Some(stream_id);
+                        }
+                        MultiplexControlMessage::RequestEnd { .. } => ended += 1,
+                        other => panic!("unexpected multiplex request control: {other:?}"),
+                    }
+                }
+                WsMessage::Binary(frame) => {
+                    let frame = decode_multiplex_binary_frame(frame.as_ref())
+                        .expect("multiplex request body frame");
+                    assert_eq!(frame.kind, MultiplexBinaryFrameKind::RequestBody);
+                    if frame.route_id == route_a_id {
+                        body_a = Some(Bytes::from(frame.payload));
+                    } else if frame.route_id == route_b_id {
+                        body_b = Some(Bytes::from(frame.payload));
+                    } else {
+                        panic!("unexpected multiplex request route {}", frame.route_id);
+                    }
+                }
+                other => panic!("unexpected multiplex request websocket frame: {other:?}"),
+            }
+        }
+        let stream_a = stream_a.expect("workspace a stream id");
+        let stream_b = stream_b.expect("workspace b stream id");
+        assert_ne!(stream_a, stream_b);
+        assert_eq!(body_a.as_deref(), Some(b"alpha".as_slice()));
+        assert_eq!(body_b.as_deref(), Some(b"beta".as_slice()));
+
+        for message in [
+            MultiplexControlMessage::ResponseHead {
+                route_id: route_a_id,
+                stream_id: stream_a,
+                status: 201,
+                headers: vec![],
+            },
+            MultiplexControlMessage::ResponseHead {
+                route_id: route_b_id,
+                stream_id: stream_b,
+                status: 202,
+                headers: vec![],
+            },
+        ] {
+            socket
+                .send(WsMessage::Text(
+                    serde_json::to_string(&message)
+                        .expect("multiplex response head")
+                        .into(),
+                ))
+                .await
+                .expect("send multiplex response head");
+        }
+        socket
+            .send(WsMessage::Binary(Bytes::from(
+                encode_multiplex_binary_frame(
+                    MultiplexBinaryFrameKind::ResponseBody,
+                    route_b_id,
+                    stream_b,
+                    b"pong-b",
+                )
+                .expect("workspace b response frame"),
+            )))
+            .await
+            .expect("send workspace b response body");
+        socket
+            .send(WsMessage::Binary(Bytes::from(
+                encode_multiplex_binary_frame(
+                    MultiplexBinaryFrameKind::ResponseBody,
+                    route_a_id,
+                    stream_a,
+                    b"pong-a",
+                )
+                .expect("workspace a response frame"),
+            )))
+            .await
+            .expect("send workspace a response body");
+        for message in [
+            MultiplexControlMessage::ResponseEnd {
+                route_id: route_a_id,
+                stream_id: stream_a,
+            },
+            MultiplexControlMessage::ResponseEnd {
+                route_id: route_b_id,
+                stream_id: stream_b,
+            },
+        ] {
+            socket
+                .send(WsMessage::Text(
+                    serde_json::to_string(&message)
+                        .expect("multiplex response end")
+                        .into(),
+                ))
+                .await
+                .expect("send multiplex response end");
+        }
+
+        let (status_a, response_a) = request_a.await.expect("workspace a task");
+        let (status_b, response_b) = request_b.await.expect("workspace b task");
+        assert_eq!(status_a, StatusCode::CREATED);
+        assert_eq!(status_b, StatusCode::ACCEPTED);
+        assert_eq!(response_a.as_ref(), b"pong-a");
+        assert_eq!(response_b.as_ref(), b"pong-b");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn new_server_keeps_v4_only_client_compatible_end_to_end() {
         let directory = tempfile::tempdir().expect("tempdir");
         let devices =
             DeviceRegistry::open(directory.path().join("devices.db")).expect("device registry");
@@ -2426,6 +5042,114 @@ mod tests {
             "text/plain"
         );
         assert_eq!(response.text().await.expect("response text"), "pong");
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn same_public_route_rejects_second_live_device_owner() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let devices =
+            DeviceRegistry::open(directory.path().join("devices.db")).expect("device registry");
+        let signing_key_a = SigningKey::from_bytes(&[31_u8; 32]);
+        let signing_key_b = SigningKey::from_bytes(&[32_u8; 32]);
+        for (device_id, device_name, signing_key) in [
+            ("device-owner-a", "route owner a", &signing_key_a),
+            ("device-owner-b", "route owner b", &signing_key_b),
+        ] {
+            let grant = devices
+                .create_enrollment("pc-a", AllowedServices::Mcp, Some(60))
+                .expect("enrollment grant");
+            devices
+                .enroll(
+                    grant.code,
+                    EnrollmentRequest {
+                        device_id: device_id.into(),
+                        client_id: "pc-a".into(),
+                        device_name: device_name.into(),
+                        public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+                    },
+                )
+                .await
+                .expect("enroll route owner");
+        }
+
+        let (address, server) = start_test_server(devices, Registry::default()).await;
+        let mut owner = authenticate_worker(address, &signing_key_a, "device-owner-a").await;
+        finish_worker_auth(&mut owner).await;
+
+        let mut contender = authenticate_worker(address, &signing_key_b, "device-owner-b").await;
+        let rejection = timeout(Duration::from_secs(2), contender.next())
+            .await
+            .expect("second device ownership decision timeout")
+            .expect("second device ownership frame")
+            .expect("second device ownership result");
+        let WsMessage::Text(rejection) = rejection else {
+            panic!("expected route ownership rejection text");
+        };
+        assert_eq!(
+            serde_json::from_str::<ControlMessage>(rejection.as_ref())
+                .expect("route ownership rejection json"),
+            ControlMessage::Error {
+                request_id: None,
+                message: "route is already owned by another device".into(),
+            }
+        );
+
+        let public_request = tokio::spawn(async move {
+            reqwest::get(format!("http://{address}/builtin/clients/pc-a/mcp?owner=a"))
+                .await
+                .expect("owner public request")
+        });
+        let request_head = timeout(Duration::from_secs(2), owner.next())
+            .await
+            .expect("owner request timeout")
+            .expect("owner request frame")
+            .expect("owner request result");
+        let WsMessage::Text(request_head) = request_head else {
+            panic!("expected owner request head text");
+        };
+        let ControlMessage::RequestHead {
+            request_id,
+            path_and_query,
+            ..
+        } = serde_json::from_str::<ControlMessage>(request_head.as_ref())
+            .expect("owner request head json")
+        else {
+            panic!("expected owner request head");
+        };
+        assert_eq!(path_and_query, "/builtin/clients/pc-a/mcp?owner=a");
+        assert!(matches!(
+            owner.next().await.expect("owner request end frame").expect("owner request end"),
+            WsMessage::Text(text)
+                if serde_json::from_str::<ControlMessage>(text.as_ref()).ok()
+                    == Some(ControlMessage::RequestEnd { request_id: request_id.clone() })
+        ));
+        owner
+            .send(WsMessage::Text(
+                serde_json::to_string(&ControlMessage::ResponseHead {
+                    request_id: request_id.clone(),
+                    status: 204,
+                    headers: vec![],
+                })
+                .expect("owner response head json")
+                .into(),
+            ))
+            .await
+            .expect("send owner response head");
+        owner
+            .send(WsMessage::Text(
+                serde_json::to_string(&ControlMessage::ResponseEnd { request_id })
+                    .expect("owner response end json")
+                    .into(),
+            ))
+            .await
+            .expect("send owner response end");
+        assert_eq!(
+            public_request.await.expect("owner public task").status(),
+            204
+        );
 
         server.abort();
         let _ = server.await;
@@ -2816,6 +5540,115 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cold_burst_waits_for_bounded_queue_capacity_while_workers_scale_up() {
+        const CONCURRENCY: usize = 128;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database_path = directory.path().join("devices.db");
+        let devices = DeviceRegistry::open(&database_path).expect("device registry");
+        let policies =
+            WorkerPolicyStore::from_writer(devices.database_writer()).expect("policy store");
+        let mut policy = policies.current(TunnelService::Mcp);
+        policy.start_workers = 1;
+        policy.min_idle_workers = 1;
+        policy.max_idle_workers = 1;
+        policy.max_workers = 16;
+        policy.max_pending_requests = 32;
+        policy.worker_acquire_timeout_ms = 1_000;
+        policies
+            .update(TunnelService::Mcp, policy)
+            .expect("save cold burst policy");
+
+        let registry = Registry::default();
+        let pool = registry
+            .register(ClientKey {
+                client_id: "pc-a".into(),
+                service: TunnelService::Mcp,
+            })
+            .await;
+        // The route is connected, but its logical stream offers have not reached the
+        // dispatcher yet. This is the cold-start scale-up catch-up window.
+        pool.active_workers.store(1, Ordering::Release);
+        let (address, server) = start_test_server_with_policies(devices, registry, policies).await;
+
+        let scaling_pool = pool.clone();
+        let scaler = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            for _ in 0..CONCURRENCY {
+                let (assign, assigned) = oneshot::channel::<ProxyJob>();
+                scaling_pool
+                    .available_tx
+                    .send(AvailableWorker {
+                        assign,
+                        shared_claim: None,
+                    })
+                    .await
+                    .expect("publish scaled worker slot");
+                tokio::spawn(async move {
+                    if let Ok(job) = assigned.await {
+                        let ProxyJob {
+                            response_head,
+                            response_body,
+                            ..
+                        } = job;
+                        let _ = response_head.send(Ok(ResponseHeadData {
+                            status: StatusCode::UNAUTHORIZED.as_u16(),
+                            headers: Vec::new(),
+                        }));
+                        drop(response_body);
+                    }
+                });
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let mut requests = Vec::with_capacity(CONCURRENCY);
+        for index in 0..CONCURRENCY {
+            let client = client.clone();
+            requests.push(tokio::spawn(async move {
+                client
+                    .get(format!(
+                        "http://{address}/builtin/clients/pc-a/mcp?cold={index}"
+                    ))
+                    .send()
+                    .await
+                    .expect("cold burst request")
+            }));
+        }
+
+        let mut unauthorized = 0;
+        let mut capacity_rejections = 0;
+        let mut other = Vec::new();
+        for request in requests {
+            let response = request.await.expect("cold burst task");
+            match response.status() {
+                StatusCode::UNAUTHORIZED => unauthorized += 1,
+                StatusCode::SERVICE_UNAVAILABLE
+                    if response
+                        .headers()
+                        .get("x-tunnel-error")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("worker_acquire_timeout") =>
+                {
+                    capacity_rejections += 1;
+                }
+                status => other.push(status),
+            }
+        }
+
+        scaler.await.expect("scale-up task");
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(capacity_rejections, 0, "cold scale-up must backpressure instead of rejecting before the worker-acquire deadline");
+        assert!(
+            other.is_empty(),
+            "unexpected cold burst statuses: {other:?}"
+        );
+        assert_eq!(unauthorized, CONCURRENCY);
+    }
+
     #[tokio::test]
     async fn saturated_route_uses_bounded_queue_and_returns_explicit_503_errors() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -2869,21 +5702,21 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(25)).await;
 
-        let rejected = reqwest::get(format!(
-            "http://{address}/builtin/clients/pc-a/mcp?rejected=1"
+        let backpressured = reqwest::get(format!(
+            "http://{address}/builtin/clients/pc-a/mcp?backpressured=1"
         ))
         .await
-        .expect("capacity rejection");
-        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        .expect("backpressured request");
+        assert_eq!(backpressured.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            rejected
+            backpressured
                 .headers()
                 .get("x-tunnel-error")
                 .and_then(|value| value.to_str().ok()),
-            Some("worker_capacity_exhausted")
+            Some("worker_acquire_timeout")
         );
         assert_eq!(
-            rejected
+            backpressured
                 .headers()
                 .get("retry-after")
                 .and_then(|value| value.to_str().ok()),
@@ -3129,6 +5962,7 @@ mod tests {
         policy.start_workers = 6;
         policy.max_idle_workers = 8;
         policy.max_workers = 24;
+        policy.burst_warm_workers = 8;
         let policy = policies
             .update(TunnelService::Mcp, policy)
             .expect("save initial policy");
@@ -3192,6 +6026,9 @@ mod tests {
         policy.min_idle_workers = 1;
         policy.max_idle_workers = 1;
         policy.max_workers = 1;
+        policy.max_connecting_workers = 1;
+        policy.scale_down_step = 1;
+        policy.burst_warm_workers = 1;
         policies
             .update(TunnelService::Mcp, policy)
             .expect("save cap policy");

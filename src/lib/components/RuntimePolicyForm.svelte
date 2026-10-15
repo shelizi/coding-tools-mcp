@@ -41,8 +41,10 @@
     title: string;
     description: string;
     highRisk?: boolean;
+    riskyWhenEnabled?: boolean;
   }> = [
     { key: "restrict_tool_catalog", title: "Restrict tool catalog", description: "Only expose the core tool catalog; disabling this exposes the advanced tool set." },
+    { key: "advertise_read_only_annotations", title: "Advertise all tools as read-only", description: "Mark every tool readOnlyHint=true and destructiveHint=false so clients such as Gemini Enterprise skip per-call confirmation. Requires an unrestricted tool catalog; server-side policies still apply.", riskyWhenEnabled: true },
     { key: "enforce_command_allowlist", title: "Command allowlist", description: "Only allow default or manually configured executables." },
     { key: "require_dangerous_confirmation", title: "Dangerous command confirmation", description: "Require confirm=true for destructive commands such as rm -rf and git reset --hard." },
     { key: "require_shell_confirmation", title: "Shell execution confirmation", description: "Require confirm=true for PowerShell, cmd, sh, pipes, redirects, and command chains." },
@@ -78,6 +80,7 @@
   let draftTransportMode = $state("streamable-http");
   let draftSecurityPolicy = $state<SecurityPolicy>({
     restrict_tool_catalog: true,
+    advertise_read_only_annotations: false,
     enforce_command_allowlist: true,
     require_dangerous_confirmation: true,
     require_shell_confirmation: true,
@@ -130,6 +133,15 @@
     draftGlobalProcessLimit = globalProcessAdmissionLimit;
     draftActiveSessions = activeSessionLimit;
   });
+
+  function isRisky(option: { key: SecurityPolicyKey; highRisk?: boolean; riskyWhenEnabled?: boolean }): boolean {
+    const enabled = draftSecurityPolicy[option.key];
+    return option.riskyWhenEnabled ? enabled : Boolean(option.highRisk) && !enabled;
+  }
+
+  function isOptionDisabled(key: SecurityPolicyKey): boolean {
+    return key === "advertise_read_only_annotations" && draftSecurityPolicy.restrict_tool_catalog;
+  }
 
   function updateSecurityOption(key: SecurityPolicyKey, checked: boolean) {
     draftSecurityPolicy = { ...draftSecurityPolicy, [key]: checked };
@@ -210,18 +222,21 @@
     </div>
     <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
       {#each SECURITY_OPTIONS as option}
-        <label class={`grid cursor-pointer gap-2 rounded-md border p-3 ${option.highRisk && !draftSecurityPolicy[option.key] ? "border-[var(--color-danger)]" : "border-[var(--color-border)]"}`}>
+        <label class={`grid gap-2 rounded-md border p-3 ${isOptionDisabled(option.key) ? "cursor-not-allowed opacity-60" : "cursor-pointer"} ${isRisky(option) ? "border-[var(--color-danger)]" : "border-[var(--color-border)]"}`}>
           <span class="flex items-start gap-2">
             <input
               class="mt-0.5 h-4 w-4"
               type="checkbox"
               checked={draftSecurityPolicy[option.key]}
+              disabled={isOptionDisabled(option.key)}
               onchange={(event) => updateSecurityOption(option.key, (event.currentTarget as HTMLInputElement).checked)}
             />
             <span class="text-sm font-medium">{$t(option.title as MessageKey)}</span>
           </span>
           <span class="pl-6 text-xs leading-5 text-[var(--color-text-muted)]">{$t(option.description as MessageKey)}</span>
-          {#if option.highRisk && !draftSecurityPolicy[option.key]}
+          {#if option.riskyWhenEnabled && isRisky(option)}
+            <span class="pl-6 text-xs font-medium text-[var(--color-danger)]">{$t("High risk: enabled")}</span>
+          {:else if isRisky(option)}
             <span class="pl-6 text-xs font-medium text-[var(--color-danger)]">{$t("High risk: disabled")}</span>
           {/if}
         </label>

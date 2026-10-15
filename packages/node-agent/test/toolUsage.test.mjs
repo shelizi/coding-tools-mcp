@@ -92,6 +92,7 @@ function toolRecord(overrides = {}) {
 
 test('persistent usage records survive restart and obey runtime/version/all scopes', async t => {
   const { root, dataDir } = await fixture(t);
+
   const first = await createToolContext(config(root, dataDir));
   const result = await callTool(first, 'server_info', {}, { 'openai/session': 'usage-persistence' });
   assert.equal(result.ok, true);
@@ -112,6 +113,55 @@ test('persistent usage records survive restart and obey runtime/version/all scop
   assert.equal(viaTool.ok, true);
   assert.equal(viaTool.matched_lines, 1);
   assert.equal(viaTool.records[0].tool, 'server_info');
+});
+
+test('createToolContext backfills retained diagnostics into the durable knowledge ledger on startup', async t => {
+  const { root, dataDir } = await fixture(t);
+  const historical = new ToolUsageStore(dataDir, {
+    profileId: 'historical-profile', runtimeBootId: 'historical-runtime', serverVersion: '0.19.0'
+  });
+  for (let index = 0; index < 5; index += 1) {
+    historical.recordToolCall({
+      tool: 'search_text',
+      workspaceId: 'repo',
+      arguments: { query: `historical-${index}`, calculate_total: true },
+      result: {
+        ok: true,
+        returned_count: 20,
+        total_matches: 20,
+        total_matches_exact: true,
+        calculate_total: true,
+        files_considered: 1_000 + index,
+        scanned_files: 1_000 + index,
+        matched_files: 10,
+        scan_completed: true,
+        early_stop_reason: null
+      },
+      startedTsMs: 10_000 + index * 3_000,
+      durationMs: 2_000,
+      requestTiming: requestTiming({ activityBurstId: index + 1 })
+    });
+  }
+  await historical.flush();
+
+  const context = await createToolContext(config(root, dataDir));
+  const runtime = context.folderRuntimes.get('repo');
+  assert.ok(runtime);
+  const learned = await runtime.knowledgeStore.list();
+  assert.equal(learned.length, 1);
+  assert.equal(learned[0].target, 'tool_strategy');
+  assert.equal(learned[0].status, 'shadow');
+  assert.equal(learned[0].evidence.observations, 5);
+  const durable = await runtime.knowledgeIngestor.durableSnapshot();
+  assert.equal(durable.ledgerEvents, 5);
+  assert.equal(durable.materializedEvents, 5);
+  assert.equal(durable.replayComplete, true);
+  assert.match(durable.lastCanonicalSourceRevision, /^[a-f0-9]{64}$/);
+
+  const restarted = await createToolContext(config(root, dataDir));
+  const restartedRuntime = restarted.folderRuntimes.get('repo');
+  assert.equal((await restartedRuntime.knowledgeStore.list())[0].evidence.observations, 5);
+  assert.equal((await restartedRuntime.knowledgeIngestor.durableSnapshot()).ledgerEvents, 5);
 });
 
 test('scope all separates current-version telemetry from historical versions', async t => {
@@ -281,7 +331,13 @@ test('canonical diagnostics envelope separates transport failures from tool fail
     exitCode: 0,
     terminationReason: 'exited',
     stdoutBytes: 12,
-    stderrBytes: 0
+    stderrBytes: 0,
+    stdout: 'password=super-secret-password',
+    stderr: '',
+    stdoutAuditTailBytes: 12,
+    stderrAuditTailBytes: 0,
+    stdoutAuditTailTruncated: true,
+    stderrAuditTailTruncated: false
   });
   assert.equal(processSession.diagnostic_schema_version, DIAGNOSTICS_SCHEMA_VERSION);
   assert.equal(processSession.event_type, 'process_session');
@@ -290,6 +346,10 @@ test('canonical diagnostics envelope separates transport failures from tool fail
   assert.equal(processSession.failure_domain, 'none');
   assert.equal(processSession.timestamp_ms, 1_100);
   assert.equal(processSession.conversation_operation_id, null);
+  assert.equal(processSession.stdout_audit_tail_bytes, 12);
+  assert.equal(processSession.stdout_audit_tail_truncated, true);
+  assert.equal(processSession.stderr_audit_tail_truncated, false);
+  assert.doesNotMatch(String(processSession.stdout), /super-secret-password/);
 
   const recoveryEvent = store.recordDiagnosticEvent({
     eventType: 'recovery_event',
@@ -530,7 +590,16 @@ test('wait request timeout is classified separately from process timeout', async
   });
   const waitTimeout = store.recordToolCall({
     tool: 'wait_command', arguments: { session_id: 'session-a', timeout_ms: 20 },
-    result: { ok: true, request_timed_out: true, process_timed_out: false, process_still_running: true },
+    result: {
+      ok: true,
+      request_timed_out: true,
+      process_timed_out: false,
+      process_still_running: true,
+      wait_returned_empty: true,
+      wait_transport_cap_reached: false,
+      recommended_wait_ms: 5_000,
+      events: []
+    },
     startedTsMs: 1_000, durationMs: 20, requestTiming: requestTiming()
   });
   const processTimeout = store.recordToolCall({
@@ -540,6 +609,60 @@ test('wait request timeout is classified separately from process timeout', async
   });
   assert.equal(waitTimeout.outcome_class, 'wait_timeout');
   assert.equal(processTimeout.outcome_class, 'timeout');
+  assert.equal(waitTimeout.caller_intent_wait_timeout_ms, 20);
+  assert.equal(waitTimeout.caller_intent_wait_timeout_explicit, true);
+  const transportCap = store.recordToolCall({
+    tool: 'wait_command', arguments: { session_id: 'session-c', timeout_ms: 20_000 },
+    result: {
+      ok: true,
+      request_timed_out: true,
+      process_timed_out: false,
+      process_still_running: true,
+      wait_returned_empty: true,
+      wait_transport_cap_reached: true,
+      recommended_wait_ms: 20_000,
+      events: []
+    },
+    startedTsMs: 1_200, durationMs: 20_000, requestTiming: requestTiming({ activityBurstSequence: 3 })
+  });
+  assert.equal(transportCap.wait_transport_cap_reached, true);
+  await store.flush();
+  const queried = await store.query({ scope: 'all', exclude_tools: [] });
+  assert.equal(queried.optimization.empty_wait_timeouts, 2);
+  assert.equal(queried.optimization.avoidable_empty_wait_timeouts, 1);
+  assert.equal(queried.optimization.transport_cap_empty_waits, 1);
+  assert.equal(queried.optimization.wait_recommendation_used_calls, 1);
+});
+
+test('tool usage records bounded caller intent for search and apply_patch', async t => {
+  const { dataDir } = await fixture(t);
+  const store = new ToolUsageStore(dataDir, {
+    profileId: 'caller-intent-profile', runtimeBootId: 'caller-intent-runtime', serverVersion: '0.19.0'
+  });
+  const search = store.recordToolCall({
+    tool: 'search_text', arguments: { query: 'needle', calculate_total: true, count_only: false },
+    result: { ok: true }, startedTsMs: 2_000, durationMs: 1, requestTiming: requestTiming()
+  });
+  const patch = store.recordToolCall({
+    tool: 'apply_patch',
+    arguments: { patch: '--- a/main.txt\n+++ b/main.txt\n@@ -1 +1 @@\n-old\n+new\n' },
+    result: { ok: false, error: { code: 'PATCH_CHECK_FAILED', details: { recommended_tool: 'edit' } } },
+    startedTsMs: 2_100, durationMs: 1, requestTiming: requestTiming({ activityBurstSequence: 2 })
+  });
+  assert.equal(search.caller_intent_calculate_total_explicit, true);
+  assert.equal(search.caller_intent_calculate_total, true);
+  assert.equal(search.caller_intent_count_only, false);
+  assert.equal(patch.caller_intent_patch_file_count, 1);
+  assert.equal(patch.caller_intent_patch_hunk_count, 1);
+  assert.ok(patch.caller_intent_patch_bytes > 0);
+  assert.equal(patch.error_recommended_tool, 'edit');
+  await store.flush();
+  const queried = await store.query({ scope: 'all', exclude_tools: [] });
+  assert.equal(queried.patch.check_failures, 1);
+  assert.equal(queried.patch.preflight_failures, 0);
+  assert.equal(queried.patch.context_failures, 0);
+  assert.equal(queried.patch.edit_recommended_failures, 1);
+  assert.equal(queried.patch.preventable_simple_failures, 1);
 });
 
 test('repeated failure detection resets on success and burst while counting concurrent duplicates', async t => {
@@ -634,6 +757,42 @@ test('search telemetry aggregates scan cost and usefulness signals', async t => 
   });
   store.recordToolCall({
     tool: 'search_text',
+    arguments: { query: 'exact', calculate_total: true },
+    result: {
+      ok: true,
+      returned_count: 1,
+      total_matches: 4,
+      total_matches_exact: true,
+      files_considered: 1,
+      scanned_files: 1,
+      matched_files: 1,
+      scan_completed: true,
+      early_stop_reason: null
+    },
+    startedTsMs: 2_005,
+    durationMs: 5,
+    requestTiming: requestTiming({ activityBurstId: 13, activityBurstSequence: 2 })
+  });
+  store.recordToolCall({
+    tool: 'search_text',
+    arguments: { query: 'counted', count_only: true },
+    result: {
+      ok: true,
+      returned_count: 0,
+      total_matches: 7,
+      total_matches_exact: true,
+      files_considered: 1,
+      scanned_files: 1,
+      matched_files: 1,
+      scan_completed: true,
+      early_stop_reason: null
+    },
+    startedTsMs: 2_007,
+    durationMs: 5,
+    requestTiming: requestTiming({ activityBurstId: 13, activityBurstSequence: 3 })
+  });
+  store.recordToolCall({
+    tool: 'search_text',
     arguments: { query: 'missing' },
     result: {
       ok: true,
@@ -648,17 +807,22 @@ test('search telemetry aggregates scan cost and usefulness signals', async t => 
     },
     startedTsMs: 2_010,
     durationMs: 5,
-    requestTiming: requestTiming({ activityBurstId: 13, activityBurstSequence: 2 })
+    requestTiming: requestTiming({ activityBurstId: 13, activityBurstSequence: 4 })
   });
   await store.flush();
   const queried = await store.query({ scope: 'all', exclude_tools: [] });
-  assert.equal(queried.search.files_considered, 5);
-  assert.equal(queried.search.files_scanned, 5);
-  assert.equal(queried.search.returned_results, 1);
-  assert.equal(queried.search.matched_files, 2);
-  assert.equal(queried.search.zero_result_calls, 1);
+  assert.equal(queried.search.files_considered, 7);
+  assert.equal(queried.search.files_scanned, 7);
+  assert.equal(queried.search.returned_results, 2);
+  assert.equal(queried.search.matched_files, 4);
+  assert.equal(queried.search.zero_result_calls, 2);
   assert.equal(queried.search.early_stop_calls, 1);
-  assert.equal(queried.search.exact_total_calls, 1);
+  assert.equal(queried.search.exact_total_calls, 3);
+  assert.equal(queried.search.caller_intent_observed_calls, 4);
+  assert.equal(queried.search.calculate_total_explicit_calls, 1);
+  assert.equal(queried.search.calculate_total_requested_calls, 1);
+  assert.equal(queried.search.count_only_requested_calls, 1);
+  assert.equal(queried.search.calculate_total_omitted_calls, 3);
 });
 
 test('recovery correlation preserves semantic fingerprints and reports successful chains', async t => {
@@ -767,6 +931,31 @@ test('rotation keeps bounded history and complete-line reader ignores an active 
   assert.match(currentLog, /\{"partial":$/);
 });
 
+test('diagnostic replay visitor deduplicates canonical and compatibility logs by diagnostic event id', async t => {
+  const { dataDir } = await fixture(t);
+  const store = new ToolUsageStore(dataDir, {
+    profileId: 'replay-profile', runtimeBootId: 'replay-runtime', serverVersion: '0.19.0'
+  });
+  store.recordToolCall({
+    tool: 'search_text', arguments: { query: 'one' }, result: { ok: true },
+    startedTsMs: 1_000, durationMs: 5, requestTiming: requestTiming()
+  });
+  store.recordToolCall({
+    tool: 'read_file', arguments: { path: 'two.txt' }, result: { ok: true },
+    startedTsMs: 1_010, durationMs: 5, requestTiming: requestTiming({ activityBurstSequence: 2 })
+  });
+  const visited = [];
+  const scan = await store.visitDiagnosticRecords(async record => {
+    await Promise.resolve();
+    visited.push(record);
+  });
+  assert.equal(visited.length, 2);
+  assert.deepEqual(visited.map(record => record.tool).sort(), ['read_file', 'search_text']);
+  assert.equal(scan.uniqueRecords, 2);
+  assert.equal(scan.duplicateRecordsIgnored, 2, 'dual-written compatibility records must not replay twice');
+  assert.match(scan.sourceRevision, /^[0-9a-f]{64}$/);
+});
+
 test('query aggregates percentiles, errors, bursts, parallel observations and async lifetimes', async t => {
   const { dataDir } = await fixture(t);
   const store = new ToolUsageStore(dataDir, {
@@ -858,11 +1047,57 @@ test('query aggregates percentiles, errors, bursts, parallel observations and as
   assert.equal(result.parallelism.pairs[0].pair, 'cargo:test@a|node:test@b');
   assert.equal(result.parallelism.pairs[0].conflicts, 1);
 
+  assert.equal(result.parallelism.actual_observations, 2);
+  assert.equal(result.parallelism.candidate_observations, 0);
+
   const filtered = await store.query({ scope: 'all', tools: ['read_file'], exclude_tools: [], min_duration_ms: 5 });
   assert.equal(filtered.matched_lines, 1);
   assert.equal(filtered.aggregate.tools[0].tool, 'read_file');
   const errors = await store.query({ scope: 'all', errors_only: true, exclude_tools: [] });
   assert.equal(errors.matched_lines, 2);
+});
+
+test('parallel candidate evidence is deduplicated and never contributes Wilson safety samples', async t => {
+  const { dataDir } = await fixture(t);
+  const store = new ToolUsageStore(dataDir, {
+    profileId: 'parallel-candidate-profile', runtimeBootId: 'parallel-candidate-runtime', serverVersion: '0.19.0'
+  });
+  const pair = 'git:status@a|git:diff@a';
+  const candidate = {
+    observation_id: '1'.repeat(64), pair, outcome: 'candidate',
+    evidence_source: 'read_only_shadow_safe', candidate_kind: 'read_only_safe_hint',
+    safety_sample: false, overlap_ms: 0, lock_wait_ms: 0
+  };
+  store.enqueue(toolRecord({
+    workspace_id: 'parallel-candidate-profile', runtime_boot_id: 'parallel-candidate-runtime',
+    started_ts_ms: 2_000, completed_ts_ms: 2_010, duration_ms: 10,
+    parallelism_observations: [candidate, candidate]
+  }));
+  store.enqueue(toolRecord({
+    workspace_id: 'parallel-candidate-profile', runtime_boot_id: 'parallel-candidate-runtime',
+    started_ts_ms: 2_020, completed_ts_ms: 2_030, duration_ms: 10,
+    activity_burst_sequence: 2,
+    parallelism_observations: [{
+      observation_id: '2'.repeat(64), pair, outcome: 'success', evidence_source: 'explicit_parallel',
+      candidate_kind: 'none', safety_sample: true, overlap_ms: 5, lock_wait_ms: 0
+    }]
+  }));
+  await store.flush();
+
+  const result = await store.query({ scope: 'current_runtime', exclude_tools: [], top: 10 });
+  assert.equal(result.parallelism.total_observations, 2);
+  assert.equal(result.parallelism.actual_observations, 1);
+  assert.equal(result.parallelism.candidate_observations, 1);
+  assert.equal(result.parallelism.duplicate_observations_ignored, 1);
+  assert.equal(result.parallelism.candidate_evidence_promotes_to_safety_sample, false);
+  const row = result.parallelism.pairs.find(item => item.pair === pair);
+  assert.ok(row, JSON.stringify(result.parallelism));
+  assert.equal(row.attempts, 1);
+  assert.equal(row.successes, 1);
+  assert.equal(row.candidate_observations, 1);
+  assert.equal(row.read_only_safe_hints, 1);
+  assert.equal(row.safety_samples, 1);
+  assert.equal(row.confident_safe, false);
 });
 
 test('payloads are opt-in and persisted arguments remain centrally redacted', async t => {
@@ -881,7 +1116,8 @@ test('payloads are opt-in and persisted arguments remain centrally redacted', as
       env: { API_KEY: 'secret-api-key' }
     },
     result: { ok: true, stdout: 'ok', command_ok: true, process_exit_code: 0 },
-    startedTsMs, durationMs: 10, requestTiming: requestTiming()
+    startedTsMs, durationMs: 10, requestTiming: requestTiming(),
+    conversationContextId: 'conversation-session-a'
   });
   await store.flush();
 
@@ -894,8 +1130,35 @@ test('payloads are opt-in and persisted arguments remain centrally redacted', as
   assert.equal(full.records[0].arguments.password, '[REDACTED]');
   assert.equal(full.records[0].arguments.token, '[REDACTED]');
   assert.equal(full.records[0].arguments.env.API_KEY, '[REDACTED]');
+  assert.match(String(full.records[0].conversation_context_id_hash), /^[0-9a-f]{64}$/);
+  assert.notEqual(full.records[0].conversation_context_id_hash, 'conversation-session-a');
   const serialized = JSON.stringify(full.records[0]);
   assert.doesNotMatch(serialized, /super-secret-password|secret-token-value|secret-api-key/);
+});
+
+test('edit audit payloads up to 64 KiB remain queryable instead of degrading to previews', async t => {
+  const { dataDir } = await fixture(t);
+  const store = new ToolUsageStore(dataDir, {
+    profileId: 'edit-audit-profile', runtimeBootId: 'edit-audit-runtime', serverVersion: '0.19.0'
+  });
+  const replacement = 'x'.repeat(8 * 1024);
+  store.recordToolCall({
+    tool: 'edit',
+    arguments: {
+      files: [{ path: 'src/lib.ts', edits: [{ type: 'replace', old_text: 'old', new_text: replacement }] }],
+      reason: 'audit regression'
+    },
+    result: { ok: true, applied: true, affected_files: [{ path: 'src/lib.ts', operation: 'update' }] },
+    startedTsMs: 2_000, durationMs: 10, requestTiming: requestTiming()
+  });
+  await store.flush();
+
+  const full = await store.query({ scope: 'all', exclude_tools: [], include_records: true, include_payloads: true });
+  assert.equal(full.records.length, 1);
+  assert.equal(full.records[0].arguments_truncated, false);
+  assert.equal(full.records[0].arguments.files[0].path, 'src/lib.ts');
+  assert.equal(full.records[0].arguments.files[0].edits[0].new_text.length, replacement.length);
+  assert.equal(full.records[0].arguments_preview, undefined);
 });
 
 test('real retained process finalization emits an async lifetime event', async t => {

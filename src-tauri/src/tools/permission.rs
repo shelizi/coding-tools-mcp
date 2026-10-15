@@ -91,6 +91,28 @@ impl PendingOperationStore {
             .contains_key(resume_id)
     }
 
+    pub fn single_resume_id(&self) -> Option<String> {
+        self.remove_expired();
+        let operations = self.operations.lock().expect("pending operations lock");
+        if operations.len() != 1 {
+            return None;
+        }
+        operations.keys().next().cloned()
+    }
+
+    pub fn resume_ids(&self) -> Vec<String> {
+        self.remove_expired();
+        let mut ids = self
+            .operations
+            .lock()
+            .expect("pending operations lock")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
     pub fn put_back(&self, operation: PendingOperation) {
         if operation.expires_at > Instant::now() {
             self.operations

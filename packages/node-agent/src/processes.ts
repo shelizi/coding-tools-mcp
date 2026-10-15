@@ -53,7 +53,18 @@ import {
   type SandboxLaunch
 } from './sandbox.js';
 
-export { processResult, processStatus, readSessionOutput } from './processes/output.js';
+const AUDIT_OUTPUT_TAIL_BYTES = 16 * 1024;
+
+function auditOutputTail(value: string, maxBytes = AUDIT_OUTPUT_TAIL_BYTES): { text: string; bytes: number; truncated: boolean } {
+  const source = Buffer.from(value);
+  if (source.length <= maxBytes) return { text: value, bytes: source.length, truncated: false };
+  let start = source.length - maxBytes;
+  while (start < source.length && (source[start] & 0xc0) === 0x80) start += 1;
+  const tail = source.subarray(start).toString('utf8');
+  return { text: tail, bytes: source.length - start, truncated: true };
+}
+
+export { processResult, processStatus, readSessionOutput, retainedNextActions } from './processes/output.js';
 export { nativeLaunchSpec } from './processes/nativeLaunch.js';
 export { cargoTargetLock, nodeGeneratedLock } from './processes/identity.js';
 export { resolvedCommandTimeoutMs } from './processes/timeoutPolicy.js';
@@ -75,7 +86,7 @@ export {
 } from './processes/commandGraph.js';
 
 export const DETACHED_SESSION_GRACE_MS = 90_000;
-export const WAIT_COMMAND_TRANSPORT_SAFE_MS = 20_000;
+export const WAIT_COMMAND_TRANSPORT_SAFE_MS = 8_000;
 export const WAIT_COMMAND_TIMEOUT_DEFAULT_MS = WAIT_COMMAND_TRANSPORT_SAFE_MS;
 export const WAIT_COMMAND_TIMEOUT_MAX_MS = 60 * 60_000;
 
@@ -174,6 +185,8 @@ async function finalizeSession(ctx: ToolContext, session: ProcessSession, verifi
   session.finalizedAt = Date.now();
   if (!session.telemetryRecorded) {
     session.telemetryRecorded = true;
+    const stdoutAudit = auditOutputTail(session.sensitiveOutput ? '[REDACTED]' : session.stdout);
+    const stderrAudit = auditOutputTail(session.sensitiveOutput ? '[REDACTED]' : session.stderr);
     ctx.usageStore.recordAsyncSession({
       sessionId: session.id,
       commandKind: session.telemetryCommandKind,
@@ -184,7 +197,13 @@ async function finalizeSession(ctx: ToolContext, session: ProcessSession, verifi
       exitCode: session.exitCode ?? null,
       terminationReason: terminationReason(session),
       stdoutBytes: session.stdoutBytes,
-      stderrBytes: session.stderrBytes
+      stderrBytes: session.stderrBytes,
+      stdout: stdoutAudit.text,
+      stderr: stderrAudit.text,
+      stdoutAuditTailBytes: stdoutAudit.bytes,
+      stderrAuditTailBytes: stderrAudit.bytes,
+      stdoutAuditTailTruncated: stdoutAudit.truncated || session.stdoutStart > 0,
+      stderrAuditTailTruncated: stderrAudit.truncated || session.stderrStart > 0
     });
   }
   await recordHarnessOperationFinalization(ctx, session);

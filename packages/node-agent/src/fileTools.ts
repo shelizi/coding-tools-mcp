@@ -6,13 +6,15 @@ import type { JsonObject, ToolContext } from './types.js';
 import { runGitBuffered } from './gitProcess.js';
 import { scanExcludedWorktreeContainerPrefixes } from './gitWorktreeBoundaries.js';
 import {
-  exists, globRegex, readText, resolveExistingPath, resolveExistingWritePath,
-  resolveInside, rootAndCwd, sha256File, walk, WorkspacePathError
+  exists, globRegex, isWalkStartBlocked, readText, relativeInside, resolveExistingPath, resolveExistingWritePath,
+  resolveInside, rootAndCwd, sha256File, walk, WorkspacePathError, type WalkOptions
 } from './workspace.js';
 import {
-  decodeTextBuffer, encodeText, readDecodedTextFile, TextDecodingError,
-  textDecodingErrorValue, type TextEncoding
+  binaryFileExtension, decodeTextBuffer, encodeText, readDecodedTextFile, searchableTextPath,
+  streamDecodedTextLines, TextDecodingError, textDecodingErrorValue, type TextEncoding
 } from './textCodec.js';
+import { extraIgnoreFiles } from './gitignore.js';
+import { runExternalContentSearch, type ExternalMatchLine, type ExternalSearchQuery } from './searchGrep.js';
 import {
   adaptNewlinesToRange, applyEditProposal, buildEditProposal, EditContractError,
   editFailure, editRecoveryActions, editResultDiff, fileVersionMismatch,
@@ -605,21 +607,22 @@ export async function listFilesTool(ctx: ToolContext, key: string, args: JsonObj
   const recursive = args.recursive !== false;
   const maxDepth = recursive ? Math.max(1, Math.min(20, Number(args.max_depth ?? 20))) : 1;
   const excludedPrefixes = recursive ? await workspaceScanExcludedPrefixes(root, base) : [];
-  let entries = await walk(root, base, {
+  const rawPatterns = [...(Array.isArray(args.patterns) ? args.patterns.map(String) : []), ...(args.glob ? [String(args.glob)] : [])];
+  const includePatterns = (rawPatterns.length ? rawPatterns : ['**']).map(globRegex);
+  const excludePatterns = (Array.isArray(args.exclude_patterns) ? args.exclude_patterns : []).map(String).map(globRegex);
+  const entryTypes = new Set(Array.isArray(args.entry_types) && args.entry_types.length ? args.entry_types.map(String) : ['file', 'symlink']);
+  const entries = (await walk(root, base, {
     maxDepth: recursive ? maxDepth : 0,
     maxResults: 50_000,
     includeDirectories: true,
     includeHidden: args.include_hidden === true,
     includeIgnored: args.include_ignored === true,
     includeGenerated: args.include_generated === true,
-    excludedPrefixes
-  });
-  const rawPatterns = [...(Array.isArray(args.patterns) ? args.patterns.map(String) : []), ...(args.glob ? [String(args.glob)] : [])];
-  const includePatterns = (rawPatterns.length ? rawPatterns : ['**']).map(globRegex);
-  const excludePatterns = (Array.isArray(args.exclude_patterns) ? args.exclude_patterns : []).map(String).map(globRegex);
-  entries = entries.filter(entry => includePatterns.some(pattern => pattern.test(entry.path)) && !excludePatterns.some(pattern => pattern.test(entry.path)));
-  const entryTypes = new Set(Array.isArray(args.entry_types) && args.entry_types.length ? args.entry_types.map(String) : ['file', 'symlink']);
-  entries = entries.filter(entry => entryTypes.has(entry.type)).sort((left, right) => left.path.localeCompare(right.path));
+    excludedPrefixes,
+    pathFilter: entry => includePatterns.some(pattern => pattern.test(entry.path))
+      && !excludePatterns.some(pattern => pattern.test(entry.path))
+      && entryTypes.has(entry.type)
+  })).sort((left, right) => left.path.localeCompare(right.path));
   const truncated = entries.length > maxResults;
   const output = entries.slice(0, maxResults).map(entry => ({ path: entry.path, type: entry.type, size_bytes: entry.size ?? 0, modified: entry.modified ?? null }));
   return ok({
@@ -637,6 +640,383 @@ export async function listFilesTool(ctx: ToolContext, key: string, args: JsonObj
 
 export interface SearchTextExecutionOptions {
   exactTotalFastTail?: boolean;
+}
+
+interface SearchQuerySpec {
+  query: string;
+  regex: boolean;
+  caseSensitive: boolean;
+}
+
+interface SearchScanState {
+  matches: JsonObject[];
+  files: JsonObject[];
+  queryCounts: number[];
+  responseBytesEstimate: number;
+  responseLimitReached: boolean;
+  matchedFiles: number;
+  skipped: number;
+  truncated: boolean;
+  stoppedEarly: boolean;
+  stop: boolean;
+  fastTailActive: boolean;
+  fastTailSkippedMatchDetails: number;
+}
+
+interface SearchScanLimits {
+  maxResults: number;
+  cursor: number;
+  maxPreview: number;
+  contextLines: number;
+  maxMatchesPerFile: number;
+  maxFileBytes: number;
+  filesOnly: boolean;
+  countOnly: boolean;
+  calculateTotal: boolean;
+  exactTotalFastTail: boolean;
+  responseBytesLimit: number;
+  contextLineBytesLimit: number;
+}
+
+function boundContextLine(line: string, limit: number): { content: string; truncated: boolean } {
+  return truncatePrefixUtf8(line, limit);
+}
+
+async function scanSearchFileStreaming(
+  state: SearchScanState,
+  entryPath: string,
+  file: string,
+  queries: readonly SearchQuerySpec[],
+  queryMatchers: readonly RegExp[],
+  limits: SearchScanLimits
+): Promise<void> {
+  const {
+    maxResults, cursor, maxPreview, contextLines, maxMatchesPerFile, maxFileBytes,
+    filesOnly, countOnly, calculateTotal, exactTotalFastTail,
+    responseBytesLimit, contextLineBytesLimit
+  } = limits;
+  let fileMatchCount = 0;
+  let fileRecorded = false;
+
+  const recordFile = (line: number, queryIndex: number, query: string, matchedBy: 'content' | 'filename'): boolean => {
+    if (state.files.some(item => item.path === entryPath)) return true;
+    if (state.files.length >= maxResults) {
+      state.truncated = true;
+      if (calculateTotal) {
+        if (exactTotalFastTail) {
+          state.fastTailActive = true;
+          state.fastTailSkippedMatchDetails += 1;
+        }
+        return false;
+      }
+      state.stoppedEarly = true;
+      state.stop = true;
+      return false;
+    }
+    state.files.push({
+      path: entryPath,
+      match_id: stableMatchId(entryPath, line, queryIndex, matchedBy === 'filename' ? 'filename' : query),
+      matched_by: matchedBy,
+      ...(matchedBy === 'content' ? { query_index: queryIndex, query } : {})
+    });
+    return true;
+  };
+
+  const emitMatch = (
+    item: JsonObject,
+    extra?: { before?: string[]; after?: string[]; contextTruncated?: boolean }
+  ): void => {
+    if (extra?.before) item.before = extra.before;
+    if (extra?.after) item.after = extra.after;
+    if (extra?.contextTruncated) item.context_truncated = true;
+    let itemBytes = Buffer.byteLength(JSON.stringify(item));
+    if (state.matches.length === 0 && itemBytes > responseBytesLimit && (item.before || item.after)) {
+      delete item.before;
+      delete item.after;
+      item.context_omitted_due_to_response_limit = true;
+      itemBytes = Buffer.byteLength(JSON.stringify(item));
+    }
+    if (state.responseBytesEstimate + itemBytes > responseBytesLimit) {
+      state.truncated = true;
+      state.responseLimitReached = true;
+      if (calculateTotal) {
+        if (exactTotalFastTail) {
+          state.fastTailActive = true;
+          state.fastTailSkippedMatchDetails += 1;
+        }
+        return;
+      }
+      state.stoppedEarly = true;
+      state.stop = true;
+      return;
+    }
+    state.responseBytesEstimate += itemBytes;
+    state.matches.push(item);
+  };
+
+  for (let queryIndex = 0; queryIndex < queries.length && !state.stop; queryIndex += 1) {
+    const query = queries[queryIndex];
+    const matcher = queryMatchers[queryIndex];
+    const before: string[] = [];
+    const pending: Array<{
+      item: JsonObject;
+      after: string[];
+      contextTruncated: boolean;
+    }> = [];
+
+    const flushPending = (completeOnly: boolean): void => {
+      const kept: typeof pending = [];
+      for (const item of pending) {
+        if (completeOnly && item.after.length < contextLines) {
+          kept.push(item);
+          continue;
+        }
+        emitMatch(item.item, {
+          before: item.item.before as string[] | undefined,
+          after: item.after,
+          contextTruncated: item.contextTruncated
+        });
+      }
+      pending.length = 0;
+      pending.push(...kept);
+    };
+
+    let lineIndex = 0;
+    for await (const line of streamDecodedTextLines(file, maxFileBytes)) {
+      if (state.stop) break;
+      if (contextLines > 0) {
+        for (const item of pending) {
+          if (item.after.length >= contextLines) continue;
+          const bounded = boundContextLine(line, contextLineBytesLimit);
+          item.after.push(bounded.content);
+          item.contextTruncated ||= bounded.truncated;
+        }
+        flushPending(true);
+      }
+
+      matcher.lastIndex = 0;
+      for (const found of line.matchAll(matcher)) {
+        state.queryCounts[queryIndex] += 1;
+        if (!fileRecorded) {
+          state.matchedFiles += 1;
+          fileRecorded = true;
+        }
+        if (state.fastTailActive) {
+          state.fastTailSkippedMatchDetails += 1;
+          continue;
+        }
+        fileMatchCount += 1;
+        if (fileMatchCount > maxMatchesPerFile) continue;
+        if (state.skipped < cursor) {
+          state.skipped += 1;
+          continue;
+        }
+        if (filesOnly) {
+          recordFile(lineIndex + 1, queryIndex, query.query, 'content');
+          if (state.stop) break;
+          continue;
+        }
+        if (countOnly) continue;
+        if (state.responseLimitReached) continue;
+        if (state.matches.length + pending.length >= maxResults) {
+          state.truncated = true;
+          if (calculateTotal) {
+            if (exactTotalFastTail) {
+              state.fastTailActive = true;
+              state.fastTailSkippedMatchDetails += 1;
+            }
+            continue;
+          }
+          state.stoppedEarly = true;
+          state.stop = true;
+          break;
+        }
+        const start = found.index ?? 0;
+        const value = found[0] ?? '';
+        const end = start + value.length;
+        const boundedMatch = truncatePrefixUtf8(value, maxPreview);
+        const boundedQuery = truncatePrefixUtf8(query.query, 1_024);
+        const item: JsonObject = {
+          match_id: stableMatchId(entryPath, lineIndex + 1, queryIndex, query.query),
+          path: entryPath,
+          line: lineIndex + 1,
+          column: [...line.slice(0, start)].length + 1,
+          end_column: [...line.slice(0, end)].length + 1,
+          query_index: queryIndex,
+          query: boundedQuery.content,
+          match: boundedMatch.content,
+          preview: previewAround(line, start, end, maxPreview)
+        };
+        if (boundedQuery.truncated) item.query_truncated = true;
+        if (boundedMatch.truncated) item.match_truncated = true;
+        if (contextLines > 0) {
+          let contextTruncated = false;
+          const beforeLines = before.map(value => {
+            const bounded = boundContextLine(value, contextLineBytesLimit);
+            contextTruncated ||= bounded.truncated;
+            return bounded.content;
+          });
+          item.before = beforeLines;
+          pending.push({ item, after: [], contextTruncated });
+        } else {
+          emitMatch(item);
+        }
+        if (state.stop) break;
+      }
+
+      if (contextLines > 0) {
+        before.push(line);
+        if (before.length > contextLines) before.shift();
+      }
+      lineIndex += 1;
+    }
+    if (contextLines > 0) flushPending(false);
+    pending.length = 0;
+    before.length = 0;
+  }
+}
+
+function ingestPreparedLine(
+  state: SearchScanState,
+  entryPath: string,
+  lineNumber: number,
+  lineText: string,
+  queryIndex: number,
+  query: SearchQuerySpec,
+  matcher: RegExp,
+  limits: SearchScanLimits,
+  fileTracker: Map<string, { matchCount: number; recorded: boolean }>,
+  context?: { before: string[]; after: string[] }
+): void {
+  const {
+    maxResults, cursor, maxPreview, contextLines, maxMatchesPerFile,
+    filesOnly, countOnly, calculateTotal, exactTotalFastTail,
+    responseBytesLimit, contextLineBytesLimit
+  } = limits;
+  let tracker = fileTracker.get(entryPath);
+  if (!tracker) {
+    tracker = { matchCount: 0, recorded: false };
+    fileTracker.set(entryPath, tracker);
+  }
+  const recordFile = (): boolean => {
+    if (state.files.some(item => item.path === entryPath)) return true;
+    if (state.files.length >= maxResults) {
+      state.truncated = true;
+      if (calculateTotal) {
+        if (exactTotalFastTail) {
+          state.fastTailActive = true;
+          state.fastTailSkippedMatchDetails += 1;
+        }
+        return false;
+      }
+      state.stoppedEarly = true;
+      state.stop = true;
+      return false;
+    }
+    state.files.push({
+      path: entryPath,
+      match_id: stableMatchId(entryPath, lineNumber, queryIndex, query.query),
+      matched_by: 'content',
+      query_index: queryIndex,
+      query: query.query
+    });
+    return true;
+  };
+  const emitMatch = (item: JsonObject): void => {
+    let itemBytes = Buffer.byteLength(JSON.stringify(item));
+    if (state.matches.length === 0 && itemBytes > responseBytesLimit && (item.before || item.after)) {
+      delete item.before;
+      delete item.after;
+      item.context_omitted_due_to_response_limit = true;
+      itemBytes = Buffer.byteLength(JSON.stringify(item));
+    }
+    if (state.responseBytesEstimate + itemBytes > responseBytesLimit) {
+      state.truncated = true;
+      state.responseLimitReached = true;
+      if (calculateTotal) {
+        if (exactTotalFastTail) {
+          state.fastTailActive = true;
+          state.fastTailSkippedMatchDetails += 1;
+        }
+        return;
+      }
+      state.stoppedEarly = true;
+      state.stop = true;
+      return;
+    }
+    state.responseBytesEstimate += itemBytes;
+    state.matches.push(item);
+  };
+
+  matcher.lastIndex = 0;
+  for (const found of lineText.matchAll(matcher)) {
+    state.queryCounts[queryIndex] += 1;
+    if (!tracker.recorded) {
+      state.matchedFiles += 1;
+      tracker.recorded = true;
+    }
+    if (state.fastTailActive) {
+      state.fastTailSkippedMatchDetails += 1;
+      continue;
+    }
+    tracker.matchCount += 1;
+    if (tracker.matchCount > maxMatchesPerFile) continue;
+    if (state.skipped < cursor) {
+      state.skipped += 1;
+      continue;
+    }
+    if (filesOnly) {
+      recordFile();
+      if (state.stop) break;
+      continue;
+    }
+    if (countOnly) continue;
+    if (state.responseLimitReached) continue;
+    if (state.matches.length >= maxResults) {
+      state.truncated = true;
+      if (calculateTotal) {
+        if (exactTotalFastTail) {
+          state.fastTailActive = true;
+          state.fastTailSkippedMatchDetails += 1;
+        }
+        continue;
+      }
+      state.stoppedEarly = true;
+      state.stop = true;
+      break;
+    }
+    const start = found.index ?? 0;
+    const value = found[0] ?? '';
+    const end = start + value.length;
+    const boundedMatch = truncatePrefixUtf8(value, maxPreview);
+    const boundedQuery = truncatePrefixUtf8(query.query, 1_024);
+    const item: JsonObject = {
+      match_id: stableMatchId(entryPath, lineNumber, queryIndex, query.query),
+      path: entryPath,
+      line: lineNumber,
+      column: [...lineText.slice(0, start)].length + 1,
+      end_column: [...lineText.slice(0, end)].length + 1,
+      query_index: queryIndex,
+      query: boundedQuery.content,
+      match: boundedMatch.content,
+      preview: previewAround(lineText, start, end, maxPreview)
+    };
+    if (boundedQuery.truncated) item.query_truncated = true;
+    if (boundedMatch.truncated) item.match_truncated = true;
+    if (contextLines > 0 && context) {
+      let contextTruncated = false;
+      const bound = (value: string): string => {
+        const bounded = boundContextLine(value, contextLineBytesLimit);
+        contextTruncated ||= bounded.truncated;
+        return bounded.content;
+      };
+      item.before = context.before.map(bound);
+      item.after = context.after.map(bound);
+      if (contextTruncated) item.context_truncated = true;
+    }
+    emitMatch(item);
+    if (state.stop) break;
+  }
 }
 
 export async function searchTextTool(
@@ -675,162 +1055,159 @@ export async function searchTextTool(
   const exclude = (Array.isArray(args.exclude_globs) ? args.exclude_globs : []).map(String).map(globRegex);
   const filenameMatcher = filenameQuery ? regexFor(filenameQuery, args.filename_regex === true, args.filename_case_sensitive === true) : undefined;
   const queryMatchers = queries.map(query => regexFor(query.query, query.regex, query.caseSensitive, true));
+  const filenameOnly = filesOnly && !queries.length;
+  const restrictToText = !filenameOnly && includeRaw.length === 0;
+  let skippedLargeFiles = 0;
+  const includeHidden = args.include_hidden === true;
+  const includeIgnored = args.include_ignored === true;
+  const includeGenerated = args.include_generated === true;
   const excludedPrefixes = await workspaceScanExcludedPrefixes(root, base);
-  const entries = (await walk(root, base, {
+  const walkOptions: WalkOptions = {
     maxDepth: 20,
     maxResults: 50_000,
-    includeHidden: args.include_hidden === true,
-    includeIgnored: args.include_ignored === true,
-    includeGenerated: args.include_generated === true,
-    excludedPrefixes
-  })).filter(entry => entry.type === 'file').sort((left, right) => left.path.localeCompare(right.path));
-  const matches: JsonObject[] = [];
-  const files: JsonObject[] = [];
+    includeHidden,
+    includeIgnored,
+    includeGenerated,
+    excludedPrefixes,
+    maxFileBytes: filenameOnly ? undefined : maxFileBytes,
+    onSkippedLargeFile: () => { skippedLargeFiles += 1; },
+    nameFilter: (name: string, isDirectory: boolean) => {
+      if (isDirectory || filenameOnly) return true;
+      if (binaryFileExtension(name)) return false;
+      if (restrictToText && !searchableTextPath(name)) return false;
+      return true;
+    },
+    pathFilter: entry => entry.type === 'file'
+      && (filenameOnly || !binaryFileExtension(entry.path))
+      && (!restrictToText || searchableTextPath(entry.path))
+      && (!include.length || include.some(pattern => pattern.test(entry.path)))
+      && !exclude.some(pattern => pattern.test(entry.path))
+      && (!filenameMatcher || filenameMatcher.test(entry.path))
+  };
   const responseBytesLimit = 128 * 1024;
   const contextLineBytesLimit = Math.min(maxPreview, 2_048);
-  let responseBytesEstimate = 0;
-  let responseLimitReached = false;
-  const queryCounts = queries.map(() => 0);
+  const state: SearchScanState = {
+    matches: [],
+    files: [],
+    queryCounts: queries.map(() => 0),
+    responseBytesEstimate: 0,
+    responseLimitReached: false,
+    matchedFiles: 0,
+    skipped: 0,
+    truncated: false,
+    stoppedEarly: false,
+    stop: false,
+    fastTailActive: false,
+    fastTailSkippedMatchDetails: 0
+  };
+  const limits: SearchScanLimits = {
+    maxResults,
+    cursor,
+    maxPreview,
+    contextLines,
+    maxMatchesPerFile,
+    maxFileBytes,
+    filesOnly,
+    countOnly,
+    calculateTotal,
+    exactTotalFastTail,
+    responseBytesLimit,
+    contextLineBytesLimit
+  };
   let filesConsidered = 0;
   let scannedFiles = 0;
-  let matchedFiles = 0;
-  let skippedLargeFiles = 0;
-  let skipped = 0;
-  let truncated = false;
-  let stoppedEarly = false;
-  let stop = false;
-  let fastTailActive = false;
-  let fastTailSkippedMatchDetails = 0;
+  let skippedBinaryFiles = 0;
+  let searchBackend: 'rg' | 'grep' | 'js' = 'js';
+  const startBlocked = await isWalkStartBlocked(root, base, walkOptions);
 
-  for (const entry of entries) {
-    if (stop) break;
-    if (include.length && !include.some(pattern => pattern.test(entry.path))) continue;
-    if (exclude.some(pattern => pattern.test(entry.path))) continue;
-    if (filenameMatcher && !filenameMatcher.test(entry.path)) continue;
-    filesConsidered += 1;
-    if (filesOnly && !queries.length) {
-      if (skipped++ < cursor) continue;
-      if (files.length >= maxResults) {
-        truncated = true;
+  if (filenameOnly) {
+    const entries = startBlocked ? [] : (await walk(root, base, walkOptions)).sort((left, right) => left.path.localeCompare(right.path));
+    for (const entry of entries) {
+      filesConsidered += 1;
+      if (state.skipped++ < cursor) continue;
+      if (state.files.length >= maxResults) {
+        state.truncated = true;
         if (calculateTotal) continue;
-        stoppedEarly = true;
+        state.stoppedEarly = true;
         break;
       }
-      files.push({ path: entry.path, match_id: stableMatchId(entry.path, 0, 0, 'filename'), matched_by: 'filename' });
-      continue;
+      state.files.push({ path: entry.path, match_id: stableMatchId(entry.path, 0, 0, 'filename'), matched_by: 'filename' });
     }
-    if ((entry.size ?? 0) > maxFileBytes) { skippedLargeFiles += 1; continue; }
-    let text: string;
-    try { text = await readText(resolveInside(root, entry.path), maxFileBytes); } catch { continue; }
-    scannedFiles += 1;
-    const lines = text.split(/\r?\n/);
-    let fileMatchCount = 0;
-    let fileRecorded = false;
-    for (let queryIndex = 0; queryIndex < queries.length && !stop; queryIndex += 1) {
-      const query = queries[queryIndex];
-      for (let lineIndex = 0; lineIndex < lines.length && !stop; lineIndex += 1) {
-        const matcher = queryMatchers[queryIndex];
-        matcher.lastIndex = 0;
-        for (const found of lines[lineIndex].matchAll(matcher)) {
-          queryCounts[queryIndex] += 1;
-          if (!fileRecorded) { matchedFiles += 1; fileRecorded = true; }
-          if (fastTailActive) {
-            fastTailSkippedMatchDetails += 1;
-            continue;
-          }
-          fileMatchCount += 1;
-          if (fileMatchCount > maxMatchesPerFile) continue;
-          if (skipped < cursor) { skipped += 1; continue; }
-          if (filesOnly) {
-            if (!files.some(item => item.path === entry.path)) {
-              if (files.length >= maxResults) {
-                truncated = true;
-                if (calculateTotal) {
-                  if (exactTotalFastTail) {
-                    fastTailActive = true;
-                    fastTailSkippedMatchDetails += 1;
-                  }
-                  continue;
-                }
-                stoppedEarly = true;
-                stop = true;
-                break;
-              }
-              files.push({ path: entry.path, match_id: stableMatchId(entry.path, lineIndex + 1, queryIndex, query.query), matched_by: 'content', query_index: queryIndex, query: query.query });
-            }
-            continue;
-          }
-          if (countOnly) continue;
-          if (responseLimitReached) continue;
-          if (matches.length >= maxResults) {
-            truncated = true;
-            if (calculateTotal) {
-              if (exactTotalFastTail) {
-                fastTailActive = true;
-                fastTailSkippedMatchDetails += 1;
-              }
-              continue;
-            }
-            stoppedEarly = true;
-            stop = true;
-            break;
-          }
-          const start = found.index ?? 0;
-          const value = found[0] ?? '';
-          const end = start + value.length;
-          const boundedMatch = truncatePrefixUtf8(value, maxPreview);
-          const boundedQuery = truncatePrefixUtf8(query.query, 1_024);
-          const item: JsonObject = {
-            match_id: stableMatchId(entry.path, lineIndex + 1, queryIndex, query.query),
-            path: entry.path,
-            line: lineIndex + 1,
-            column: [...lines[lineIndex].slice(0, start)].length + 1,
-            end_column: [...lines[lineIndex].slice(0, end)].length + 1,
-            query_index: queryIndex,
-            query: boundedQuery.content,
-            match: boundedMatch.content,
-            preview: previewAround(lines[lineIndex], start, end, maxPreview)
-          };
-          if (boundedQuery.truncated) item.query_truncated = true;
-          if (boundedMatch.truncated) item.match_truncated = true;
-          if (contextLines > 0) {
-            let contextTruncated = false;
-            const boundContextLine = (line: string) => {
-              const bounded = truncatePrefixUtf8(line, contextLineBytesLimit);
-              contextTruncated ||= bounded.truncated;
-              return bounded.content;
-            };
-            item.before = lines.slice(Math.max(0, lineIndex - contextLines), lineIndex).map(boundContextLine);
-            item.after = lines.slice(lineIndex + 1, Math.min(lines.length, lineIndex + 1 + contextLines)).map(boundContextLine);
-            if (contextTruncated) item.context_truncated = true;
-          }
-          let itemBytes = Buffer.byteLength(JSON.stringify(item));
-          if (matches.length === 0 && itemBytes > responseBytesLimit && (item.before || item.after)) {
-            delete item.before;
-            delete item.after;
-            item.context_omitted_due_to_response_limit = true;
-            itemBytes = Buffer.byteLength(JSON.stringify(item));
-          }
-          if (responseBytesEstimate + itemBytes > responseBytesLimit) {
-            truncated = true;
-            responseLimitReached = true;
-            if (calculateTotal) {
-              if (exactTotalFastTail) {
-                fastTailActive = true;
-                fastTailSkippedMatchDetails += 1;
-              }
-              continue;
-            }
-            stoppedEarly = true;
-            stop = true;
-            break;
-          }
-          responseBytesEstimate += itemBytes;
-          matches.push(item);
+  } else if (!startBlocked) {
+    const startInfo = await stat(base);
+    const fileTracker = new Map<string, { matchCount: number; recorded: boolean }>();
+    const consumeExternal = async (line: ExternalMatchLine, group: readonly ExternalSearchQuery[]): Promise<boolean> => {
+      if (restrictToText && !searchableTextPath(line.path)) return true;
+      if (binaryFileExtension(line.path)) return true;
+      if (filenameMatcher && !filenameMatcher.test(line.path)) return true;
+      for (const spec of group) {
+        const queryIndex = queries.findIndex(item => item === spec);
+        if (queryIndex < 0 || state.stop) continue;
+        ingestPreparedLine(
+          state,
+          line.path,
+          line.line,
+          line.text,
+          queryIndex,
+          queries[queryIndex],
+          queryMatchers[queryIndex],
+          limits,
+          fileTracker,
+          { before: line.before, after: line.after }
+        );
+      }
+      return !state.stop;
+    };
+    const external = await runExternalContentSearch({
+      dataDir: ctx.config.dataDir,
+      root,
+      searchPath: relativeInside(root, base).replaceAll('\\', '/') || '.',
+      isDirectory: startInfo.isDirectory(),
+      queries,
+      includeGlobs: includeRaw,
+      excludeGlobs: Array.isArray(args.exclude_globs) ? args.exclude_globs.map(String) : [],
+      excludedPrefixes,
+      includeHidden,
+      includeIgnored,
+      includeGenerated,
+      restrictToText,
+      contextLines,
+      maxFileBytes,
+      maxMatchesPerFile,
+      ignoreFiles: includeIgnored ? [] : await extraIgnoreFiles(root)
+    }, consumeExternal);
+    if (external) {
+      searchBackend = external.backend;
+      filesConsidered = external.filesConsidered;
+      scannedFiles = external.scannedFiles;
+      skippedBinaryFiles = external.skippedBinaryFiles;
+      skippedLargeFiles += external.skippedLargeFiles;
+    } else {
+      const entries = (await walk(root, base, walkOptions)).sort((left, right) => left.path.localeCompare(right.path));
+      for (const entry of entries) {
+        if (state.stop) break;
+        filesConsidered += 1;
+        if (binaryFileExtension(entry.path)) { skippedBinaryFiles += 1; continue; }
+        if ((entry.size ?? 0) > maxFileBytes) { skippedLargeFiles += 1; continue; }
+        try {
+          await scanSearchFileStreaming(state, entry.path, resolveInside(root, entry.path), queries, queryMatchers, limits);
+          scannedFiles += 1;
+        } catch (error) {
+          if (error instanceof TextDecodingError && error.code === 'BINARY_FILE') skippedBinaryFiles += 1;
         }
       }
     }
   }
+  const matches = state.matches;
+  const files = state.files;
+  const queryCounts = state.queryCounts;
+  const responseBytesEstimate = state.responseBytesEstimate;
+  const responseLimitReached = state.responseLimitReached;
+  const matchedFiles = state.matchedFiles;
+  const truncated = state.truncated;
+  const stoppedEarly = state.stoppedEarly;
+  const fastTailActive = state.fastTailActive;
+  const fastTailSkippedMatchDetails = state.fastTailSkippedMatchDetails;
   const returned = filesOnly ? files.length : matches.length;
   const normalized = requestedMax !== maxResults || requestedPreview !== maxPreview || requestedContext !== contextLines;
   const exactTotalForcedFullScan = calculateTotal && !countOnly && truncated && !stoppedEarly;
@@ -862,6 +1239,7 @@ export async function searchTextTool(
     scan_excluded_worktree_container_count: excludedPrefixes.length,
     scanned_files: scannedFiles,
     skipped_large_files: skippedLargeFiles,
+    skipped_binary_files: skippedBinaryFiles,
     cursor,
     next_cursor: truncated ? cursor + returned : null,
     scan_completed: !stoppedEarly,
@@ -877,6 +1255,7 @@ export async function searchTextTool(
     arguments_normalized: normalized,
     normalized_arguments: normalized ? { max_results: maxResults, max_preview_bytes: maxPreview, context_lines: contextLines } : null,
     truncated,
+    search_backend: searchBackend,
     warnings
   });
 }

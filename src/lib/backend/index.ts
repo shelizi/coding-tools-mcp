@@ -52,8 +52,6 @@ export {
   workspaceAuthSecretKeys,
 } from "./secret-read";
 export type { McpAuthSecrets } from "./secret-read";
-export { createTauriBackend } from "./tauri";
-export { createNodeBackend } from "./node";
 
 let current: FrontendBackend | null = null;
 

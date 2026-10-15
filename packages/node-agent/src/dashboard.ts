@@ -156,6 +156,7 @@ export async function dashboardPayload(ctx: ToolContext, startedAt: number): Pro
   const operations = ctx.state.operations(undefined, ACTIVITY_LIMIT);
   const lastActivityAt = Math.max(
     0,
+    ctx.lastMcpAccessAtMs ?? 0,
     ...recentRows.map(row => row.startedAt),
     ...operations.map(row => Number(row.created_at) || 0)
   );

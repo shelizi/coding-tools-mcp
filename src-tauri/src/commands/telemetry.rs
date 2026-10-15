@@ -24,11 +24,17 @@ pub fn read_workspace_telemetry(
     errors_only: Option<bool>,
     min_duration_ms: Option<u64>,
     since_ts_ms: Option<u64>,
+    statistics_period: Option<String>,
+    statistics_until_ts_ms: Option<u64>,
 ) -> AppResult<Value> {
     let profile_id = profile_id(&state, &id)?;
+    let statistics = statistics_period.is_some();
     let args = json!({
         "limit": limit.unwrap_or(100).clamp(1, 200),
-        "top": 20,
+        "top": if statistics { 50 } else { 20 },
+        "scope": if statistics { "all" } else { "current_runtime" },
+        "statistics_period": statistics_period,
+        "statistics_until_ts_ms": statistics_until_ts_ms,
         "include_records": true,
         "include_payloads": false,
         "aggregate": true,
@@ -44,4 +50,3 @@ pub fn read_workspace_telemetry(
     crate::tools::tool_usage::query_tool_usage_for_profile(&profile_id, &args)
         .map_err(|error| AppError::Message(error.message()))
 }
-

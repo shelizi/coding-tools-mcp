@@ -1,12 +1,14 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::tools::workspace::WorkspaceError;
 
 use super::lifecycle::prune_finalized_sessions;
+use super::operation_persistence;
 use super::{ExecSession, SessionRegistry, SessionStore, DEFAULT_ACTIVE_SESSION_LIMIT};
 
 impl Default for SessionStore {
@@ -15,6 +17,7 @@ impl Default for SessionStore {
             registry: Mutex::new(SessionRegistry::default()),
             active_slots: Arc::new(Semaphore::new(DEFAULT_ACTIVE_SESSION_LIMIT)),
             active_session_limit: DEFAULT_ACTIVE_SESSION_LIMIT,
+            operation_record_dir: None,
         }
     }
 }
@@ -30,6 +33,20 @@ impl SessionStore {
             registry: Mutex::new(SessionRegistry::default()),
             active_slots: Arc::new(Semaphore::new(limit)),
             active_session_limit: limit,
+            operation_record_dir: None,
+        }
+    }
+
+    pub fn with_active_session_limit_and_operation_dir(
+        limit: usize,
+        operation_record_dir: PathBuf,
+    ) -> Self {
+        let limit = limit.clamp(1, u16::MAX as usize);
+        Self {
+            registry: Mutex::new(SessionRegistry::default()),
+            active_slots: Arc::new(Semaphore::new(limit)),
+            active_session_limit: limit,
+            operation_record_dir: Some(operation_record_dir),
         }
     }
 
@@ -50,6 +67,8 @@ impl SessionStore {
         registry
             .sessions
             .insert(arc.session_id.clone(), arc.clone());
+        drop(registry);
+        operation_persistence::bind_record_path(&arc, self.operation_record_dir.as_deref());
         arc
     }
 
@@ -128,6 +147,10 @@ impl SessionStore {
         prune_finalized_sessions(&mut registry);
         let session_id = registry.operation_index.get(operation_id)?.clone();
         registry.sessions.get(&session_id).cloned()
+    }
+
+    pub fn load_persisted_operation(&self, operation_id: &str) -> Option<Value> {
+        operation_persistence::load_record(self.operation_record_dir.as_deref(), operation_id)
     }
 
     pub fn get_by_fingerprint(&self, fingerprint: &str) -> Option<Arc<ExecSession>> {

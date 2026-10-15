@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { listFrpProfiles, type FrpProfileDto } from "$lib/api/settings";
   import { getBackend } from "$lib/backend";
-  import { testTunnel as invokeTunnelTest } from "$lib/api/tunnel";
+  import { getTunnelStatus, testTunnel as invokeTunnelTest, type TunnelStatus } from "$lib/api/tunnel";
   import SecretTokenField from "$lib/components/SecretTokenField.svelte";
   import { showToast } from "$lib/stores/toast";
   import { t } from "$lib/i18n";
@@ -49,6 +49,7 @@
   let tokenPending = $state(false);
   let frpProfiles = $state<FrpProfileDto[]>([]);
   let legacyFrpOpen = $state(false);
+  let tunnelStatus = $state<TunnelStatus | null>(null);
 
 
   const secretKey = $derived(
@@ -98,9 +99,23 @@
     };
   });
 
-  onMount(async () => {
-    if (!capabilities.frpManagement) return;
-    frpProfiles = await listFrpProfiles();
+  async function refreshTunnelStatus(): Promise<void> {
+    if (!showBuiltin) {
+      tunnelStatus = null;
+      return;
+    }
+    try {
+      tunnelStatus = await getTunnelStatus(workspaceId, service);
+    } catch {
+      // Keep the last known status while the local runtime is restarting.
+    }
+  }
+
+  onMount(() => {
+    if (capabilities.frpManagement) void listFrpProfiles().then((profiles) => (frpProfiles = profiles));
+    void refreshTunnelStatus();
+    const timer = setInterval(() => void refreshTunnelStatus(), 2000);
+    return () => clearInterval(timer);
   });
 
   function normalizeMcpFrpUrl(value: string): string {
@@ -386,6 +401,38 @@
     <p class="text-[11px] text-[var(--color-text-muted)]">
       {$t("The link is consumed once and cleared after this workspace registers its local device key. MCP and Actions share the same device identity.")}
     </p>
+
+    <div class="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-3 text-xs">
+      <div class="mb-2 flex items-center justify-between gap-2">
+        <span class="font-medium text-[var(--color-text-secondary)]">WSS connection status</span>
+        <span class="rounded-full border border-[var(--color-border)] px-2 py-0.5 font-medium">
+          {tunnelStatus?.state ?? "—"}
+        </span>
+      </div>
+      <div class="grid grid-cols-2 gap-x-4 gap-y-2 text-[11px]">
+        <div><span class="text-[var(--color-text-muted)]">Transport</span><p>{tunnelStatus?.transportMode ?? "—"}</p></div>
+        <div><span class="text-[var(--color-text-muted)]">Control</span><p>{tunnelStatus?.controlConnected == null ? "—" : tunnelStatus.controlConnected ? "connected" : "disconnected"}</p></div>
+        <div><span class="text-[var(--color-text-muted)]">Data connections</span><p>{tunnelStatus?.dataConnections ?? tunnelStatus?.connectedWorkers ?? "—"}{tunnelStatus?.maxDataConnections != null ? ` / ${tunnelStatus.maxDataConnections}` : tunnelStatus?.configuredWorkers != null ? ` / ${tunnelStatus.configuredWorkers}` : ""}</p></div>
+        <div><span class="text-[var(--color-text-muted)]">Streams</span><p>{tunnelStatus?.activeStreams ?? "—"}{tunnelStatus?.streamCapacity != null ? ` / ${tunnelStatus.streamCapacity}` : ""}</p></div>
+        <div><span class="text-[var(--color-text-muted)]">Available slots</span><p>{tunnelStatus?.availableStreamSlots ?? "—"}</p></div>
+        <div><span class="text-[var(--color-text-muted)]">Queue</span><p>{tunnelStatus?.queuedRequests ?? "—"}</p></div>
+        <div><span class="text-[var(--color-text-muted)]">Desired data</span><p>{tunnelStatus?.desiredDataConnections ?? "—"}</p></div>
+        <div><span class="text-[var(--color-text-muted)]">Route</span><p>{tunnelStatus?.routeId ?? "—"}{tunnelStatus?.sharedSession ? " · shared" : ""}</p></div>
+      </div>
+      <details class="mt-3 text-[11px] text-[var(--color-text-muted)]">
+        <summary class="cursor-pointer">WSS identity / endpoint</summary>
+        <div class="mt-2 grid gap-1 break-all font-mono">
+          <div>origin: {tunnelStatus?.serverOrigin ?? "—"}</div>
+          <div>wss: {tunnelStatus?.websocketUrl ?? "—"}</div>
+          <div>session: {tunnelStatus?.sessionId ?? "—"}</div>
+          <div>server: {tunnelStatus?.serverId ?? "—"}</div>
+          <div>device: {tunnelStatus?.deviceId ?? "—"}</div>
+        </div>
+      </details>
+      {#if tunnelStatus?.lastError}
+        <p class="mt-2 text-[11px] text-[var(--color-danger)]">{tunnelStatus.lastError}</p>
+      {/if}
+    </div>
   {/if}
 
   {#if showFrp}

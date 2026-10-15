@@ -2,13 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { syncToolEvolutionRuntimes } from '../dist/folderRuntime.js';
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   CanaryImpactStore,
   CanaryStrategyEngine,
   ExperienceCompiler,
+  ExperienceLedger,
+  EXPERIENCE_COMPILER_REVISION,
+  EXPERIENCE_NORMALIZER_REVISION,
   EvolvedSkillCanaryEngine,
   EvolvedSkillRegistry,
   KnowledgeIngestor,
@@ -120,6 +123,7 @@ test('knowledgeRecordId is deterministic across object key order', () => {
 
 test('ExperienceCompiler emits bounded tool strategy knowledge and does not retain unknown features', () => {
   const compiler = new ExperienceCompiler();
+
   const observations = Array.from({ length: 5 }, (_, index) => observation({
     eventId: `event-${index + 1}`,
     timestampMs: 1000 + index,
@@ -144,6 +148,155 @@ test('ExperienceCompiler emits bounded tool strategy knowledge and does not reta
   assert.equal('secret_token' in item.trigger, false);
   assert.equal('path' in item.trigger, false);
   assert.match(item.id, /^[a-f0-9]{64}$/);
+});
+
+test('ExperienceCompiler learns guarded-edit recommendation from repeated simple apply_patch preflight failures', () => {
+  const compiler = new ExperienceCompiler();
+  const observations = Array.from({ length: 5 }, (_, index) => observation({
+    eventId: `patch-friction-${index + 1}`,
+    tool: 'apply_patch',
+    outcome: 'failure',
+    errorCode: 'PATCH_CHECK_FAILED',
+    timestampMs: 1_500 + index,
+    features: {
+      caller_intent_patch_bytes: 200 + index,
+      caller_intent_patch_file_count: 1,
+      caller_intent_patch_hunk_count: 1,
+      error_recommended_tool: 'edit'
+    }
+  }));
+  const [item] = compiler.compile(observations);
+  assert.equal(item.target, 'tool_strategy');
+  assert.equal(item.status, 'candidate');
+  assert.equal(item.trigger.errorCode, 'PATCH_CHECK_FAILED');
+  assert.equal(item.trigger.caller_intent_patch_file_count, 1);
+  assert.equal(item.trigger.caller_intent_patch_hunk_count, 1);
+  assert.equal(item.recommendedAction.recommendation, 'prefer_guarded_edit_for_single_file_replacement');
+  assert.equal(item.recommendedAction.caller_intent_required, 'single_file_replacement');
+  assert.equal('caller_intent_patch_bytes' in item.trigger, false, 'patch size must not fragment strategy identity');
+});
+
+test('ExperienceCompiler learns adaptive wait recommendation from repeated empty wait windows', () => {
+  const compiler = new ExperienceCompiler();
+  const observations = Array.from({ length: 5 }, (_, index) => observation({
+    eventId: `empty-wait-${index + 1}`,
+    tool: 'wait_command',
+    outcome: 'success',
+    timestampMs: 1_700 + index,
+    features: {
+      caller_intent_wait_timeout_ms: 20_000,
+      caller_intent_wait_timeout_explicit: true,
+      caller_intent_wait_until: 'output_or_exit',
+      wait_timed_out: true,
+      process_completed: false,
+      event_count: 0
+    }
+  }));
+  const [item] = compiler.compile(observations);
+  assert.equal(item.target, 'tool_strategy');
+  assert.equal(item.status, 'candidate');
+  assert.equal(item.trigger.wait_timed_out, true);
+  assert.equal(item.trigger.process_completed, false);
+  assert.equal(item.trigger.caller_intent_wait_timeout_explicit, true);
+  assert.equal(item.recommendedAction.recommendation, 'prefer_adaptive_wait');
+  assert.equal(item.recommendedAction.caller_intent_required, 'retained_process_still_running');
+  assert.equal('event_count' in item.trigger, false, 'empty-event count is evidence, not strategy identity');
+});
+
+test('ExperienceCompiler preserves pre-hashed context evidence and stamps its compiler revision', () => {
+  const compiler = new ExperienceCompiler();
+  const conversationHashes = [contextId('conversation', 'ledger-a'), contextId('conversation', 'ledger-b')];
+  const observations = Array.from({ length: 5 }, (_, index) => observation({
+    eventId: `prehashed-${index + 1}`,
+    tool: 'project_state',
+    conversationContextIdHash: conversationHashes[index < 3 ? 0 : 1],
+    runtimeBootIdHash: contextId('runtime-boot', `runtime-${index % 2}`),
+    timestampMs: 1800 + index,
+    durationMs: 10_000,
+    features: { phase_baseline_capture_ms: 9_000 }
+  }));
+  const [candidate] = compiler.compile(observations);
+  assert.equal(candidate.status, 'candidate');
+  assert.deepEqual(candidate.evidence.conversationContextIds, [...conversationHashes].sort());
+  assert.equal(candidate.metadata.compilerRevision, EXPERIENCE_COMPILER_REVISION);
+  assert.match(EXPERIENCE_COMPILER_REVISION, /^[0-9a-f]{64}$/);
+  assert.match(EXPERIENCE_NORMALIZER_REVISION, /^[0-9a-f]{64}$/);
+});
+
+test('ExperienceLedger persists bounded hashed observations, deduplicates across restart, and resets materialization on compiler revision change', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-experience-ledger-'));
+  const firstLedger = new ExperienceLedger(root, {
+    compilerRevision: '1'.repeat(64),
+    normalizerRevision: '2'.repeat(64)
+  });
+  const privateTask = 'private-task-id';
+  const privateConversation = 'private-conversation-id';
+  const privateBoot = 'private-runtime-boot';
+  const first = await firstLedger.append([observation({
+    eventId: 'ledger-event-1',
+    taskId: privateTask,
+    conversationContextId: privateConversation,
+    runtimeBootId: privateBoot,
+    features: { calculate_total: true, files_considered: 900 },
+    timestampMs: 1900
+  })]);
+  assert.equal(first.added, 1);
+  assert.equal(first.deduped, 0);
+  assert.equal((await firstLedger.append([observation({ eventId: 'ledger-event-1' })])).deduped, 1);
+  await firstLedger.advanceMaterialized(0, 1);
+  const firstSnapshot = await firstLedger.snapshot();
+  assert.equal(firstSnapshot.ledgerEvents, 1);
+  assert.equal(firstSnapshot.materializedEvents, 1);
+
+  const ledgerText = await readFile(path.join(root, 'experience.jsonl'), 'utf8');
+  assert.equal(ledgerText.includes(privateTask), false);
+  assert.equal(ledgerText.includes(privateConversation), false);
+  assert.equal(ledgerText.includes(privateBoot), false);
+  const persisted = JSON.parse(ledgerText.trim());
+  assert.equal(persisted.taskIdHash, contextId('task', privateTask));
+  assert.equal(persisted.conversationContextIdHash, contextId('conversation', privateConversation));
+  assert.equal(persisted.runtimeBootIdHash, contextId('runtime-boot', privateBoot));
+
+  const reopened = new ExperienceLedger(root, {
+    compilerRevision: '1'.repeat(64),
+    normalizerRevision: '2'.repeat(64)
+  });
+  assert.equal((await reopened.append([observation({ eventId: 'ledger-event-1' })])).deduped, 1);
+  assert.equal((await reopened.snapshot()).materializedEvents, 1);
+
+  const newCompiler = new ExperienceLedger(root, {
+    compilerRevision: '3'.repeat(64),
+    normalizerRevision: '2'.repeat(64)
+  });
+  const rebuilt = await newCompiler.snapshot();
+  assert.equal(rebuilt.ledgerEvents, 1);
+  assert.equal(rebuilt.materializedEvents, 0);
+  assert.equal(rebuilt.compilerRevision, '3'.repeat(64));
+});
+
+test('ExperienceLedger serializes concurrent shared-root instances without losing state or temp files', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-experience-ledger-concurrent-'));
+  const revisions = {
+    compilerRevision: '4'.repeat(64),
+    normalizerRevision: '5'.repeat(64)
+  };
+  const left = new ExperienceLedger(root, revisions);
+  const right = new ExperienceLedger(root, revisions);
+
+  await Promise.all([left.snapshot(), right.snapshot()]);
+  const events = Array.from({ length: 12 }, (_, index) => observation({
+    eventId: `concurrent-ledger-${index + 1}`,
+    timestampMs: 2_000 + index
+  }));
+  await Promise.all(events.map((item, index) => (index % 2 === 0 ? left : right).append([item])));
+
+  const reopened = new ExperienceLedger(root, revisions);
+  const snapshot = await reopened.snapshot();
+  assert.equal(snapshot.ledgerEvents, events.length);
+  const ledgerLines = (await readFile(path.join(root, 'experience.jsonl'), 'utf8')).trim().split(/\r?\n/);
+  assert.equal(ledgerLines.length, events.length);
+  assert.equal(new Set(ledgerLines.map(line => JSON.parse(line).eventId)).size, events.length);
+  assert.deepEqual((await readdir(root)).filter(name => name.includes('ingestion-state.json') && name.endsWith('.tmp')), []);
 });
 
 test('ExperienceCompiler requires independent context evidence before promoting MCP implementation cost', () => {
@@ -545,6 +698,7 @@ test('KnowledgeIngestor activates candidates for held-out shadow measurement wit
   assert.equal(impact.matched, 1);
   assert.equal(impact.actualSuccesses, 1);
   assert.equal(impact.totalObservedDurationMs, 2500);
+  assert.deepEqual(impact.durationSamplesMs, [2500]);
   assert.deepEqual(impact.sourceEventIds, ['heldout-expensive']);
 
   ingestor.enqueueToolUsage({
@@ -566,6 +720,222 @@ test('KnowledgeIngestor activates candidates for held-out shadow measurement wit
   assert.equal(snapshot.shadowActivated, 1);
   assert.equal(snapshot.failed, 0);
   assert.equal(snapshot.queued, 0);
+});
+
+test('historical replay materializes retained diagnostics once and remains idempotent across restarts', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-knowledge-replay-'));
+  const store = new KnowledgeStore(root);
+  const impactStore = new KnowledgeImpactStore(root);
+  const records = Array.from({ length: 5 }, (_, index) => ({
+    event_type: 'tool_call',
+    diagnostic_event_id: `historical-${index + 1}`,
+    selected_workspace_id: 'repo',
+    tool: 'search_text',
+    outcome: 'success',
+    duration_ms: 2_000 + index,
+    request_json_bytes: 100,
+    response_json_bytes: 200,
+    completed_ts_ms: 40_000 + index,
+    runtime_boot_id: `historical-boot-${index % 2}`,
+    calculate_total: true,
+    files_considered: 1_000 + index
+  }));
+
+  const first = new KnowledgeIngestor(store, impactStore, 'repo');
+  const appended = await first.backfillToolUsage(records);
+  assert.deepEqual(appended, { sourceEventsSeen: 5, ledgerEventsAdded: 5, sourceEventsDeduped: 0, invalidEvents: 0 });
+  const materialized = await first.finalizeHistoricalReplay({ sourceRevision: 'a'.repeat(64), replayComplete: true });
+  assert.equal(materialized.materializedEvents, 5);
+  assert.equal(materialized.materializedRecords, 5);
+  let [learned] = await store.list();
+  assert.equal(learned.evidence.observations, 5);
+  assert.equal(learned.status, 'shadow');
+
+  const restarted = new KnowledgeIngestor(store, impactStore, 'repo');
+  const replayed = await restarted.backfillToolUsage(records);
+  assert.equal(replayed.ledgerEventsAdded, 0);
+  assert.equal(replayed.sourceEventsDeduped, 5);
+  const secondMaterialization = await restarted.finalizeHistoricalReplay({ sourceRevision: 'a'.repeat(64), replayComplete: true });
+  assert.equal(secondMaterialization.materializedEvents, 0);
+  [learned] = await store.list();
+  assert.equal(learned.evidence.observations, 5, 'replaying the same diagnostics must not double count knowledge evidence');
+  const durable = await restarted.durableSnapshot();
+  assert.equal(durable.ledgerEvents, 5);
+  assert.equal(durable.materializedEvents, 5);
+  assert.equal(durable.replayComplete, true);
+  assert.equal(durable.lastCanonicalSourceRevision, 'a'.repeat(64));
+});
+
+test('historical replay rematerializes deterministically after compiler revision changes without double counting', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-knowledge-replay-revision-'));
+  const store = new KnowledgeStore(root);
+  const impactStore = new KnowledgeImpactStore(root);
+  const records = Array.from({ length: 5 }, (_, index) => ({
+    event_type: 'tool_call',
+    diagnostic_event_id: `revision-historical-${index + 1}`,
+    selected_workspace_id: 'repo',
+    tool: 'search_text',
+    outcome: 'success',
+    duration_ms: 2_000 + index,
+    completed_ts_ms: 50_000 + index,
+    runtime_boot_id: `revision-boot-${index % 2}`,
+    calculate_total: true,
+    files_considered: 1_200 + index
+  }));
+
+  const first = new KnowledgeIngestor(store, impactStore, 'repo');
+  assert.equal((await first.backfillToolUsage(records)).ledgerEventsAdded, 5);
+  assert.deepEqual(
+    await first.finalizeHistoricalReplay({ sourceRevision: 'a'.repeat(64), replayComplete: true }),
+    { materializedEvents: 5, materializedRecords: 5, ignoredEvents: 0 }
+  );
+  const [before] = await store.list();
+  const beforeSourceEvents = [...before.sourceEventIds];
+  assert.equal(before.evidence.observations, 5);
+  assert.equal((await first.durableSnapshot()).materializedEvents, 5);
+
+  const statePath = path.join(root, 'ingestion-state.json');
+  const retainedState = JSON.parse(await readFile(statePath, 'utf8'));
+  retainedState.compilerRevision = '0'.repeat(64);
+  retainedState.replayComplete = true;
+  await writeFile(statePath, `${JSON.stringify(retainedState, null, 2)}\n`, 'utf8');
+
+  const revised = new KnowledgeIngestor(store, impactStore, 'repo');
+  const reset = await revised.durableSnapshot();
+  assert.equal(reset.ledgerEvents, 5);
+  assert.equal(reset.materializedEvents, 0);
+  assert.equal(reset.replayComplete, false);
+  assert.equal(reset.compilerRevision, EXPERIENCE_COMPILER_REVISION);
+  assert.equal(reset.normalizerRevision, EXPERIENCE_NORMALIZER_REVISION);
+
+  const rematerialized = await revised.finalizeHistoricalReplay({ sourceRevision: 'b'.repeat(64), replayComplete: true });
+  assert.deepEqual(rematerialized, { materializedEvents: 5, materializedRecords: 5, ignoredEvents: 0 });
+  const [after] = await store.list();
+  assert.equal(after.id, before.id);
+  assert.equal(after.status, before.status);
+  assert.equal(after.evidence.observations, 5, 'revision rematerialization must not double count retained evidence');
+  assert.deepEqual(after.sourceEventIds, beforeSourceEvents);
+  assert.equal(after.metadata.compilerRevision, EXPERIENCE_COMPILER_REVISION);
+
+  const durable = await revised.durableSnapshot();
+  assert.equal(durable.materializedEvents, 5);
+  assert.equal(durable.replayComplete, true);
+  assert.equal(durable.lastCanonicalSourceRevision, 'b'.repeat(64));
+  assert.deepEqual(
+    await revised.finalizeHistoricalReplay({ sourceRevision: 'b'.repeat(64), replayComplete: true }),
+    { materializedEvents: 0, materializedRecords: 0, ignoredEvents: 0 }
+  );
+  assert.equal((await store.list())[0].evidence.observations, 5);
+});
+
+test('tool strategy lifecycle closes candidate through promotion and regression rollback', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-knowledge-lifecycle-'));
+  const store = new KnowledgeStore(root);
+  const shadowImpactStore = new KnowledgeImpactStore(root);
+  const canaryImpactStore = new CanaryImpactStore(root);
+  const strategyEngine = new CanaryStrategyEngine(store, canaryImpactStore);
+  const ingestor = new KnowledgeIngestor(store, shadowImpactStore, 'repo', 1024, {
+    impactStore: canaryImpactStore,
+    strategyEngine
+  });
+
+  for (let index = 0; index < 5; index += 1) {
+    ingestor.enqueueToolUsage({
+      event_type: 'tool_call', diagnostic_event_id: `lifecycle-train-${index}`, selected_workspace_id: 'repo',
+      tool: 'search_text', outcome: 'success', duration_ms: 2_000, completed_ts_ms: 1_000 + index,
+      calculate_total: true, files_considered: 1_000
+    }, { conversationContextId: `train-${index % 2}` });
+  }
+  await ingestor.flush();
+  let [strategy] = (await store.list()).filter(item => item.target === 'tool_strategy');
+  assert.ok(strategy);
+  assert.equal(strategy.status, 'shadow');
+  assert.equal(strategy.recommendedAction.semantic_preserving_implementation, 'search_exact_total_fast_tail');
+
+  for (let index = 0; index < 20; index += 1) {
+    ingestor.enqueueToolUsage({
+      event_type: 'tool_call', diagnostic_event_id: `lifecycle-shadow-${index}`, selected_workspace_id: 'repo',
+      tool: 'search_text', outcome: 'success', duration_ms: 1_000, completed_ts_ms: 2_000 + index,
+      calculate_total: true, files_considered: 1_000,
+      knowledge_shadow_equivalence_implementation: 'search_exact_total_fast_tail',
+      knowledge_shadow_equivalence_passed: true
+    }, { conversationContextId: `held-out-${index % 2}` });
+  }
+  await ingestor.flush();
+  strategy = await store.get(strategy.id);
+  assert.equal(strategy.status, 'validated');
+  const [shadowImpact] = await shadowImpactStore.list();
+  assert.equal(shadowImpact.matched, 20);
+  assert.equal(shadowImpact.semanticEquivalenceChecks, 20);
+  assert.equal(shadowImpact.semanticEquivalenceFailures, 0);
+  assert.equal(shadowImpact.matchedConversationContextIds.length, 2);
+
+  await strategyEngine.refresh();
+  const decisions = [];
+  for (let index = 0; index < 100; index += 1) {
+    decisions.push(await strategyEngine.decide('search_text', { query: 'needle', calculate_total: true }, `lifecycle-${index}`));
+  }
+  assert.ok(decisions.some(item => item?.applied === true));
+  assert.ok(decisions.some(item => item?.applied === false));
+
+  for (let index = 0; index < 10; index += 1) {
+    ingestor.enqueueToolUsage({
+      event_type: 'tool_call', diagnostic_event_id: `lifecycle-control-${index}`, selected_workspace_id: 'repo',
+      tool: 'search_text', outcome: 'success', duration_ms: 1_000, completed_ts_ms: 3_000 + index,
+      calculate_total: true, files_considered: 1_000,
+      knowledge_canary_id: strategy.id,
+      knowledge_canary_implementation: 'search_exact_total_fast_tail',
+      knowledge_canary_eligible: true,
+      knowledge_canary_applied: false,
+      knowledge_canary_bucket: 50 + index
+    });
+  }
+  for (let index = 0; index < 20; index += 1) {
+    ingestor.enqueueToolUsage({
+      event_type: 'tool_call', diagnostic_event_id: `lifecycle-intervention-${index}`, selected_workspace_id: 'repo',
+      tool: 'search_text', outcome: 'success', duration_ms: 600, completed_ts_ms: 4_000 + index,
+      calculate_total: true, files_considered: 1_000,
+      knowledge_canary_id: strategy.id,
+      knowledge_canary_implementation: 'search_exact_total_fast_tail',
+      knowledge_canary_eligible: true,
+      knowledge_canary_applied: true,
+      knowledge_canary_bucket: index
+    });
+  }
+  await ingestor.flush();
+  strategy = await store.get(strategy.id);
+  assert.equal(strategy.status, 'promoted');
+  let [canaryImpact] = await canaryImpactStore.list();
+  assert.equal(canaryImpact.controlCalls, 10);
+  assert.equal(canaryImpact.interventionCalls, 20);
+  assert.ok(canaryImpact.promotedAtMs);
+
+  ingestor.enqueueToolUsage({
+    event_type: 'tool_call', diagnostic_event_id: 'lifecycle-regression', selected_workspace_id: 'repo',
+    tool: 'search_text', outcome: 'success', duration_ms: 700, completed_ts_ms: 5_000,
+    calculate_total: true, files_considered: 1_000,
+    knowledge_canary_id: strategy.id,
+    knowledge_canary_implementation: 'search_exact_total_fast_tail',
+    knowledge_canary_eligible: true,
+    knowledge_canary_applied: true,
+    knowledge_canary_bucket: 1
+  }, { taskId: 'lifecycle-regression-task', taskOutcome: 'rolled_back' });
+  await ingestor.flush();
+
+  strategy = await store.get(strategy.id);
+  assert.equal(strategy.status, 'rejected');
+  [canaryImpact] = await canaryImpactStore.list();
+  assert.equal(canaryImpact.rollbackReason, 'promoted_task_rollback');
+  assert.ok(canaryImpact.rolledBackAtMs);
+  await strategyEngine.refresh();
+  assert.equal(await strategyEngine.decide(
+    'search_text', { query: 'needle', calculate_total: true }, 'lifecycle-after-rollback'
+  ), undefined);
+
+  const snapshot = ingestor.snapshot();
+  assert.equal(snapshot.validationValidated, 1);
+  assert.equal(snapshot.canaryPromoted, 1);
+  assert.equal(snapshot.canaryRolledBack, 1);
 });
 
 test('task-level held-out credit validates a strategy only after enough verified task outcomes', async () => {
@@ -669,17 +1039,91 @@ test('task credit is idempotent and rollback blocks validation', async () => {
   assert.equal(gate.evaluated, 1);
   assert.equal(gate.validated, 0);
   assert.equal(gate.blocked, 1);
+  assert.deepEqual(gate.blockers, [{
+    knowledgeId: shadow.id,
+    target: 'tool_strategy',
+    reason: 'rollback_observed',
+    actual: 1,
+    required: 0
+  }]);
   assert.equal((await store.get(shadow.id)).status, 'shadow');
 });
 
-test('tool strategy implementation registry exposes only semantics-preserving runtime implementations', () => {
+test('validation inspection explains blockers without mutating shadow state', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-knowledge-inspect-'));
+  const store = new KnowledgeStore(root);
+  const impactStore = new KnowledgeImpactStore(root);
+  const shadow = await store.upsert(record({
+    status: 'shadow',
+    evidence: {
+      observations: 15, successes: 15, failures: 0,
+      totalDurationMs: 15_000, totalRequestBytes: 150, totalResponseBytes: 300,
+      firstSeenAtMs: 1, lastSeenAtMs: 15
+    },
+    sourceEventIds: Array.from({ length: 15 }, (_, index) => `inspect-seed-${index}`),
+    updatedAtMs: 15
+  }));
+  await impactStore.record({
+    schemaVersion: 1,
+    knowledgeId: shadow.id,
+    target: 'tool_strategy',
+    tool: 'search_text',
+    sourceEventIds: Array.from({ length: 10 }, (_, index) => `inspect-heldout-${index}`),
+    matchedTaskIds: [],
+    creditedTaskIds: [],
+    considered: 10,
+    matched: 10,
+    actualSuccesses: 10,
+    actualFailures: 0,
+    verifiedSuccesses: 0,
+    verificationFailures: 0,
+    recoverySuccesses: 0,
+    recoveryFailures: 0,
+    taskVerifiedSuccesses: 0,
+    taskUnverifiedSuccesses: 0,
+    taskFailures: 0,
+    taskRollbacks: 0,
+    totalObservedDurationMs: 15_000,
+    totalObservedRequestBytes: 100,
+    totalObservedResponseBytes: 200,
+    firstSeenAtMs: 100,
+    lastSeenAtMs: 109
+  });
+
+  const snapshot = await new ValidationGate(store, impactStore).inspect();
+  assert.equal(snapshot.evaluated, 1);
+  assert.equal(snapshot.ready, 0);
+  assert.equal(snapshot.blocked, 1);
+  assert.equal(snapshot.blockersTruncated, 0);
+  assert.deepEqual(snapshot.blockers, [{
+    knowledgeId: shadow.id,
+    target: 'tool_strategy',
+    reason: 'insufficient_task_outcomes',
+    actual: 0,
+    required: 3
+  }]);
+  assert.equal((await store.get(shadow.id)).status, 'shadow');
+});
+
+test('tool strategy implementation registry exposes semantic and recommendation-only runtime implementations', () => {
   const snapshot = toolStrategyImplementationSnapshot();
-  assert.equal(snapshot.count, 1);
+  assert.equal(snapshot.count, 3);
   assert.match(snapshot.revision, /^[a-f0-9]{64}$/);
   assert.deepEqual(snapshot.implementations, [{
     id: 'search_exact_total_fast_tail',
     tool: 'search_text',
-    safety: 'semantics_preserving'
+    safety: 'semantics_preserving',
+    validationClass: 'semantics_preserving'
+  }, {
+    id: 'apply_patch_prefer_guarded_edit',
+    tool: 'apply_patch',
+    safety: 'recommendation_only',
+    validationClass: 'task_aware'
+  }, {
+    id: 'wait_command_adaptive_poll',
+    tool: 'wait_command',
+    safety: 'recommendation_only',
+    validationClass: 'task_aware'
   }]);
   const safe = record({
     status: 'validated',
@@ -694,6 +1138,7 @@ test('tool strategy implementation registry exposes only semantics-preserving ru
   });
   assert.equal(resolved?.id, 'search_exact_total_fast_tail');
   assert.equal(resolved?.safety, 'semantics_preserving');
+  assert.equal(resolved?.validationClass, 'semantics_preserving');
   assert.equal(resolveToolStrategyImplementation(safe, 'search_text', {
     query: 'needle',
     calculate_total: false
@@ -701,6 +1146,50 @@ test('tool strategy implementation registry exposes only semantics-preserving ru
   assert.equal(resolveToolStrategyImplementation(safe, 'edit', {
     path: 'file.txt'
   }), undefined);
+});
+
+test('recommendation-only patch and wait strategies become deterministic canary decisions after validation', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-recommendation-canary-'));
+  const store = new KnowledgeStore(root);
+  const impactStore = new CanaryImpactStore(root);
+  const patch = await store.upsert(record({
+    trigger: { tool: 'apply_patch', errorCode: 'PATCH_CHECK_FAILED', caller_intent_patch_file_count: 1, caller_intent_patch_hunk_count: 1, error_recommended_tool: 'edit' },
+    status: 'validated',
+    recommendedAction: {
+      recommendation: 'prefer_guarded_edit_for_single_file_replacement',
+      task_aware_implementation: 'apply_patch_prefer_guarded_edit'
+    }
+  }));
+  const wait = await store.upsert(record({
+    trigger: { tool: 'wait_command', wait_timed_out: true, process_completed: false },
+    status: 'validated',
+    recommendedAction: {
+      recommendation: 'prefer_adaptive_wait',
+      task_aware_implementation: 'wait_command_adaptive_poll'
+    }
+  }));
+  const engine = new CanaryStrategyEngine(store, impactStore);
+  const patchDecision = await engine.decide('apply_patch', {
+    patch: '--- a/main.txt\n+++ b/main.txt\n@@ -1 +1 @@\n-old\n+new\n'
+  }, 'patch-session');
+  const waitDecision = await engine.decide('wait_command', { session_id: 'session-a', timeout_ms: 20_000 }, 'wait-session');
+  assert.equal(patchDecision?.knowledgeId, patch.id);
+  assert.equal(patchDecision?.implementation, 'apply_patch_prefer_guarded_edit');
+  assert.equal(waitDecision?.knowledgeId, wait.id);
+  assert.equal(waitDecision?.implementation, 'wait_command_adaptive_poll');
+  assert.equal(await engine.decide('apply_patch', { patch: 'not-a-patch' }, 'patch-session'), undefined);
+});
+
+test('tool usage normalization preserves generic recommendation canary attribution', () => {
+  const normalized = toolUsageRecordToObservation({
+    event_type: 'tool_call', diagnostic_event_id: 'recommendation-canary-1', selected_workspace_id: 'repo',
+    tool: 'wait_command', outcome: 'success', duration_ms: 20_000, completed_ts_ms: 10_000,
+    knowledge_canary_id: 'a'.repeat(64), knowledge_canary_implementation: 'wait_command_adaptive_poll',
+    knowledge_canary_eligible: true, knowledge_canary_applied: true, knowledge_canary_bucket: 3
+  }, 'repo');
+  assert.deepEqual(normalized?.canary, {
+    knowledgeId: 'a'.repeat(64), implementation: 'wait_command_adaptive_poll', eligible: true, applied: true, bucket: 3
+  });
 });
 
 test('validated search canaries are deterministic and never rewrite caller exact-count intent', async () => {
@@ -811,6 +1300,58 @@ test('evolved Skill lifecycle requires held-out task evidence, uses session cana
   assert.equal((await store.get(learned.id)).status, 'rejected');
   assert.equal(await engine.decide(baseSkill, 'after-rollback'), undefined);
 });
+test('semantics-preserving canary promotes from call-level impact without task outcomes', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-knowledge-canary-semantic-promotion-'));
+  const store = new KnowledgeStore(root);
+  const canaryImpactStore = new CanaryImpactStore(root);
+  const validated = await store.upsert(record({
+    status: 'validated',
+    recommendedAction: { recommendation: 'prefer_bounded_search', semantic_preserving_implementation: 'search_exact_total_fast_tail' }
+  }));
+  const observations = [];
+  for (let index = 0; index < 10; index += 1) {
+    observations.push(observation({
+      eventId: `semantic-control-${index}`,
+      durationMs: 1_000,
+      timestampMs: 100 + index,
+      canary: {
+        knowledgeId: validated.id,
+        implementation: 'search_exact_total_fast_tail',
+        eligible: true,
+        applied: false,
+        bucket: 50 + index
+      }
+    }));
+  }
+  for (let index = 0; index < 20; index += 1) {
+    observations.push(observation({
+      eventId: `semantic-intervention-${index}`,
+      durationMs: 600,
+      timestampMs: 200 + index,
+      canary: {
+        knowledgeId: validated.id,
+        implementation: 'search_exact_total_fast_tail',
+        eligible: true,
+        applied: true,
+        bucket: index
+      }
+    }));
+  }
+  assert.equal(await canaryImpactStore.recordObservations(observations), 30);
+  const [before] = await canaryImpactStore.list();
+  assert.equal(before.interventionTaskVerifiedSuccesses, 0);
+  assert.equal(before.interventionTaskUnverifiedSuccesses, 0);
+  assert.equal(before.interventionTaskFailures, 0);
+  assert.equal(before.interventionTaskRollbacks, 0);
+
+  assert.deepEqual(await evaluateCanaryPromotions(store, canaryImpactStore, 400), { evaluated: 1, promoted: 1 });
+  assert.equal((await store.get(validated.id)).status, 'promoted');
+  const [after] = await canaryImpactStore.list();
+  assert.equal(after.promotedAtMs, 400);
+  assert.equal(after.promotionInterventionCalls, 20);
+  assert.equal(after.promotionInterventionTaskVerifiedSuccesses, 0);
+});
+
 test('successful canary promotes to 100 percent rollout and post-promotion rollback disables it', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-knowledge-canary-promotion-'));
   const store = new KnowledgeStore(root);

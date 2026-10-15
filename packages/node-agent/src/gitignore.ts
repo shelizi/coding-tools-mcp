@@ -216,6 +216,19 @@ async function commonGitDirectory(root: string): Promise<string | undefined> {
   }
 }
 
+export async function extraIgnoreFiles(root: string): Promise<string[]> {
+  const gitDirectory = await commonGitDirectory(root);
+  if (!gitDirectory) return [];
+  const exclude = path.join(gitDirectory, 'info', 'exclude');
+  try {
+    const info = await lstat(exclude);
+    if (info.isFile() && info.size <= MAX_IGNORE_FILE_BYTES) return [exclude];
+  } catch {
+    return [];
+  }
+  return [];
+}
+
 export async function rootIgnoreRules(root: string): Promise<IgnoreRule[]> {
   const rules: IgnoreRule[] = [];
   const gitDirectory = await commonGitDirectory(root);
@@ -228,5 +241,5 @@ export async function extendIgnoreRules(root: string, directory: string, inherit
   const base = path.relative(root, directory).replaceAll('\\', '/');
   const appended: IgnoreRule[] = [];
   for (const name of IGNORE_FILES) appended.push(...await rulesFromFile(path.join(directory, name), base));
-  return appended.length ? [...inherited, ...appended] : [...inherited];
+  return appended.length ? [...inherited, ...appended] : inherited as IgnoreRule[];
 }

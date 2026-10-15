@@ -551,20 +551,26 @@ async fn call_permission_tool_async(ctx: SharedToolContext, name: &str, args: &V
         return policy_tool_err(ctx.as_ref(), name, &effective_args, error);
     }
 
-    let tracking = match begin_tracked_call(ctx.as_ref(), name, args, &effective_args) {
-        Ok(tracking) => tracking,
-        Err(output) => return output,
-    };
-    let result = if effective_args.get("resume_id").is_some() {
-        resume_pending_operation_async(ctx.clone(), &effective_args).await
+    let inferred_resume_id = effective_args
+        .get("resume_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| ctx.pending_operations.single_resume_id());
+    let result = if let Some(resume_id) = inferred_resume_id {
+        let mut resume_args = effective_args.as_ref().clone();
+        if resume_args.get("resume_id").is_none() {
+            if let Some(object) = resume_args.as_object_mut() {
+                object.insert("resume_id".into(), Value::String(resume_id));
+            }
+        }
+        resume_pending_operation_async(ctx.clone(), &resume_args).await
     } else {
         request_permissions(ctx.as_ref(), &effective_args)
     };
-    let output = match result {
+    match result {
         Ok(value) => value,
         Err(error) => tool_err(error),
-    };
-    finish_tracked_call(ctx.as_ref(), name, args, tracking, output)
+    }
 }
 
 async fn resume_pending_operation_async(
@@ -771,6 +777,13 @@ fn call_tool_inner(
         }
     }
 
+    if name == "request_permissions" {
+        return match request_permissions(ctx, &effective_args) {
+            Ok(value) => value,
+            Err(error) => tool_err(error),
+        };
+    }
+
     let tracking = match begin_tracked_call(ctx, name, args, &effective_args) {
         Ok(tracking) => tracking,
         Err(output) => return output,
@@ -780,6 +793,7 @@ fn call_tool_inner(
     let result = match name {
         "history_session_bootstrap" => history::bootstrap(ctx, &effective_args),
         "history_session_checkpoint" => history::checkpoint(ctx, &effective_args),
+        "history_search" => history::search(ctx, &effective_args),
         "history_session_validate" => history::validate(ctx, &effective_args),
         "server_info" => server_info(ctx),
         "query_tool_usage" => crate::tools::tool_usage::query_tool_usage(ctx, &effective_args),
@@ -829,7 +843,6 @@ fn call_tool_inner(
         "desktop_scroll" => desktop::scroll(&effective_args),
         "desktop_type" => desktop::type_text(&effective_args),
         "desktop_key" => desktop::key(&effective_args),
-        "request_permissions" => request_permissions(ctx, &effective_args),
         _ => {
             return tool_err_code(
                 "INVALID_ARGUMENT",
@@ -915,7 +928,12 @@ fn canary_sample_key<'a>(
 
 fn request_permissions(ctx: &ToolContext, args: &Value) -> Result<Value, WorkspaceError> {
     let runtime = ctx.runtime_config();
-    if let Some(resume_id) = args.get("resume_id").and_then(Value::as_str) {
+    let inferred_resume_id = args
+        .get("resume_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| ctx.pending_operations.single_resume_id());
+    if let Some(resume_id) = inferred_resume_id.as_deref() {
         let operation = ctx.pending_operations.take(resume_id)?;
         let explicitly_approved = args
             .get("approve")
@@ -988,6 +1006,7 @@ fn request_permissions(ctx: &ToolContext, args: &Value) -> Result<Value, Workspa
             ]
         })))
     } else {
+        let resume_ids = ctx.pending_operations.resume_ids();
         Ok(tool_ok(json!({
             "ok": false,
             "status": "unsupported",
@@ -999,7 +1018,11 @@ fn request_permissions(ctx: &ToolContext, args: &Value) -> Result<Value, Workspa
                 "message": "Provide the resume_id returned by the blocked operation.",
                 "category": "permission",
                 "retryable": true,
-                "details": { "requested": args }
+                "details": {
+                    "requested": args,
+                    "pending_count": resume_ids.len(),
+                    "available_resume_ids": resume_ids
+                }
             }
         })))
     }
@@ -2034,6 +2057,12 @@ mod tests {
         assert_eq!(observations.len(), 1);
         assert_eq!(observations[0]["outcome"], "success");
         assert_eq!(observations[0]["overlap_ms"], 300);
+        assert_eq!(observations[0]["evidence_source"], "explicit_parallel");
+        assert_eq!(observations[0]["safety_sample"], true);
+        assert_eq!(
+            observations[0]["observation_id"].as_str().unwrap().len(),
+            64
+        );
 
         let conflict_results = vec![
             json!({
@@ -2079,6 +2108,96 @@ mod tests {
         let (observations, _) =
             collect_parallelism_observations(&locked_commands, &serialized_results, "parallel");
         assert_eq!(observations[0]["outcome"], "serialized");
+        assert_eq!(
+            observations[0]["evidence_source"],
+            "resource_lock_serialization"
+        );
+        assert_eq!(observations[0]["safety_sample"], false);
+
+        let (candidate_observations, _) =
+            collect_parallelism_observations(&commands, &results, "sequential");
+        assert_eq!(candidate_observations[0]["outcome"], "candidate");
+        assert_eq!(
+            candidate_observations[0]["candidate_kind"],
+            "read_only_safe_hint"
+        );
+        assert_eq!(
+            candidate_observations[0]["evidence_source"],
+            "read_only_shadow_safe"
+        );
+        assert_eq!(candidate_observations[0]["safety_sample"], false);
+
+        let explicit_locked_commands = parse_exec_batch_commands(&[
+            json!({"program": "node", "args": ["--version"], "lock_group": "shared-fixture"}),
+            json!({"program": "python", "args": ["--version"], "lock_group": "shared-fixture"}),
+        ])
+        .expect("explicit locked commands");
+        let (candidate_observations, _) =
+            collect_parallelism_observations(&explicit_locked_commands, &results, "sequential");
+        assert_eq!(candidate_observations[0]["outcome"], "candidate");
+        assert_eq!(candidate_observations[0]["candidate_kind"], "conflict_hint");
+        assert_eq!(
+            candidate_observations[0]["evidence_source"],
+            "resource_conflict_hint"
+        );
+
+        let write_scope_commands = parse_exec_batch_commands(&[
+            json!({"program": "node", "args": ["build-a.js"]}),
+            json!({"program": "python", "args": ["build-b.py"]}),
+        ])
+        .expect("write scope commands");
+        let private_scope = "C:\\private\\workspace\\target";
+        let write_scope_results = vec![
+            json!({
+                "id": "command-0",
+                "command_ok": true,
+                "resource_lock_wait_ms": 0,
+                "result": {
+                    "started_ts_ms": 1000,
+                    "elapsed_ms": 200,
+                    "resource_lock_group": "runtime-write-scope",
+                    "resource_lock_target": private_scope
+                }
+            }),
+            json!({
+                "id": "command-1",
+                "command_ok": true,
+                "resource_lock_wait_ms": 0,
+                "result": {
+                    "started_ts_ms": 1300,
+                    "elapsed_ms": 200,
+                    "resource_lock_group": "runtime-write-scope",
+                    "resource_lock_target": format!("{private_scope}\\nested")
+                }
+            }),
+        ];
+        let (candidate_observations, _) = collect_parallelism_observations(
+            &write_scope_commands,
+            &write_scope_results,
+            "sequential",
+        );
+        assert_eq!(candidate_observations[0]["outcome"], "candidate");
+        assert_eq!(candidate_observations[0]["candidate_kind"], "conflict_hint");
+        assert_eq!(
+            candidate_observations[0]["evidence_source"],
+            "filesystem_write_scope_conflict"
+        );
+        assert_eq!(candidate_observations[0]["same_lock_group"], true);
+        assert_eq!(candidate_observations[0]["overlapping_write_scope"], true);
+        assert_eq!(candidate_observations[0]["safety_sample"], false);
+        assert!(!candidate_observations[0]
+            .to_string()
+            .contains(private_scope));
+
+        let unknown_commands = parse_exec_batch_commands(&[
+            json!({"program": "node", "args": ["script-a.js"]}),
+            json!({"program": "python", "args": ["script-b.py"]}),
+        ])
+        .expect("unknown commands");
+        let (candidate_observations, _) =
+            collect_parallelism_observations(&unknown_commands, &results, "sequential");
+        assert_eq!(candidate_observations[0]["candidate_kind"], "unknown_pair");
+        assert_eq!(candidate_observations[0]["safety_sample"], false);
     }
 
     #[tokio::test]

@@ -155,6 +155,16 @@ pub fn redirect_uri_allowed(redirect_uri: &str) -> bool {
     }
     let origin = url.origin().ascii_serialization();
     OAUTH_REDIRECT_ORIGINS.contains(&origin.as_str())
+        || (origin == "https://oauth-redirect.googleusercontent.com"
+            && url
+                .path()
+                .strip_prefix("/r/user_bound_custom-mcp-")
+                .is_some_and(|suffix| {
+                    !suffix.is_empty()
+                        && suffix
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                }))
 }
 
 pub fn verify_oauth_bearer_header(
@@ -650,6 +660,7 @@ mod tests {
 
     #[test]
     fn redirect_allowlist_accepts_supported_chatgpt_origins() {
+        assert!(redirect_uri_allowed("https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-115782671353371059086-coding-tools_neo-ai_one"));
         assert!(redirect_uri_allowed(
             "https://chatgpt.com/connector/oauth/test"
         ));
@@ -664,6 +675,11 @@ mod tests {
     #[test]
     fn redirect_allowlist_rejects_untrusted_or_ambiguous_urls() {
         for redirect_uri in [
+            "https://oauth-redirect.googleusercontent.com/r/wrong",
+            "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-",
+            "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-valid/evil",
+            "https://oauth-redirect.googleusercontent.com.evil.example/r/user_bound_custom-mcp-valid",
+            "http://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-valid",
             "http://chatgpt.com/connector/oauth/test",
             "https://attacker.example/callback",
             "https://chatgpt.com.attacker.example/callback",

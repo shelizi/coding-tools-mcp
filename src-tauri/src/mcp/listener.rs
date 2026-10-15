@@ -56,12 +56,15 @@ pub(crate) fn behavioral_parity_fixture() -> Value {
         "latest_protocol_version": LATEST_PROTOCOL_VERSION,
         "supported_protocol_versions": SUPPORTED_PROTOCOL_VERSIONS,
         "stream_heartbeat_interval_ms": MCP_STREAM_HEARTBEAT_INTERVAL.as_millis(),
-        "stream_channel_capacity": MCP_STREAM_CHANNEL_CAPACITY
+        "stream_channel_capacity": MCP_STREAM_CHANNEL_CAPACITY,
+        "conversation_handle_ttl_ms": super::conversation_handles::TTL_MS,
+        "max_conversation_handles": super::conversation_handles::MAX_HANDLES
     })
 }
 
 #[derive(Clone)]
 struct ListenerState {
+    conversation_handles: Arc<std::sync::Mutex<super::conversation_handles::HandleStore>>,
     mcp: SharedState,
     auth: AuthConfig,
     workspace_id: String,
@@ -232,6 +235,36 @@ async fn mcp_post(
         return response;
     }
 
+    super::identity_diagnostics::record(&state.workspace_id, &headers, &body);
+
+    // Authentication above is authoritative. Never derive an owner from client
+    // JSON, identity headers or an unverified Authorization value.
+    let credential =
+        if state.auth.bearer_enabled() || (state.auth.oauth_enabled() && state.oauth.is_some()) {
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        } else {
+            None
+        };
+    let mut body = body;
+    let handle_response = match super::conversation_handles::prepare(
+        &state.conversation_handles,
+        &state.workspace_id,
+        credential,
+        &mut body,
+    ) {
+        Ok(grant) => grant,
+        Err(error) => {
+            return json_no_store(
+                json!({"jsonrpc": "2.0", "id": body.get("id").cloned().unwrap_or(Value::Null), "error": error}),
+            )
+        }
+    };
+
     let method = body
         .get("method")
         .and_then(Value::as_str)
@@ -269,6 +302,7 @@ async fn mcp_post(
         &argument_value,
         started_ts_ms,
     );
+    session_activity::record_workspace_access(&state.workspace_id, started_ts_ms);
     let request_timing =
         (!tool_name.is_empty()).then(|| begin_tool_request(&state.workspace_id, started_ts_ms));
     let orchestration_gap_log = request_timing
@@ -376,24 +410,31 @@ async fn mcp_post(
     let response_id = request_id.clone();
     let diagnostic_method_name = method.clone();
     let missing_elicitation_tool = tool_name.clone();
-    let execution = execute_rpc(
-        RpcExecutionContext {
-            state,
-            method,
-            request_id,
-            tool_name,
-            argument_value,
-            started_ts_ms,
-            started_at,
-            session_activity,
-            request_timing,
-            request_json_bytes,
-            protocol_version,
-            host_session_key: host_session_key_owned,
-        },
-        body,
-        fast_path,
-    );
+    let execution = async move {
+        let response = execute_rpc(
+            RpcExecutionContext {
+                state,
+                method,
+                request_id,
+                tool_name,
+                argument_value,
+                started_ts_ms,
+                started_at,
+                session_activity,
+                request_timing,
+                request_json_bytes,
+                protocol_version,
+                host_session_key: host_session_key_owned,
+            },
+            body,
+            fast_path,
+        )
+        .await;
+        match handle_response {
+            Some(grant) => grant.decorate(response),
+            None => response,
+        }
+    };
     if !fast_path && !is_notification && !missing_elicitation_check {
         return streaming_json_no_store(execution);
     }
@@ -1378,6 +1419,7 @@ mod tests {
             ..AuthConfig::default()
         };
         let state = ListenerState {
+            conversation_handles: Default::default(),
             mcp,
             auth,
             workspace_id: "test-workspace".into(),
@@ -1399,6 +1441,205 @@ mod tests {
         let port = occupied.local_addr().expect("读取测试端口").port();
 
         assert!(bind_listener("0.0.0.0", port).is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticated_conversation_handles_route_and_reject_identity_conflicts() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(second.path().join("nested")).unwrap();
+        std::fs::write(
+            second.path().join("nested/marker.txt"),
+            "handle nested file",
+        )
+        .unwrap();
+        let profile_id = format!("handle-http-{}", uuid::Uuid::new_v4());
+        let auth = AuthConfig {
+            auth_type: "bearer".into(),
+            ..Default::default()
+        };
+        let folders = [("first", first.path()), ("second", second.path())]
+            .into_iter()
+            .map(|(id, path)| crate::workspace::WorkspaceFolder {
+                id: id.into(),
+                name: id.into(),
+                path: path.display().to_string(),
+                execution: Default::default(),
+            })
+            .collect();
+        let mcp = crate::mcp::server::new_state(
+            folders,
+            "first".into(),
+            profile_id.clone(),
+            auth.clone(),
+            Default::default(),
+            "full".into(),
+            "trusted".into(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        let state = ListenerState {
+            conversation_handles: Default::default(),
+            mcp,
+            auth,
+            workspace_id: profile_id.clone(),
+            bind_address: "127.0.0.1".into(),
+            bind_port: 28766,
+            configured_public_url: "https://mcp.example.com".into(),
+            bearer_token: Some("credential-a".into()),
+            oauth: None,
+            oauth_client_secret: None,
+            transport_mode: "streamable-http".into(),
+            redact_telemetry: false,
+        };
+        async fn call(
+            state: &ListenerState,
+            credential: &str,
+            name: &str,
+            args: Value,
+            native: Option<&str>,
+        ) -> Value {
+            let mut body = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":name, "arguments":args}});
+            if let Some(native) = native {
+                body["params"]["_meta"] = json!({"openai/session":native});
+            }
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "authorization",
+                format!("Bearer {credential}").parse().unwrap(),
+            );
+            let response = mcp_post(State(state.clone()), headers, Json(body)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 2_000_000)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let choices = call(
+            &state,
+            "credential-a",
+            "conversation_bootstrap",
+            json!({}),
+            None,
+        )
+        .await;
+        let choices = &choices["result"]["structuredContent"];
+        assert_eq!(choices["needs_folder_selection"], true);
+        let handle = choices["conversation_handle"].as_str().expect("handle");
+        let selected = call(
+            &state,
+            "credential-a",
+            "conversation_bootstrap",
+            json!({"conversation_handle":handle,"folder_id":"second"}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            selected["result"]["structuredContent"]["selected_folder_id"], "second",
+            "{selected}"
+        );
+        let cwd = call(
+            &state,
+            "credential-a",
+            "set_default_cwd",
+            json!({"conversation_handle":handle,"path":"nested"}),
+            None,
+        )
+        .await;
+        assert_eq!(cwd["result"]["structuredContent"]["ok"], true, "{cwd}");
+        let read = call(
+            &state,
+            "credential-a",
+            "read_file",
+            json!({"conversation_handle":handle,"path":"marker.txt"}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            read["result"]["structuredContent"]["content"], "handle nested file",
+            "{read}"
+        );
+        let independent = call(
+            &state,
+            "credential-a",
+            "conversation_bootstrap",
+            json!({}),
+            None,
+        )
+        .await;
+        assert_eq!(
+            independent["result"]["structuredContent"]["needs_folder_selection"],
+            true
+        );
+        assert_ne!(
+            independent["result"]["structuredContent"]["conversation_handle"],
+            handle
+        );
+        let mut rotated = state.clone();
+        rotated.bearer_token = Some("credential-b".into());
+        let denied = call(&rotated, "credential-b", "read_file", json!({"conversation_handle":handle,"workspace_folder_id":"second","path":"marker.txt"}), None).await;
+        assert_eq!(
+            denied["error"]["data"]["error_code"],
+            "CONVERSATION_HANDLE_INVALID"
+        );
+        let conflict = call(
+            &state,
+            "credential-a",
+            "list_workspace_folders",
+            json!({"conversation_handle":handle}),
+            Some("native-chat"),
+        )
+        .await;
+        assert_eq!(
+            conflict["error"]["data"]["error_code"],
+            "CONVERSATION_HANDLE_CONFLICT"
+        );
+        let native = call(
+            &state,
+            "credential-a",
+            "conversation_bootstrap",
+            json!({"folder_id":"first"}),
+            Some("native-chat"),
+        )
+        .await;
+        assert!(native["result"]["structuredContent"]
+            .get("conversation_handle")
+            .is_none());
+        let native_handle = call(
+            &state,
+            "credential-a",
+            "conversation_bootstrap",
+            json!({"create_conversation_handle":true}),
+            Some("native-chat"),
+        )
+        .await;
+        assert_eq!(
+            native_handle["result"]["structuredContent"]["platform_conversation_bound"],
+            true
+        );
+        assert!(
+            native_handle["result"]["structuredContent"]["conversation_handle"]
+                .as_str()
+                .is_some()
+        );
+        let unauth = mcp_post(State(state.clone()), HeaderMap::new(), Json(json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"conversation_bootstrap","arguments":{}}}))).await;
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+        let logs = crate::tunnel::log_dir_for_profile(&profile_id);
+        for _ in 0..40 {
+            if std::fs::read_to_string(logs.join("mcp-requests.log"))
+                .unwrap_or_default()
+                .contains("tool=read_file")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        for file in ["mcp-requests.log", "diagnostics.jsonl"] {
+            let logged = std::fs::read_to_string(logs.join(file)).unwrap_or_default();
+            assert!(!logged.contains(handle), "raw handle leaked into {file}");
+        }
+        crate::tools::hub::remove_live_hub(&profile_id);
     }
 
     #[test]

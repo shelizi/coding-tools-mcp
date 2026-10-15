@@ -1,12 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createToolContext } from '../dist/server.js';
 import { callTool } from '../dist/tools.js';
 import { disposeProcessSessions } from '../dist/processes.js';
 import { runtimeForFolderId } from '../dist/folderRuntime.js';
+import { syncDurableSession } from '../dist/processes/durableSession.js';
 
 const nodeProgram = path.basename(process.execPath);
 const sleeper = ['-e', "console.log('job-start'); setTimeout(() => console.log('job-end'), 60000)"];
@@ -41,6 +43,52 @@ async function waitFinal(invoke, sessionId) {
   assert.fail(`session did not finalize: ${JSON.stringify(result)}`);
 }
 
+test('durable monitor waits for a late result file before declaring a dead worker crashed', async t => {
+  const dataDir = await mkdtemp(path.join(tmpdir(), 'ctmcp-durable-race-data-'));
+  t.after(() => rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }));
+  const folderId = 'repo';
+  const sessionId = 'late-result';
+  const folderKey = `${encodeURIComponent(folderId)}-${createHash('sha256').update(folderId).digest('hex').slice(0, 8)}`;
+  const durableDirectory = path.join(dataDir, 'process-sessions', folderKey, sessionId);
+  await mkdir(durableDirectory, { recursive: true });
+  await Promise.all([
+    writeFile(path.join(durableDirectory, 'stdout.log'), ''),
+    writeFile(path.join(durableDirectory, 'stderr.log'), '')
+  ]);
+  const ctx = { config: { dataDir, limits: { maxOutputBytes: 1024 * 1024 } } };
+  const session = {
+    id: sessionId,
+    folderId,
+    durableDirectory,
+    durableWorkerPid: 0x7fffffff,
+    stdoutBytes: 0,
+    stderrBytes: 0
+  };
+
+  const first = await syncDurableSession(ctx, session);
+  assert.equal(first, undefined);
+  assert.ok(Number.isFinite(session.durableWorkerExitObservedAt));
+
+  const expected = {
+    version: 1,
+    exitCode: 0,
+    signal: null,
+    terminationReason: 'exited',
+    error: null,
+    endedAt: Date.now()
+  };
+  await writeFile(path.join(durableDirectory, 'result.json'), `${JSON.stringify(expected)}\n`);
+  const recovered = await syncDurableSession(ctx, session);
+  assert.deepEqual(recovered, expected);
+  assert.equal(session.durableWorkerExitObservedAt, undefined);
+
+  await rm(path.join(durableDirectory, 'result.json'), { force: true });
+  session.durableWorkerExitObservedAt = Date.now() - 6_000;
+  const crashed = await syncDurableSession(ctx, session);
+  assert.equal(crashed.terminationReason, 'crashed');
+  assert.match(crashed.error, /retry grace period/i);
+});
+
 test('managed job survives ordinary command cap and reattaches without renewing its deadline', async t => {
   const { invoke } = await fixture(t);
   const args = { program: nodeProgram, args: sleeper, operation_id: 'long-one', job_timeout_ms: 5000, yield_time_ms: 0 };
@@ -50,6 +98,20 @@ test('managed job survives ordinary command cap and reattaches without renewing 
   assert.equal(started.effective_process_timeout_ms, 5000);
   assert.equal(started.process_deadline_ts_ms - started.started_ts_ms, 5000);
   assert.equal(started.polling_extends_process_deadline, false);
+  assert.equal(started.next_actions[0].tool, 'resolve_operation');
+  assert.deepEqual(started.next_actions[0].arguments, {
+    operation_id: 'long-one',
+    cursor: started.latest_cursor,
+    output_mode: 'delta',
+    event_detail: 'compact'
+  });
+  const snapshotStartedAt = Date.now();
+  const snapshot = await invoke('resolve_operation', started.next_actions[0].arguments);
+  assert.ok(Date.now() - snapshotStartedAt < 500, JSON.stringify(snapshot));
+  assert.equal(snapshot.process_still_running, true, JSON.stringify(snapshot));
+  assert.equal(snapshot.process_deadline_ts_ms, started.process_deadline_ts_ms);
+  assert.equal(snapshot.next_actions[0].tool, 'resolve_operation');
+  assert.equal(snapshot.next_actions[0].arguments.operation_id, 'long-one');
   const waited = await invoke('wait_command', { session_id: started.session_id, until: 'finalized', timeout_ms: 300 });
   assert.equal(waited.request_timed_out, true);
   assert.equal(waited.process_still_running, true);

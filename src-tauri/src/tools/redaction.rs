@@ -192,6 +192,7 @@ pub fn is_sensitive_key(key: &str) -> bool {
     }
 
     normalized == "stdin"
+        || normalized == "conversation_handle"
         || normalized == "chars"
         || normalized == "authorization"
         || normalized == "cookie"
@@ -262,7 +263,7 @@ pub fn redact_sensitive_text(value: &str) -> (String, u64) {
     });
     let known_token_re = KNOWN_TOKEN_RE.get_or_init(|| {
         Regex::new(
-            r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})\b",
+            r"\b(?:ch_[a-f0-9]{64}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})\b",
         )
         .expect("valid known token regex")
     });

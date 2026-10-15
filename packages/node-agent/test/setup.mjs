@@ -1,5 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { after } from 'node:test';
 
 // Test processes must never inherit live Agent state or listener overrides.
 delete process.env.CTMCP_DATA_DIR;
@@ -19,7 +20,8 @@ if (process.platform === 'win32') {
 
 // Windows cancels later tests in a file when spawned children unref every timer
 // and the test runner sees beforeExit. A referenced interval keeps the file
-// alive; --test-force-exit ends the process after the tests settle.
+// alive until the root after hook lets remaining resources drain naturally.
 if (process.platform === 'win32' && process.env.NODE_TEST_CONTEXT === 'child-v8') {
-  setInterval(() => {}, 60_000);
+  const keepAlive = setInterval(() => {}, 60_000);
+  after(() => clearInterval(keepAlive));
 }

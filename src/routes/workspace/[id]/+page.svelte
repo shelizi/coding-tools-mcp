@@ -48,7 +48,7 @@
   } from "$lib/types";
   import { t } from "$lib/i18n";
 
-  type WorkspaceTab = "overview" | "history" | "telemetry" | "logs" | "health" | "features" | "mcp" | "actions" | "settings";
+  type WorkspaceTab = "overview" | "history" | "telemetry" | "statistics" | "logs" | "health" | "features" | "mcp" | "actions" | "settings";
   type ServiceSection = "service" | "tunnel" | "auth" | "policy" | "logs" | "health";
 
   const capabilities = getBackend().capabilities;
@@ -56,6 +56,7 @@
     "overview",
     "history",
     "telemetry",
+    "statistics",
     "logs",
     "health",
     "features",
@@ -81,6 +82,7 @@
   let actionsBusy = $state(false);
   let mcpLocal = $state("");
   let mcpPublic = $state("");
+  let mcpLastActivityAtMs = $state<number | null>(null);
   let actionsLocal = $state("");
   let actionsPublic = $state("");
   let frpProfiles = $state<FrpProfileDto[]>([]);
@@ -107,6 +109,9 @@
   let telemetryViewerPromise:
     | Promise<typeof import("$lib/components/TelemetryViewer.svelte")>
     | undefined;
+  let statisticsViewerPromise:
+    | Promise<typeof import("$lib/components/StatisticsViewer.svelte")>
+    | undefined;
   let operationLogViewerPromise:
     | Promise<typeof import("$lib/components/OperationLogViewer.svelte")>
     | undefined;
@@ -122,6 +127,7 @@
       { value: "overview", label: $t("Overview") },
       { value: "history", label: $t("History") },
       { value: "telemetry", label: $t("Telemetry") },
+      { value: "statistics", label: $t("Statistics") },
       capabilities.operationLogs ? { value: "logs", label: $t("Operation logs") } : null,
       { value: "health", label: $t("Health") },
       capabilities.workspaceFeatureControls
@@ -159,6 +165,10 @@
 
   function loadTelemetryViewer() {
     return (telemetryViewerPromise ??= import("$lib/components/TelemetryViewer.svelte"));
+  }
+
+  function loadStatisticsViewer() {
+    return (statisticsViewerPromise ??= import("$lib/components/StatisticsViewer.svelte"));
   }
 
   function loadOperationLogViewer() {
@@ -244,7 +254,13 @@
   }
 
   function applyMcpRuntime(
-    runtime: { state: RuntimeState; localEndpoint: string; publicEndpoint: string; localMessage?: string },
+    runtime: {
+      state: RuntimeState;
+      localEndpoint: string;
+      publicEndpoint: string;
+      localMessage?: string;
+      lastActivityAtMs?: number | null;
+    },
     id = workspaceId,
   ) {
     if (!id || id !== workspaceId) return;
@@ -252,6 +268,7 @@
     mcpStatusMessage = runtime.localMessage ?? "";
     mcpLocal = runtime.localEndpoint;
     mcpPublic = runtime.publicEndpoint;
+    mcpLastActivityAtMs = runtime.lastActivityAtMs ?? null;
     mcpRuntimeStates.update((current) => ({ ...current, [id]: runtime.state }));
   }
 
@@ -799,10 +816,12 @@
               {actionsBusy}
               {mcpLocal}
               {mcpPublic}
+              {mcpLastActivityAtMs}
               {actionsLocal}
               {actionsPublic}
               {frpProfiles}
               {stateLabel}
+              onRefreshMcp={refreshMcpRuntime}
               onToggleMcp={toggleMcp}
               onToggleActions={toggleActions}
               onNavigate={(tab) => navigateWorkspace(tab)}
@@ -825,6 +844,13 @@
           {:then module}
             {@const TelemetryViewer = module.default}
             <TelemetryViewer workspaceId={workspaceId!} />
+          {/await}
+        {:else if activeWorkspaceTab === "statistics"}
+          {#await loadStatisticsViewer()}
+            <div class="tx-card p-5 text-sm text-[var(--color-text-muted)]">{$t("Working…")}</div>
+          {:then module}
+            {@const StatisticsViewer = module.default}
+            <StatisticsViewer workspaceId={workspaceId!} />
           {/await}
         {:else if activeWorkspaceTab === "logs"}
           {#await loadOperationLogViewer()}

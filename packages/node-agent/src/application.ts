@@ -83,6 +83,11 @@ export interface LoadedApplication {
   registryCreated: boolean;
 }
 
+export interface WorkspaceRuntimeLifecycle {
+  start(workspaceId: string): Promise<void>;
+  stop(workspaceId: string): Promise<void>;
+}
+
 interface ManagedWorkspaceProfile {
   id: string;
   name: string;
@@ -208,11 +213,13 @@ export class ApplicationConfigStore {
   readonly primaryWorkspaceId: string;
   private registry: WorkspaceRegistryDocument;
   private readonly workspaces = new Map<string, ManagedWorkspaceProfile>();
+  private runtimeLifecycle?: WorkspaceRuntimeLifecycle;
 
-  constructor(application: LoadedApplication) {
+  constructor(application: LoadedApplication, runtimeLifecycle?: WorkspaceRuntimeLifecycle) {
     this.registryPath = application.registryPath;
     this.registry = structuredClone(application.registry);
     this.primaryWorkspaceId = application.workspaces[0]?.id ?? '';
+    this.runtimeLifecycle = runtimeLifecycle;
     for (const workspace of application.workspaces) {
       this.workspaces.set(workspace.id, {
         id: workspace.id,
@@ -220,6 +227,10 @@ export class ApplicationConfigStore {
         store: new ConfigStore(workspace.loaded)
       });
     }
+  }
+
+  setRuntimeLifecycle(runtimeLifecycle?: WorkspaceRuntimeLifecycle): void {
+    this.runtimeLifecycle = runtimeLifecycle;
   }
 
   entries(): Array<{ id: string; name: string; store: ConfigStore }> {
@@ -263,6 +274,8 @@ export class ApplicationConfigStore {
       host: '127.0.0.1',
       port,
       dataDir: workspaceHome,
+      permissionMode: 'guarded',
+      toolProfile: 'core',
       folders: [{ path: folder, name: workspaceName }],
       management: { enabled: false },
       oauth: { clientId: createOAuthClientId() },
@@ -274,12 +287,14 @@ export class ApplicationConfigStore {
     this.workspaces.set(id, { id, name: workspaceName, store: new ConfigStore(loaded) });
     this.registry.workspaces.push({ id, name: workspaceName, configPath });
     await writeRegistry(this.registryPath, this.registry);
+    const runtimeLifecycle = this.runtimeLifecycle;
+    if (runtimeLifecycle) await runtimeLifecycle.start(id);
     return {
       ...this.workspace(id).store.snapshot(),
       ok: true,
       id,
       name: workspaceName,
-      restartRequired: true
+      restartRequired: !runtimeLifecycle
     };
   }
 
@@ -394,12 +409,14 @@ export class ApplicationConfigStore {
     this.workspaces.set(id, { id, name: workspaceName, store: new ConfigStore(loaded) });
     this.registry.workspaces.push({ id, name: workspaceName, configPath });
     await writeRegistry(this.registryPath, this.registry);
+    const runtimeLifecycle = this.runtimeLifecycle;
+    if (runtimeLifecycle) await runtimeLifecycle.start(id);
     return {
       ...this.workspace(id).store.snapshot(),
       ok: true,
       id,
       name: workspaceName,
-      restartRequired: true
+      restartRequired: !runtimeLifecycle
     };
   }
 
@@ -407,10 +424,12 @@ export class ApplicationConfigStore {
     if (id === this.primaryWorkspaceId) throw new Error('The primary workspace cannot be deleted');
     if (this.registry.workspaces.length <= 1) throw new Error('At least one workspace must remain');
     if (!this.workspaces.has(id)) throw new Error(`Workspace was not found: ${id}`);
+    const runtimeLifecycle = this.runtimeLifecycle;
+    if (runtimeLifecycle) await runtimeLifecycle.stop(id);
     this.registry.workspaces = this.registry.workspaces.filter(item => item.id !== id);
     this.workspaces.delete(id);
     await writeRegistry(this.registryPath, this.registry);
-    return { ok: true, id, restartRequired: true };
+    return { ok: true, id, restartRequired: !runtimeLifecycle };
   }
 
   workspace(id: string): { id: string; name: string; store: ConfigStore } {

@@ -50,7 +50,8 @@ export function statusPayload(options: ManagementOptions): JsonObject {
       folders: record.context.config.folders,
       permissionMode: record.context.config.permissionMode,
       toolProfile: record.context.config.activeToolProfile,
-      tunnel: record.context.tunnelStatus
+      tunnel: record.context.tunnelStatus,
+      lastMcpAccessAtMs: record.context.lastMcpAccessAtMs ?? null
     })),
     permissionMode: primary.context.config.permissionMode,
     sessions: {

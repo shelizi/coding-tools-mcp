@@ -9,6 +9,7 @@ export const CANONICAL_SCHEMA_VERSION = 2 as const;
 
 const securityPolicyKeys = [
   "restrictToolCatalog",
+  "advertiseReadOnlyAnnotations",
   "enforceCommandAllowlist",
   "requireDangerousConfirmation",
   "requireShellConfirmation",
@@ -218,7 +219,7 @@ export function parseCanonicalWorkspace(value: unknown): CanonicalWorkspace {
       oauthTokenTtlSeconds: integer(auth.oauthTokenTtlSeconds ?? auth.oauth_token_ttl_seconds, 7 * 24 * 60 * 60)
     },
     toolProfile: text(value.toolProfile, 'core') || 'core',
-    permissionMode: text(value.permissionMode, 'trusted') || 'trusted',
+    permissionMode: text(value.permissionMode, 'guarded') || 'guarded',
     securityPolicy: parseSecurityPolicy(value.securityPolicy),
     policy: {
       allowedCommands: stringList(policy.allowedCommands),
@@ -314,7 +315,7 @@ export function migrateNodeV1Document(
       oauthTokenTtlSeconds: integer(oauth.tokenTtlSeconds, 7 * 24 * 60 * 60)
     },
     toolProfile: text(value.toolProfile, 'core') || 'core',
-    permissionMode: text(value.permissionMode, 'trusted') || 'trusted',
+    permissionMode: text(value.permissionMode, 'guarded') || 'guarded',
     securityPolicy: value.securityPolicy,
     policy: value.policy,
     sandbox: value.sandbox,
@@ -375,6 +376,7 @@ export function migrateDesktopProfile(value: unknown): CanonicalWorkspace {
   const sourcePolicy = recordValue(runtime.security_policy);
   for (const [snake, camel] of [
     ['restrict_tool_catalog', 'restrictToolCatalog'],
+    ['advertise_read_only_annotations', 'advertiseReadOnlyAnnotations'],
     ['enforce_command_allowlist', 'enforceCommandAllowlist'],
     ['require_dangerous_confirmation', 'requireDangerousConfirmation'],
     ['require_shell_confirmation', 'requireShellConfirmation'],
@@ -411,7 +413,7 @@ export function migrateDesktopProfile(value: unknown): CanonicalWorkspace {
       oauthTokenTtlSeconds: integer(auth.oauth_token_ttl_seconds, 7 * 24 * 60 * 60)
     },
     toolProfile: text(runtime.tool_profile, 'core') || 'core',
-    permissionMode: text(runtime.permission_mode, 'trusted') || 'trusted',
+    permissionMode: text(runtime.permission_mode, 'safe') || 'safe',
     securityPolicy: policy,
     policy: {
       allowedCommands: stringList(runtime.allowed_commands),

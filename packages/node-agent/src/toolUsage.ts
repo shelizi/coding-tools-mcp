@@ -8,11 +8,13 @@ import { requestMutates, toolUsageFamily } from './toolRuntime.js';
 import type {
   AsyncSessionUsageInput,
   DiagnosticEventInput,
+  DiagnosticRecordVisitResult,
   ToolRequestTiming,
   ToolUsageInput,
   ToolUsageStoreContract
 } from './toolUsage/contract.js';
 import { ToolUsageLogStore } from './toolUsage/logStore.js';
+import { usageStatistics } from './toolUsage/statistics.js';
 
 export type {
   AsyncSessionUsageInput,
@@ -35,9 +37,9 @@ export const TOOL_USAGE_QUEUE_CAPACITY = 1_024;
 export const TOOL_USAGE_RECORD_CURSOR_MAX = 10_000;
 export const DEFAULT_BURST_IDLE_MS = 120_000;
 
-const MAX_LOG_STRING_CHARS = 4 * 1024;
-const MAX_ARGUMENT_RECORD_BYTES = 4 * 1024;
-const MAX_ARGUMENT_PREVIEW_BYTES = 512;
+const MAX_LOG_STRING_CHARS = 64 * 1024;
+const MAX_ARGUMENT_RECORD_BYTES = 64 * 1024;
+const MAX_ARGUMENT_PREVIEW_BYTES = 4 * 1024;
 const FAILURE_IDENTITY_FIELDS = [
   'path', 'file_index', 'edit_index', 'start_line', 'end_line',
   'expected_sha256', 'actual_sha256', 'expected_occurrences', 'actual_occurrences',
@@ -74,8 +76,9 @@ const STRUCTURED_FIELDS = [
   'execution_boundary', 'sandbox_enforced', 'program', 'shell', 'resolved_cwd',
   'child_process', 'interactive', 'stdin_open', 'elapsed_ms', 'first_output_ms',
   'returned_count', 'total_matches', 'total_matches_exact', 'calculate_total', 'matched_files',
-  'files_considered', 'scanned_files', 'scan_excluded_worktree_container_count', 'scan_completed', 'early_stop_reason', 'skipped_large_files', 'bytes_read',
+  'files_considered', 'scanned_files', 'scan_excluded_worktree_container_count', 'scan_completed', 'early_stop_reason', 'skipped_large_files', 'skipped_binary_files', 'bytes_read',
   'exact_total_forced_full_scan', 'exact_total_fast_tail', 'exact_total_fast_tail_skipped_match_details',
+  'knowledge_shadow_equivalence_implementation', 'knowledge_shadow_equivalence_passed',
   'knowledge_canary_id', 'knowledge_canary_implementation', 'knowledge_canary_eligible', 'knowledge_canary_stage',
   'knowledge_canary_selected', 'knowledge_canary_applied', 'knowledge_canary_bucket',
   'total_bytes', 'total_lines', 'total_stream_bytes', 'total_retained_bytes',
@@ -89,9 +92,11 @@ const STRUCTURED_FIELDS = [
   'requested_mode', 'auto_selected', 'parallel_decision_source', 'parallel_confidence',
   'parallel_history_samples', 'parallel_blocked_pair_count', 'recommended_max_parallel',
   'inferred_lock_group_count', 'parallel_observation_count',
-  'parallelism_observation_truncated', 'wait_timeout_ms', 'effective_wait_ms',
-  'wait_timed_out', 'wait_completed', 'process_completed', 'terminal',
-  'progress_since_last_wait', 'next_wait_ms', 'heartbeat_ms', 'heartbeat',
+  'parallelism_observation_truncated', 'wait_timeout_ms', 'effective_wait_ms', 'transport_safe_wait_ms',
+  'wait_timed_out', 'observation_timed_out', 'observation_state', 'wait_completed', 'process_completed', 'terminal',
+  'progress_since_last_wait', 'next_wait_ms', 'recommended_wait_ms', 'recommended_until',
+  'since_last_output_ms', 'wait_returned_empty', 'wait_returned_output', 'wait_returned_terminal',
+  'wait_transport_cap_reached', 'heartbeat_ms', 'heartbeat',
   'deduplicated', 'coalesced_inflight', 'coalesced_wait_ms',
   'graph_operation_id', 'graph_action', 'graph_status', 'graph_completed', 'graph_execution_ok', 'graph_progress_ok', 'control_ok', 'reattached', 'graph_deduplicated', 'graph_yield_ms', 'graph_wait_ms',
   'cancel_requested', 'cancel_accepted', 'cancelled_session_count', 'forgotten',
@@ -179,6 +184,11 @@ interface ToolStats {
   failedCommandIds: number;
   skippedCommandIds: number;
   emptyWaitTimeouts: number;
+  avoidableEmptyWaitTimeouts: number;
+  transportCapEmptyWaits: number;
+  waitReturnedOutput: number;
+  waitReturnedTerminal: number;
+  waitRecommendationUsed: number;
   deduplicatedCalls: number;
   heartbeatResponses: number;
   detachedResponses: number;
@@ -200,6 +210,15 @@ interface ToolStats {
   searchZeroResultCalls: number;
   searchEarlyStops: number;
   searchExactTotalCalls: number;
+  searchCallerIntentObservedCalls: number;
+  searchCalculateTotalExplicitCalls: number;
+  searchCalculateTotalRequestedCalls: number;
+  searchCountOnlyRequestedCalls: number;
+  patchCheckFailures: number;
+  patchPreflightFailures: number;
+  patchContextFailures: number;
+  patchEditRecommendedFailures: number;
+  patchPreventableSimpleFailures: number;
   phaseLatency: Record<PhaseName, PhaseStats>;
   durations: number[];
 }
@@ -251,13 +270,22 @@ interface ParallelPairStats {
   serialized: number;
   failures: number;
   notOverlapped: number;
+  candidateObservations: number;
+  readOnlySafeHints: number;
+  conflictHints: number;
+  overlapHints: number;
+  unknownCandidates: number;
   overlapMs: number;
   lockWaitMs: number;
 }
 
 interface ParallelHistory {
   pairs: Map<string, ParallelPairStats>;
+  seenObservationIds: Set<string>;
   totalObservations: number;
+  actualObservations: number;
+  candidateObservations: number;
+  duplicateObservationsIgnored: number;
 }
 
 interface RepeatedFailureGroup {
@@ -373,6 +401,28 @@ function warningSeverityCounts(result: JsonObject): JsonObject {
     else output.notice_count += 1;
   }
   return output;
+}
+
+function copyCallerIntentMetrics(record: JsonObject, tool: string, args: JsonObject): void {
+  if (tool === 'search_text') {
+    record.caller_intent_calculate_total_explicit = Object.hasOwn(args, 'calculate_total');
+    record.caller_intent_calculate_total = args.calculate_total === true;
+    record.caller_intent_count_only = args.count_only === true;
+    return;
+  }
+  if (tool === 'apply_patch' && typeof args.patch === 'string') {
+    const lines = args.patch.replaceAll('\r\n', '\n').split('\n');
+    const fileMarkers = lines.filter(line => /^\+\+\+\s+/.test(line) || /^\*\*\*\s+(?:Update|Add|Delete) File:/.test(line));
+    record.caller_intent_patch_bytes = Buffer.byteLength(args.patch);
+    record.caller_intent_patch_file_count = fileMarkers.length;
+    record.caller_intent_patch_hunk_count = lines.filter(line => /^@@/.test(line)).length;
+    return;
+  }
+  if (tool === 'wait_command') {
+    if (Number.isFinite(Number(args.timeout_ms))) record.caller_intent_wait_timeout_ms = Math.max(0, Number(args.timeout_ms));
+    if (typeof args.until === 'string') record.caller_intent_wait_until = args.until;
+    record.caller_intent_wait_timeout_explicit = Object.hasOwn(args, 'timeout_ms');
+  }
 }
 
 function copyResultMetrics(record: JsonObject, tool: string, result: JsonObject, redact: boolean): void {
@@ -514,6 +564,9 @@ function buildToolCallRecord(store: ToolUsageStore, input: ToolUsageInput): Json
     conversation_operation_id: typeof input.result.harness_operation_id === 'string'
       ? input.result.harness_operation_id
       : null,
+    conversation_context_id_hash: typeof input.conversationContextId === 'string' && input.conversationContextId
+      ? createHash('sha256').update(input.conversationContextId).digest('hex')
+      : null,
     started_ts_ms: input.startedTsMs,
     completed_ts_ms: input.startedTsMs + input.durationMs,
     workspace_id: store.profileId,
@@ -549,6 +602,7 @@ function buildToolCallRecord(store: ToolUsageStore, input: ToolUsageInput): Json
     structured_field_count: Object.keys(input.result).length,
     is_error: input.result.ok === false
   };
+  copyCallerIntentMetrics(record, input.tool, input.arguments);
   if (argumentBytes.length <= MAX_ARGUMENT_RECORD_BYTES) record.arguments = sanitizedArguments;
   else record.arguments_preview = truncateUtf8(JSON.stringify(sanitizedArguments), MAX_ARGUMENT_PREVIEW_BYTES);
   const keys = Object.keys(sanitizedArguments).sort();
@@ -609,14 +663,20 @@ function newToolStats(): ToolStats {
     actualWaitMs: 0, snapshotMs: 0, resourceLockWaitMs: 0, operationLockWaitMs: 0,
     batchQueueWaitMs: 0, queueNonzero: 0, requestBytes: 0, responseBytes: 0,
     recoveryActions: 0, failedCommandIds: 0, skippedCommandIds: 0,
-    emptyWaitTimeouts: 0, deduplicatedCalls: 0, heartbeatResponses: 0,
+    emptyWaitTimeouts: 0, avoidableEmptyWaitTimeouts: 0, transportCapEmptyWaits: 0,
+    waitReturnedOutput: 0, waitReturnedTerminal: 0, waitRecommendationUsed: 0,
+    deduplicatedCalls: 0, heartbeatResponses: 0,
     detachedResponses: 0, formatFilesRequested: 0, formatFilesSupported: 0,
     formatFilesChanged: 0, formatFilesUnchanged: 0, formatFilesSkipped: 0,
     formatterGroups: 0, customFormatterGroups: 0, unavailableAdapters: 0,
     unexpectedChanges: 0, formatDiffBytes: 0, formatApplyCalls: 0,
     searchFilesConsidered: 0, searchFilesScanned: 0, searchReturned: 0,
     searchMatchedFiles: 0, searchZeroResultCalls: 0, searchEarlyStops: 0,
-    searchExactTotalCalls: 0,
+    searchExactTotalCalls: 0, searchCallerIntentObservedCalls: 0,
+    searchCalculateTotalExplicitCalls: 0, searchCalculateTotalRequestedCalls: 0,
+    searchCountOnlyRequestedCalls: 0,
+    patchCheckFailures: 0, patchPreflightFailures: 0, patchContextFailures: 0,
+    patchEditRecommendedFailures: 0, patchPreventableSimpleFailures: 0,
     phaseLatency: newPhaseLatency(), durations: []
   };
 }
@@ -670,7 +730,17 @@ function addStats(record: JsonObject, stats: ToolStats): void {
   stats.recoveryActions += metric(record, 'recovery_action_count');
   stats.failedCommandIds += metric(record, 'failed_command_id_count');
   stats.skippedCommandIds += metric(record, 'skipped_command_id_count');
-  stats.emptyWaitTimeouts += record.tool === 'wait_command' && record.request_timed_out === true && metric(record, 'event_count') === 0 ? 1 : 0;
+  if (record.tool === 'wait_command') {
+    const legacyEmptyWait = record.request_timed_out === true && metric(record, 'event_count') === 0;
+    const emptyWait = record.wait_returned_empty === true || (record.wait_returned_empty === undefined && legacyEmptyWait);
+    stats.emptyWaitTimeouts += emptyWait ? 1 : 0;
+    stats.transportCapEmptyWaits += emptyWait && record.wait_transport_cap_reached === true ? 1 : 0;
+    stats.avoidableEmptyWaitTimeouts += emptyWait && record.wait_transport_cap_reached !== true ? 1 : 0;
+    stats.waitReturnedOutput += record.wait_returned_output === true ? 1 : 0;
+    stats.waitReturnedTerminal += record.wait_returned_terminal === true ? 1 : 0;
+    stats.waitRecommendationUsed += record.caller_intent_wait_timeout_explicit === true
+      && Number(record.caller_intent_wait_timeout_ms) === Number(record.recommended_wait_ms) ? 1 : 0;
+  }
   stats.deduplicatedCalls += record.deduplicated === true ? 1 : 0;
   stats.heartbeatResponses += record.heartbeat === true ? 1 : 0;
   stats.detachedResponses += record.detached === true ? 1 : 0;
@@ -694,6 +764,24 @@ function addStats(record: JsonObject, stats: ToolStats): void {
     stats.searchZeroResultCalls += returned === 0 ? 1 : 0;
     stats.searchEarlyStops += record.early_stop_reason === 'result_limit' ? 1 : 0;
     stats.searchExactTotalCalls += record.total_matches_exact === true ? 1 : 0;
+    const hasCallerIntent = typeof record.caller_intent_calculate_total_explicit === 'boolean'
+      && typeof record.caller_intent_calculate_total === 'boolean'
+      && typeof record.caller_intent_count_only === 'boolean';
+    stats.searchCallerIntentObservedCalls += hasCallerIntent ? 1 : 0;
+    stats.searchCalculateTotalExplicitCalls += record.caller_intent_calculate_total_explicit === true ? 1 : 0;
+    stats.searchCalculateTotalRequestedCalls += record.caller_intent_calculate_total === true ? 1 : 0;
+    stats.searchCountOnlyRequestedCalls += record.caller_intent_count_only === true ? 1 : 0;
+  }
+  if (record.tool === 'apply_patch' && isToolErrorRecord(record)) {
+    const errorCode = String(record.error_code ?? '');
+    stats.patchCheckFailures += errorCode === 'PATCH_CHECK_FAILED' ? 1 : 0;
+    stats.patchPreflightFailures += errorCode === 'PATCH_PREFLIGHT_FAILED' ? 1 : 0;
+    stats.patchContextFailures += errorCode === 'PATCH_CONTEXT_NOT_FOUND' ? 1 : 0;
+    const editRecommended = record.error_recommended_tool === 'edit';
+    stats.patchEditRecommendedFailures += editRecommended ? 1 : 0;
+    const simpleSingleFile = Number(record.caller_intent_patch_file_count ?? 0) === 1
+      && Number(record.caller_intent_patch_hunk_count ?? 0) <= 1;
+    stats.patchPreventableSimpleFailures += editRecommended && simpleSingleFile ? 1 : 0;
   }
   for (const [phase, field] of PHASE_METRICS) {
     if (record[field] === undefined || record[field] === null) continue;
@@ -764,7 +852,12 @@ function diagnosticsSummaryValue(
     },
     wait: {
       actual_wait_ms: stats.actualWaitMs,
-      empty_wait_timeouts: stats.emptyWaitTimeouts
+      empty_wait_timeouts: stats.emptyWaitTimeouts,
+      avoidable_empty_wait_timeouts: stats.avoidableEmptyWaitTimeouts,
+      transport_cap_empty_waits: stats.transportCapEmptyWaits,
+      returned_output_calls: stats.waitReturnedOutput,
+      returned_terminal_calls: stats.waitReturnedTerminal,
+      recommendation_used_calls: stats.waitRecommendationUsed
     },
     recovery: { repeated_identical_error_count: repeatedIdenticalErrorCount },
     events_by_type: mapObject(eventsByType),
@@ -797,7 +890,22 @@ function searchStats(stats: ToolStats): JsonObject {
     matched_files: stats.searchMatchedFiles,
     zero_result_calls: stats.searchZeroResultCalls,
     early_stop_calls: stats.searchEarlyStops,
-    exact_total_calls: stats.searchExactTotalCalls
+    exact_total_calls: stats.searchExactTotalCalls,
+    caller_intent_observed_calls: stats.searchCallerIntentObservedCalls,
+    calculate_total_explicit_calls: stats.searchCalculateTotalExplicitCalls,
+    calculate_total_requested_calls: stats.searchCalculateTotalRequestedCalls,
+    count_only_requested_calls: stats.searchCountOnlyRequestedCalls,
+    calculate_total_omitted_calls: Math.max(0, stats.searchCallerIntentObservedCalls - stats.searchCalculateTotalExplicitCalls)
+  };
+}
+
+function patchStats(stats: ToolStats): JsonObject {
+  return {
+    check_failures: stats.patchCheckFailures,
+    preflight_failures: stats.patchPreflightFailures,
+    context_failures: stats.patchContextFailures,
+    edit_recommended_failures: stats.patchEditRecommendedFailures,
+    preventable_simple_failures: stats.patchPreventableSimpleFailures
   };
 }
 
@@ -839,11 +947,17 @@ function statsRecord(tool: string, stats: ToolStats): JsonObject {
     optimization: {
       recovery_actions: stats.recoveryActions, failed_command_ids: stats.failedCommandIds,
       skipped_command_ids: stats.skippedCommandIds, empty_wait_timeouts: stats.emptyWaitTimeouts,
+      avoidable_empty_wait_timeouts: stats.avoidableEmptyWaitTimeouts,
+      transport_cap_empty_waits: stats.transportCapEmptyWaits,
+      wait_returned_output_calls: stats.waitReturnedOutput,
+      wait_returned_terminal_calls: stats.waitReturnedTerminal,
+      wait_recommendation_used_calls: stats.waitRecommendationUsed,
       deduplicated_calls: stats.deduplicatedCalls, heartbeat_responses: stats.heartbeatResponses,
       detached_responses: stats.detachedResponses
     },
     formatting: formattingStats(stats),
-    search: searchStats(stats)
+    search: searchStats(stats),
+    patch: patchStats(stats)
   };
 }
 
@@ -1150,22 +1264,54 @@ function performanceReport(performance: PerformanceStats, top: number, includeBu
   };
 }
 
-function newParallelHistory(): ParallelHistory { return { pairs: new Map(), totalObservations: 0 }; }
+function newParallelHistory(): ParallelHistory {
+  return {
+    pairs: new Map(), seenObservationIds: new Set(), totalObservations: 0,
+    actualObservations: 0, candidateObservations: 0, duplicateObservationsIgnored: 0
+  };
+}
+
+function newParallelPairStats(): ParallelPairStats {
+  return {
+    attempts: 0, successes: 0, conflicts: 0, serialized: 0, failures: 0, notOverlapped: 0,
+    candidateObservations: 0, readOnlySafeHints: 0, conflictHints: 0, overlapHints: 0, unknownCandidates: 0,
+    overlapMs: 0, lockWaitMs: 0
+  };
+}
 
 function applyParallelObservation(history: ParallelHistory, observation: unknown): void {
   if (!isRecord(observation)) return;
   const pair = typeof observation.pair === 'string' ? observation.pair.trim() : '';
   const outcome = typeof observation.outcome === 'string' ? observation.outcome : '';
-  if (!pair || pair.length > 320 || !['success', 'conflict', 'serialized', 'failure', 'not_overlapped'].includes(outcome)) return;
-  const stats = history.pairs.get(pair) ?? { attempts: 0, successes: 0, conflicts: 0, serialized: 0, failures: 0, notOverlapped: 0, overlapMs: 0, lockWaitMs: 0 };
-  stats.attempts += 1;
+  if (!pair || pair.length > 320 || !['success', 'conflict', 'serialized', 'failure', 'not_overlapped', 'candidate'].includes(outcome)) return;
+  const observationId = typeof observation.observation_id === 'string' ? observation.observation_id.trim() : '';
+  if (observationId) {
+    if (history.seenObservationIds.has(observationId)) {
+      history.duplicateObservationsIgnored += 1;
+      return;
+    }
+    history.seenObservationIds.add(observationId);
+  }
+  const stats = history.pairs.get(pair) ?? newParallelPairStats();
   stats.overlapMs += numberValue(observation.overlap_ms);
   stats.lockWaitMs += numberValue(observation.lock_wait_ms);
-  if (outcome === 'success') stats.successes += 1;
-  else if (outcome === 'conflict') stats.conflicts += 1;
-  else if (outcome === 'serialized') stats.serialized += 1;
-  else if (outcome === 'failure') stats.failures += 1;
-  else stats.notOverlapped += 1;
+  if (outcome === 'candidate') {
+    stats.candidateObservations += 1;
+    const candidateKind = typeof observation.candidate_kind === 'string' ? observation.candidate_kind : 'unknown_pair';
+    if (candidateKind === 'read_only_safe_hint') stats.readOnlySafeHints += 1;
+    else if (candidateKind === 'conflict_hint') stats.conflictHints += 1;
+    else if (candidateKind === 'overlap_hint') stats.overlapHints += 1;
+    else stats.unknownCandidates += 1;
+    history.candidateObservations += 1;
+  } else {
+    stats.attempts += 1;
+    if (outcome === 'success') stats.successes += 1;
+    else if (outcome === 'conflict') stats.conflicts += 1;
+    else if (outcome === 'serialized') stats.serialized += 1;
+    else if (outcome === 'failure') stats.failures += 1;
+    else stats.notOverlapped += 1;
+    history.actualObservations += 1;
+  }
   history.pairs.set(pair, stats);
   history.totalObservations += 1;
 }
@@ -1195,6 +1341,11 @@ function parallelismReport(history: ParallelHistory, top: number): JsonObject {
     return {
       pair, attempts: stats.attempts, successes: stats.successes, conflicts: stats.conflicts,
       serialized: stats.serialized, failures: stats.failures, not_overlapped: stats.notOverlapped,
+      candidate_observations: stats.candidateObservations,
+      read_only_safe_hints: stats.readOnlySafeHints,
+      conflict_hints: stats.conflictHints,
+      overlap_hints: stats.overlapHints,
+      unknown_candidates: stats.unknownCandidates,
       safety_samples: safetySamples, success_rate: round3(ratio(stats.successes, safetySamples)),
       conflict_rate: round3(ratio(stats.conflicts, safetySamples)),
       serialization_rate: round3(ratio(stats.serialized, stats.attempts)),
@@ -1212,11 +1363,16 @@ function parallelismReport(history: ParallelHistory, top: number): JsonObject {
   if (conflicts) recommendations.push(`Keep ${conflicts} conflict-prone command pair(s) sequential or assign an explicit shared lock_group.`);
   if (serialized) recommendations.push(`Reduce max_parallel or separate ${serialized} pair(s) that mostly wait on the same resource lock.`);
   if (confidentSafe) recommendations.push(`The LLM may batch ${confidentSafe} statistically supported pair(s) with exec_many mode=auto.`);
+  if (history.candidateObservations) recommendations.push(`${history.candidateObservations} candidate-only pair observation(s) are available for cold-start discovery; explicit parallel evidence is still required for evidence-required auto scheduling.`);
   if (!history.totalObservations) recommendations.push('Collect exec_many observations before allowing evidence-required command pairs to run in parallel.');
   return {
     decision_method: 'hard_rules_plus_wilson_statistics', machine_learning_enabled: false,
+    candidate_evidence_promotes_to_safety_sample: false,
     minimum_confident_samples: 5, safe_lower_bound_threshold: 0.7,
     observed_pairs: history.pairs.size, total_observations: history.totalObservations,
+    actual_observations: history.actualObservations,
+    candidate_observations: history.candidateObservations,
+    duplicate_observations_ignored: history.duplicateObservationsIgnored,
     confident_safe_pairs: confidentSafe, conflict_pairs: conflicts,
     serialization_prone_pairs: serialized, pairs: rows, llm_recommendations: recommendations,
     future_model_note: 'Consider a contextual bandit only after stable command signatures, explicit conflict labels, and enough observations per context are available.'
@@ -1406,7 +1562,13 @@ export class ToolUsageStore implements ToolUsageStoreContract {
       exit_code: input.exitCode ?? null,
       termination_reason: input.terminationReason,
       stdout_bytes: input.stdoutBytes,
-      stderr_bytes: input.stderrBytes
+      stderr_bytes: input.stderrBytes,
+      stdout: sanitizeValue(input.stdout ?? '', 'stdout', this.redactTelemetry),
+      stderr: sanitizeValue(input.stderr ?? '', 'stderr', this.redactTelemetry),
+      stdout_audit_tail_bytes: input.stdoutAuditTailBytes ?? 0,
+      stderr_audit_tail_bytes: input.stderrAuditTailBytes ?? 0,
+      stdout_audit_tail_truncated: input.stdoutAuditTailTruncated === true,
+      stderr_audit_tail_truncated: input.stderrAuditTailTruncated === true
     };
     this.enqueue(record);
     return record;
@@ -1490,6 +1652,38 @@ export class ToolUsageStore implements ToolUsageStoreContract {
     }
   }
 
+  async visitDiagnosticRecords(visit: (record: JsonObject) => void | Promise<void>): Promise<DiagnosticRecordVisitResult> {
+    await this.flush();
+    const seen = new Set<string>();
+    const revision = createHash('sha256');
+    let uniqueRecords = 0;
+    let duplicateRecordsIgnored = 0;
+    const visitRecord = async (record: JsonObject): Promise<void> => {
+      const eventId = typeof record.diagnostic_event_id === 'string' && record.diagnostic_event_id
+        ? record.diagnostic_event_id
+        : undefined;
+      if (eventId && seen.has(eventId)) {
+        duplicateRecordsIgnored += 1;
+        return;
+      }
+      if (eventId) seen.add(eventId);
+      uniqueRecords += 1;
+      revision.update(eventId ?? createHash('sha256').update(JSON.stringify(compactRecord(record))).digest('hex'));
+      revision.update('\0');
+      await visit(structuredClone(record));
+    };
+    const legacy = await this.#logStore.visitCompleteRecords(visitRecord);
+    const canonical = await this.#diagnosticsLogStore.visitCompleteRecords(visitRecord);
+    return {
+      scannedLines: legacy.scannedLines + canonical.scannedLines,
+      invalidLines: legacy.invalidLines + canonical.invalidLines,
+      bytesRead: legacy.bytesRead + canonical.bytesRead,
+      uniqueRecords,
+      duplicateRecordsIgnored,
+      sourceRevision: revision.digest('hex')
+    };
+  }
+
   async dashboardSummary(): Promise<JsonObject> {
     const now = this.now();
     if (this.#dashboardCache && now - this.#dashboardCache.createdAt <= 5_000) {
@@ -1525,6 +1719,7 @@ export class ToolUsageStore implements ToolUsageStoreContract {
 
 
   async query(args: JsonObject): Promise<JsonObject> {
+    const statistics = usageStatistics(args);
     await this.flush();
     const limit = integer(args.limit, 100, 1, 1000);
     const cursor = integer(args.cursor, 0, 0, TOOL_USAGE_RECORD_CURSOR_MAX);
@@ -1584,6 +1779,7 @@ export class ToolUsageStore implements ToolUsageStoreContract {
         }
         seenDiagnosticEventIds.add(diagnosticEventId);
       }
+      if (statistics && !statistics.includes(record)) return;
       const event = typeof record.event === 'string' ? record.event : 'tool_call';
       if (matchesScope(record, scope, sinceTsMs, this.runtimeBootId, this.serverVersion)) {
         const eventType = diagnosticEventType(record, event);
@@ -1626,6 +1822,7 @@ export class ToolUsageStore implements ToolUsageStoreContract {
       if (!matchesScope(record, scope, sinceTsMs, this.runtimeBootId, this.serverVersion)
         || !matchesRequestedFilters) return;
       matchedLines += 1;
+      statistics?.accumulate(record, isErrorRecord(record));
       persistedDroppedRecords += metric(record, 'telemetry_dropped_before');
       accumulateParallelHistory(parallelHistory, record);
       const signature = errorSignature(record);
@@ -1794,6 +1991,7 @@ export class ToolUsageStore implements ToolUsageStoreContract {
       slowest: includeSlowest ? slowest : null,
       largest: includeLargest ? largest : null,
       aggregate,
+      ...(statistics ? { statistics: statistics.report() } : {}),
       scope_breakdown: scope === 'all' ? {
         current_version: { version: this.serverVersion, stats: versionScopeStats(currentVersionTotals) },
         previous_versions: { versions: [...previousVersions].sort(), stats: versionScopeStats(previousVersionTotals) },
@@ -1802,6 +2000,11 @@ export class ToolUsageStore implements ToolUsageStoreContract {
       optimization: aggregateEnabled ? {
         recovery_actions: totals.recoveryActions, failed_command_ids: totals.failedCommandIds,
         skipped_command_ids: totals.skippedCommandIds, empty_wait_timeouts: totals.emptyWaitTimeouts,
+        avoidable_empty_wait_timeouts: totals.avoidableEmptyWaitTimeouts,
+        transport_cap_empty_waits: totals.transportCapEmptyWaits,
+        wait_returned_output_calls: totals.waitReturnedOutput,
+        wait_returned_terminal_calls: totals.waitReturnedTerminal,
+        wait_recommendation_used_calls: totals.waitRecommendationUsed,
         deduplicated_calls: totals.deduplicatedCalls, heartbeat_responses: totals.heartbeatResponses,
         detached_responses: totals.detachedResponses, repeated_identical_error_count: repeatedIdenticalErrorCount,
         repeated_failures: repeatedFailureReport(repeatedFailures, repeatedIdenticalErrorCount, top),
@@ -1809,6 +2012,7 @@ export class ToolUsageStore implements ToolUsageStoreContract {
       } : null,
       formatting: aggregateEnabled ? formattingStats(totals) : null,
       search: aggregateEnabled ? searchStats(totals) : null,
+      patch: aggregateEnabled ? patchStats(totals) : null,
       parallelism: parallelismReport(parallelHistory, top),
       performance: includePerformance ? performanceReport(performance, top, includeBursts, burstIdleMs) : null,
       warnings: this.#lastWriteError ? [`tool usage telemetry write failed: ${this.#lastWriteError}`] : []

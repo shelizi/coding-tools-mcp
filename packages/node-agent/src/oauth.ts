@@ -24,6 +24,7 @@ interface TokenResponse {
 }
 
 const allowedOrigins = new Set(['https://chatgpt.com', 'https://chat.openai.com']);
+const geminiRedirectPath = new RegExp('^/r/user_bound_custom-mcp-[A-Za-z0-9_-]+$');
 const codeTtlMs = 5 * 60_000;
 export const DEFAULT_OAUTH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60;
 export const MAX_OAUTH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -137,7 +138,7 @@ export function redirectUriAllowed(value: string): boolean {
     return url.protocol === 'https:'
       && !url.username && !url.password && !url.hash
       && (url.port === '' || url.port === '443')
-      && allowedOrigins.has(url.origin);
+      && (allowedOrigins.has(url.origin) || (url.origin === 'https://oauth-redirect.googleusercontent.com' && geminiRedirectPath.test(url.pathname)));
   } catch { return false; }
 }
 

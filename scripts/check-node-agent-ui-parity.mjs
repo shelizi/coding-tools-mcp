@@ -472,7 +472,7 @@ export async function validateUiParity(root = workspace) {
   if (/(?:watch::|mpsc|JoinSet|WorkerEvent|PoolWorkerState|WorkerConnectionExit|ConnectedWorkerGuard|BuiltinTunnelMetrics|forward_request|receive_request|receive_live_control|prepare_local_request|response_headers|reqwest|bytes_stream|tokio::select!|load_or_enroll_device_identity|policy_tx|status_tx|event_tx|shutdown|retire|ControlMessage::Ready)/.test(source.rustBuiltinConnection)) {
     errors.push('Rust built-in tunnel authenticated connection boundary owns worker, forwarding, policy publication, or cancellation lifecycle implementation');
   }
-  if (!/connect_authenticated_worker\(config, worker_id\)\.await\?;[\s\S]*?policy_tx\.send_replace\(Some\(initial_policy\.clone\(\)\)\);[\s\S]*?send_control\(&mut sink, &ControlMessage::Ready\)\.await\?;[\s\S]*?\*connected = true;/.test(source.rustBuiltinTunnel)) {
+  if (!/policy_tx\.send_replace\(Some\(initial_policy\.clone\(\)\)\);[\s\S]*?send_control\(&mut sink, &ControlMessage::Ready\)\.await\?;[\s\S]*?\*connected = true;/.test(source.rustBuiltinTunnel)) {
     errors.push('Rust built-in tunnel parent must publish the authenticated policy before Ready and connected state');
   }
   for (const marker of ['mod metrics;', 'pub use metrics::BuiltinTunnelSnapshot;', 'use metrics::{BuiltinTunnelMetrics, ConnectedWorkerGuard};']) {

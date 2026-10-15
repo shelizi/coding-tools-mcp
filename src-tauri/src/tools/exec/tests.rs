@@ -1398,6 +1398,82 @@ fn automatic_dedupe_only_reattaches_active_sessions() {
 
 #[test]
 #[serial_test::serial(process_runtime)]
+fn managed_job_uses_nonblocking_resolve_operation_continuation() {
+    let workspace = tempdir().expect("workspace");
+    let harness = tempdir().expect("harness");
+    let ctx = ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+        .expect("context");
+    let started = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": sleeping_command(),
+            "operation_id": "snapshot-job",
+            "job_timeout_ms": 5000,
+            "yield_time_ms": 0,
+            "output_mode": "none"
+        }),
+    );
+    assert_eq!(started["execution_mode"], "job", "{started}");
+    assert_eq!(started["process_still_running"], true, "{started}");
+    assert_eq!(
+        started["next_actions"][0]["tool"], "resolve_operation",
+        "{started}"
+    );
+    assert_eq!(
+        started["next_actions"][0]["arguments"]["operation_id"], "snapshot-job",
+        "{started}"
+    );
+    assert_eq!(
+        started["next_actions"][0]["arguments"]["event_detail"], "compact",
+        "{started}"
+    );
+    assert!(
+        started["next_actions"][0]["after_ms"].as_u64().is_some(),
+        "{started}"
+    );
+
+    let snapshot = call_tool(
+        &ctx,
+        "resolve_operation",
+        &started["next_actions"][0]["arguments"],
+    );
+    assert_eq!(snapshot["process_still_running"], true, "{snapshot}");
+    assert_eq!(
+        snapshot["process_deadline_ts_ms"], started["process_deadline_ts_ms"],
+        "{snapshot}"
+    );
+    assert_eq!(
+        snapshot["next_actions"][0]["tool"], "resolve_operation",
+        "{snapshot}"
+    );
+    assert_eq!(
+        snapshot["next_actions"][0]["arguments"]["operation_id"], "snapshot-job",
+        "{snapshot}"
+    );
+    let poll_after_ms = snapshot["recommended_poll_after_ms"]
+        .as_u64()
+        .expect("recommended poll");
+    assert!((2_000..=30_000).contains(&poll_after_ms), "{snapshot}");
+    assert_eq!(
+        snapshot["poll_strategy"], "managed_job_backoff",
+        "{snapshot}"
+    );
+    assert_eq!(
+        snapshot["next_actions"][0]["after_ms"], poll_after_ms,
+        "{snapshot}"
+    );
+
+    let session_id = started["session_id"].as_str().expect("session id");
+    let _ = call_tool(
+        &ctx,
+        "kill_session",
+        &json!({"session_id": session_id, "wait_ms": 5000}),
+    );
+}
+
+#[test]
+#[serial_test::serial(process_runtime)]
 fn wait_command_caps_long_requested_wait_to_transport_safe_chunk() {
     let workspace = tempdir().expect("workspace");
     let harness = tempdir().expect("harness");
@@ -1431,7 +1507,8 @@ fn wait_command_caps_long_requested_wait_to_transport_safe_chunk() {
         "{waited}"
     );
     assert_eq!(waited["wait_timeout_ms"], 60 * 60_000, "{waited}");
-    assert_eq!(waited["effective_wait_ms"], 20_000, "{waited}");
+    assert_eq!(waited["effective_wait_ms"], 8_000, "{waited}");
+    assert_eq!(waited["transport_safe_wait_ms"], 8_000, "{waited}");
     assert_eq!(waited["process_still_running"], false, "{waited}");
 }
 #[test]
@@ -1494,6 +1571,8 @@ fn duplicate_operations_reattach_and_ignore_legacy_wait_heartbeats() {
     );
     assert_eq!(waited["heartbeat"], false, "{waited}");
     assert_eq!(waited["request_timed_out"], true, "{waited}");
+    assert_eq!(waited["observation_timed_out"], true, "{waited}");
+    assert_eq!(waited["observation_state"], "working", "{waited}");
     assert_eq!(waited["effective_wait_ms"], 1000, "{waited}");
     assert!(
         waited["actual_wait_ms"].as_u64().unwrap_or(0) >= 900,
@@ -1647,6 +1726,8 @@ fn wait_timeout_does_not_become_process_timeout() {
         }),
     );
     assert_eq!(waited["request_timed_out"], true, "{waited}");
+    assert_eq!(waited["observation_timed_out"], true, "{waited}");
+    assert_eq!(waited["observation_state"], "working", "{waited}");
     assert_eq!(waited["process_timed_out"], false, "{waited}");
     assert_eq!(waited["process_still_running"], true, "{waited}");
     let _ = call_tool(
@@ -1984,6 +2065,57 @@ fn permission_grant_resumes_original_operation() {
         .as_str()
         .unwrap_or_default()
         .contains("permission-resumed"));
+}
+
+#[test]
+#[serial_test::serial(process_runtime)]
+fn permission_grant_infers_single_pending_resume_id() {
+    let workspace = tempdir().expect("workspace");
+    let harness = tempdir().expect("harness");
+    let ctx = ToolContext::for_test(workspace.path().to_path_buf(), harness.path().to_path_buf())
+        .expect("context");
+
+    #[cfg(windows)]
+    let shell = "powershell";
+    #[cfg(windows)]
+    let command = "Write-Output permission-inferred";
+    #[cfg(unix)]
+    let shell = "sh";
+    #[cfg(unix)]
+    let command = "printf permission-inferred";
+
+    let blocked = call_tool(
+        &ctx,
+        "exec_command",
+        &json!({
+            "cmd": command,
+            "shell": shell,
+            "timeout_ms": 5000,
+            "yield_time_ms": 5000
+        }),
+    );
+    assert_eq!(blocked["ok"], false, "{blocked}");
+    assert!(blocked["error"]["details"]["permission_request"]["resume_id"].is_string());
+
+    let resumed = call_tool(
+        &ctx,
+        "request_permissions",
+        &json!({
+            "approve": true,
+            "confirm": true,
+            "scope": "once"
+        }),
+    );
+    assert_eq!(resumed["ok"], true, "{resumed}");
+    assert_eq!(resumed["resumed"], true, "{resumed}");
+    assert_eq!(resumed["command_ok"], true, "{resumed}");
+    assert!(resumed["resume_id"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(resumed["stdout"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("permission-inferred"));
 }
 
 #[test]

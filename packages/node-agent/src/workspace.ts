@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { statSync } from 'node:fs';
-import { access, lstat, readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { access, lstat, opendir, readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import type { ToolContext, WorkspaceFolder } from './types.js';
 import { extendIgnoreRules, isIgnoredByRules, rootIgnoreRules, type IgnoreRule } from './gitignore.js';
@@ -419,6 +419,10 @@ export interface WalkOptions {
   includeGenerated?: boolean;
   includeDirectories?: boolean;
   excludedPrefixes?: string[];
+  pathFilter?: (entry: WalkEntry) => boolean;
+  nameFilter?: (name: string, isDirectory: boolean) => boolean;
+  maxFileBytes?: number;
+  onSkippedLargeFile?: () => void;
 }
 
 export interface WalkEntry {
@@ -490,13 +494,14 @@ export async function walk(rootValue: string, startValue: string, options: WalkO
 
   async function visit(directory: string, depth: number, rules: readonly IgnoreRule[]): Promise<void> {
     if (depth > maxDepth || stopped) return;
-    let entries;
-    try { entries = await readdir(directory, { withFileTypes: true }); } catch { return; }
-    entries.sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
+    let dir;
+    try { dir = await opendir(directory); } catch { return; }
+    for await (const entry of dir) {
       if (stopped || visited >= maxVisited) { stopped = true; break; }
-      visited += 1;
+      const isDirectory = entry.isDirectory();
       if (fixedExcluded(entry.name, options)) continue;
+      if (options.nameFilter && !options.nameFilter(entry.name, isDirectory)) continue;
+      visited += 1;
       const full = path.join(directory, entry.name);
       const relative = relativeInside(root, full).replaceAll('\\', '/');
       if (prefixExcluded(relative, options)) continue;
@@ -505,13 +510,19 @@ export async function walk(rootValue: string, startValue: string, options: WalkO
       try { info = await lstat(full); } catch { continue; }
       const type: WalkEntry['type'] = info.isSymbolicLink() ? 'symlink' : info.isDirectory() ? 'directory' : 'file';
       if (options.includeIgnored !== true && isIgnoredByRules(relative, type === 'directory', rules)) continue;
+      if (type === 'file' && options.maxFileBytes !== undefined && info.size > options.maxFileBytes) {
+        options.onSkippedLargeFile?.();
+        continue;
+      }
+      const candidate: WalkEntry = { path: relative, type, size: info.size, modified: info.mtime.toISOString() };
+      const accepted = !options.pathFilter || options.pathFilter(candidate);
       if (type === 'directory') {
-        if (options.includeDirectories) addEntry(relative, 'directory', info);
+        if (options.includeDirectories && accepted) addEntry(relative, 'directory', info);
         if (!stopped && depth + 1 < maxDepth) {
           const nestedRules = options.includeIgnored === true ? rules : await extendIgnoreRules(root, full, rules);
           await visit(full, depth + 1, nestedRules);
         }
-      } else {
+      } else if (accepted) {
         addEntry(relative, type, info);
       }
     }
@@ -519,6 +530,12 @@ export async function walk(rootValue: string, startValue: string, options: WalkO
 
   await visit(start, 0, initial.rules);
   return output;
+}
+
+export async function isWalkStartBlocked(rootValue: string, startValue: string, options: WalkOptions = {}): Promise<boolean> {
+  const root = normalizeWorkspacePath(rootValue);
+  const start = resolveInside(root, startValue);
+  return (await rulesForStart(root, start, options)).blocked;
 }
 
 export function globRegex(pattern: string): RegExp {

@@ -74,6 +74,7 @@ impl ExecSession {
             process_deadline_ts_ms: None,
             process_deadline: None,
             operation_id: None,
+            operation_record_path: Mutex::new(None),
             harness_operations: Mutex::new(Vec::new()),
             harness_operation_recorded: Mutex::new(HashSet::new()),
             command_fingerprint: None,

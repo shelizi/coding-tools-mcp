@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use coding_tools_tunnel_protocol::{
-    auth_signing_payload, valid_client_id, DeviceAuthProof, EnrollmentRequest, EnrollmentResponse,
-    TunnelService,
+    auth_signing_payload, device_session_auth_signing_payload, split_session_auth_signing_payload,
+    valid_client_id, DeviceAuthProof, DeviceSessionAuthProof, EnrollmentRequest,
+    EnrollmentResponse, SplitSessionAuthProof, TunnelService, MULTIPLEX_PROTOCOL_VERSION,
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -241,6 +242,63 @@ impl DeviceRegistry {
         self.verify_cached(&nonce, expires_at_unix_ms, &proof)
     }
 
+    pub async fn verify_device_session(
+        &self,
+        nonce: String,
+        expires_at_unix_ms: u64,
+        proof: DeviceSessionAuthProof,
+    ) -> Result<(), DeviceAuthError> {
+        self.verify_device_session_cached(&nonce, expires_at_unix_ms, &proof)
+    }
+
+    pub async fn verify_split_session(
+        &self,
+        nonce: String,
+        expires_at_unix_ms: u64,
+        proof: SplitSessionAuthProof,
+    ) -> Result<(), DeviceAuthError> {
+        self.verify_split_session_cached(&nonce, expires_at_unix_ms, &proof)
+    }
+
+    pub fn route_allowed(
+        &self,
+        device_id: &str,
+        client_id: &str,
+        service: TunnelService,
+    ) -> Result<bool, DeviceAuthError> {
+        if !valid_client_id(device_id) || !valid_client_id(client_id) {
+            return Ok(false);
+        }
+        {
+            let devices = self
+                .devices
+                .read()
+                .map_err(|_| DeviceAuthError::Storage("device cache lock poisoned".into()))?;
+            let Some(device) = devices.get(device_id) else {
+                return Ok(false);
+            };
+            if device.summary.revoked_at_unix_ms.is_some() {
+                return Ok(false);
+            }
+        }
+        let device_id = device_id.to_string();
+        let client_id = client_id.to_string();
+        let service = service.as_str().to_string();
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT 1 FROM device_route_grants WHERE device_id = ?1 AND client_id = ?2 AND service = ?3 LIMIT 1",
+                        params![device_id, client_id, service],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map(|value| value.is_some())
+                    .map_err(DeviceAuthError::from)
+            })
+            .map_err(|error| DeviceAuthError::Storage(error.to_string()))?
+    }
+
     pub fn list_devices(&self) -> Result<Vec<DeviceSummary>, DeviceAuthError> {
         let devices = self
             .devices
@@ -297,6 +355,10 @@ impl DeviceRegistry {
                 if revoked_at.is_none() {
                     return Err(DeviceAuthError::DeviceNotRevoked);
                 }
+                connection.execute(
+                    "DELETE FROM device_route_grants WHERE device_id = ?1",
+                    params![&device_id],
+                )?;
                 let changed = connection.execute(
                     "DELETE FROM devices WHERE device_id = ?1 AND revoked_at IS NOT NULL",
                     params![device_id],
@@ -328,6 +390,10 @@ impl DeviceRegistry {
                 if revoked_ids.is_empty() {
                     return Ok::<_, DeviceAuthError>(0);
                 }
+                connection.execute(
+                    "DELETE FROM device_route_grants WHERE device_id IN (SELECT device_id FROM devices WHERE revoked_at IS NOT NULL)",
+                    [],
+                )?;
                 let changed =
                     connection.execute("DELETE FROM devices WHERE revoked_at IS NOT NULL", [])?;
                 let mut cache = devices
@@ -411,18 +477,27 @@ impl DeviceRegistry {
                 // The enrollment grant is authoritative. request.client_id remains on the wire
                 // for compatibility with older desktop clients and must not select the route.
                 let client_id = enrollment.0.clone();
-                let existing_public_key = transaction
+                let existing_device = transaction
                     .query_row(
-                        "SELECT public_key FROM devices WHERE device_id = ?1",
+                        "SELECT public_key, revoked_at FROM devices WHERE device_id = ?1",
                         params![&device_id],
-                        |row| row.get::<_, Vec<u8>>(0),
+                        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<i64>>(1)?)),
                     )
                     .optional()?;
-                match existing_public_key {
-                    Some(existing) if existing.as_slice() != public_key.as_slice() => {
+                let reactivating = existing_device
+                    .as_ref()
+                    .is_some_and(|(_, revoked_at)| revoked_at.is_some());
+                match existing_device {
+                    Some((existing, _)) if existing.as_slice() != public_key.as_slice() => {
                         return Err(DeviceAuthError::DeviceIdConflict);
                     }
                     Some(_) => {
+                        if reactivating {
+                            transaction.execute(
+                                "DELETE FROM device_route_grants WHERE device_id = ?1",
+                                params![&device_id],
+                            )?;
+                        }
                         transaction.execute(
                             "UPDATE devices SET
                                client_id = ?2,
@@ -461,6 +536,14 @@ impl DeviceRegistry {
                         )?;
                     }
                 }
+                insert_route_grants(
+                    &transaction,
+                    &device_id,
+                    &client_id,
+                    enrollment.1,
+                    enrollment.2,
+                    now,
+                )?;
                 let consumed = transaction.execute(
                     "UPDATE enrollment_codes SET used_at = ?2, enrolled_device_id = ?3
                      WHERE code_hash = ?1 AND used_at IS NULL",
@@ -545,6 +628,95 @@ impl DeviceRegistry {
         self.record_last_seen(&proof.device_id, unix_ms())
     }
 
+    fn verify_device_session_cached(
+        &self,
+        nonce: &str,
+        expires_at_unix_ms: u64,
+        proof: &DeviceSessionAuthProof,
+    ) -> Result<(), DeviceAuthError> {
+        if unix_ms() > expires_at_unix_ms {
+            return Err(DeviceAuthError::ChallengeExpired);
+        }
+        if proof.hello.protocol_version != MULTIPLEX_PROTOCOL_VERSION
+            || !valid_client_id(&proof.device_id)
+            || proof.hello.connection_id.trim().is_empty()
+            || proof.hello.connection_id.len() > 128
+        {
+            return Err(DeviceAuthError::InvalidSignature);
+        }
+        let device = self
+            .devices
+            .read()
+            .map_err(|_| DeviceAuthError::Storage("device cache lock poisoned".into()))?
+            .get(&proof.device_id)
+            .cloned()
+            .ok_or(DeviceAuthError::UnknownDevice)?;
+        if device.summary.revoked_at_unix_ms.is_some() {
+            return Err(DeviceAuthError::RevokedDevice);
+        }
+        let verifying_key = VerifyingKey::from_bytes(&device.public_key)
+            .map_err(|_| DeviceAuthError::InvalidPublicKey)?;
+        let signature_bytes = URL_SAFE_NO_PAD
+            .decode(proof.signature.as_bytes())
+            .map_err(|_| DeviceAuthError::InvalidSignature)?;
+        let signature = Signature::from_slice(&signature_bytes)
+            .map_err(|_| DeviceAuthError::InvalidSignature)?;
+        verifying_key
+            .verify(
+                &device_session_auth_signing_payload(nonce, proof),
+                &signature,
+            )
+            .map_err(|_| DeviceAuthError::InvalidSignature)?;
+        self.record_last_seen(&proof.device_id, unix_ms())
+    }
+
+    fn verify_split_session_cached(
+        &self,
+        nonce: &str,
+        expires_at_unix_ms: u64,
+        proof: &SplitSessionAuthProof,
+    ) -> Result<(), DeviceAuthError> {
+        if unix_ms() > expires_at_unix_ms {
+            return Err(DeviceAuthError::ChallengeExpired);
+        }
+        if proof.hello.protocol_version != MULTIPLEX_PROTOCOL_VERSION
+            || !valid_client_id(&proof.device_id)
+            || proof.hello.connection_id.trim().is_empty()
+            || proof.hello.connection_id.len() > 128
+            || proof
+                .hello
+                .session_id
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
+        {
+            return Err(DeviceAuthError::InvalidSignature);
+        }
+        let device = self
+            .devices
+            .read()
+            .map_err(|_| DeviceAuthError::Storage("device cache lock poisoned".into()))?
+            .get(&proof.device_id)
+            .cloned()
+            .ok_or(DeviceAuthError::UnknownDevice)?;
+        if device.summary.revoked_at_unix_ms.is_some() {
+            return Err(DeviceAuthError::RevokedDevice);
+        }
+        let verifying_key = VerifyingKey::from_bytes(&device.public_key)
+            .map_err(|_| DeviceAuthError::InvalidPublicKey)?;
+        let signature_bytes = URL_SAFE_NO_PAD
+            .decode(proof.signature.as_bytes())
+            .map_err(|_| DeviceAuthError::InvalidSignature)?;
+        let signature = Signature::from_slice(&signature_bytes)
+            .map_err(|_| DeviceAuthError::InvalidSignature)?;
+        verifying_key
+            .verify(
+                &split_session_auth_signing_payload(nonce, proof),
+                &signature,
+            )
+            .map_err(|_| DeviceAuthError::InvalidSignature)?;
+        self.record_last_seen(&proof.device_id, unix_ms())
+    }
+
     fn record_last_seen(&self, device_id: &str, now: u64) -> Result<(), DeviceAuthError> {
         let should_flush = {
             let mut devices = self
@@ -599,6 +771,26 @@ impl DeviceRegistry {
     }
 }
 
+fn insert_route_grants(
+    connection: &Connection,
+    device_id: &str,
+    client_id: &str,
+    allow_mcp: i64,
+    allow_actions: i64,
+    created_at: u64,
+) -> Result<(), DeviceAuthError> {
+    for (service, allowed) in [("mcp", allow_mcp), ("actions", allow_actions)] {
+        if allowed != 0 {
+            connection.execute(
+                "INSERT OR IGNORE INTO device_route_grants
+                 (device_id, client_id, service, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![device_id, client_id, service, created_at as i64],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn initialize_schema(connection: &Connection) -> Result<(), DeviceAuthError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS enrollment_codes (
@@ -622,8 +814,21 @@ fn initialize_schema(connection: &Connection) -> Result<(), DeviceAuthError> {
             last_seen_at INTEGER,
             revoked_at INTEGER
          );
+         CREATE TABLE IF NOT EXISTS device_route_grants (
+             device_id TEXT NOT NULL,
+             client_id TEXT NOT NULL,
+             service TEXT NOT NULL CHECK (service IN ('mcp', 'actions')),
+             created_at INTEGER NOT NULL,
+             PRIMARY KEY (device_id, client_id, service)
+         );
          CREATE INDEX IF NOT EXISTS devices_client_id_idx ON devices(client_id);
-         CREATE INDEX IF NOT EXISTS enrollment_expiry_idx ON enrollment_codes(expires_at);",
+         CREATE INDEX IF NOT EXISTS enrollment_expiry_idx ON enrollment_codes(expires_at);
+         CREATE INDEX IF NOT EXISTS device_route_grants_client_idx
+             ON device_route_grants(client_id, service);
+         INSERT OR IGNORE INTO device_route_grants(device_id, client_id, service, created_at)
+             SELECT device_id, client_id, 'mcp', created_at FROM devices WHERE allow_mcp != 0;
+         INSERT OR IGNORE INTO device_route_grants(device_id, client_id, service, created_at)
+             SELECT device_id, client_id, 'actions', created_at FROM devices WHERE allow_actions != 0;",
     )?;
     Ok(())
 }
@@ -1137,5 +1342,140 @@ mod tests {
 
         assert_eq!(second_persisted, first_persisted);
         assert!(memory_last_seen > first_persisted);
+    }
+
+    #[tokio::test]
+    async fn device_session_auth_is_workspace_independent_and_route_grants_accumulate() {
+        use coding_tools_tunnel_protocol::{
+            device_session_auth_signing_payload, DeviceSessionAuthProof, DeviceSessionHello,
+            MULTIPLEX_PROTOCOL_VERSION,
+        };
+
+        let (_directory, registry) = registry();
+        let signing_key = SigningKey::from_bytes(&[31_u8; 32]);
+        let device_id = "shared-device";
+        let request = |client_id: &str| EnrollmentRequest {
+            device_id: device_id.into(),
+            client_id: client_id.into(),
+            device_name: "shared device".into(),
+            public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+        };
+
+        let first = registry
+            .create_enrollment("workspace-a", AllowedServices::Mcp, Some(60))
+            .expect("first route grant");
+        registry
+            .enroll(first.code, request("workspace-a"))
+            .await
+            .expect("first route enrollment");
+        let second = registry
+            .create_enrollment("workspace-b", AllowedServices::Actions, Some(60))
+            .expect("second route grant");
+        registry
+            .enroll(second.code, request("workspace-b"))
+            .await
+            .expect("second route enrollment");
+
+        assert!(registry
+            .route_allowed(device_id, "workspace-a", TunnelService::Mcp)
+            .expect("workspace a route"));
+        assert!(registry
+            .route_allowed(device_id, "workspace-b", TunnelService::Actions)
+            .expect("workspace b route"));
+        assert!(!registry
+            .route_allowed(device_id, "workspace-b", TunnelService::Mcp)
+            .expect("workspace b wrong service"));
+
+        let nonce = "device-session-nonce";
+        let mut proof = DeviceSessionAuthProof {
+            hello: DeviceSessionHello {
+                protocol_version: MULTIPLEX_PROTOCOL_VERSION,
+                connection_id: "connection-1".into(),
+            },
+            device_id: device_id.into(),
+            signature: String::new(),
+        };
+        proof.signature = URL_SAFE_NO_PAD.encode(
+            signing_key
+                .sign(&device_session_auth_signing_payload(nonce, &proof))
+                .to_bytes(),
+        );
+        registry
+            .verify_device_session(nonce.into(), unix_ms() + 5_000, proof.clone())
+            .await
+            .expect("device session verification");
+
+        proof.hello.connection_id = "connection-tampered".into();
+        assert_eq!(
+            registry
+                .verify_device_session(nonce.into(), unix_ms() + 5_000, proof)
+                .await,
+            Err(DeviceAuthError::InvalidSignature)
+        );
+
+        assert!(registry
+            .revoke_device(device_id)
+            .expect("revoke shared device"));
+        let recovery = registry
+            .create_enrollment("workspace-c", AllowedServices::Mcp, Some(60))
+            .expect("recovery route grant");
+        registry
+            .enroll(recovery.code, request("workspace-c"))
+            .await
+            .expect("reactivate device");
+        assert!(!registry
+            .route_allowed(device_id, "workspace-a", TunnelService::Mcp)
+            .expect("old route cleared on recovery"));
+        assert!(!registry
+            .route_allowed(device_id, "workspace-b", TunnelService::Actions)
+            .expect("old actions route cleared on recovery"));
+        assert!(registry
+            .route_allowed(device_id, "workspace-c", TunnelService::Mcp)
+            .expect("new recovery route"));
+    }
+
+    #[tokio::test]
+    async fn schema_migration_backfills_legacy_device_route_grants() {
+        let (_directory, registry) = registry();
+        let signing_key = SigningKey::from_bytes(&[32_u8; 32]);
+        let grant = registry
+            .create_enrollment("legacy-workspace", AllowedServices::Both, Some(60))
+            .expect("legacy enrollment");
+        let enrolled = registry
+            .enroll(
+                grant.code,
+                EnrollmentRequest {
+                    device_id: "legacy-device".into(),
+                    client_id: "legacy-workspace".into(),
+                    device_name: "legacy device".into(),
+                    public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+                },
+            )
+            .await
+            .expect("legacy device enrollment");
+        let device_id = enrolled.device_id.clone();
+
+        registry
+            .with_connection(move |connection| {
+                connection.execute(
+                    "DELETE FROM device_route_grants WHERE device_id = ?1",
+                    params![device_id],
+                )?;
+                initialize_schema(connection)?;
+                let count = connection.query_row(
+                    "SELECT COUNT(*) FROM device_route_grants WHERE device_id = ?1",
+                    params!["legacy-device"],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                Ok(count)
+            })
+            .expect("route grant migration");
+
+        assert!(registry
+            .route_allowed("legacy-device", "legacy-workspace", TunnelService::Mcp)
+            .expect("legacy mcp grant"));
+        assert!(registry
+            .route_allowed("legacy-device", "legacy-workspace", TunnelService::Actions)
+            .expect("legacy actions grant"));
     }
 }

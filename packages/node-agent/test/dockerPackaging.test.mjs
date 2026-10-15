@@ -15,6 +15,11 @@ test('Docker Compose exposes the management UI only through host loopback while 
   assert.match(compose, /127\.0\.0\.1:\$\{CTMCP_PORT:-3789\}:3789/);
   assert.match(compose, /CTMCP_UI_ENABLED:\s*(?:true|"true"|'true'|1|"1"|'1')/);
   assert.match(compose, /CTMCP_UI_TRUST_PRIVATE_PROXY:\s*(?:true|"true"|'true'|1|"1"|'1')/);
+  assert.doesNotMatch(
+    compose,
+    /CTMCP_OAUTH_PASSWORD\s*:/,
+    'default Docker Compose must let the durable secret store own the authorization password so the UI can change it',
+  );
   assert.doesNotMatch(dockerfile, /CTMCP_UI_TRUST_PRIVATE_PROXY/);
   assert.match(compose, /restart:\s*unless-stopped/);
   assert.match(entrypoint, /export CTMCP_RESTART_SUPERVISOR=active-v1/);

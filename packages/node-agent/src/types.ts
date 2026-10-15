@@ -40,6 +40,7 @@ export type ToolProfileSetting = ToolProfile | 'core';
 
 export interface SecurityPolicy {
   restrictToolCatalog: boolean;
+  advertiseReadOnlyAnnotations: boolean;
   enforceCommandAllowlist: boolean;
   requireDangerousConfirmation: boolean;
   requireShellConfirmation: boolean;
@@ -278,6 +279,8 @@ export interface ToolContext {
   state: StateStoreContract;
   resolveSecret?: (name: string) => string | undefined;
   tunnelStatus?: TunnelStatus;
+  /** Last authenticated MCP request time (epoch ms) for this workspace runtime. */
+  lastMcpAccessAtMs?: number;
 }
 
 export interface ProcessOutputEvent {
@@ -303,6 +306,7 @@ export interface ProcessSession {
   timeoutContract?: ProcessTimeoutContract;
   processDeadlineMs?: number;
   firstOutputAt?: number;
+  lastOutputAt?: number;
   endedAt?: number;
   finalizedAt?: number;
   exitCode?: number | null;
@@ -320,6 +324,7 @@ export interface ProcessSession {
   processId?: number;
   durableDirectory?: string;
   durableWorkerPid?: number;
+  durableWorkerExitObservedAt?: number;
   durableMonitor?: NodeJS.Timeout;
   interactive: boolean;
   stdinOpen: boolean;
@@ -371,6 +376,24 @@ export interface TunnelStatus {
   enabled: boolean;
   state: 'disabled' | 'starting' | 'running' | 'reconnecting' | 'stopped' | 'error';
   publicUrl?: string;
+  serverOrigin?: string;
+  websocketUrl?: string;
+  serverId?: string;
+  deviceId?: string;
+  transportMode?: 'legacy-v4' | 'multiplex-v5' | 'split-v5';
+  controlConnected?: boolean;
+  sharedSession?: boolean;
+  sessionId?: string;
+  routeId?: number;
+  streamLimit?: number;
+  dataConnections?: number;
+  maxDataConnections?: number;
+  streamsPerConnection?: number;
+  activeStreams?: number;
+  streamCapacity?: number;
+  availableStreamSlots?: number;
+  queuedRequests?: number;
+  desiredDataConnections?: number;
   workers: number;
   connectedWorkers: number;
   connectingWorkers?: number;

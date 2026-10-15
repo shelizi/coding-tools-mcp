@@ -4,7 +4,11 @@ import path from 'node:path';
 import type { JsonObject } from '../types.js';
 import { KnowledgeImpactStore } from './impact.js';
 import { KnowledgeStore } from './store.js';
-import { resolveToolStrategyImplementation, type ToolStrategyImplementationId } from './strategyImplementations.js';
+import {
+  declaredToolStrategyImplementation,
+  resolveToolStrategyImplementation,
+  type ToolStrategyImplementationId
+} from './strategyImplementations.js';
 import type { ExperienceObservation, KnowledgeRecord, TaskOutcome } from './types.js';
 
 const CANARY_PERCENT = 25;
@@ -21,6 +25,11 @@ const MAX_PROMOTION_FAILURE_RATE = 0.1;
 const MAX_PROMOTION_FAILURE_RATE_DELTA = 0.05;
 const MAX_PROMOTION_DURATION_RATIO = 0.9;
 const POST_PROMOTION_MIN_CALLS = 10;
+const MAX_DURATION_SAMPLES = 128;
+
+function appendDurationSample(samples: number[] | undefined, value: number): number[] {
+  return [...(samples ?? []), Math.max(0, value)].slice(-MAX_DURATION_SAMPLES);
+}
 
 export interface KnowledgeCanaryDecision {
   knowledgeId: string;
@@ -49,6 +58,8 @@ export interface CanaryImpactRecord {
   interventionFailures: number;
   controlDurationMs: number;
   interventionDurationMs: number;
+  controlDurationSamplesMs?: number[];
+  interventionDurationSamplesMs?: number[];
   controlTaskVerifiedSuccesses: number;
   controlTaskUnverifiedSuccesses: number;
   controlTaskFailures: number;
@@ -139,6 +150,8 @@ function emptyRecord(observation: ExperienceObservation): CanaryImpactRecord {
     interventionFailures: 0,
     controlDurationMs: 0,
     interventionDurationMs: 0,
+    controlDurationSamplesMs: [],
+    interventionDurationSamplesMs: [],
     controlTaskVerifiedSuccesses: 0,
     controlTaskUnverifiedSuccesses: 0,
     controlTaskFailures: 0,
@@ -190,6 +203,7 @@ export class CanaryImpactStore {
         if (observation.outcome === 'success') record.interventionSuccesses += 1;
         else record.interventionFailures += 1;
         record.interventionDurationMs += Math.max(0, observation.durationMs);
+        record.interventionDurationSamplesMs = appendDurationSample(record.interventionDurationSamplesMs, observation.durationMs);
         if (observation.taskId
           && !record.controlTaskIds.includes(observation.taskId)
           && !record.interventionTaskIds.includes(observation.taskId)) {
@@ -201,6 +215,7 @@ export class CanaryImpactStore {
         if (observation.outcome === 'success') record.controlSuccesses += 1;
         else record.controlFailures += 1;
         record.controlDurationMs += Math.max(0, observation.durationMs);
+        record.controlDurationSamplesMs = appendDurationSample(record.controlDurationSamplesMs, observation.durationMs);
         if (observation.taskId
           && !record.controlTaskIds.includes(observation.taskId)
           && !record.interventionTaskIds.includes(observation.taskId)) {
@@ -346,9 +361,13 @@ export async function evaluateCanaryPromotions(
       || impact.controlCalls < MIN_PROMOTION_CONTROL_CALLS) continue;
     evaluated += 1;
     if (impact.interventionTaskRollbacks > 0) continue;
+    const implementation = declaredToolStrategyImplementation(record);
+    const semanticsPreserving = implementation?.validationClass === 'semantics_preserving'
+      && impact.implementation === implementation.id;
     const taskOutcomes = taskOutcomeCount(impact, 'intervention');
-    if (taskOutcomes < MIN_PROMOTION_TASK_OUTCOMES) continue;
-    if (ratio(impact.interventionTaskVerifiedSuccesses, taskOutcomes) < MIN_PROMOTION_VERIFIED_TASK_RATE) continue;
+    if (!semanticsPreserving && taskOutcomes < MIN_PROMOTION_TASK_OUTCOMES) continue;
+    if (taskOutcomes > 0
+      && ratio(impact.interventionTaskVerifiedSuccesses, taskOutcomes) < MIN_PROMOTION_VERIFIED_TASK_RATE) continue;
     const interventionFailureRate = ratio(impact.interventionFailures, impact.interventionCalls);
     const controlFailureRate = ratio(impact.controlFailures, impact.controlCalls);
     if (interventionFailureRate > MAX_PROMOTION_FAILURE_RATE) continue;

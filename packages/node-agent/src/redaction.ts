@@ -10,7 +10,7 @@ interface RedactionState {
 
 const privateKeyPattern = /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/g;
 const jwtPattern = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g;
-const knownTokenPattern = /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})\b/g;
+const knownTokenPattern = /\b(?:ch_[a-f0-9]{64}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16})\b/g;
 const bearerPattern = /(bearer\s+)[A-Za-z0-9._~+/=-]+/gi;
 const basicAuthUrlPattern = /(https?:\/\/[^\s:/@]+:)[^\s/@]+(@)/gi;
 const jsonQuotedPattern = /("(?:password|passwd|secret|token|api[-_]?key|authorization|credential|private[-_]?key|client[-_]?secret|bearer[-_]?token|oauth[-_]?password|oauth[-_]?token[-_]?secret)"\s*:\s*)"(?:\\.|[^"\\])*"/gi;
@@ -76,6 +76,7 @@ export function isSensitiveKey(key: string): boolean {
   if (['_count', '_bytes', '_duration', '_duration_ms', '_length', '_present', '_available']
     .some(suffix => normalized.endsWith(suffix))) return false;
   return normalized === 'stdin'
+    || normalized === 'conversation_handle'
     || normalized === 'chars'
     || normalized === 'authorization'
     || normalized === 'cookie'

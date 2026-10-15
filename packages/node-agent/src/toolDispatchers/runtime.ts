@@ -9,7 +9,8 @@ import type { ToolDispatchRequest, ToolHandlerMap } from '../toolDispatch/contra
 import type { JsonObject, ToolContext } from '../types.js';
 import { runtimeRevisionForWorkspace } from '../runtimeRevision.js';
 import { skillSummary } from '../skills/types.js';
-import { toolStrategyImplementationSnapshot } from '../knowledge/strategyImplementations.js';
+import { declaredToolStrategyImplementation, toolStrategyImplementationSnapshot } from '../knowledge/strategyImplementations.js';
+import { ValidationGate } from '../knowledge/validation.js';
 import { AGENT_VERSION, CLIENT_COMPAT_VERSION } from '../version.js';
 import { resolveExistingDirectory, resolveInside, rootAndCwd, selectedFolderSafe, validatedFolderCwd } from '../workspace.js';
 import { normalizedSandboxConfig, sandboxAvailable, sandboxBackend, sandboxBackends } from '../sandbox.js';
@@ -18,6 +19,114 @@ import { validateWslWorkspacePath } from '../wsl.js';
 
 function ok(value: JsonObject = {}): JsonObject {
   return { ok: true, ...value };
+}
+
+function knowledgeStatusFunnel(records: readonly { status: string }[]): JsonObject {
+  const statuses = ['observed', 'candidate', 'shadow', 'validated', 'promoted', 'rejected', 'deprecated', 'superseded'] as const;
+  const funnel: JsonObject = { total: records.length };
+  for (const status of statuses) funnel[status] = records.filter(record => record.status === status).length;
+  return funnel;
+}
+
+function roundedRate(numerator: number, denominator: number): number {
+  return denominator > 0 ? Math.round((numerator / denominator) * 10_000) / 10_000 : 0;
+}
+
+function roundedAverage(total: number, count: number): number {
+  return count > 0 ? Math.round((total / count) * 100) / 100 : 0;
+}
+
+function percentile(values: readonly number[] | undefined, fraction: number): number | null {
+  if (!values?.length) return null;
+  const sorted = values.filter(Number.isFinite).map(value => Math.max(0, value)).sort((left, right) => left - right);
+  if (!sorted.length) return null;
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * fraction) - 1));
+  return Math.round(sorted[index]! * 100) / 100;
+}
+
+function durationStats(total: number, count: number, samples: readonly number[] | undefined): JsonObject {
+  return {
+    avg: roundedAverage(total, count),
+    p50: percentile(samples, 0.5),
+    p95: percentile(samples, 0.95),
+    samples: samples?.length ?? 0,
+    distribution_available: Boolean(samples?.length)
+  };
+}
+
+function boundedLearningSnapshot(
+  records: readonly any[],
+  shadowImpacts: readonly any[],
+  canaryImpacts: readonly any[],
+  validation: any,
+  durable: any
+): JsonObject {
+  const funnel = knowledgeStatusFunnel(records);
+  const shadowById = new Map(shadowImpacts.map(item => [item.knowledgeId, item]));
+  const canaryById = new Map(canaryImpacts.map(item => [item.knowledgeId, item]));
+  const blockerById = new Map(validation.blockers.map((item: any) => [item.knowledgeId, item]));
+  const strategies = records
+    .filter(record => record.target === 'tool_strategy')
+    .sort((left, right) => right.updatedAtMs - left.updatedAtMs || left.id.localeCompare(right.id))
+    .slice(0, 20)
+    .map(record => {
+      const implementation = declaredToolStrategyImplementation(record);
+      const shadow = shadowById.get(record.id);
+      const canary = canaryById.get(record.id);
+      const matchedContexts = shadow ? Math.max(
+        shadow.matchedTaskIds?.length ?? 0,
+        shadow.matchedConversationContextIds?.length ?? 0,
+        shadow.matchedRuntimeBootContextIds?.length ?? 0
+      ) : 0;
+      const controlCalls = canary?.controlCalls ?? 0;
+      const interventionCalls = canary?.interventionCalls ?? 0;
+      return {
+        id: record.id,
+        target: record.target,
+        tool: String(record.trigger?.tool ?? implementation?.tool ?? ''),
+        status: record.status,
+        implementation: implementation?.id ?? null,
+        validation_class: implementation?.validationClass ?? 'task_aware',
+        observations: record.evidence.observations,
+        independent_contexts: matchedContexts,
+        shadow_matches: shadow?.matched ?? 0,
+        validation_blocker: blockerById.get(record.id) ?? null,
+        control_calls: controlCalls,
+        intervention_calls: interventionCalls,
+        control_failure_rate: roundedRate(canary?.controlFailures ?? 0, controlCalls),
+        intervention_failure_rate: roundedRate(canary?.interventionFailures ?? 0, interventionCalls),
+        shadow_failure_rate: roundedRate(shadow?.actualFailures ?? 0, shadow?.matched ?? 0),
+        durations_ms: {
+          shadow: durationStats(shadow?.totalObservedDurationMs ?? 0, shadow?.matched ?? 0, shadow?.durationSamplesMs),
+          control: durationStats(canary?.controlDurationMs ?? 0, controlCalls, canary?.controlDurationSamplesMs),
+          intervention: durationStats(canary?.interventionDurationMs ?? 0, interventionCalls, canary?.interventionDurationSamplesMs)
+        },
+        semantic_mismatch_count: shadow?.semanticEquivalenceFailures ?? 0,
+        promoted_at_ms: canary?.promotedAtMs ?? null,
+        rollback_at_ms: canary?.rolledBackAtMs ?? null,
+        rollback_reason: canary?.rollbackReason ?? null
+      };
+    });
+  return {
+    experience: {
+      ledger_events: durable.ledgerEvents ?? 0,
+      materialized_events: durable.materializedEvents ?? 0,
+      replay_complete: durable.replayComplete ?? false,
+      compiler_revision: durable.compilerRevision ?? null,
+      normalizer_revision: durable.normalizerRevision ?? null
+    },
+    funnel,
+    top_blockers: validation.blockers.slice(0, 10).map((blocker: any) => ({
+      knowledge_id: blocker.knowledgeId,
+      target: blocker.target,
+      reason: blocker.reason,
+      actual: blocker.actual,
+      ...(blocker.required === undefined ? {} : { required: blocker.required })
+    })),
+    top_blockers_truncated: Math.max(0, validation.blockers.length - 10) + validation.blockersTruncated,
+    strategies,
+    strategies_truncated: Math.max(0, records.filter(record => record.target === 'tool_strategy').length - strategies.length)
+  };
 }
 
 function workspaceHistoryDir(folder: { path: string }): string {
@@ -210,7 +319,10 @@ async function conversationBootstrap({ ctx, key, args, historyArgs, identity }: 
     skillRuntime.knowledgeImpactStore.revision(),
     skillRuntime.knowledgeImpactStore.list(),
     skillRuntime.canaryImpactStore.revision(),
-    skillRuntime.canaryImpactStore.list()
+    skillRuntime.canaryImpactStore.list(),
+    skillRuntime.knowledgeStore.list(),
+    new ValidationGate(skillRuntime.knowledgeStore, skillRuntime.knowledgeImpactStore).inspect(),
+    skillRuntime.knowledgeIngestor.durableSnapshot()
   ]) : undefined;
   const projectSkills = skillSnapshot ? {
     count: skillSnapshot.skills.length,
@@ -220,6 +332,10 @@ async function conversationBootstrap({ ctx, key, args, historyArgs, identity }: 
     mcp_surfaces: ['prompts/list', 'prompts/get', 'resources/list', 'resources/read'],
     loading_policy: 'Load only clearly relevant workspace or user-level skills; skill guidance never changes runtime permissions.'
   } : { count: 0, skills: [] };
+  const runtimeIngestion = skillRuntime?.knowledgeIngestor.snapshot();
+  const learningSummary = learningSnapshot ? boundedLearningSnapshot(
+    learningSnapshot[8], learningSnapshot[5], learningSnapshot[7], learningSnapshot[9], learningSnapshot[10]
+  ) : undefined;
   const learning = learningSnapshot ? {
     knowledge_revision: learningSnapshot[0],
     tool_strategy_revision: learningSnapshot[1].revision,
@@ -239,7 +355,39 @@ async function conversationBootstrap({ ctx, key, args, historyArgs, identity }: 
     validated_tool_strategy_count: learningSnapshot[1].strategies.filter(item => item.status === 'validated').length,
     promoted_tool_strategy_count: learningSnapshot[1].strategies.filter(item => item.status === 'promoted').length,
     validated_tool_evolution_count: learningSnapshot[2].candidates.filter(item => item.status === 'validated').length,
-    ingestion: skillRuntime?.knowledgeIngestor.snapshot(),
+    knowledge_funnel: knowledgeStatusFunnel(learningSnapshot[8]),
+    validation_gate: {
+      evaluated: learningSnapshot[9].evaluated,
+      ready: learningSnapshot[9].ready,
+      blocked: learningSnapshot[9].blocked,
+      blockers: learningSnapshot[9].blockers.map(blocker => ({
+        knowledge_id: blocker.knowledgeId,
+        target: blocker.target,
+        reason: blocker.reason,
+        actual: blocker.actual,
+        ...(blocker.required === undefined ? {} : { required: blocker.required })
+      })),
+      blockers_truncated: learningSnapshot[9].blockersTruncated
+    },
+    ingestion: runtimeIngestion,
+    runtime_ingestion: runtimeIngestion,
+    durable_ingestion: learningSnapshot[10],
+    durable_lifetime: {
+      experience: learningSummary?.experience ?? {},
+      knowledge_funnel: learningSummary?.funnel ?? {},
+      shadow_impact_count: learningSnapshot[5].length,
+      canary_impact_count: learningSnapshot[7].length
+    },
+    learning_snapshot: learningSummary,
+    counter_scopes: {
+      ingestion: 'runtime_process',
+      runtime_ingestion: 'runtime_process',
+      durable_ingestion: 'durable_experience_ledger_and_replay_state',
+      durable_lifetime: 'durable_knowledge_impact_and_experience_state',
+      learning_snapshot: 'bounded_durable_learning_explanation',
+      knowledge_funnel: 'durable_knowledge_store',
+      validation_gate: 'durable_knowledge_and_impact_store_snapshot'
+    },
     runtime_policy: 'adaptive_rollout_phase_2e',
     canary_policy: 'Validated strategies use a deterministic 25% semantics-preserving canary; evidence-positive strategies promote to 100% rollout, while post-promotion regressions automatically reject and disable them. Caller arguments and static security policy remain authoritative.',
     knowledge_loading_policy: 'Persistent knowledge and rejected/candidate experiments are not injected into inference context; rollout lifecycle and impact remain out of band.'

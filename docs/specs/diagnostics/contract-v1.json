@@ -64,6 +64,7 @@
       "optimization",
       "formatting",
       "search",
+      "patch",
       "parallelism",
       "performance",
       "warnings"

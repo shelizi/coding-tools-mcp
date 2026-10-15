@@ -23,7 +23,20 @@ const SAFE_FEATURES = new Set([
   'graph_yield_ms',
   'graph_wait_ms',
   'parallel_conflict',
-  'parallel_serialized'
+  'parallel_serialized',
+  'caller_intent_calculate_total_explicit',
+  'caller_intent_calculate_total',
+  'caller_intent_count_only',
+  'caller_intent_patch_bytes',
+  'caller_intent_patch_file_count',
+  'caller_intent_patch_hunk_count',
+  'caller_intent_wait_timeout_ms',
+  'caller_intent_wait_until',
+  'caller_intent_wait_timeout_explicit',
+  'wait_timed_out',
+  'process_completed',
+  'event_count',
+  'error_recommended_tool'
 ]);
 
 const IDENTITY_FEATURES = new Set([
@@ -32,12 +45,28 @@ const IDENTITY_FEATURES = new Set([
   'detached',
   'reattached',
   'parallel_conflict',
-  'parallel_serialized'
+  'parallel_serialized',
+  'caller_intent_calculate_total_explicit',
+  'caller_intent_calculate_total',
+  'caller_intent_count_only',
+  'caller_intent_patch_file_count',
+  'caller_intent_patch_hunk_count',
+  'caller_intent_wait_timeout_explicit',
+  'caller_intent_wait_until',
+  'wait_timed_out',
+  'process_completed',
+  'error_recommended_tool'
 ]);
 
 const EVOLVED_SKILL_SOURCES = new Set(['project', 'agents', 'claude', 'codex-user', 'claude-user']);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const STALE_EDIT_GUIDANCE = 'When a guarded edit reports stale state, re-read the current file and rebuild the guarded edit before retrying.';
+const EXPERIENCE_COMPILER_SCHEMA = [
+  'experience-compiler-v2',
+  'features:calculate_total,files_considered,scanned_files,scan_excluded_worktree_container_count,returned_count,phase_baseline_capture_ms,phase_baseline_refresh_ms,phase_harness_begin_ms,phase_harness_finish_ms,baseline_refresh_mode,baseline_refresh_file_count,recovery_succeeded,error_direct_recovery_action_count,retry_attempt,graph_action,detached,reattached,graph_yield_ms,graph_wait_ms,parallel_conflict,parallel_serialized,caller_intent_calculate_total_explicit,caller_intent_calculate_total,caller_intent_count_only,caller_intent_patch_bytes,caller_intent_patch_file_count,caller_intent_patch_hunk_count,caller_intent_wait_timeout_ms,caller_intent_wait_until,caller_intent_wait_timeout_explicit,wait_timed_out,process_completed,event_count,error_recommended_tool',
+  'rules:search_exact_total_fast_tail,broad_search_worktree_exclusion,project_state_incremental_baseline,edit_incremental_baseline,exec_many_adaptive_wait,apply_patch_prefer_guarded_edit,wait_command_adaptive_poll,stale_edit_recovery,evolved_skill_stale_edit'
+].join('\n');
+export const EXPERIENCE_COMPILER_REVISION = createHash('sha256').update(EXPERIENCE_COMPILER_SCHEMA).digest('hex');
 
 function safeFeatures(observation: ExperienceObservation): Record<string, string | number | boolean | null> {
   return Object.fromEntries(
@@ -55,9 +84,9 @@ function identityFeatures(observation: ExperienceObservation): Record<string, st
 
 function evidenceFor(observations: readonly ExperienceObservation[]): KnowledgeEvidence {
   const successes = observations.filter(item => item.outcome === 'success').length;
-  const taskContextIds = contextIds(observations, 'task', observation => observation.taskId);
-  const conversationContextIds = contextIds(observations, 'conversation', observation => observation.conversationContextId);
-  const runtimeBootContextIds = contextIds(observations, 'runtime-boot', observation => observation.runtimeBootId);
+  const taskContextIds = contextIds(observations, observation => contextEvidenceId('task', observation.taskId, observation.taskIdHash));
+  const conversationContextIds = contextIds(observations, observation => contextEvidenceId('conversation', observation.conversationContextId, observation.conversationContextIdHash));
+  const runtimeBootContextIds = contextIds(observations, observation => contextEvidenceId('runtime-boot', observation.runtimeBootId, observation.runtimeBootIdHash));
   return {
     observations: observations.length,
     successes,
@@ -88,13 +117,17 @@ function contextDigest(kind: string, value: string | undefined): string | undefi
   return createHash('sha256').update(`${kind}\0${normalized}`).digest('hex');
 }
 
+function contextEvidenceId(kind: string, raw: string | undefined, hashed: string | undefined): string | undefined {
+  if (hashed && SHA256_PATTERN.test(hashed)) return hashed;
+  return contextDigest(kind, raw);
+}
+
 function contextIds(
   observations: readonly ExperienceObservation[],
-  kind: string,
   value: (observation: ExperienceObservation) => string | undefined
 ): string[] {
   return [...new Set(observations
-    .map(observation => contextDigest(kind, value(observation)))
+    .map(value)
     .filter((item): item is string => Boolean(item)))]
     .sort()
     .slice(0, 256);
@@ -139,6 +172,26 @@ function groupedRetainedGraphPolling(
       && yieldMs >= 25_000
       && waitMs >= Math.max(25_000, yieldMs * 0.9);
   });
+}
+
+function groupedPreventablePatchFailure(
+  observations: readonly ExperienceObservation[],
+  features: readonly Record<string, string | number | boolean | null>[]
+): boolean {
+  return features.some((feature, index) => observations[index]!.outcome === 'failure'
+    && feature.error_recommended_tool === 'edit'
+    && Number(feature.caller_intent_patch_file_count ?? 0) === 1
+    && Number(feature.caller_intent_patch_hunk_count ?? 0) <= 1);
+}
+
+function groupedEmptyWaitTimeout(
+  observations: readonly ExperienceObservation[],
+  features: readonly Record<string, string | number | boolean | null>[]
+): boolean {
+  return features.some((feature, index) => observations[index]!.outcome === 'success'
+    && feature.wait_timed_out === true
+    && feature.process_completed === false
+    && Number(feature.event_count ?? 0) === 0);
 }
 
 function classify(observations: readonly ExperienceObservation[]): {
@@ -195,6 +248,28 @@ function classify(observations: readonly ExperienceObservation[]): {
         preserve_initial_responsiveness: true
       },
       metadata: { proposalType: 'performance' }
+    };
+  }
+  if (first.tool === 'apply_patch' && groupedPreventablePatchFailure(observations, features)) {
+    return {
+      target: 'tool_strategy',
+      hypothesis: 'Single-file replacement patches that preflight-fail and already map cleanly to guarded edit should prefer edit instead of retrying apply_patch.',
+      action: {
+        recommendation: 'prefer_guarded_edit_for_single_file_replacement',
+        caller_intent_required: 'single_file_replacement',
+        task_aware_implementation: 'apply_patch_prefer_guarded_edit'
+      }
+    };
+  }
+  if (first.tool === 'wait_command' && groupedEmptyWaitTimeout(observations, features)) {
+    return {
+      target: 'tool_strategy',
+      hypothesis: 'Repeated empty wait windows on a healthy retained process create avoidable tool round-trips and should use adaptive waiting guidance.',
+      action: {
+        recommendation: 'prefer_adaptive_wait',
+        caller_intent_required: 'retained_process_still_running',
+        task_aware_implementation: 'wait_command_adaptive_poll'
+      }
     };
   }
   if (first.tool === 'edit' && (errorCodes.has('FILE_VERSION_MISMATCH') || errorCodes.has('EDIT_MATCH_COUNT_MISMATCH'))) {
@@ -259,6 +334,7 @@ function compileEvolvedSkillRecords(observations: readonly ExperienceObservation
       createdAtMs: grouped[0]!.timestampMs,
       updatedAtMs: grouped[grouped.length - 1]!.timestampMs,
       metadata: {
+        compilerRevision: EXPERIENCE_COMPILER_REVISION,
         name: skill.name,
         base: { source: skill.source, name: skill.name, contentSha256: skill.contentSha256 },
         generation: skill.generation + 1,
@@ -312,7 +388,10 @@ export class ExperienceCompiler {
         counterexampleEventIds: [],
         createdAtMs: grouped[0]!.timestampMs,
         updatedAtMs: now,
-        metadata: classification.metadata
+        metadata: {
+          ...(classification.metadata ?? {}),
+          compilerRevision: EXPERIENCE_COMPILER_REVISION
+        }
       };
       record.id = knowledgeRecordId(record);
       records.push(record);

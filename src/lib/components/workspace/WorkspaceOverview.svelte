@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import StatusOrb from "$lib/components/StatusOrb.svelte";
   import { t } from "$lib/i18n";
   import {
@@ -21,10 +22,12 @@
     actionsBusy: boolean;
     mcpLocal: string;
     mcpPublic: string;
+    mcpLastActivityAtMs: number | null;
     actionsLocal: string;
     actionsPublic: string;
     frpProfiles: FrpProfileDto[];
     stateLabel: (state: RuntimeState) => string;
+    onRefreshMcp?: () => unknown;
     onToggleMcp: () => void | Promise<void>;
     onToggleActions: () => void | Promise<void>;
     onNavigate: (tab: "mcp" | "actions" | "settings") => void;
@@ -39,16 +42,26 @@
     actionsBusy,
     mcpLocal,
     mcpPublic,
+    mcpLastActivityAtMs,
     actionsLocal,
     actionsPublic,
     frpProfiles,
     stateLabel,
+    onRefreshMcp,
     onToggleMcp,
     onToggleActions,
     onNavigate,
   }: Props = $props();
 
   const capabilities = getBackend().capabilities;
+
+  onMount(() => {
+    if (!onRefreshMcp) return;
+    const timer = setInterval(() => {
+      if (mcpStatus === "running") void onRefreshMcp();
+    }, 5000);
+    return () => clearInterval(timer);
+  });
 </script>
 
 <div class="grid gap-4 lg:grid-cols-2">
@@ -79,6 +92,14 @@
           <p class="break-all text-[var(--color-text-secondary)]">{mcpPublic}</p>
         </div>
       {/if}
+      <div>
+        <p class="tx-section-label">{$t("Last activity")}</p>
+        <p class="break-all text-[var(--color-text-secondary)]">
+          {mcpLastActivityAtMs
+            ? new Date(mcpLastActivityAtMs).toLocaleString()
+            : $t("No requests yet")}
+        </p>
+      </div>
     </div>
 
     <div class="mt-auto flex flex-wrap gap-2">

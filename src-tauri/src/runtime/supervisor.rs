@@ -140,6 +140,10 @@ impl RuntimeSupervisor {
         let (local_endpoint, public_endpoint) = endpoints(profile, kind);
         let port = port_for(profile, kind);
         let service_label = service_label(kind);
+        let last_activity_at_ms = match kind {
+            ServiceKind::Mcp => mcp::workspace_last_access_ms(&profile.id),
+            ServiceKind::Actions => None,
+        };
 
         match phase {
             RuntimePhase::Running => RuntimeStatusDto {
@@ -152,6 +156,7 @@ impl RuntimeSupervisor {
                 public_message: public_message_for(profile, kind),
                 local_endpoint,
                 public_endpoint,
+                last_activity_at_ms,
             },
             RuntimePhase::Starting => RuntimeStatusDto {
                 state: "starting".into(),
@@ -160,6 +165,7 @@ impl RuntimeSupervisor {
                 public_message: "等待服务就绪".into(),
                 local_endpoint,
                 public_endpoint,
+                last_activity_at_ms,
             },
             RuntimePhase::Stopping => RuntimeStatusDto {
                 state: "stopping".into(),
@@ -168,6 +174,7 @@ impl RuntimeSupervisor {
                 public_message: "正在停止".into(),
                 local_endpoint,
                 public_endpoint,
+                last_activity_at_ms,
             },
             RuntimePhase::Error => {
                 let message = self
@@ -182,6 +189,7 @@ impl RuntimeSupervisor {
                     public_message: message,
                     local_endpoint,
                     public_endpoint,
+                    last_activity_at_ms,
                 }
             }
             RuntimePhase::Stopped => RuntimeStatusDto {
@@ -191,6 +199,7 @@ impl RuntimeSupervisor {
                 public_message: "未知".into(),
                 local_endpoint,
                 public_endpoint,
+                last_activity_at_ms,
             },
         }
     }

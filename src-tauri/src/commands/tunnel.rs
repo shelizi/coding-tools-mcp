@@ -142,6 +142,19 @@ pub fn get_frp_snippet(
 }
 
 #[tauri::command]
+pub async fn get_tunnel_status(
+    state: State<'_, AppState>,
+    id: String,
+    service: String,
+) -> AppResult<TunnelStatus> {
+    let profile = profile_by_id(&state, &id)?;
+    let kind = TunnelServiceKind::parse(&service)?;
+    let settings = state.with_settings(|store| Ok(store.settings()))?;
+    let guard = supervisor().lock().await;
+    Ok(guard.status(&profile, kind, &settings))
+}
+
+#[tauri::command]
 pub async fn restart_tunnel(
     state: State<'_, AppState>,
     id: String,

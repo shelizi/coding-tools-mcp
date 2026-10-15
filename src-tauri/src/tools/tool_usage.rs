@@ -9,6 +9,9 @@ use crate::tools::context::ToolContext;
 use crate::tools::parallel_stats::{parallelism_report, ParallelHistory};
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 
+mod statistics;
+use statistics::UsageStatistics;
+
 const DIAGNOSTICS_LOG_FILE: &str = "diagnostics.jsonl";
 const TOOL_USAGE_LOG_FILE: &str = "mcp-tool-usage.jsonl";
 const DIAGNOSTICS_SCHEMA_VERSION: u64 = 1;
@@ -64,6 +67,11 @@ struct ToolStats {
     failed_command_ids: u64,
     skipped_command_ids: u64,
     empty_wait_timeouts: u64,
+    avoidable_empty_wait_timeouts: u64,
+    transport_cap_empty_waits: u64,
+    wait_returned_output: u64,
+    wait_returned_terminal: u64,
+    wait_recommendation_used: u64,
     deduplicated_calls: u64,
     heartbeat_responses: u64,
     detached_responses: u64,
@@ -85,6 +93,15 @@ struct ToolStats {
     search_zero_result_calls: u64,
     search_early_stops: u64,
     search_exact_total_calls: u64,
+    search_caller_intent_observed_calls: u64,
+    search_calculate_total_explicit_calls: u64,
+    search_calculate_total_requested_calls: u64,
+    search_count_only_requested_calls: u64,
+    patch_check_failures: u64,
+    patch_preflight_failures: u64,
+    patch_context_failures: u64,
+    patch_edit_recommended_failures: u64,
+    patch_preventable_simple_failures: u64,
     phase_latency: BTreeMap<String, PhaseStats>,
     durations: Vec<u64>,
 }
@@ -184,6 +201,7 @@ pub fn query_tool_usage_for_profile(
         .unwrap_or(0)
         .min(RECORD_CURSOR_MAX as u64) as usize;
     let record_window_limit = cursor.saturating_add(limit);
+    let mut statistics = UsageStatistics::from_args(args)?;
     let top = args
         .get("top")
         .and_then(Value::as_u64)
@@ -251,15 +269,12 @@ pub fn query_tool_usage_for_profile(
     let outcomes = string_filter(args.get("outcomes"));
 
     let log_dir = crate::tunnel::log_dir_for_profile(profile_id);
-    let paths = log_paths(&log_dir, TOOL_USAGE_LOG_FILE)
-        .into_iter()
-        .map(|path| ("legacy", path))
-        .chain(
-            log_paths(&log_dir, DIAGNOSTICS_LOG_FILE)
-                .into_iter()
-                .map(|path| ("canonical", path)),
-        )
-        .collect::<Vec<_>>();
+    let paths = diagnostic_log_sources(&log_dir, scope);
+    let query_source_mode = if scope == "current_runtime" {
+        "canonical_current_runtime"
+    } else {
+        "canonical_then_legacy"
+    };
     let mut invalid_lines = 0u64;
     let mut scanned_lines = 0u64;
     let mut log_bytes_read = 0u64;
@@ -296,6 +311,12 @@ pub fn query_tool_usage_for_profile(
         let (scanned, invalid, bytes_read) = visit_complete_jsonl_records(&path, |record| {
             if diagnostic_event_is_duplicate(&record, &mut seen_diagnostic_event_ids) {
                 duplicate_records_ignored = duplicate_records_ignored.saturating_add(1);
+                return;
+            }
+            if statistics
+                .as_ref()
+                .is_some_and(|window| !window.includes(&record))
+            {
                 return;
             }
             let event = record
@@ -387,6 +408,9 @@ pub fn query_tool_usage_for_profile(
                 return;
             }
             matched_lines += 1;
+            if let Some(window) = &mut statistics {
+                window.accumulate(&record, is_error_record(&record));
+            }
             persisted_dropped_records = persisted_dropped_records.saturating_add(
                 record
                     .get("telemetry_dropped_before")
@@ -489,12 +513,18 @@ pub fn query_tool_usage_for_profile(
                     "failed_command_ids": stats.failed_command_ids,
                     "skipped_command_ids": stats.skipped_command_ids,
                     "empty_wait_timeouts": stats.empty_wait_timeouts,
+                    "avoidable_empty_wait_timeouts": stats.avoidable_empty_wait_timeouts,
+                    "transport_cap_empty_waits": stats.transport_cap_empty_waits,
+                    "wait_returned_output_calls": stats.wait_returned_output,
+                    "wait_returned_terminal_calls": stats.wait_returned_terminal,
+                    "wait_recommendation_used_calls": stats.wait_recommendation_used,
                     "deduplicated_calls": stats.deduplicated_calls,
                     "heartbeat_responses": stats.heartbeat_responses,
                     "detached_responses": stats.detached_responses
                 }
                 ,"formatting": formatting_stats(&stats)
                 ,"search": search_stats(&stats)
+                ,"patch": patch_stats(&stats)
             })
         })
         .collect::<Vec<_>>();
@@ -586,6 +616,11 @@ pub fn query_tool_usage_for_profile(
             "failed_command_ids": totals.failed_command_ids,
             "skipped_command_ids": totals.skipped_command_ids,
             "empty_wait_timeouts": totals.empty_wait_timeouts,
+            "avoidable_empty_wait_timeouts": totals.avoidable_empty_wait_timeouts,
+            "transport_cap_empty_waits": totals.transport_cap_empty_waits,
+            "wait_returned_output_calls": totals.wait_returned_output,
+            "wait_returned_terminal_calls": totals.wait_returned_terminal,
+            "wait_recommendation_used_calls": totals.wait_recommendation_used,
             "deduplicated_calls": totals.deduplicated_calls,
             "heartbeat_responses": totals.heartbeat_responses,
             "detached_responses": totals.detached_responses,
@@ -610,13 +645,18 @@ pub fn query_tool_usage_for_profile(
     } else {
         Value::Null
     };
+    let patch_value = if aggregate {
+        patch_stats(&totals)
+    } else {
+        Value::Null
+    };
     let performance_value = if include_performance {
         performance_report(&performance, top, include_bursts, burst_idle_ms)
     } else {
         Value::Null
     };
 
-    Ok(tool_ok(json!({
+    let mut result = json!({
         "workspace_id": profile_id,
         "scope": scope,
         "runtime_boot_id": crate::mcp::runtime_boot_id(),
@@ -639,7 +679,9 @@ pub fn query_tool_usage_for_profile(
                 "legacy_write_env": crate::mcp::legacy_compat_write_env(),
                 "legacy_read_preserved": true,
                 "retirement_requires_compatibility_window": true,
-                "query_deduplicates_by": "diagnostic_event_id"
+                "query_deduplicates_by": "diagnostic_event_id",
+                "query_source_mode": query_source_mode,
+                "canonical_preferred": true
             },
             "migration": {
                 "duplicate_records_ignored": duplicate_records_ignored,
@@ -678,10 +720,15 @@ pub fn query_tool_usage_for_profile(
         "optimization": optimization_value,
         "formatting": formatting_value,
         "search": search_value,
+        "patch": patch_value,
         "parallelism": parallelism_report(&parallel_history, top),
         "performance": performance_value,
         "warnings": Vec::<String>::new()
-    })))
+    });
+    if let Some(window) = statistics {
+        result["statistics"] = window.report();
+    }
+    Ok(tool_ok(result))
 }
 
 fn top_error_counts(counts: &BTreeMap<String, u64>) -> Vec<Value> {
@@ -772,6 +819,22 @@ fn diagnostic_event_type(record: &Value, legacy_event: &str) -> String {
         return "transport_event".to_string();
     }
     legacy_event.to_string()
+}
+
+fn diagnostic_log_sources(log_dir: &Path, scope: &str) -> Vec<(&'static str, PathBuf)> {
+    let canonical = log_paths(log_dir, DIAGNOSTICS_LOG_FILE)
+        .into_iter()
+        .map(|path| ("canonical", path));
+    if scope == "current_runtime" {
+        return canonical.collect();
+    }
+    canonical
+        .chain(
+            log_paths(log_dir, TOOL_USAGE_LOG_FILE)
+                .into_iter()
+                .map(|path| ("legacy", path)),
+        )
+        .collect()
 }
 
 fn diagnostic_event_is_duplicate(record: &Value, seen: &mut BTreeSet<String>) -> bool {
@@ -1015,15 +1078,43 @@ fn add_stats(record: &Value, stats: &mut ToolStats) {
         .get("skipped_command_id_count")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    stats.empty_wait_timeouts += u64::from(
-        record.get("tool").and_then(Value::as_str) == Some("wait_command")
-            && record.get("request_timed_out").and_then(Value::as_bool) == Some(true)
+    if record.get("tool").and_then(Value::as_str) == Some("wait_command") {
+        let legacy_empty_wait = record.get("request_timed_out").and_then(Value::as_bool)
+            == Some(true)
             && record
                 .get("event_count")
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
-                == 0,
-    );
+                == 0;
+        let empty_wait = record
+            .get("wait_returned_empty")
+            .and_then(Value::as_bool)
+            .unwrap_or(legacy_empty_wait);
+        stats.empty_wait_timeouts += u64::from(empty_wait);
+        let transport_cap = record
+            .get("wait_transport_cap_reached")
+            .and_then(Value::as_bool)
+            == Some(true);
+        stats.transport_cap_empty_waits += u64::from(empty_wait && transport_cap);
+        stats.avoidable_empty_wait_timeouts += u64::from(empty_wait && !transport_cap);
+        stats.wait_returned_output +=
+            u64::from(record.get("wait_returned_output").and_then(Value::as_bool) == Some(true));
+        stats.wait_returned_terminal += u64::from(
+            record
+                .get("wait_returned_terminal")
+                .and_then(Value::as_bool)
+                == Some(true),
+        );
+        let recommendation_used = record
+            .get("caller_intent_wait_timeout_explicit")
+            .and_then(Value::as_bool)
+            == Some(true)
+            && record
+                .get("caller_intent_wait_timeout_ms")
+                .and_then(Value::as_u64)
+                == record.get("recommended_wait_ms").and_then(Value::as_u64);
+        stats.wait_recommendation_used += u64::from(recommendation_used);
+    }
     stats.deduplicated_calls +=
         u64::from(record.get("deduplicated").and_then(Value::as_bool) == Some(true));
     stats.heartbeat_responses +=
@@ -1096,6 +1187,62 @@ fn add_stats(record: &Value, stats: &mut ToolStats) {
         );
         stats.search_exact_total_calls +=
             u64::from(record.get("total_matches_exact").and_then(Value::as_bool) == Some(true));
+        let has_caller_intent = record
+            .get("caller_intent_calculate_total_explicit")
+            .and_then(Value::as_bool)
+            .is_some()
+            && record
+                .get("caller_intent_calculate_total")
+                .and_then(Value::as_bool)
+                .is_some()
+            && record
+                .get("caller_intent_count_only")
+                .and_then(Value::as_bool)
+                .is_some();
+        stats.search_caller_intent_observed_calls += u64::from(has_caller_intent);
+        stats.search_calculate_total_explicit_calls += u64::from(
+            record
+                .get("caller_intent_calculate_total_explicit")
+                .and_then(Value::as_bool)
+                == Some(true),
+        );
+        stats.search_calculate_total_requested_calls += u64::from(
+            record
+                .get("caller_intent_calculate_total")
+                .and_then(Value::as_bool)
+                == Some(true),
+        );
+        stats.search_count_only_requested_calls += u64::from(
+            record
+                .get("caller_intent_count_only")
+                .and_then(Value::as_bool)
+                == Some(true),
+        );
+    }
+    if record.get("tool").and_then(Value::as_str) == Some("apply_patch")
+        && is_tool_error_record(record)
+    {
+        let error_code = record
+            .get("error_code")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        stats.patch_check_failures += u64::from(error_code == "PATCH_CHECK_FAILED");
+        stats.patch_preflight_failures += u64::from(error_code == "PATCH_PREFLIGHT_FAILED");
+        stats.patch_context_failures += u64::from(error_code == "PATCH_CONTEXT_NOT_FOUND");
+        let edit_recommended =
+            record.get("error_recommended_tool").and_then(Value::as_str) == Some("edit");
+        stats.patch_edit_recommended_failures += u64::from(edit_recommended);
+        let simple_single_file = record
+            .get("caller_intent_patch_file_count")
+            .and_then(Value::as_u64)
+            == Some(1)
+            && record
+                .get("caller_intent_patch_hunk_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                <= 1;
+        stats.patch_preventable_simple_failures +=
+            u64::from(edit_recommended && simple_single_file);
     }
     for (phase, field) in PHASE_METRICS {
         if let Some(duration) = record.get(field).and_then(Value::as_u64) {
@@ -1131,7 +1278,22 @@ fn search_stats(stats: &ToolStats) -> Value {
         "matched_files": stats.search_matched_files,
         "zero_result_calls": stats.search_zero_result_calls,
         "early_stop_calls": stats.search_early_stops,
-        "exact_total_calls": stats.search_exact_total_calls
+        "exact_total_calls": stats.search_exact_total_calls,
+        "caller_intent_observed_calls": stats.search_caller_intent_observed_calls,
+        "calculate_total_explicit_calls": stats.search_calculate_total_explicit_calls,
+        "calculate_total_requested_calls": stats.search_calculate_total_requested_calls,
+        "count_only_requested_calls": stats.search_count_only_requested_calls,
+        "calculate_total_omitted_calls": stats.search_caller_intent_observed_calls.saturating_sub(stats.search_calculate_total_explicit_calls)
+    })
+}
+
+fn patch_stats(stats: &ToolStats) -> Value {
+    json!({
+        "check_failures": stats.patch_check_failures,
+        "preflight_failures": stats.patch_preflight_failures,
+        "context_failures": stats.patch_context_failures,
+        "edit_recommended_failures": stats.patch_edit_recommended_failures,
+        "preventable_simple_failures": stats.patch_preventable_simple_failures
     })
 }
 
@@ -1828,6 +1990,23 @@ mod tests {
     }
 
     #[test]
+    fn current_runtime_uses_only_canonical_diagnostics() {
+        let dir = tempfile::tempdir().expect("log dir");
+        let sources = diagnostic_log_sources(dir.path(), "current_runtime");
+        assert!(sources.iter().all(|(source, _)| *source == "canonical"));
+        assert_eq!(sources.len(), MAX_ROTATED_FILES + 1);
+
+        let all_sources = diagnostic_log_sources(dir.path(), "all");
+        assert_eq!(all_sources.len(), (MAX_ROTATED_FILES + 1) * 2);
+        assert!(all_sources[..MAX_ROTATED_FILES + 1]
+            .iter()
+            .all(|(source, _)| *source == "canonical"));
+        assert!(all_sources[MAX_ROTATED_FILES + 1..]
+            .iter()
+            .all(|(source, _)| *source == "legacy"));
+    }
+
+    #[test]
     fn canonical_diagnostics_dual_read_deduplicates_event_ids_but_keeps_legacy_records() {
         let mut seen = BTreeSet::new();
         let canonical = json!({ "diagnostic_event_id": "event-1", "event": "tool_call" });
@@ -2305,6 +2484,9 @@ mod tests {
                 "matched_files": 2,
                 "early_stop_reason": "result_limit",
                 "total_matches_exact": false,
+                "caller_intent_calculate_total_explicit": false,
+                "caller_intent_calculate_total": false,
+                "caller_intent_count_only": false,
                 "ok": true
             }),
             &mut stats,
@@ -2318,6 +2500,9 @@ mod tests {
                 "scanned_files": 3,
                 "matched_files": 0,
                 "total_matches_exact": true,
+                "caller_intent_calculate_total_explicit": true,
+                "caller_intent_calculate_total": true,
+                "caller_intent_count_only": false,
                 "ok": true
             }),
             &mut stats,
@@ -2330,6 +2515,91 @@ mod tests {
         assert_eq!(report["zero_result_calls"], 1);
         assert_eq!(report["early_stop_calls"], 1);
         assert_eq!(report["exact_total_calls"], 1);
+        assert_eq!(report["caller_intent_observed_calls"], 2);
+        assert_eq!(report["calculate_total_explicit_calls"], 1);
+        assert_eq!(report["calculate_total_requested_calls"], 1);
+        assert_eq!(report["count_only_requested_calls"], 0);
+        assert_eq!(report["calculate_total_omitted_calls"], 1);
+    }
+
+    #[test]
+    fn wait_stats_separate_avoidable_empty_polls_from_transport_cap_reattach() {
+        let mut stats = ToolStats::default();
+        add_stats(
+            &json!({
+                "tool": "wait_command",
+                "duration_ms": 5_000,
+                "request_timed_out": true,
+                "event_count": 0,
+                "wait_returned_empty": true,
+                "wait_transport_cap_reached": false,
+                "wait_returned_output": false,
+                "wait_returned_terminal": false,
+                "caller_intent_wait_timeout_explicit": true,
+                "caller_intent_wait_timeout_ms": 5_000,
+                "recommended_wait_ms": 5_000,
+                "ok": true
+            }),
+            &mut stats,
+        );
+        add_stats(
+            &json!({
+                "tool": "wait_command",
+                "duration_ms": 20_000,
+                "request_timed_out": true,
+                "event_count": 0,
+                "wait_returned_empty": true,
+                "wait_transport_cap_reached": true,
+                "wait_returned_output": false,
+                "wait_returned_terminal": false,
+                "caller_intent_wait_timeout_explicit": true,
+                "caller_intent_wait_timeout_ms": 20_000,
+                "recommended_wait_ms": 20_000,
+                "ok": true
+            }),
+            &mut stats,
+        );
+        assert_eq!(stats.empty_wait_timeouts, 2);
+        assert_eq!(stats.avoidable_empty_wait_timeouts, 1);
+        assert_eq!(stats.transport_cap_empty_waits, 1);
+        assert_eq!(stats.wait_recommendation_used, 2);
+    }
+
+    #[test]
+    fn patch_stats_report_preventable_simple_failures() {
+        let mut stats = ToolStats::default();
+        add_stats(
+            &json!({
+                "tool": "apply_patch",
+                "duration_ms": 10,
+                "outcome": "tool_error",
+                "is_error": true,
+                "error_code": "PATCH_CHECK_FAILED",
+                "error_recommended_tool": "edit",
+                "caller_intent_patch_file_count": 1,
+                "caller_intent_patch_hunk_count": 1
+            }),
+            &mut stats,
+        );
+        add_stats(
+            &json!({
+                "tool": "apply_patch",
+                "duration_ms": 12,
+                "outcome": "tool_error",
+                "is_error": true,
+                "error_code": "PATCH_PREFLIGHT_FAILED",
+                "error_recommended_tool": "edit",
+                "caller_intent_patch_file_count": 3,
+                "caller_intent_patch_hunk_count": 4
+            }),
+            &mut stats,
+        );
+        let report = patch_stats(&stats);
+        assert_eq!(report["check_failures"], 1);
+        assert_eq!(report["preflight_failures"], 1);
+        assert_eq!(report["context_failures"], 0);
+        assert_eq!(report["edit_recommended_failures"], 2);
+        assert_eq!(report["preventable_simple_failures"], 1);
     }
 
     #[test]

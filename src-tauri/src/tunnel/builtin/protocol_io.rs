@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use coding_tools_tunnel_protocol::ControlMessage;
+use coding_tools_tunnel_protocol::{ControlMessage, MultiplexControlMessage};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -8,7 +8,7 @@ use tokio::time::{timeout, Instant};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+pub(super) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(super) type ClientWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -42,6 +42,16 @@ pub(super) fn decode_control(text: &str) -> Result<ControlMessage, String> {
 }
 
 pub(super) fn encode_control(message: &ControlMessage) -> Result<String, String> {
+    serde_json::to_string(message).map_err(|error| error.to_string())
+}
+
+pub(super) fn decode_multiplex_control(text: &str) -> Result<MultiplexControlMessage, String> {
+    serde_json::from_str(text).map_err(|error| error.to_string())
+}
+
+pub(super) fn encode_multiplex_control(
+    message: &MultiplexControlMessage,
+) -> Result<String, String> {
     serde_json::to_string(message).map_err(|error| error.to_string())
 }
 
@@ -97,6 +107,34 @@ pub(super) async fn send_control(
     message: &ControlMessage,
 ) -> Result<(), String> {
     let encoded = encode_control(message)?;
+    sink.send(Message::Text(encoded.into()))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub(super) async fn receive_multiplex_control(
+    sink: &mut ClientSink,
+    stream: &mut ClientStream,
+) -> Result<MultiplexControlMessage, String> {
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(text))) => return decode_multiplex_control(text.as_str()),
+            Some(Ok(Message::Ping(payload))) => sink
+                .send(Message::Pong(payload))
+                .await
+                .map_err(|error| error.to_string())?,
+            Some(Ok(Message::Close(_))) | None => return Err("websocket closed".into()),
+            Some(Ok(_)) => return Err("expected text multiplex control message".into()),
+            Some(Err(error)) => return Err(error.to_string()),
+        }
+    }
+}
+
+pub(super) async fn send_multiplex_control(
+    sink: &mut ClientSink,
+    message: &MultiplexControlMessage,
+) -> Result<(), String> {
+    let encoded = encode_multiplex_control(message)?;
     sink.send(Message::Text(encoded.into()))
         .await
         .map_err(|error| error.to_string())

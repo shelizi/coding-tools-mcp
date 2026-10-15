@@ -12,6 +12,7 @@ const OPERATION_RESULT_BOOLEAN_FIELDS: &[&str] = &[
     "verification_ok",
     "process_timed_out",
     "request_timed_out",
+    "observation_timed_out",
     "recoverable",
     "truncated",
     "stdout_truncated",
@@ -31,6 +32,13 @@ const OPERATION_RESULT_TOKEN_FIELDS: &[&str] = &[
     "outcome_class",
     "execution_mode",
     "timeout_scope",
+    "observation_state",
+    "commit",
+    "previous_head",
+    "expected_head",
+    "actual_head_before",
+    "actual_head_at_commit",
+    "actual_head_after",
 ];
 
 const OPERATION_RESULT_INTEGER_FIELDS: &[&str] = &[
@@ -50,6 +58,7 @@ const OPERATION_RESULT_INTEGER_FIELDS: &[&str] = &[
     "resource_lock_wait_ms",
     "history_lock_wait_ms",
     "session_registry_wait_ms",
+    "transport_safe_wait_ms",
     "requested_process_timeout_ms",
     "effective_process_timeout_ms",
     "process_timeout_limit_ms",
@@ -64,6 +73,35 @@ fn operation_summary_token(value: Option<&Value>) -> Option<&str> {
                 byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
             })
     })
+}
+
+fn operation_summary_output_refs(value: Option<&Value>) -> Option<Value> {
+    let object = value?.as_object()?;
+    let mut safe = Map::new();
+    for stream in ["stdout", "stderr"] {
+        let Some(reference) = object.get(stream).and_then(Value::as_str) else {
+            continue;
+        };
+        let valid = reference.starts_with("output://")
+            && reference
+                .rsplit_once('/')
+                .is_some_and(|(_, suffix)| suffix == "stdout" || suffix == "stderr")
+            && reference
+                .trim_start_matches("output://")
+                .split('/')
+                .next()
+                .is_some_and(|id| {
+                    !id.is_empty()
+                        && id.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'.' | b'_' | b':' | b'-')
+                        })
+                });
+        if valid {
+            safe.insert(stream.into(), Value::String(reference.to_string()));
+        }
+    }
+    (!safe.is_empty()).then_some(Value::Object(safe))
 }
 
 pub(crate) fn operation_result_summary(name: &str, output: &Value) -> Value {
@@ -94,6 +132,9 @@ pub(crate) fn operation_result_summary(name: &str, output: &Value) -> Value {
         {
             summary.insert((*field).into(), value.clone());
         }
+    }
+    if let Some(output_refs) = operation_summary_output_refs(output.get("output_refs")) {
+        summary.insert("output_refs".into(), output_refs);
     }
     let error = output.get("error").and_then(Value::as_object);
     if let Some(value) = operation_summary_token(
@@ -326,4 +367,57 @@ fn filter_exposed_actions(ctx: &ToolContext, actions: Vec<String>) -> Vec<String
         .into_iter()
         .filter(|action| exposed.contains(&action.as_str()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::operation_result_summary;
+
+    #[test]
+    fn operation_summary_keeps_safe_audit_refs_and_git_provenance_without_raw_output() {
+        let summary = operation_result_summary(
+            "git_commit",
+            &json!({
+                "ok": true,
+                "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "previous_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "actual_head_after": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "output_refs": {
+                    "stdout": "output://session-123/stdout",
+                    "stderr": "output://session-123/stderr",
+                    "extra": "output://session-123/private"
+                },
+                "stdout": "raw secret output",
+                "stderr": "raw secret error",
+                "command": "git commit -m secret"
+            }),
+        );
+
+        assert_eq!(
+            summary["commit"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            summary["previous_head"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(
+            summary["actual_head_after"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            summary["output_refs"]["stdout"],
+            "output://session-123/stdout"
+        );
+        assert_eq!(
+            summary["output_refs"]["stderr"],
+            "output://session-123/stderr"
+        );
+        assert!(summary["output_refs"].get("extra").is_none());
+        assert!(summary.get("stdout").is_none());
+        assert!(summary.get("stderr").is_none());
+        assert!(summary.get("command").is_none());
+    }
 }

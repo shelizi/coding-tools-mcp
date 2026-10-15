@@ -59,6 +59,7 @@ struct AdminState {
     policies: WorkerPolicyStore,
     observability: Observability,
     registry: Registry,
+    multiplex_sessions: crate::SplitSessionRegistry,
     public_origin: String,
     username: String,
     username_digest: [u8; 32],
@@ -225,6 +226,7 @@ pub fn build_admin_app(
     policies: WorkerPolicyStore,
     observability: Observability,
     registry: Registry,
+    multiplex_sessions: crate::SplitSessionRegistry,
     public_origin: String,
     config: AdminConfig,
 ) -> Result<Router, String> {
@@ -239,6 +241,7 @@ pub fn build_admin_app(
         policies,
         observability,
         registry,
+        multiplex_sessions,
         public_origin: public_origin.trim_end_matches('/').to_string(),
         username: config.username,
         username_digest,
@@ -263,6 +266,8 @@ pub fn build_admin_app(
             "/api/clients/{client_id}/update",
             post(dispatch_node_update),
         )
+        .route("/api/connections", get(list_connections))
+        .route("/api/multiplex-sessions", get(list_multiplex_sessions))
         .route("/api/activity", get(list_activity))
         .route("/api/logs", get(list_logs))
         .route("/api/worker-policies", get(list_worker_policies))
@@ -465,6 +470,27 @@ async fn dispatch_node_update(
             target_workers,
         })
         .into_response(),
+    )
+}
+
+async fn list_connections(State(state): State<AdminState>, headers: HeaderMap) -> Response<Body> {
+    if state.sessions.get(&headers).await.is_none() {
+        return unauthorized_response();
+    }
+    secure_json_response(
+        Json(json!({ "connections": state.observability.connections() })).into_response(),
+    )
+}
+
+async fn list_multiplex_sessions(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if state.sessions.get(&headers).await.is_none() {
+        return unauthorized_response();
+    }
+    secure_json_response(
+        Json(json!({ "sessions": state.multiplex_sessions.snapshots().await })).into_response(),
     )
 }
 
@@ -866,6 +892,7 @@ mod tests {
             policies,
             Observability::new(),
             Registry::default(),
+            crate::SplitSessionRegistry::default(),
             "https://tunnel.example.com/".into(),
             AdminConfig {
                 username: TEST_USERNAME.into(),
@@ -888,6 +915,7 @@ mod tests {
             policies,
             Observability::new(),
             Registry::default(),
+            crate::SplitSessionRegistry::default(),
             "https://tunnel.example.com/".into(),
             AdminConfig {
                 username: TEST_USERNAME.into(),
@@ -1079,8 +1107,20 @@ mod tests {
             "queue-wait",
             "capacity-errors",
             "worker-count",
+            "connected-connections",
+            "Client 連線資源",
+            "renderClientResources",
+            "connection.device_id",
+            "Multiplex / Split Route",
             "/api/dashboard",
             "/api/workers",
+            "/api/connections",
+            "/api/multiplex-sessions",
+            "connectionsPayload",
+            "sessionsPayload",
+            "client-sessions",
+            "client.sessions",
+            "client.connections.length",
             "/api/activity",
             "/api/logs",
         ] {
@@ -1109,6 +1149,8 @@ mod tests {
         for path in [
             "/api/dashboard",
             "/api/workers",
+            "/api/connections",
+            "/api/multiplex-sessions",
             "/api/activity?limit=10",
             "/api/logs?q=server&level=info&scope=system&limit=10",
             "/api/logs?client_id=pc-a&scope=client&limit=10",
@@ -1402,11 +1444,12 @@ mod tests {
             .await
             .expect("policy body");
         let value: serde_json::Value = serde_json::from_slice(&body).expect("policy json");
-        assert_eq!(value["mcp"]["max_workers"], 16);
-        assert_eq!(value["actions"]["min_idle_workers"], 2);
+        assert_eq!(value["mcp"]["max_workers"], 8);
+        assert_eq!(value["actions"]["min_idle_workers"], 1);
         assert_eq!(value["mcp"]["max_pending_requests"], 32);
         assert_eq!(value["mcp"]["worker_acquire_timeout_ms"], 10_000);
-        assert_eq!(value["mcp"]["scale_down_step"], 4);
+        assert_eq!(value["mcp"]["scale_down_step"], 2);
+        assert_eq!(value["mcp"]["burst_warm_seconds"], 60);
 
         let update = r#"{
             "start_workers":6,

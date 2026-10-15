@@ -34,6 +34,20 @@ async function waitFor(read, timeoutMs = 2_000) {
   throw new Error('timed out waiting for admission state');
 }
 
+async function settleGraph(ctx, meta, graph, operationId, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let current = graph;
+  while (!current.graph_completed && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    current = await callTool(ctx, 'exec_many', {
+      operation_id: operationId,
+      action: 'status',
+      result_mode: 'full'
+    }, meta);
+  }
+  return current;
+}
+
 async function fixture(t, processConcurrency = 1) {
   const rootA = await mkdtemp(path.join(tmpdir(), 'ctmcp-admission-a-'));
   const rootB = await mkdtemp(path.join(tmpdir(), 'ctmcp-admission-b-'));
@@ -149,12 +163,107 @@ test('exec_many orchestrator does not hold process admission and each child is a
   assert.equal(runtime.admission.process.active, 0);
 });
 
+test('exec_many explicit parallel emits real safety evidence with stable provenance', async t => {
+  const { ctx } = await fixture(t, 2);
+  const meta = { 'openai/session': 'exec-many-parallel-evidence' };
+  await callTool(ctx, 'switch_workspace_folder', { folder_id: 'a' }, meta);
+  const graph = await callTool(ctx, 'exec_many', {
+    operation_id: 'exec-many-parallel-evidence',
+    mode: 'parallel', max_parallel: 2, yield_time_ms: 2_000, result_mode: 'full',
+    commands: [
+      { id: 'one', program: 'node', args: ['-e', 'setTimeout(() => process.stdout.write("one"), 180)'], timeout_ms: 5_000 },
+      { id: 'two', program: 'node', args: ['-e', 'setTimeout(() => process.stdout.write("two"), 180)'], timeout_ms: 5_000 }
+    ]
+  }, meta);
+
+  assert.equal(graph.graph_completed, true, JSON.stringify(graph));
+  assert.equal(graph.parallel_observation_count, 1);
+  assert.equal(graph.parallel_candidate_observation_count, 0);
+  const [observation] = graph.parallelism_observations;
+  assert.equal(observation.outcome, 'success', JSON.stringify(observation));
+  assert.equal(observation.evidence_source, 'explicit_parallel');
+  assert.equal(observation.safety_sample, true);
+  assert.match(observation.observation_id, /^[0-9a-f]{64}$/);
+});
+
+test('exec_many auto sequential emits read-only candidate evidence without safety promotion', async t => {
+  const { ctx } = await fixture(t, 2);
+  const meta = { 'openai/session': 'exec-many-readonly-candidate' };
+  await callTool(ctx, 'switch_workspace_folder', { folder_id: 'a' }, meta);
+  let graph = await callTool(ctx, 'exec_many', {
+    operation_id: 'exec-many-readonly-candidate',
+    mode: 'auto', yield_time_ms: 2_000, result_mode: 'full',
+    commands: [
+      { id: 'one', program: 'node', args: ['--version'], timeout_ms: 5_000 },
+      { id: 'two', program: 'node', args: ['--version'], timeout_ms: 5_000 }
+    ]
+  }, meta);
+  graph = await settleGraph(ctx, meta, graph, 'exec-many-readonly-candidate');
+
+  assert.equal(graph.graph_completed, true, JSON.stringify(graph));
+  assert.equal(graph.mode, 'sequential');
+  assert.equal(graph.parallel_candidate_observation_count, 1);
+  const [observation] = graph.parallelism_observations;
+  assert.equal(observation.outcome, 'candidate');
+  assert.equal(observation.candidate_kind, 'read_only_safe_hint');
+  assert.equal(observation.evidence_source, 'read_only_shadow_safe');
+  assert.equal(observation.safety_sample, false);
+});
+
+test('exec_many shared lock pair emits candidate conflict hint while remaining sequential', async t => {
+  const { ctx } = await fixture(t, 2);
+  const meta = { 'openai/session': 'exec-many-lock-candidate' };
+  await callTool(ctx, 'switch_workspace_folder', { folder_id: 'a' }, meta);
+  let graph = await callTool(ctx, 'exec_many', {
+    operation_id: 'exec-many-lock-candidate',
+    mode: 'sequential', yield_time_ms: 2_000, result_mode: 'full',
+    commands: [
+      { id: 'one', lock_group: 'shared-fixture', program: 'node', args: ['--version'], timeout_ms: 5_000 },
+      { id: 'two', lock_group: 'shared-fixture', program: 'node', args: ['--version'], timeout_ms: 5_000 }
+    ]
+  }, meta);
+  graph = await settleGraph(ctx, meta, graph, 'exec-many-lock-candidate');
+
+  assert.equal(graph.graph_completed, true, JSON.stringify(graph));
+  const [observation] = graph.parallelism_observations;
+  assert.equal(observation.outcome, 'candidate');
+  assert.equal(observation.candidate_kind, 'conflict_hint');
+  assert.equal(observation.evidence_source, 'resource_conflict_hint');
+  assert.equal(observation.same_lock_group, true);
+  assert.equal(observation.safety_sample, false);
+});
+
+test('exec_many inferred write scope emits conflict candidate without becoming a safety sample', async t => {
+  const { ctx } = await fixture(t, 2);
+  const meta = { 'openai/session': 'exec-many-write-scope-candidate' };
+  await callTool(ctx, 'switch_workspace_folder', { folder_id: 'a' }, meta);
+  let graph = await callTool(ctx, 'exec_many', {
+    operation_id: 'exec-many-write-scope-candidate',
+    mode: 'sequential', yield_time_ms: 5_000, result_mode: 'full',
+    commands: [
+      { id: 'one', program: 'cargo', args: ['check', '--help'], timeout_ms: 10_000 },
+      { id: 'two', program: 'cargo', args: ['check', '--help'], timeout_ms: 10_000 }
+    ]
+  }, meta);
+  graph = await settleGraph(ctx, meta, graph, 'exec-many-write-scope-candidate');
+
+  assert.equal(graph.graph_completed, true, JSON.stringify(graph));
+  assert.ok(graph.results.every(result => typeof result.resource_lock_target === 'string'), JSON.stringify(graph.results));
+  const [observation] = graph.parallelism_observations;
+  assert.equal(observation.outcome, 'candidate');
+  assert.equal(observation.candidate_kind, 'conflict_hint');
+  assert.equal(observation.evidence_source, 'filesystem_write_scope_conflict');
+  assert.equal(observation.same_lock_group, true);
+  assert.equal(observation.overlapping_write_scope, true);
+  assert.equal(observation.safety_sample, false);
+});
+
 test('exec_many serializes io_heavy children independently of ordinary process concurrency', async t => {
   const { ctx } = await fixture(t, 2);
   const meta = { 'openai/session': 'exec-many-io-heavy' };
   await callTool(ctx, 'switch_workspace_folder', { folder_id: 'a' }, meta);
   const startedAt = Date.now();
-  const graph = await callTool(ctx, 'exec_many', {
+  let graph = await callTool(ctx, 'exec_many', {
     operation_id: 'exec-many-io-heavy',
     mode: 'parallel',
     max_parallel: 2,
@@ -165,6 +274,13 @@ test('exec_many serializes io_heavy children independently of ordinary process c
       { id: 'two', resource_class: 'io_heavy', program: 'node', args: ['-e', 'setTimeout(() => process.stdout.write("two"), 220)'], timeout_ms: 5_000 }
     ]
   }, meta);
+  if (!graph.graph_completed) {
+    graph = await callTool(ctx, 'exec_many', {
+      operation_id: 'exec-many-io-heavy',
+      yield_time_ms: 20_000,
+      result_mode: 'full'
+    }, meta);
+  }
 
   assert.equal(graph.graph_completed, true, JSON.stringify(graph));
   assert.equal(graph.graph_execution_ok, true, JSON.stringify(graph));

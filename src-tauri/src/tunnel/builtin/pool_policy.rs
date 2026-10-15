@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use coding_tools_tunnel_protocol::WorkerPolicy;
+use coding_tools_tunnel_protocol::{MultiplexConnectionPolicy, WorkerPolicy};
 
-pub(super) const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
+pub(super) const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(120);
 pub(super) const INITIAL_RECONNECT_DELAY: Duration = Duration::from_secs(1);
-pub(super) const ESTABLISHED_RECONNECT_DELAY: Duration = Duration::from_millis(250);
+pub(super) const ESTABLISHED_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PoolCounts {
@@ -18,6 +18,80 @@ pub(super) struct PoolCounts {
 pub(super) struct PoolAdjustment {
     pub(super) spawn: usize,
     pub(super) retire: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MultiplexPoolSnapshot {
+    pub(super) connected_connections: usize,
+    pub(super) connecting_connections: usize,
+    pub(super) active_streams: usize,
+    pub(super) queued_requests: usize,
+    pub(super) desired_connections: usize,
+    pub(super) idle_connections: usize,
+    pub(super) idle_excess_elapsed: bool,
+}
+
+pub(super) fn multiplex_pool_adjustment(
+    policy: &MultiplexConnectionPolicy,
+    snapshot: MultiplexPoolSnapshot,
+) -> PoolAdjustment {
+    let connected = snapshot.connected_connections;
+    let connecting = snapshot.connecting_connections;
+    let projected = connected.saturating_add(connecting);
+    let maximum = usize::from(policy.max_connections);
+    let available_to_spawn = maximum.saturating_sub(projected);
+
+    let minimum = usize::from(policy.min_connections);
+    if projected < minimum {
+        return PoolAdjustment {
+            spawn: minimum.saturating_sub(projected).min(available_to_spawn),
+            retire: 0,
+        };
+    }
+    let start = usize::from(policy.start_connections);
+    if projected < start && snapshot.active_streams == 0 && snapshot.queued_requests == 0 {
+        return PoolAdjustment {
+            spawn: start.saturating_sub(projected).min(available_to_spawn),
+            retire: 0,
+        };
+    }
+
+    let projected_capacity = projected
+        .max(1)
+        .saturating_mul(usize::from(policy.streams_per_connection));
+    let utilization_reached = snapshot.active_streams.saturating_mul(100)
+        >= projected_capacity.saturating_mul(usize::from(policy.scale_up_threshold_percent));
+    let mut spawn = 0;
+    if snapshot.queued_requests > 0 || snapshot.desired_connections > projected {
+        let demand_gap = snapshot.desired_connections.saturating_sub(projected);
+        spawn = usize::from(policy.burst_scale_up_step).max(demand_gap);
+    } else if utilization_reached {
+        spawn = usize::from(policy.scale_up_step);
+    }
+    if spawn > 0 {
+        return PoolAdjustment {
+            spawn: spawn.min(available_to_spawn),
+            retire: 0,
+        };
+    }
+
+    if !snapshot.idle_excess_elapsed || connected <= minimum {
+        return PoolAdjustment {
+            spawn: 0,
+            retire: 0,
+        };
+    }
+    let target = if snapshot.active_streams == 0 {
+        minimum
+    } else {
+        minimum.max(usize::from(policy.max_idle_connections))
+    };
+    PoolAdjustment {
+        spawn: 0,
+        retire: snapshot
+            .idle_connections
+            .min(connected.saturating_sub(target)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,7 +284,7 @@ pub(super) fn reconnect_delay(base: Duration, worker_index: usize, attempt: u64)
         .wrapping_mul(0x9E37_79B9)
         .rotate_left((attempt % 31) as u32)
         ^ attempt.wrapping_mul(0x85EB_CA6B);
-    let percent = 80 + mixed % 21;
+    let percent = 50 + mixed % 51;
     let millis = base.as_millis().saturating_mul(u128::from(percent)) / 100;
     Duration::from_millis(millis.max(1).min(MAX_RECONNECT_DELAY.as_millis()) as u64)
 }

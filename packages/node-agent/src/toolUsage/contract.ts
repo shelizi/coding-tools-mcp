@@ -22,6 +22,7 @@ export interface ToolUsageInput {
   protocolVersion?: string;
   method?: string;
   rpcFastPath?: boolean;
+  conversationContextId?: string;
 }
 
 export type DiagnosticEventType = 'tool_call' | 'process_session' | 'service_event' | 'transport_event' | 'lifecycle_event' | 'recovery_event';
@@ -46,6 +47,21 @@ export interface AsyncSessionUsageInput {
   terminationReason: string;
   stdoutBytes: number;
   stderrBytes: number;
+  stdout?: string;
+  stderr?: string;
+  stdoutAuditTailBytes?: number;
+  stderrAuditTailBytes?: number;
+  stdoutAuditTailTruncated?: boolean;
+  stderrAuditTailTruncated?: boolean;
+}
+
+export interface DiagnosticRecordVisitResult {
+  scannedLines: number;
+  invalidLines: number;
+  bytesRead: number;
+  uniqueRecords: number;
+  duplicateRecordsIgnored: number;
+  sourceRevision: string;
 }
 
 export interface ToolUsageStoreContract {
@@ -59,6 +75,7 @@ export interface ToolUsageStoreContract {
   recordAsyncSession(input: AsyncSessionUsageInput): ToolUsageJsonObject;
   recordDiagnosticEvent(input: DiagnosticEventInput): ToolUsageJsonObject;
   enqueue(record: ToolUsageJsonObject): void;
+  visitDiagnosticRecords(visit: (record: ToolUsageJsonObject) => void | Promise<void>): Promise<DiagnosticRecordVisitResult>;
   flush(): Promise<void>;
   dashboardSummary(): Promise<ToolUsageJsonObject>;
   query(args: ToolUsageJsonObject): Promise<ToolUsageJsonObject>;

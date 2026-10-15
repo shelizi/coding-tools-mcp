@@ -9,7 +9,7 @@ import { createToolContext } from '../dist/server.js';
 import { callTool } from '../dist/tools.js';
 import { HistoryError } from '../dist/history.js';
 import {
-  acquireHistoryLock, HISTORY_INDEX_FILE, HISTORY_LOCK_DIR
+  acquireHistoryLock, HISTORY_INDEX_FILE, HISTORY_LOCK_DIR, HISTORY_RETRIEVAL_INDEX_FILE
 } from '../dist/historyStorage.js';
 
 function config(root, dataDir) {
@@ -249,11 +249,17 @@ test('validate reports gaps, invalid and empty files and repairs only the derive
   assert.equal(repaired.ok, true);
   assert.equal(repaired.repaired, true);
   assert.equal(repaired.index_status, 'invalid');
+  assert.equal(repaired.retrieval_index_rebuilt, true);
   assert.equal(await pathExists(path.join(dir, '2.md')), false);
   assert.equal(await pathExists(path.join(dir, 'bad.md')), true);
   const index = JSON.parse(await readFile(path.join(dir, HISTORY_INDEX_FILE), 'utf8'));
   assert.equal(index.sessions['gap-one'].number, 1);
   assert.equal(index.sessions['gap-three'].number, 3);
+  const retrieval = JSON.parse(await readFile(path.join(dir, HISTORY_RETRIEVAL_INDEX_FILE), 'utf8'));
+  assert.equal(retrieval.version, 1);
+  assert.equal(retrieval.documentCount, 3);
+  assert.deepEqual(retrieval.documents.map(document => document.sessionNumber), [1, 3, 4]);
+  assert.match(retrieval.sourceDigest, /^[0-9a-f]{64}$/);
 });
 
 test('concurrent Agent contexts allocate distinct history numbers through the shared directory lock', async t => {
@@ -309,8 +315,8 @@ test('bootstrap bounds summaries and inherited history without recursive growth'
   const boot = await callTool(ctx, 'history_session_bootstrap', { session_key: 'bounded-summary' }, meta);
   assert.equal(boot.ok, true);
   assert.equal(boot.history_count, 20);
-  assert.equal(boot.history_loaded_count, 12);
-  assert.equal(boot.history_omitted_count, 8);
+  assert.equal(boot.history_loaded_count, 5);
+  assert.equal(boot.history_omitted_count, 15);
   assert.equal(boot.payload_bounded, true);
   const content = await readFile(path.join(dir, '21.md'), 'utf8');
   assert.match(content, /个较早会话未展开/);
@@ -325,6 +331,80 @@ test('bootstrap bounds summaries and inherited history without recursive growth'
   const updated = await readFile(path.join(dir, '21.md'), 'utf8');
   assert.equal(updated.match(/## 继承的历史摘要/g)?.length, 1);
   assert.match(updated, /继续实现/);
+});
+
+test('history_search and bootstrap recall_query recover an older relevant session beyond the recent window', async t => {
+  const { root, ctx, meta } = await fixture(t, 'ctmcp-history-recall-');
+  const files = {};
+  files['1.md'] = historyFile(1, 'old-terminal', '終端持久化 durable session SQLite liveness');
+  for (let number = 2; number <= 12; number += 1) {
+    files[`${number}.md`] = historyFile(number, `recent-${number}`, `近期設定頁 UI ${number}`);
+  }
+  await writeHistory(root, files);
+  const repaired = await callTool(ctx, 'history_session_validate', { repair: true }, meta);
+  assert.equal(repaired.ok, true, JSON.stringify(repaired));
+
+  const search = await callTool(ctx, 'history_search', {
+    query: '終端持久化 durable session', top_k: 3
+  }, meta);
+  assert.equal(search.ok, true, JSON.stringify(search));
+  assert.equal(search.results[0].session_number, 1);
+  assert.equal(search.index_source, 'derived_index');
+
+  const boot = await callTool(ctx, 'history_session_bootstrap', {
+    session_key: 'recall-current', recall_query: '終端持久化 durable session'
+  }, meta);
+  assert.equal(boot.ok, true, JSON.stringify(boot));
+  assert.equal(boot.history_loaded_count, 5);
+  assert.equal(boot.history_omitted_count, 7);
+  assert.equal(boot.recall_query, '終端持久化 durable session');
+  assert.equal(boot.relevant_history_summaries[0].number, 1);
+  assert.match(boot.relevant_history_summaries[0].summary, /終端持久化/);
+  assert.equal(boot.history_retrieval_source, 'derived_index');
+  assert.equal(boot.recent_history_summary, boot.all_history_summary);
+});
+
+test('180-session history recall keeps old relevant decisions in top-k with bounded bootstrap payload', async t => {
+  const { root, ctx, meta } = await fixture(t, 'ctmcp-history-180-');
+  const files = {};
+  for (let number = 1; number <= 180; number += 1) {
+    const marker = number === 17
+      ? '終端持久化 durable session SQLite actor liveness recovery'
+      : `近期設定翻譯面板與按鈕配置 ${number}`;
+    files[`${number}.md`] = historyFile(number, `session-${number}`, marker);
+  }
+  await writeHistory(root, files);
+
+  const repaired = await callTool(ctx, 'history_session_validate', { repair: true }, meta);
+  assert.equal(repaired.ok, true, JSON.stringify(repaired));
+  assert.equal(repaired.retrieval_index_rebuilt, true);
+
+  const search = await callTool(ctx, 'history_search', {
+    query: '終端持久化 durable session SQLite actor liveness', top_k: 5
+  }, meta);
+  assert.equal(search.ok, true, JSON.stringify(search));
+  assert.equal(search.index_source, 'derived_index');
+  assert.equal(search.index_document_count, 180);
+  assert.equal(search.result_count, 1);
+  assert.equal(search.results[0].session_number, 17);
+  assert.ok(search.results[0].matched_fields.includes('title'));
+  assert.ok(search.results[0].matched_fields.includes('decisions'));
+
+  const boot = await callTool(ctx, 'history_session_bootstrap', {
+    session_key: 'session-181-current',
+    recall_query: '終端持久化 durable session SQLite actor liveness'
+  }, meta);
+  assert.equal(boot.ok, true, JSON.stringify(boot));
+  assert.equal(boot.history_count, 180);
+  assert.equal(boot.history_loaded_count, 5);
+  assert.equal(boot.history_omitted_count, 175);
+  assert.equal(boot.current_number, 181);
+  assert.equal(boot.latest_completed_number, 180);
+  assert.equal(boot.payload_bounded, true);
+  assert.equal(boot.history_retrieval_source, 'derived_index');
+  assert.equal(boot.relevant_history_summaries[0].number, 17);
+  assert.match(boot.relevant_history_summaries[0].summary, /終端持久化/);
+  assert.ok(Buffer.byteLength(JSON.stringify(boot), 'utf8') < 128 * 1024);
 });
 
 test('history paths and stable checkpoint targets cannot escape or cross sessions', async t => {

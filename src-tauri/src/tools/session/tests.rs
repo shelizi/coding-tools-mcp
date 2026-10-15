@@ -1,4 +1,5 @@
 use super::*;
+use tempfile::tempdir;
 
 #[tokio::test]
 async fn active_session_admission_is_bounded_and_recoverable() {
@@ -69,6 +70,101 @@ async fn finalizing_a_session_releases_its_active_slot() {
     session.mark_finalized();
     assert_eq!(store.active_slots_available(), DEFAULT_ACTIVE_SESSION_LIMIT);
     assert!(session.finalized_at().is_some());
+}
+
+#[tokio::test]
+#[serial_test::serial(process_runtime)]
+async fn managed_operation_metadata_recovers_after_store_recreation() {
+    let records = tempdir().expect("operation records");
+    let store = SessionStore::with_active_session_limit_and_operation_dir(
+        DEFAULT_ACTIVE_SESSION_LIMIT,
+        records.path().to_path_buf(),
+    );
+
+    #[cfg(windows)]
+    let child = tokio::process::Command::new("cmd")
+        .args(["/d", "/c", "ping 127.0.0.1 -n 4 >nul"])
+        .spawn()
+        .expect("spawn managed child");
+    #[cfg(unix)]
+    let child = tokio::process::Command::new("sh")
+        .args(["-c", "sleep 3"])
+        .spawn()
+        .expect("spawn managed child");
+
+    let operation_id = "restart-recovery-job";
+    let contract = crate::tools::execution_timeout::ProcessTimeoutContract {
+        execution_mode: "job",
+        requested_timeout_ms: Some(10_000),
+        effective_timeout_ms: 10_000,
+        limit_ms: 60_000,
+    };
+    let session = store.insert(
+        ExecSession::new(child)
+            .with_process_timeout(contract, Instant::now())
+            .with_execution_identity(Some(operation_id.into()), "a".repeat(64), None, None, 0, 0),
+    );
+
+    let record_path = operation_persistence::record_path(records.path(), operation_id);
+    let raw = std::fs::read_to_string(&record_path).expect("persisted operation record");
+    assert!(
+        !raw.contains(operation_id),
+        "operation id must remain hashed at rest"
+    );
+
+    let mut record: Value = serde_json::from_str(&raw).expect("operation record json");
+    record["runtime_boot_id"] = json!("previous-runtime-boot");
+    std::fs::write(
+        &record_path,
+        serde_json::to_vec(&record).expect("serialize previous boot record"),
+    )
+    .expect("rewrite previous boot record");
+
+    let restarted_store = SessionStore::with_active_session_limit_and_operation_dir(
+        DEFAULT_ACTIVE_SESSION_LIMIT,
+        records.path().to_path_buf(),
+    );
+    let recovered = resolve_operation_async(
+        &restarted_store,
+        &json!({"operation_id": operation_id, "output_mode": "none"}),
+    )
+    .await
+    .expect("recover interrupted operation");
+    assert_eq!(
+        recovered["resolved_by"], "durable_operation_record",
+        "{recovered}"
+    );
+    assert_eq!(recovered["restored_from_disk"], true, "{recovered}");
+    assert_eq!(recovered["runtime_session_available"], false, "{recovered}");
+    assert_eq!(recovered["status"], "runtime_restarted", "{recovered}");
+    assert_eq!(
+        recovered["termination_reason"], "server_restart",
+        "{recovered}"
+    );
+    assert_eq!(recovered["recoverable"], true, "{recovered}");
+    assert_eq!(recovered["process_still_running"], false, "{recovered}");
+    assert_eq!(recovered["output_refs"], Value::Null, "{recovered}");
+
+    session.kill_and_wait().await;
+    session.mark_finalized();
+
+    let finalized_store = SessionStore::with_active_session_limit_and_operation_dir(
+        DEFAULT_ACTIVE_SESSION_LIMIT,
+        records.path().to_path_buf(),
+    );
+    let finalized = resolve_operation_async(
+        &finalized_store,
+        &json!({"operation_id": operation_id, "output_mode": "none"}),
+    )
+    .await
+    .expect("recover finalized operation");
+    assert_eq!(
+        finalized["resolved_by"], "durable_operation_record",
+        "{finalized}"
+    );
+    assert_eq!(finalized["restored_from_disk"], true, "{finalized}");
+    assert_ne!(finalized["status"], "runtime_restarted", "{finalized}");
+    assert_eq!(finalized["process_still_running"], false, "{finalized}");
 }
 
 #[tokio::test]

@@ -4,12 +4,14 @@ const OPERATION_RESULT_BOOLEAN_FIELDS = [
   'transport_ok', 'execution_ok', 'command_ok', 'verification_ok',
   'process_timed_out', 'request_timed_out', 'recoverable', 'truncated',
   'stdout_truncated', 'stderr_truncated', 'cursor_expired', 'post_checks_pending',
-  'detached', 'deduplicated', 'timeout_clamped', 'polling_extends_process_deadline'
+  'detached', 'deduplicated', 'timeout_clamped', 'polling_extends_process_deadline',
+  'observation_timed_out'
 ] as const;
 
 const OPERATION_RESULT_TOKEN_FIELDS = [
   'status', 'termination_reason', 'execution_lane', 'outcome_class',
-  'execution_mode', 'timeout_scope'
+  'execution_mode', 'timeout_scope', 'observation_state', 'commit', 'previous_head', 'expected_head',
+  'actual_head_before', 'actual_head_at_commit', 'actual_head_after'
 ] as const;
 
 const OPERATION_RESULT_INTEGER_FIELDS = [
@@ -17,7 +19,7 @@ const OPERATION_RESULT_INTEGER_FIELDS = [
   'stdout_bytes', 'stderr_bytes', 'blocking_queue_wait_ms', 'workspace_admission_wait_ms',
   'global_admission_wait_ms', 'admission_queue_wait_ms', 'workspace_lock_wait_ms',
   'operation_lock_wait_ms', 'resource_lock_wait_ms', 'history_lock_wait_ms',
-  'session_registry_wait_ms', 'requested_process_timeout_ms', 'effective_process_timeout_ms',
+  'session_registry_wait_ms', 'transport_safe_wait_ms', 'requested_process_timeout_ms', 'effective_process_timeout_ms',
   'process_timeout_limit_ms', 'process_deadline_ts_ms', 'process_timeout_remaining_ms'
 ] as const;
 
@@ -29,6 +31,17 @@ function operationSummaryToken(value: unknown): string | undefined {
 
 function operationSummaryInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined;
+}
+
+function operationSummaryOutputRefs(value: unknown): JsonObject | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const refs = value as JsonObject;
+  const safe: JsonObject = {};
+  for (const stream of ['stdout', 'stderr'] as const) {
+    const ref = refs[stream];
+    if (typeof ref === 'string' && /^output:\/\/[A-Za-z0-9._:-]+\/(stdout|stderr)$/.test(ref)) safe[stream] = ref;
+  }
+  return Object.keys(safe).length ? safe : undefined;
 }
 
 export function operationResultSummary(name: string, result: JsonObject): JsonObject {
@@ -48,6 +61,8 @@ export function operationResultSummary(name: string, result: JsonObject): JsonOb
     const value = operationSummaryInteger(result[field]);
     if (value !== undefined) summary[field] = value;
   }
+  const outputRefs = operationSummaryOutputRefs(result.output_refs);
+  if (outputRefs) summary.output_refs = outputRefs;
   const error = result.error && typeof result.error === 'object' && !Array.isArray(result.error)
     ? result.error as JsonObject
     : {};

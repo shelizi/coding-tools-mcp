@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,6 +23,7 @@ struct Inner {
     database: Option<DatabaseWriter>,
     activities: Mutex<VecDeque<ActivityEntry>>,
     workers: Mutex<HashMap<String, WorkerSnapshot>>,
+    connections: Mutex<HashMap<String, ClientConnectionSnapshot>>,
     total_requests: AtomicU64,
     successful_requests: AtomicU64,
     failed_requests: AtomicU64,
@@ -79,6 +80,17 @@ pub struct WorkerSnapshot {
     pub update_message: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ClientConnectionSnapshot {
+    pub connection_key: String,
+    pub device_id: String,
+    pub client_id: String,
+    pub service: String,
+    pub transport: String,
+    pub connected_at_unix_ms: u64,
+    pub last_seen_at_unix_ms: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DashboardSnapshot {
     pub status: String,
@@ -87,6 +99,8 @@ pub struct DashboardSnapshot {
     pub connected_workers: usize,
     pub idle_workers: usize,
     pub busy_workers: usize,
+    pub connected_connections: usize,
+    pub connected_clients: usize,
     pub total_requests: u64,
     pub successful_requests: u64,
     pub failed_requests: u64,
@@ -127,6 +141,11 @@ pub struct WorkerGuard {
     observability: Observability,
     worker_id: String,
     disconnected: bool,
+}
+
+pub struct ClientConnectionGuard {
+    observability: Observability,
+    connection_key: String,
 }
 
 impl Default for Observability {
@@ -196,6 +215,7 @@ impl Observability {
                 database,
                 activities: Mutex::new(VecDeque::with_capacity(ACTIVITY_CAPACITY)),
                 workers: Mutex::new(HashMap::new()),
+                connections: Mutex::new(HashMap::new()),
                 total_requests: AtomicU64::new(0),
                 successful_requests: AtomicU64::new(0),
                 failed_requests: AtomicU64::new(0),
@@ -226,12 +246,28 @@ impl Observability {
             .values()
             .filter(|worker| worker.state == "busy")
             .count();
+        let connections = self
+            .inner
+            .connections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let connected_connections = connections.len();
+        let connected_clients = workers
+            .values()
+            .map(|worker| worker.client_id.clone())
+            .chain(
+                connections
+                    .values()
+                    .map(|connection| connection.client_id.clone()),
+            )
+            .collect::<HashSet<_>>()
+            .len();
         let total_requests = self.inner.total_requests.load(Ordering::Relaxed);
         let failed_requests = self.inner.failed_requests.load(Ordering::Relaxed);
         let assigned_requests = self.inner.assigned_requests.load(Ordering::Relaxed);
         let queue_wait_total_ms = self.inner.queue_wait_total_ms.load(Ordering::Relaxed);
         DashboardSnapshot {
-            status: if connected_workers > 0 || total_requests == 0 {
+            status: if connected_workers > 0 || connected_connections > 0 || total_requests == 0 {
                 "healthy"
             } else {
                 "degraded"
@@ -242,6 +278,8 @@ impl Observability {
             connected_workers,
             idle_workers,
             busy_workers,
+            connected_connections,
+            connected_clients,
             total_requests,
             successful_requests: self.inner.successful_requests.load(Ordering::Relaxed),
             failed_requests,
@@ -287,6 +325,58 @@ impl Observability {
             .collect::<Vec<_>>();
         workers.sort_by_key(|worker| std::cmp::Reverse(worker.connected_at_unix_ms));
         workers
+    }
+
+    pub fn connections(&self) -> Vec<ClientConnectionSnapshot> {
+        let mut connections = self
+            .inner
+            .connections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        connections.sort_by_key(|connection| std::cmp::Reverse(connection.connected_at_unix_ms));
+        connections
+    }
+
+    pub fn connect_client_route(
+        &self,
+        connection_key: &str,
+        device_id: &str,
+        client_id: &str,
+        service: &str,
+        transport: &str,
+    ) -> ClientConnectionGuard {
+        let now = now_unix_ms();
+        self.inner
+            .connections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                connection_key.into(),
+                ClientConnectionSnapshot {
+                    connection_key: connection_key.into(),
+                    device_id: device_id.into(),
+                    client_id: client_id.into(),
+                    service: service.into(),
+                    transport: transport.into(),
+                    connected_at_unix_ms: now,
+                    last_seen_at_unix_ms: now,
+                },
+            );
+        ClientConnectionGuard {
+            observability: self.clone(),
+            connection_key: connection_key.into(),
+        }
+    }
+
+    fn disconnect_client_route(&self, connection_key: &str) {
+        self.inner
+            .connections
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(connection_key);
     }
 
     pub fn activities(&self, limit: usize) -> Vec<ActivityEntry> {
@@ -766,6 +856,13 @@ impl Drop for WorkerGuard {
     }
 }
 
+impl Drop for ClientConnectionGuard {
+    fn drop(&mut self) {
+        self.observability
+            .disconnect_client_route(&self.connection_key);
+    }
+}
+
 fn push_bounded<T>(queue: &mut VecDeque<T>, capacity: usize, value: T) {
     if queue.len() == capacity {
         queue.pop_front();
@@ -905,6 +1002,26 @@ mod tests {
         assert_eq!(telemetry.dashboard().idle_workers, 1);
         drop(worker);
         assert!(telemetry.workers().is_empty());
+    }
+
+    #[test]
+    fn client_connection_lifecycle_is_visible() {
+        let telemetry = Observability::new();
+        let connection = telemetry.connect_client_route(
+            "multiplex:connection-1:1",
+            "device-1",
+            "pc-a",
+            "mcp",
+            "multiplex",
+        );
+        let dashboard = telemetry.dashboard();
+        assert_eq!(dashboard.connected_connections, 1);
+        assert_eq!(dashboard.connected_clients, 1);
+        assert_eq!(dashboard.status, "healthy");
+        assert_eq!(telemetry.connections()[0].client_id, "pc-a");
+        drop(connection);
+        assert!(telemetry.connections().is_empty());
+        assert_eq!(telemetry.dashboard().connected_clients, 0);
     }
 
     #[test]

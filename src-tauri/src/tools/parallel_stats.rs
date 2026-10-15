@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::BufRead;
 use std::path::Path;
@@ -20,6 +20,11 @@ pub(crate) struct ParallelPairStats {
     pub serialized: u64,
     pub failures: u64,
     pub not_overlapped: u64,
+    pub candidate_observations: u64,
+    pub read_only_safe_hints: u64,
+    pub conflict_hints: u64,
+    pub overlap_hints: u64,
+    pub unknown_candidates: u64,
     pub overlap_ms: u128,
     pub lock_wait_ms: u128,
 }
@@ -41,7 +46,11 @@ impl ParallelPairStats {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ParallelHistory {
     pub pairs: BTreeMap<String, ParallelPairStats>,
+    seen_observation_ids: HashSet<String>,
     pub total_observations: u64,
+    pub actual_observations: u64,
+    pub candidate_observations: u64,
+    pub duplicate_observations_ignored: u64,
 }
 
 impl ParallelHistory {
@@ -76,14 +85,30 @@ impl ParallelHistory {
             .filter(|outcome| {
                 matches!(
                     *outcome,
-                    "success" | "conflict" | "serialized" | "failure" | "not_overlapped"
+                    "success"
+                        | "conflict"
+                        | "serialized"
+                        | "failure"
+                        | "not_overlapped"
+                        | "candidate"
                 )
             })
         else {
             return;
         };
+        if let Some(observation_id) = observation
+            .get("observation_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !self.seen_observation_ids.insert(observation_id.to_string()) {
+                self.duplicate_observations_ignored =
+                    self.duplicate_observations_ignored.saturating_add(1);
+                return;
+            }
+        }
         let stats = self.pairs.entry(pair.to_string()).or_default();
-        stats.attempts = stats.attempts.saturating_add(1);
         stats.overlap_ms = stats.overlap_ms.saturating_add(
             observation
                 .get("overlap_ms")
@@ -96,13 +121,32 @@ impl ParallelHistory {
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as u128,
         );
-        match outcome {
-            "success" => stats.successes = stats.successes.saturating_add(1),
-            "conflict" => stats.conflicts = stats.conflicts.saturating_add(1),
-            "serialized" => stats.serialized = stats.serialized.saturating_add(1),
-            "failure" => stats.failures = stats.failures.saturating_add(1),
-            "not_overlapped" => stats.not_overlapped = stats.not_overlapped.saturating_add(1),
-            _ => unreachable!("outcome validated above"),
+        if outcome == "candidate" {
+            stats.candidate_observations = stats.candidate_observations.saturating_add(1);
+            match observation
+                .get("candidate_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown_pair")
+            {
+                "read_only_safe_hint" => {
+                    stats.read_only_safe_hints = stats.read_only_safe_hints.saturating_add(1)
+                }
+                "conflict_hint" => stats.conflict_hints = stats.conflict_hints.saturating_add(1),
+                "overlap_hint" => stats.overlap_hints = stats.overlap_hints.saturating_add(1),
+                _ => stats.unknown_candidates = stats.unknown_candidates.saturating_add(1),
+            }
+            self.candidate_observations = self.candidate_observations.saturating_add(1);
+        } else {
+            stats.attempts = stats.attempts.saturating_add(1);
+            match outcome {
+                "success" => stats.successes = stats.successes.saturating_add(1),
+                "conflict" => stats.conflicts = stats.conflicts.saturating_add(1),
+                "serialized" => stats.serialized = stats.serialized.saturating_add(1),
+                "failure" => stats.failures = stats.failures.saturating_add(1),
+                "not_overlapped" => stats.not_overlapped = stats.not_overlapped.saturating_add(1),
+                _ => unreachable!("candidate handled above and outcome validated"),
+            }
+            self.actual_observations = self.actual_observations.saturating_add(1);
         }
         self.total_observations = self.total_observations.saturating_add(1);
     }
@@ -184,6 +228,11 @@ pub(crate) fn parallelism_report(history: &ParallelHistory, top: usize) -> Value
                 "serialized": stats.serialized,
                 "failures": stats.failures,
                 "not_overlapped": stats.not_overlapped,
+                "candidate_observations": stats.candidate_observations,
+                "read_only_safe_hints": stats.read_only_safe_hints,
+                "conflict_hints": stats.conflict_hints,
+                "overlap_hints": stats.overlap_hints,
+                "unknown_candidates": stats.unknown_candidates,
                 "safety_samples": stats.safety_samples(),
                 "success_rate": rounded_ratio(stats.successes, stats.safety_samples()),
                 "conflict_rate": rounded_ratio(stats.conflicts, stats.safety_samples()),
@@ -246,6 +295,12 @@ pub(crate) fn parallelism_report(history: &ParallelHistory, top: usize) -> Value
             "The LLM may batch {confident_safe_pairs} statistically supported pair(s) with exec_many mode=auto."
         ));
     }
+    if history.candidate_observations > 0 {
+        recommendations.push(format!(
+            "{} candidate-only pair observation(s) are available for cold-start discovery; explicit parallel evidence is still required for evidence-required auto scheduling.",
+            history.candidate_observations
+        ));
+    }
     if history.total_observations == 0 {
         recommendations.push(
             "Collect exec_many observations before allowing evidence-required command pairs to run in parallel."
@@ -256,10 +311,14 @@ pub(crate) fn parallelism_report(history: &ParallelHistory, top: usize) -> Value
     json!({
         "decision_method": "hard_rules_plus_wilson_statistics",
         "machine_learning_enabled": false,
+        "candidate_evidence_promotes_to_safety_sample": false,
         "minimum_confident_samples": MIN_CONFIDENT_SAMPLES,
         "safe_lower_bound_threshold": SAFE_LOWER_BOUND,
         "observed_pairs": history.pairs.len(),
         "total_observations": history.total_observations,
+        "actual_observations": history.actual_observations,
+        "candidate_observations": history.candidate_observations,
+        "duplicate_observations_ignored": history.duplicate_observations_ignored,
         "confident_safe_pairs": confident_safe_pairs,
         "conflict_pairs": conflict_pairs,
         "serialization_prone_pairs": serialized_pairs,
@@ -355,6 +414,42 @@ mod tests {
         })]);
         assert!(!history.pairs.contains_key("ignored|pair"));
         assert_eq!(history.total_observations, 3);
+    }
+
+    #[test]
+    fn candidate_observations_are_deduplicated_without_promoting_safety_samples() {
+        let mut history = ParallelHistory::default();
+        let candidate = json!({
+            "observation_id": "candidate-1",
+            "pair": "git:status@a|git:diff@a",
+            "outcome": "candidate",
+            "candidate_kind": "read_only_safe_hint",
+            "evidence_source": "read_only_shadow_safe"
+        });
+        history.apply_observations(&[candidate.clone(), candidate]);
+        history.apply_observations(&[json!({
+            "observation_id": "actual-1",
+            "pair": "git:status@a|git:diff@a",
+            "outcome": "success",
+            "evidence_source": "explicit_parallel"
+        })]);
+        let stats = &history.pairs["git:status@a|git:diff@a"];
+        assert_eq!(history.total_observations, 2);
+        assert_eq!(history.actual_observations, 1);
+        assert_eq!(history.candidate_observations, 1);
+        assert_eq!(history.duplicate_observations_ignored, 1);
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.successes, 1);
+        assert_eq!(stats.candidate_observations, 1);
+        assert_eq!(stats.read_only_safe_hints, 1);
+        assert_eq!(stats.safety_samples(), 1);
+        assert!(parallel_safety_lower_bound(stats) < SAFE_LOWER_BOUND);
+        let report = parallelism_report(&history, 20);
+        assert_eq!(
+            report["candidate_evidence_promotes_to_safety_sample"],
+            false
+        );
+        assert_eq!(report["confident_safe_pairs"], 0);
     }
 
     #[test]

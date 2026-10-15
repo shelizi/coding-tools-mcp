@@ -11,6 +11,7 @@ pub(super) fn input_schema(name: &str) -> Option<Value> {
                 "history_dir": { "type": "string", "default": "docs/history-session" },
                 "create_if_missing": { "type": "boolean", "default": true },
                 "response_mode": { "type": "string", "enum": ["compact", "full"], "default": "compact" }
+                ,"recall_query": { "type": "string", "minLength": 1 }
             },
             "additionalProperties": false
         }),
@@ -33,6 +34,19 @@ pub(super) fn input_schema(name: &str) -> Option<Value> {
                 "remaining_issues": { "type": "array", "items": { "type": "string" } },
                 "next_actions": { "type": "array", "items": { "type": "string" } },
                 "notes": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
+        "history_search" => json!({
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "workspace_root": { "type": "string", "minLength": 1 },
+                "history_dir": { "type": "string", "default": "docs/history-session" },
+                "query": { "type": "string", "minLength": 1 },
+                "top_k": { "type": "integer", "minimum": 1, "maximum": 20, "default": 8 },
+                "recent_boost": { "type": "number", "minimum": 0, "maximum": 1, "default": 0.05 },
+                "include_excerpt": { "type": "boolean", "default": true }
             },
             "additionalProperties": false
         }),

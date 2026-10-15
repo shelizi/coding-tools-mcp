@@ -160,9 +160,11 @@ function positiveInt(value: unknown, fallback: number, max = Number.MAX_SAFE_INT
 }
 
 function permissionMode(value: unknown): PermissionMode {
-  return ['read-only', 'guarded', 'trusted', 'dangerous'].includes(String(value))
-    ? String(value) as PermissionMode
-    : 'trusted';
+  const normalized = String(value).trim();
+  if (normalized === 'safe') return 'guarded';
+  return ['read-only', 'guarded', 'trusted', 'dangerous'].includes(normalized)
+    ? normalized as PermissionMode
+    : 'guarded';
 }
 
 function enabled(value: unknown, fallback: boolean): boolean {

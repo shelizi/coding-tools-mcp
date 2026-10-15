@@ -173,7 +173,9 @@ pub(super) fn merge_exec_result(
         obj.insert("duration_ms".into(), json!(duration_ms));
         obj.insert("elapsed_ms".into(), json!(duration_ms));
         obj.insert("transport_ok".into(), Value::Bool(true));
-        obj.insert("execution_mode".into(), json!("direct"));
+        if !obj.contains_key("execution_mode") {
+            obj.insert("execution_mode".into(), json!("direct"));
+        }
         obj.insert("warnings".into(), json!(Vec::<&str>::new()));
         if let Some(diagnostics) = startup_diagnostics {
             obj.insert("startup".into(), diagnostics.to_json());
@@ -185,23 +187,52 @@ pub(super) fn merge_exec_result(
                 .map(str::to_string);
             if let Some(session_id) = session_id {
                 let cursor = obj.get("next_cursor").and_then(Value::as_u64).unwrap_or(0);
-                obj.insert(
-                    "next_actions".into(),
-                    json!([{
-                        "tool": "wait_command",
-                        "arguments": {
-                            "session_id": session_id,
-                            "cursor": cursor,
-                            "timeout_ms": WAIT_COMMAND_TIMEOUT_DEFAULT_MS,
-                            "until": "output_or_exit",
-                            "output_mode": "delta"
-                        }
-                    }]),
-                );
-                obj.insert(
-                    "suggestion".into(),
-                    json!("Call wait_command with next_actions[0].arguments to continue without polling duplicate output"),
-                );
+                let managed_job = obj.get("execution_mode").and_then(Value::as_str) == Some("job");
+                let operation_id = obj
+                    .get("operation_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if managed_job {
+                    if let Some(operation_id) = operation_id {
+                        obj.insert(
+                            "next_actions".into(),
+                            json!([{
+                                "tool": "resolve_operation",
+                                "after_ms": 2_000,
+                                "arguments": {
+                                    "operation_id": operation_id,
+                                    "cursor": cursor,
+                                    "output_mode": "delta",
+                                    "event_detail": "compact"
+                                }
+                            }]),
+                        );
+                        obj.insert("recommended_poll_after_ms".into(), json!(2_000));
+                        obj.insert("poll_strategy".into(), json!("managed_job_backoff"));
+                        obj.insert(
+                            "suggestion".into(),
+                            json!("Wait recommended_poll_after_ms, then use resolve_operation with next_actions[0].arguments for a non-blocking managed-job snapshot."),
+                        );
+                    }
+                } else {
+                    obj.insert(
+                        "next_actions".into(),
+                        json!([{
+                            "tool": "wait_command",
+                            "arguments": {
+                                "session_id": session_id,
+                                "cursor": cursor,
+                                "timeout_ms": WAIT_COMMAND_TIMEOUT_DEFAULT_MS,
+                                "until": "output_or_exit",
+                                "output_mode": "delta"
+                            }
+                        }]),
+                    );
+                    obj.insert(
+                        "suggestion".into(),
+                        json!("Call wait_command with next_actions[0].arguments to continue without polling duplicate output"),
+                    );
+                }
             }
         }
     }

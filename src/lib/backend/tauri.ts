@@ -97,6 +97,10 @@ export function createTauriBackend(deps: TauriBackendDeps): FrontendBackend {
           errorsOnly: options.errorsOnly,
           minDurationMs: options.minDurationMs,
           sinceTsMs: options.sinceTsMs,
+          ...(options.statisticsPeriod ? {
+            statisticsPeriod: options.statisticsPeriod,
+            statisticsUntilTsMs: options.statisticsUntilTsMs,
+          } : {}),
         }),
     },
 
@@ -135,6 +139,7 @@ export function createTauriBackend(deps: TauriBackendDeps): FrontendBackend {
 
     tunnel: {
       getFrpSnippet: (id, service) => invoke("get_frp_snippet", { id, service }),
+      status: (id, service) => invoke("get_tunnel_status", { id, service }),
       start: (id, service) => invoke("start_tunnel", { id, service }),
       stop: (id, service) => invoke("stop_tunnel", { id, service }),
       test: (id, service) => invoke("test_tunnel", { id, service }),

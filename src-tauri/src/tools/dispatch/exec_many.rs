@@ -749,7 +749,7 @@ pub(super) fn collect_parallelism_observations(
     results: &[Value],
     mode: &str,
 ) -> (Vec<Value>, bool) {
-    if mode != "parallel" || commands.len() < 2 {
+    if commands.len() < 2 {
         return (Vec::new(), false);
     }
     let result_by_id = results
@@ -777,42 +777,196 @@ pub(super) fn collect_parallelism_observations(
             let Some(right_result) = result_by_id.get(commands[right].id.as_str()) else {
                 continue;
             };
+            if left_result.get("skipped").and_then(Value::as_bool) == Some(true)
+                || right_result.get("skipped").and_then(Value::as_bool) == Some(true)
+            {
+                continue;
+            }
             let overlap_ms = execution_overlap_ms(left_result, right_result);
             let lock_wait_ms =
                 result_lock_wait_ms(left_result).saturating_add(result_lock_wait_ms(right_result));
-            let same_lock_group = commands[left].lock_group.is_some()
+            let explicit_same_lock_group = commands[left].lock_group.is_some()
                 && commands[left].lock_group == commands[right].lock_group;
-            let left_ok = left_result.get("command_ok").and_then(Value::as_bool) == Some(true);
-            let right_ok = right_result.get("command_ok").and_then(Value::as_bool) == Some(true);
-            let outcome = if overlap_ms == 0 && (same_lock_group || lock_wait_ms > 0) {
-                "serialized"
-            } else if overlap_ms > 0
-                && (result_has_conflict_marker(left_result)
-                    || result_has_conflict_marker(right_result))
-            {
-                "conflict"
-            } else if overlap_ms > 0 && left_ok && right_ok {
-                "success"
-            } else if overlap_ms > 0 {
-                "failure"
+            let left_runtime_lock_group = result_resource_lock_group(left_result);
+            let right_runtime_lock_group = result_resource_lock_group(right_result);
+            let left_effective_lock_group = commands[left]
+                .lock_group
+                .as_deref()
+                .or(left_runtime_lock_group);
+            let right_effective_lock_group = commands[right]
+                .lock_group
+                .as_deref()
+                .or(right_runtime_lock_group);
+            let same_lock_group = left_effective_lock_group.is_some()
+                && left_effective_lock_group == right_effective_lock_group;
+            let read_only_pair = command_read_only_shadow_safe(&commands[left])
+                && command_read_only_shadow_safe(&commands[right]);
+            let explicit_shared_lock = explicit_same_lock_group
+                && (!commands[left].lock_group_inferred || !commands[right].lock_group_inferred);
+            let overlapping_write_scope =
+                !read_only_pair && result_write_scopes_overlap(left_result, right_result);
+            let pair = parallel_pair_key(
+                &commands[left].parallel_signature,
+                &commands[right].parallel_signature,
+            );
+            let (outcome, evidence_source, candidate_kind) = if mode == "parallel" {
+                let left_ok = left_result.get("command_ok").and_then(Value::as_bool) == Some(true);
+                let right_ok =
+                    right_result.get("command_ok").and_then(Value::as_bool) == Some(true);
+                let outcome = if overlap_ms == 0 && (same_lock_group || lock_wait_ms > 0) {
+                    "serialized"
+                } else if overlap_ms > 0
+                    && (result_has_conflict_marker(left_result)
+                        || result_has_conflict_marker(right_result))
+                {
+                    "conflict"
+                } else if overlap_ms > 0 && left_ok && right_ok {
+                    "success"
+                } else if overlap_ms > 0 {
+                    "failure"
+                } else {
+                    "not_overlapped"
+                };
+                (
+                    outcome,
+                    if outcome == "serialized" {
+                        "resource_lock_serialization"
+                    } else {
+                        "explicit_parallel"
+                    },
+                    "none",
+                )
+            } else if lock_wait_ms > 0 || explicit_shared_lock {
+                ("candidate", "resource_conflict_hint", "conflict_hint")
+            } else if overlapping_write_scope || (same_lock_group && !read_only_pair) {
+                (
+                    "candidate",
+                    "filesystem_write_scope_conflict",
+                    "conflict_hint",
+                )
+            } else if read_only_pair {
+                ("candidate", "read_only_shadow_safe", "read_only_safe_hint")
+            } else if mode == "dag" && overlap_ms > 0 {
+                ("candidate", "dag_overlap_candidate", "overlap_hint")
             } else {
-                "not_overlapped"
+                ("candidate", "sequential_candidate", "unknown_pair")
             };
+            let observation_id = parallel_observation_id(
+                &pair,
+                mode,
+                outcome,
+                candidate_kind,
+                left_result,
+                right_result,
+            );
             observations.push(json!({
-                "pair": parallel_pair_key(
-                    &commands[left].parallel_signature,
-                    &commands[right].parallel_signature,
-                ),
+                "observation_id": observation_id,
+                "pair": pair,
                 "left": commands[left].parallel_signature,
                 "right": commands[right].parallel_signature,
                 "outcome": outcome,
+                "evidence_source": evidence_source,
+                "candidate_kind": candidate_kind,
+                "safety_sample": mode == "parallel" && matches!(outcome, "success" | "conflict"),
                 "overlap_ms": overlap_ms,
                 "lock_wait_ms": lock_wait_ms,
-                "same_lock_group": same_lock_group
+                "same_lock_group": same_lock_group,
+                "overlapping_write_scope": overlapping_write_scope
             }));
         }
     }
     (observations, total_pairs > MAX_PARALLEL_OBSERVATIONS)
+}
+
+fn result_resource_lock_group(batch_result: &Value) -> Option<&str> {
+    batch_result
+        .get("result")
+        .and_then(|result| result.get("resource_lock_group"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+fn normalized_result_write_scope(batch_result: &Value) -> Option<String> {
+    let raw = batch_result
+        .get("result")
+        .and_then(|result| result.get("resource_lock_target"))
+        .and_then(Value::as_str)?
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let normalized = raw.replace('\\', "/").trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+    #[cfg(windows)]
+    let normalized = normalized.to_ascii_lowercase();
+    Some(normalized)
+}
+
+fn result_write_scopes_overlap(left: &Value, right: &Value) -> bool {
+    let Some(left) = normalized_result_write_scope(left) else {
+        return false;
+    };
+    let Some(right) = normalized_result_write_scope(right) else {
+        return false;
+    };
+    left == right
+        || left
+            .strip_prefix(right.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left.as_str())
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn command_read_only_shadow_safe(command: &ExecBatchCommand) -> bool {
+    if command_has_version_flag(&command.args) {
+        return true;
+    }
+    let Some(program) = normalized_program(&command.args) else {
+        return false;
+    };
+    let verb = normalized_command_verb(&command.args, &program);
+    program == "git"
+        && matches!(
+            verb.as_str(),
+            "status" | "diff" | "log" | "show" | "rev-parse" | "ls-files" | "cat-file"
+        )
+}
+
+fn parallel_observation_id(
+    pair: &str,
+    mode: &str,
+    outcome: &str,
+    candidate_kind: &str,
+    left_result: &Value,
+    right_result: &Value,
+) -> String {
+    let mut digest = Sha256::new();
+    for value in [pair, mode, outcome, candidate_kind] {
+        digest.update(value.as_bytes());
+        digest.update([0]);
+    }
+    for result in [left_result, right_result] {
+        digest.update(
+            result
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        digest.update([0]);
+        digest.update(
+            result
+                .get("result")
+                .and_then(|value| value.get("started_ts_ms"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn execution_overlap_ms(left: &Value, right: &Value) -> u64 {

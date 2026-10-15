@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { normalizeConfig } from '../dist/config.js';
 import { MAX_CONVERSATION_CONTEXTS } from '../dist/conversation.js';
+import { CONVERSATION_HANDLE_TTL_MS, MAX_CONVERSATION_HANDLES } from '../dist/server/mcp/conversationHandles.js';
 import { ABSOLUTE_COMMAND_TIMEOUT_MAX_MS, DEFAULT_COMMAND_TIMEOUT_MAX_MS } from '../dist/executionLimits.js';
 import {
   WINDOWS_CIRCUIT_BREAKER_DELAY_MS,
@@ -18,7 +19,11 @@ import {
 import { rustBehavioralParityFixtures } from '../dist/rustCatalog.generated.js';
 import {
   BUILTIN_TUNNEL_DEMAND_TTL_MS,
-  BUILTIN_TUNNEL_LOCAL_CONNECT_TIMEOUT_MS
+  BUILTIN_TUNNEL_HEARTBEAT_INTERVAL_MS,
+  BUILTIN_TUNNEL_HEARTBEAT_TIMEOUT_MS,
+  BUILTIN_TUNNEL_LOCAL_CONNECT_TIMEOUT_MS,
+  BUILTIN_TUNNEL_RECONNECT_INITIAL_MS,
+  BUILTIN_TUNNEL_RECONNECT_MAX_MS
 } from '../dist/tunnel.js';
 import {
   LATEST_MCP_PROTOCOL_VERSION,
@@ -68,10 +73,16 @@ test('Rust behavioral parity fixtures match Node runtime constants', () => {
     latest_protocol_version: LATEST_MCP_PROTOCOL_VERSION,
     supported_protocol_versions: [...SUPPORTED_MCP_PROTOCOL_VERSIONS],
     stream_heartbeat_interval_ms: MCP_STREAM_HEARTBEAT_INTERVAL_MS,
-    stream_channel_capacity: MCP_STREAM_CHANNEL_CAPACITY
+    stream_channel_capacity: MCP_STREAM_CHANNEL_CAPACITY,
+    conversation_handle_ttl_ms: CONVERSATION_HANDLE_TTL_MS,
+    max_conversation_handles: MAX_CONVERSATION_HANDLES
   }, mcpTransport);
   assert.deepEqual({
     demand_hint_ttl_ms: BUILTIN_TUNNEL_DEMAND_TTL_MS,
-    local_connect_timeout_ms: BUILTIN_TUNNEL_LOCAL_CONNECT_TIMEOUT_MS
+    local_connect_timeout_ms: BUILTIN_TUNNEL_LOCAL_CONNECT_TIMEOUT_MS,
+    heartbeat_interval_ms: BUILTIN_TUNNEL_HEARTBEAT_INTERVAL_MS,
+    heartbeat_timeout_ms: BUILTIN_TUNNEL_HEARTBEAT_TIMEOUT_MS,
+    reconnect_initial_ms: BUILTIN_TUNNEL_RECONNECT_INITIAL_MS,
+    reconnect_max_ms: BUILTIN_TUNNEL_RECONNECT_MAX_MS
   }, tunnel);
 });

@@ -29,11 +29,7 @@ impl SecretStore {
     }
 
     pub fn set_shared(key: &str, value: &str) -> AppResult<()> {
-        DataStore::update_file(|data| {
-            data.shared_secrets
-                .insert(key.to_string(), value.to_string());
-            Ok(())
-        })
+        DataStore::write_shared_secret_latest(key, value)
     }
 
     pub fn get_app(scope: &str, item_id: &str) -> AppResult<Option<String>> {
@@ -47,15 +43,8 @@ impl SecretStore {
         })
     }
 
-    #[cfg(test)]
     pub fn set_app(scope: &str, item_id: &str, value: &str) -> AppResult<()> {
-        DataStore::update_file(|data| {
-            data.app_secrets
-                .entry(scope.to_string())
-                .or_default()
-                .insert(item_id.to_string(), value.to_string());
-            Ok(())
-        })
+        DataStore::write_app_secret_latest(scope, item_id, value)
     }
 }
 

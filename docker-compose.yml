@@ -13,7 +13,6 @@ services:
       CTMCP_PORT: 3789
       CTMCP_UI_ENABLED: "true"
       CTMCP_UI_TRUST_PRIVATE_PROXY: "true"
-      CTMCP_OAUTH_PASSWORD: ${CTMCP_OAUTH_PASSWORD:?Set CTMCP_OAUTH_PASSWORD before starting the stack}
       DOCKER_HOST: unix:///var/run/docker.sock
     volumes:
       - .data:/data

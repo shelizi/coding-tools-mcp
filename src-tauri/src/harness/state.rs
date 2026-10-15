@@ -123,7 +123,8 @@ impl Harness {
             .cloned()
         {
             if let Ok(task) = self.store.load_task(&self.workspace_id, &task_id) {
-                if task.status.is_writable() && self.task_scope_id(&task) == scope_id {
+                if task.status.occupies_current_task_slot() && self.task_scope_id(&task) == scope_id
+                {
                     return Ok(Some(task));
                 }
             }
@@ -144,7 +145,10 @@ impl Harness {
             return Ok(None);
         };
         let task = self.store.load_task(&self.workspace_id, task_id)?;
-        Ok((task.status.is_writable() && self.task_scope_id(&task) == scope_id).then_some(task))
+        Ok(
+            (task.status.occupies_current_task_slot() && self.task_scope_id(&task) == scope_id)
+                .then_some(task),
+        )
     }
 
     pub fn scope_root_for(&self, cwd: &Path) -> PathBuf {
@@ -286,7 +290,12 @@ impl Harness {
         self.store.save_task(&task)?;
         self.store
             .append_event_for_workspace(&self.workspace_id, &finished_event)?;
-        self.save_workspace_state(task.status.is_writable().then_some(task.id.as_str()), &task)?;
+        self.save_workspace_state(
+            task.status
+                .occupies_current_task_slot()
+                .then_some(task.id.as_str()),
+            &task,
+        )?;
         Ok((task, change))
     }
 
@@ -298,12 +307,26 @@ impl Harness {
                 format!("不允许从 {:?} 转换到 {:?}", task.status, next),
             ));
         }
+        if next.occupies_current_task_slot() && !task.status.occupies_current_task_slot() {
+            let scope_id = self.task_scope_id(&task).to_string();
+            if let Some(current) = self.current_task_for_scope(&scope_id)? {
+                if current.id != task.id {
+                    return Err(HarnessError::new(
+                        "TASK_ALREADY_ACTIVE",
+                        format!("当前工作树已有活动任务 {}", current.id),
+                    ));
+                }
+            }
+        }
         task.status = next;
         task.updated_at = timestamp();
         self.store.save_task(&task)?;
-        if !task.status.is_writable() {
-            self.save_workspace_state(None, &task)?;
-        }
+        self.save_workspace_state(
+            task.status
+                .occupies_current_task_slot()
+                .then_some(task.id.as_str()),
+            &task,
+        )?;
         self.record_event(
             task_id,
             "task_status_changed",
@@ -706,7 +729,7 @@ impl Harness {
         let tasks = self.store.list_tasks(&self.workspace_id)?;
         let mut active_task_ids = HashMap::new();
         for task in &tasks {
-            if task.status.is_writable() {
+            if task.status.occupies_current_task_slot() {
                 active_task_ids
                     .entry(self.task_scope_id(task).to_string())
                     .or_insert_with(|| task.id.clone());
@@ -753,7 +776,7 @@ impl Harness {
         };
         let active = state.active_task_ids.get_or_insert_with(HashMap::new);
         let scope_id = self.task_scope_id(task).to_string();
-        if task.status.is_writable() {
+        if task.status.occupies_current_task_slot() {
             active.insert(scope_id, task.id.clone());
         } else if active.get(&scope_id).is_some_and(|id| id == &task.id) {
             active.remove(&scope_id);
@@ -1090,6 +1113,54 @@ mod tests {
             .join(harness.workspace_id())
             .join("snapshots")
             .exists());
+    }
+
+    #[test]
+    fn paused_task_releases_scope_slot_and_resume_respects_active_task() {
+        let workspace = tempdir().expect("workspace");
+        let harness_root = tempdir().expect("harness");
+        let harness = Harness::new(
+            workspace.path().to_path_buf(),
+            harness_root.path().to_path_buf(),
+        )
+        .expect("harness");
+
+        let first = harness.start_task("first task").expect("first task");
+        harness
+            .transition(&first.id, TaskStatus::Paused)
+            .expect("pause first");
+        assert!(harness
+            .current_task()
+            .expect("current after pause")
+            .is_none());
+
+        let second = harness.start_task("second task").expect("second task");
+        assert_ne!(first.id, second.id);
+        assert_eq!(
+            harness.task(&first.id).expect("retained first").status,
+            TaskStatus::Paused
+        );
+
+        let blocked = harness
+            .transition(&first.id, TaskStatus::Active)
+            .expect_err("resume should be blocked");
+        assert_eq!(blocked.code(), "TASK_ALREADY_ACTIVE");
+        assert_eq!(
+            harness.current_task().expect("current second").unwrap().id,
+            second.id
+        );
+
+        harness
+            .transition(&second.id, TaskStatus::Paused)
+            .expect("pause second");
+        let resumed = harness
+            .transition(&first.id, TaskStatus::Active)
+            .expect("resume first");
+        assert_eq!(resumed.status, TaskStatus::Active);
+        assert_eq!(
+            harness.current_task().expect("current first").unwrap().id,
+            first.id
+        );
     }
 
     #[test]

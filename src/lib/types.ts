@@ -57,6 +57,7 @@ export interface SandboxBackendDescriptor {
 
 export interface SecurityPolicy {
   restrict_tool_catalog: boolean;
+  advertise_read_only_annotations: boolean;
   enforce_command_allowlist: boolean;
   require_dangerous_confirmation: boolean;
   require_shell_confirmation: boolean;
@@ -78,6 +79,7 @@ export interface SecurityPolicy {
 export function securityPolicyConfig(runtime: RuntimeConfig): SecurityPolicy {
   return {
     restrict_tool_catalog: !["advanced", "compat-readonly-all"].includes(runtime.tool_profile),
+    advertise_read_only_annotations: runtime.tool_profile === "compat-readonly-all",
     enforce_command_allowlist: true,
     require_dangerous_confirmation: runtime.permission_mode !== "dangerous",
     require_shell_confirmation: runtime.permission_mode !== "dangerous",
@@ -106,7 +108,8 @@ export function compatibilityPermissionMode(policy: SecurityPolicy): string {
 }
 
 export function compatibilityToolProfile(policy: SecurityPolicy): string {
-  return policy.restrict_tool_catalog ? "trusted-core" : "advanced";
+  if (policy.restrict_tool_catalog) return "trusted-core";
+  return policy.advertise_read_only_annotations ? "compat-readonly-all" : "advanced";
 }
 
 export interface RuntimeConfig {
@@ -206,6 +209,7 @@ export interface RuntimeStatus {
   publicMessage: string;
   localEndpoint: string;
   publicEndpoint: string;
+  lastActivityAtMs?: number | null;
 }
 
 export function actionsConfig(profile: WorkspaceProfile): ActionsConfig {
@@ -217,7 +221,7 @@ export function actionsConfig(profile: WorkspaceProfile): ActionsConfig {
     cloudflare_mode: "quick",
     local_port: DEFAULT_ACTIONS_PORT,
     bind_address: "127.0.0.1",
-    permission_mode: "trusted",
+    permission_mode: "safe",
     auth_type: "api_key",
     allowed_commands:
       "pytest,python,python3,npm,npx,node,pnpm,yarn,make,mvn,mvnw,gradle,gradlew,cargo,go,ruff,mypy,eslint,tsc",

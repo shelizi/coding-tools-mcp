@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -37,6 +37,30 @@ test('child stream draining is owned by a dedicated module', async () => {
   const childStreams = await import('../dist/processes/childStreams.js');
   assert.equal(typeof childStreams.waitForReadableEnd, 'function');
   assert.equal(typeof childStreams.waitForChildStreams, 'function');
+});
+
+test('child stream draining resolves when close happened before listeners were attached', async () => {
+  const { waitForReadableEnd } = await import('../dist/processes/childStreams.js');
+  const stream = new EventEmitter();
+  stream.readableEnded = false;
+  stream.destroyed = false;
+  stream.closed = true;
+  const resolved = await Promise.race([
+    waitForReadableEnd(stream).then(() => true),
+    new Promise(resolve => setTimeout(() => resolve(false), 50))
+  ]);
+  assert.equal(resolved, true);
+});
+
+test('standalone buffered startup stays alive across the Windows throttle interval', () => {
+  const result = spawnSync(process.execPath, ['test/fixtures/startupThrottleStandalone.mjs'], {
+    cwd: path.resolve('.'),
+    encoding: 'utf8',
+    timeout: 10_000,
+    env: { ...process.env, CTMCP_SHARED_STORE_DISABLED: '1' }
+  });
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  assert.match(result.stdout, /standalone-startup-ok/);
 });
 
 class FakeClock {

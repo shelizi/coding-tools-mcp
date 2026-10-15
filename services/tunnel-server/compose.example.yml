@@ -24,11 +24,16 @@ services:
       CODING_TOOLS_TUNNEL_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
       CODING_TOOLS_TUNNEL_DB: /data/tunnel.db
       CODING_TOOLS_TUNNEL_LOG_DIR: /data/logs
+      CODING_TOOLS_NODE_UPDATE_GITEA_URL: ${TUNNEL_NODE_UPDATE_GITEA_URL:?set TUNNEL_NODE_UPDATE_GITEA_URL}
+      CODING_TOOLS_NODE_UPDATE_GITEA_REPOSITORY: ${TUNNEL_NODE_UPDATE_GITEA_REPOSITORY:?set TUNNEL_NODE_UPDATE_GITEA_REPOSITORY}
+      CODING_TOOLS_NODE_UPDATE_GITEA_TOKEN_FILE: /run/secrets/node_update_gitea_token
+      CODING_TOOLS_NODE_UPDATE_POLL_SECONDS: ${TUNNEL_NODE_UPDATE_POLL_SECONDS:-300}
       RUST_LOG: ${RUST_LOG:-coding_tools_tunnel_server=info}
     volumes:
       - tunnel-data:/data
     secrets:
       - admin_password
+      - node_update_gitea_token
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8088/health"]
       interval: 30s
@@ -43,3 +48,5 @@ secrets:
   # Path is resolved relative to this compose file's directory when relative.
   admin_password:
     file: ${TUNNEL_ADMIN_PASSWORD_FILE:?set TUNNEL_ADMIN_PASSWORD_FILE}
+  node_update_gitea_token:
+    file: ${TUNNEL_NODE_UPDATE_GITEA_TOKEN_FILE:?set TUNNEL_NODE_UPDATE_GITEA_TOKEN_FILE}

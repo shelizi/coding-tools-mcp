@@ -2,12 +2,12 @@
   "schema_version": 2,
   "assertion_registry": "assertions.json",
   "baseline": {
-    "audited_at": "2026-09-14",
-    "repository_head": "f7ab8735dd61d1cc8fb5eeba7da8a980add2af90",
+    "audited_at": "2026-10-15",
+    "repository_head": "d3c9d97b45cb0331d1a17f5442c71eab4e8f5c3d",
     "head_policy": "ancestor",
-    "desktop_client_version": "0.1.59",
-    "node_agent_version": "0.29.35",
-    "client_compatibility_version": "0.1.59"
+    "desktop_client_version": "0.1.63",
+    "node_agent_version": "0.29.46",
+    "client_compatibility_version": "0.1.63"
   },
   "status_values": ["todo", "in_progress", "blocked", "done", "excluded"],
   "priority_values": ["P0", "P1", "P2"],
@@ -446,6 +446,13 @@
       "status": "excluded",
       "reason": "The Node Agent keeps process-level restart and duplicate-port validation, but does not reproduce the Rust Desktop automatic free-port assignment, stale listener recovery, and per-service MCP/Actions supervisor state machine.",
       "shared_assertion_ids": ["PA-019-PROCESS-STARTUP", "PA-020-ADMISSION"]
+    },
+    {
+      "id": "ND-011",
+      "title": "Node search_text uses ripgrep or grep",
+      "status": "excluded",
+      "reason": "Node Agent content search prefers a ripgrep/grep subprocess to avoid in-process walks of huge bind-mounted trees. Desktop search_text remains in-process, including UTF-16 decoding. Node falls back to JS streaming only when rg and grep are unavailable. Node software management can install a managed rg; Desktop software management does not list rg.",
+      "shared_assertion_ids": ["PA-005-TEXT-DECODING", "PA-006-GITIGNORE-WALK"]
     }
   ]
 }

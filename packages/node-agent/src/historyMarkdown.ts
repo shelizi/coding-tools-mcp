@@ -95,6 +95,12 @@ function sectionBody(content: string, heading: string): string | undefined {
   return tail.slice(0, end < 0 ? undefined : end).trim();
 }
 
+export function historySectionItems(content: string, heading: string): string[] {
+  const body = sectionBody(content, heading);
+  if (!body) return [];
+  return uniqueValues(body.split(/\r?\n/).map(line => line.trim().replace(/^[-*]\s+/, '')).filter(Boolean));
+}
+
 export function inheritedSummary(content: string): string | undefined {
   const value = sectionBody(content, INHERITED_SUMMARY_HEADING)?.trim();
   return value || undefined;

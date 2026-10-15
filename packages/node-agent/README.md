@@ -42,7 +42,27 @@ Pure Node.js/TypeScript implementation of Coding Tools MCP. It does not bundle a
 
 ## Requirements
 
+MCP clients without conversation/session identity metadata can use tools whose schema
+exposes `workspace_folder_id` by passing an allowed folder ID on every call. This
+one-call route also works in the Rust Desktop server and does not select a folder
+for later calls. Persistent folder binding still requires conversation identity;
+the history `session_key` is not a substitute for transport conversation identity.
+
 - Node.js 22 or later
+
+### MCP identity diagnostics
+
+Set `CTMCP_MCP_IDENTITY_DIAGNOSTICS=1` in the server process environment to enable
+`mcp_identity_observed` events in `logs/diagnostics.jsonl`. The Rust Desktop server
+supports the same switch in its per-profile diagnostics logs. Restart the server
+after changing the environment; leaving the variable unset disables collection.
+
+Events contain bounded header and `_meta` key names, sanitized client name/version
+from legacy or modern `clientInfo`, and SHA-256 fingerprints of string-valued
+session/conversation/thread/chat candidates. Authorization, cookies and fields
+whose names suggest credentials are never fingerprinted. Raw headers, metadata
+values and tool arguments are not included. Client information is self-reported;
+a transport session fingerprint does not prove chat-conversation isolation.
 - Git for Git and patch tools
 - Windows with WSL installed when using `\\wsl.localhost`, `\\wsl$`, or extended WSL UNC workspaces
 - The command-line programs invoked by the MCP tools must already be installed
@@ -178,7 +198,7 @@ The runner verifies public OAuth metadata, authorization-code PKCE, token exchan
 | `CTMCP_PORT` | `3789` | Local HTTP port |
 | `CTMCP_WORKSPACES` | current directory | Allowed workspace folders |
 | `CTMCP_DATA_DIR` | OS user data directory | Durable state, encrypted Agent secrets, and tunnel identity; keep custom Windows locations user-private |
-| `CTMCP_PERMISSION_MODE` | `trusted` | `read-only`, `guarded`, `trusted`, or `dangerous` |
+| `CTMCP_PERMISSION_MODE` | `guarded` | `read-only`, `guarded`, `trusted`, or `dangerous` (`safe` is accepted as the Rust alias) |
 | `CTMCP_TOOL_PROFILE` | `core` | `core`, `trusted-core`, `guarded-core`, `read-only`, `advanced`, or `compat-readonly-all` |
 | `CTMCP_UI_ENABLED` | `true` | Enables the loopback-only browser/PWA management UI |
 | `CTMCP_UI_TRUST_PRIVATE_PROXY` | `false` | Allows a private Docker bridge peer to reach the management UI while still requiring a loopback Host header; the provided Compose file enables this with a host-loopback-only port binding |
@@ -244,7 +264,7 @@ Secret updates are written to the effective data directory selected by `CTMCP_DA
 
 ## Tool profiles
 
-The persisted default is `toolProfile: "core"`. It resolves to `trusted-core` when `permissionMode` is `trusted` or `dangerous`, and automatically resolves to `guarded-core` for safer permission modes. `CTMCP_TOOL_PROFILE` overrides the saved value for the current process. The management UI shows the configured and effective profiles separately because profile changes require an Agent restart.
+New workspaces persist the safe-equivalent `permissionMode: "guarded"`. The persisted default is `toolProfile: "core"`. It resolves to `trusted-core` when `permissionMode` is `trusted` or `dangerous`, and automatically resolves to `guarded-core` for safer permission modes. `CTMCP_TOOL_PROFILE` overrides the saved value for the current process. The management UI shows the configured and effective profiles separately because profile changes require an Agent restart.
 
 The catalogs are generated directly from the Rust registry:
 
@@ -425,6 +445,34 @@ pnpm run test:wss:production
 ```
 
 `verify` is the pure Node package verification used before packing. `verify:repo` additionally runs the Rust catalog exporter, verifies the Desktop Client compatibility marker, validates the Rust/Node parity roadmap, and fails if a generated contract or roadmap reference has drifted. The Node Agent package version is an independent release version; `codingTools.clientVersion` and `src/clientVersion.generated.ts` record the Desktop Client version whose shared contracts were synchronized. Root `pnpm run version:sync` updates these values whenever the Desktop Client version changes. `test:wss:production` is deliberately separate and fails immediately unless production URL, OAuth, and enrollment or persisted-identity settings are supplied.
+
+## Conversation handles (Rust Desktop and Node Agent)
+
+Clients without a platform conversation identity, including the observed Gemini
+connection, obtain a server-generated `conversation_handle` from
+`conversation_bootstrap`. Call it with `folder_id` when known; a folder-choice
+response also returns a handle. Include that same handle in every subsequent
+built-in tool call to preserve folder selection and default working directory:
+
+```json
+{"name":"conversation_bootstrap","arguments":{"folder_id":"your-folder-id"}}
+{"name":"read_file","arguments":{"conversation_handle":"<returned handle>","path":"README.md"}}
+```
+
+OpenAI clients with a native conversation identity continue using existing routing.
+They may request a handle with `create_conversation_handle: true` on bootstrap;
+subsequent calls must retain the same native identity. A handle is scoped to the
+verified Bearer credential and profile/runtime, expires after 24 hours, and is
+invalid after server restart or credential rotation. Bootstrap again to obtain a
+new one. Handle storage is memory-only and bounded to 1,024 live entries per profile.
+Invalid, expired or conflicting handles are rejected even if a folder is supplied.
+
+The model must carry the handle correctly: it does not establish platform-level
+conversation isolation. Treat it as sensitive and do not copy it between chats.
+Handle-only clients use `exec_command`/`wait_command` and related process controls;
+automatic MCP Tasks projection is disabled because task polling cannot carry tool
+arguments. Handles require verified authentication and are not exposed in Actions
+or external proxied tool schemas.
 
 ## HTTP endpoints
 

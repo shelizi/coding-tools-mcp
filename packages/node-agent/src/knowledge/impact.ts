@@ -3,6 +3,12 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { KnowledgeArtifactTarget, TaskOutcome } from './types.js';
 
+const MAX_DURATION_SAMPLES = 128;
+
+function boundedDurationSamples(values: readonly number[]): number[] {
+  return values.filter(Number.isFinite).map(value => Math.max(0, value)).slice(-MAX_DURATION_SAMPLES);
+}
+
 export interface KnowledgeImpactRecord {
   schemaVersion: 1;
   knowledgeId: string;
@@ -10,7 +16,11 @@ export interface KnowledgeImpactRecord {
   tool: string;
   sourceEventIds: string[];
   matchedTaskIds: string[];
+  matchedConversationContextIds?: string[];
+  matchedRuntimeBootContextIds?: string[];
   creditedTaskIds: string[];
+  semanticEquivalenceChecks?: number;
+  semanticEquivalenceFailures?: number;
   considered: number;
   matched: number;
   actualSuccesses: number;
@@ -24,6 +34,7 @@ export interface KnowledgeImpactRecord {
   taskFailures: number;
   taskRollbacks: number;
   totalObservedDurationMs: number;
+  durationSamplesMs?: number[];
   totalObservedRequestBytes: number;
   totalObservedResponseBytes: number;
   firstSeenAtMs: number;
@@ -52,7 +63,12 @@ function normalize(record: KnowledgeImpactRecord): KnowledgeImpactRecord {
     ...record,
     sourceEventIds: unique(record.sourceEventIds ?? []),
     matchedTaskIds: unique(record.matchedTaskIds ?? []),
+    matchedConversationContextIds: unique(record.matchedConversationContextIds ?? []),
+    matchedRuntimeBootContextIds: unique(record.matchedRuntimeBootContextIds ?? []),
     creditedTaskIds: unique(record.creditedTaskIds ?? []),
+    semanticEquivalenceChecks: Number(record.semanticEquivalenceChecks ?? 0),
+    semanticEquivalenceFailures: Number(record.semanticEquivalenceFailures ?? 0),
+    durationSamplesMs: boundedDurationSamples(record.durationSamplesMs ?? []),
     taskVerifiedSuccesses: Number(record.taskVerifiedSuccesses ?? 0),
     taskUnverifiedSuccesses: Number(record.taskUnverifiedSuccesses ?? 0),
     taskFailures: Number(record.taskFailures ?? 0),
@@ -66,7 +82,11 @@ function merge(left: KnowledgeImpactRecord, right: KnowledgeImpactRecord): Knowl
     ...right,
     sourceEventIds: unique([...left.sourceEventIds, ...right.sourceEventIds]),
     matchedTaskIds: unique([...left.matchedTaskIds, ...right.matchedTaskIds]),
+    matchedConversationContextIds: unique([...(left.matchedConversationContextIds ?? []), ...(right.matchedConversationContextIds ?? [])]),
+    matchedRuntimeBootContextIds: unique([...(left.matchedRuntimeBootContextIds ?? []), ...(right.matchedRuntimeBootContextIds ?? [])]),
     creditedTaskIds: unique([...left.creditedTaskIds, ...right.creditedTaskIds]),
+    semanticEquivalenceChecks: Number(left.semanticEquivalenceChecks ?? 0) + Number(right.semanticEquivalenceChecks ?? 0),
+    semanticEquivalenceFailures: Number(left.semanticEquivalenceFailures ?? 0) + Number(right.semanticEquivalenceFailures ?? 0),
     considered: left.considered + right.considered,
     matched: left.matched + right.matched,
     actualSuccesses: left.actualSuccesses + right.actualSuccesses,
@@ -80,6 +100,7 @@ function merge(left: KnowledgeImpactRecord, right: KnowledgeImpactRecord): Knowl
     taskFailures: left.taskFailures + right.taskFailures,
     taskRollbacks: left.taskRollbacks + right.taskRollbacks,
     totalObservedDurationMs: left.totalObservedDurationMs + right.totalObservedDurationMs,
+    durationSamplesMs: boundedDurationSamples([...(left.durationSamplesMs ?? []), ...(right.durationSamplesMs ?? [])]),
     totalObservedRequestBytes: left.totalObservedRequestBytes + right.totalObservedRequestBytes,
     totalObservedResponseBytes: left.totalObservedResponseBytes + right.totalObservedResponseBytes,
     firstSeenAtMs: Math.min(left.firstSeenAtMs, right.firstSeenAtMs),

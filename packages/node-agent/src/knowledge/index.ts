@@ -3,6 +3,8 @@ export * from './store.js';
 export * from './registries.js';
 export * from './compiler.js';
 export * from './ingestor.js';
+export * from './ledger.js';
+export * from './replay.js';
 export * from './impact.js';
 export * from './shadow.js';
 export * from './validation.js';

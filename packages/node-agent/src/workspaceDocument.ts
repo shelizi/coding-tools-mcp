@@ -11,6 +11,7 @@ export const CANONICAL_SCHEMA_VERSION = 2 as const;
 
 const securityPolicyKeys = [
   'restrictToolCatalog',
+  'advertiseReadOnlyAnnotations',
   'enforceCommandAllowlist',
   'requireDangerousConfirmation',
   'requireShellConfirmation',
@@ -250,7 +251,7 @@ export function parseCanonicalWorkspace(value: unknown): CanonicalWorkspace {
       oauthTokenTtlSeconds: integer(auth.oauthTokenTtlSeconds ?? auth.oauth_token_ttl_seconds, 7 * 24 * 60 * 60)
     },
     toolProfile: text(value.toolProfile, 'core') || 'core',
-    permissionMode: text(value.permissionMode, 'trusted') || 'trusted',
+    permissionMode: text(value.permissionMode, 'guarded') || 'guarded',
     securityPolicy: parseSecurityPolicy(value.securityPolicy),
     policy: {
       allowedCommands: stringList(policy.allowedCommands),
@@ -358,7 +359,7 @@ export function migrateNodeV1Document(
       oauthTokenTtlSeconds: integer(oauth.tokenTtlSeconds, 7 * 24 * 60 * 60)
     },
     toolProfile: text(value.toolProfile, 'core') || 'core',
-    permissionMode: text(value.permissionMode, 'trusted') || 'trusted',
+    permissionMode: text(value.permissionMode, 'guarded') || 'guarded',
     securityPolicy: value.securityPolicy,
     policy: value.policy,
     sandbox: value.sandbox,
@@ -416,7 +417,9 @@ export function canonicalToAgentConfigDocument(canonical: CanonicalWorkspace): A
     schema_version: 1,
     host: canonical.bind.host,
     port: canonical.bind.port,
-    permissionMode: canonical.permissionMode as PermissionMode,
+    permissionMode: (canonical.permissionMode === 'safe'
+      ? 'guarded'
+      : canonical.permissionMode) as PermissionMode,
     toolProfile: canonical.toolProfile,
     securityPolicy: canonical.securityPolicy,
     policy: canonical.policy,

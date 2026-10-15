@@ -38,6 +38,64 @@ async function heartbeatAgeMs(file) {
   }
 }
 
+async function readLockOwner(file) {
+  try {
+    return JSON.parse(await readFile(file, 'utf8'));
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    return true;
+  }
+}
+
+async function restoreQuarantinedLock(quarantined) {
+  try {
+    await rename(quarantined, lockPath);
+  } catch {
+    // Another contender may already have created the replacement lock.
+  }
+}
+
+async function recoverDeadOwnerLock() {
+  const observedOwner = await readLockOwner(lockPath);
+  if (!observedOwner || processIsAlive(observedOwner.pid)) return false;
+
+  const quarantined = `${lockPath}.dead-${randomUUID()}`;
+  try {
+    await rename(lockPath, quarantined);
+  } catch (error) {
+    if (['ENOENT', 'EACCES', 'EPERM'].includes(error?.code)) return false;
+    throw error;
+  }
+
+  const quarantinedOwner = await readLockOwner(quarantined);
+  if (
+    !quarantinedOwner
+    || quarantinedOwner.pid !== observedOwner.pid
+    || quarantinedOwner.token !== observedOwner.token
+    || processIsAlive(quarantinedOwner.pid)
+  ) {
+    await restoreQuarantinedLock(quarantined);
+    return false;
+  }
+
+  await unlink(quarantined).catch(error => {
+    if (error?.code !== 'ENOENT') throw error;
+  });
+  return true;
+}
+
 async function recoverStaleLock() {
   if (await heartbeatAgeMs(lockPath) < staleLockMs) return false;
   const quarantined = `${lockPath}.stale-${randomUUID()}`;
@@ -79,6 +137,7 @@ async function acquireLock() {
       return { token, heartbeat };
     } catch (error) {
       if (error?.code !== 'EEXIST') throw error;
+      if (await recoverDeadOwnerLock()) continue;
       if (await recoverStaleLock()) continue;
       if (!announcedWait && Date.now() - started >= 500) {
         announcedWait = true;

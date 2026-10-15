@@ -5,6 +5,7 @@ export type TaskStatus = 'active' | 'paused' | 'verifying' | 'failed' | 'failed_
 export interface ProjectBaseline {
   branch?: string;
   head?: string;
+  baseline_mode?: 'full' | 'git_status_v2';
   worktree_fingerprint: string;
   entries: Array<{
     path: string;

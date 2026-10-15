@@ -121,6 +121,17 @@ pub fn input_schema(name: &str) -> Value {
         }
     }
     if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("conversation_handle".into(), json!({
+            "type": "string", "minLength": 67, "maxLength": 67,
+            "pattern": "^ch_[a-f0-9]{64}$",
+            "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart."
+        }));
+        if name == "conversation_bootstrap" {
+            properties.insert("create_conversation_handle".into(), json!({
+                "type": "boolean",
+                "description": "Request a conversation_handle even when native platform conversation identity is available. Clients without native identity receive one automatically."
+            }));
+        }
         properties.insert(
             "retry_of_call_sequence".into(),
             json!({
@@ -160,6 +171,24 @@ mod tests {
     use super::{input_schema, list_tools_for_profile, P0_TOOLS};
     use crate::tools::execution_timeout::ABSOLUTE_JOB_TIMEOUT_MAX_MS;
     use crate::tools::ABSOLUTE_COMMAND_TIMEOUT_MAX_MS;
+
+    #[test]
+    fn built_in_mcp_tools_expose_conversation_handle_and_only_bootstrap_can_request_one() {
+        for (name, ..) in P0_TOOLS {
+            let schema = input_schema(name);
+            assert_eq!(
+                schema["properties"]["conversation_handle"]["pattern"], "^ch_[a-f0-9]{64}$",
+                "{name}"
+            );
+            assert_eq!(
+                schema["properties"]
+                    .get("create_conversation_handle")
+                    .is_some(),
+                *name == "conversation_bootstrap",
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn read_only_annotations_match_the_tunnel_retry_contract() {
@@ -227,10 +256,11 @@ mod tests {
             .collect();
         let unique: HashSet<_> = names.iter().copied().collect();
 
-        assert_eq!(tools.len(), 37);
+        assert_eq!(tools.len(), 38);
         assert_eq!(unique.len(), tools.len());
         assert!(names.contains(&"history_session_bootstrap"));
         assert!(names.contains(&"history_session_checkpoint"));
+        assert!(names.contains(&"history_search"));
         assert!(names.contains(&"list_workspace_folders"));
         assert!(names.contains(&"conversation_bootstrap"));
         assert!(names.contains(&"switch_workspace_folder"));
@@ -269,11 +299,20 @@ mod tests {
     fn guarded_core_adds_only_permission_requests() {
         let trusted = list_tools_for_profile("trusted-core");
         let guarded = list_tools_for_profile("guarded-core");
-        assert_eq!(trusted.len(), 37);
-        assert_eq!(guarded.len(), 38);
-        assert!(guarded
+        assert_eq!(guarded.len(), trusted.len() + 1);
+        assert!(trusted.iter().all(|tool| guarded
             .iter()
-            .any(|tool| tool["name"] == "request_permissions"));
+            .any(|candidate| candidate["name"] == tool["name"])));
+        let extras = guarded
+            .iter()
+            .filter(|tool| {
+                !trusted
+                    .iter()
+                    .any(|candidate| candidate["name"] == tool["name"])
+            })
+            .map(|tool| tool["name"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(extras, vec!["request_permissions"]);
     }
 
     #[test]

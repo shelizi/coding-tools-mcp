@@ -96,6 +96,7 @@ pub fn spawn_listener(
         None
     };
     let state = ListenerState {
+        conversation_handles: Default::default(),
         mcp,
         auth,
         workspace_id,

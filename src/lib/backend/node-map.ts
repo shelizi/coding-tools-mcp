@@ -16,6 +16,7 @@ import {
 
 const POLICY_FIELDS = [
   ["restrict_tool_catalog", "restrictToolCatalog"],
+  ["advertise_read_only_annotations", "advertiseReadOnlyAnnotations"],
   ["enforce_command_allowlist", "enforceCommandAllowlist"],
   ["require_dangerous_confirmation", "requireDangerousConfirmation"],
   ["require_shell_confirmation", "requireShellConfirmation"],
@@ -207,6 +208,7 @@ export function runtimeStatusFromConfig(config: NodeSafeConfig): RuntimeStatus {
     publicMessage: "",
     localEndpoint: `http://${host}:${port}/mcp`,
     publicEndpoint: config.tunnel?.publicUrl || config.publicBaseUrl || "",
+    lastActivityAtMs: null,
   };
 }
 

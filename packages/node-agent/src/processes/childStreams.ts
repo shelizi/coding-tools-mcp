@@ -1,7 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 
 export function waitForReadableEnd(stream: ChildProcessWithoutNullStreams['stdout']): Promise<void> {
-  if (stream.readableEnded || stream.destroyed) return Promise.resolve();
+  if (stream.readableEnded || stream.destroyed || stream.closed) return Promise.resolve();
   return new Promise(resolve => {
     const done = () => {
       stream.off('end', done);
@@ -12,7 +12,7 @@ export function waitForReadableEnd(stream: ChildProcessWithoutNullStreams['stdou
     stream.once('end', done);
     stream.once('close', done);
     stream.once('error', done);
-    if (stream.readableEnded || stream.destroyed) done();
+    if (stream.readableEnded || stream.destroyed || stream.closed) done();
   });
 }
 

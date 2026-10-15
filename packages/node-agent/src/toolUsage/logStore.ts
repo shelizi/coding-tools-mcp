@@ -41,7 +41,7 @@ export class ToolUsageLogStore {
     await appendFile(this.logFile, line, { encoding: 'utf8', mode: 0o600 });
   }
 
-  async visitCompleteRecords(visit: (record: JsonObject) => void): Promise<{
+  async visitCompleteRecords(visit: (record: JsonObject) => void | Promise<void>): Promise<{
     scannedLines: number;
     invalidLines: number;
     bytesRead: number;
@@ -67,7 +67,7 @@ export class ToolUsageLogStore {
               scannedLines += 1;
               try {
                 const parsed = JSON.parse(line);
-                if (isJsonObject(parsed)) visit(parsed);
+                if (isJsonObject(parsed)) await visit(parsed);
                 else invalidLines += 1;
               } catch {
                 invalidLines += 1;

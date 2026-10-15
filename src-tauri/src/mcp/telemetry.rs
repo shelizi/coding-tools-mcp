@@ -16,9 +16,9 @@ use crate::tools::tool_runtime::{
 use log_writer::append_tool_usage_log;
 
 const MAX_LOG_VALUE_BYTES: usize = 16 * 1024;
-const MAX_LOG_STRING_CHARS: usize = 4 * 1024;
-const MAX_ARGUMENT_RECORD_BYTES: usize = 4 * 1024;
-const MAX_ARGUMENT_PREVIEW_BYTES: usize = 512;
+const MAX_LOG_STRING_CHARS: usize = 64 * 1024;
+const MAX_ARGUMENT_RECORD_BYTES: usize = 64 * 1024;
+const MAX_ARGUMENT_PREVIEW_BYTES: usize = 4 * 1024;
 const TOOL_USAGE_LOG_SCHEMA_VERSION: u64 = 7;
 const DIAGNOSTICS_SCHEMA_VERSION: u64 = 1;
 const DIAGNOSTICS_HOST_KIND: &str = "rust_desktop";
@@ -59,6 +59,12 @@ pub(crate) struct AsyncSessionTelemetry<'a> {
     pub termination_reason: &'a str,
     pub stdout_bytes: usize,
     pub stderr_bytes: usize,
+    pub stdout: &'a str,
+    pub stderr: &'a str,
+    pub stdout_audit_tail_bytes: usize,
+    pub stderr_audit_tail_bytes: usize,
+    pub stdout_audit_tail_truncated: bool,
+    pub stderr_audit_tail_truncated: bool,
 }
 
 pub(crate) fn runtime_boot_id() -> &'static str {
@@ -409,7 +415,13 @@ fn build_async_session_record(input: &AsyncSessionTelemetry<'_>, completed_ts_ms
         "exit_code": input.exit_code,
         "termination_reason": input.termination_reason,
         "stdout_bytes": input.stdout_bytes,
-        "stderr_bytes": input.stderr_bytes
+        "stderr_bytes": input.stderr_bytes,
+        "stdout": sanitize_log_value(&Value::String(input.stdout.to_string()), Some("stdout")),
+        "stderr": sanitize_log_value(&Value::String(input.stderr.to_string()), Some("stderr")),
+        "stdout_audit_tail_bytes": input.stdout_audit_tail_bytes,
+        "stderr_audit_tail_bytes": input.stderr_audit_tail_bytes,
+        "stdout_audit_tail_truncated": input.stdout_audit_tail_truncated,
+        "stderr_audit_tail_truncated": input.stderr_audit_tail_truncated
     })
 }
 
@@ -683,6 +695,13 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
             .map(|value| json!(value))
             .unwrap_or(Value::Null),
     );
+    record.insert(
+        "conversation_context_id_hash".into(),
+        input
+            .host_session_key
+            .map(|value| json!(format!("{:x}", Sha256::digest(value.as_bytes()))))
+            .unwrap_or(Value::Null),
+    );
     record.insert("started_ts_ms".into(), json!(input.started_ts_ms));
     record.insert(
         "completed_ts_ms".into(),
@@ -744,20 +763,6 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
     );
     record.insert("duration_ms".into(), json!(input.duration_ms));
     record.insert("outcome".into(), json!(input.outcome));
-    let failure_domain = match input.outcome {
-        "success" => "none",
-        "rpc_error" => "transport",
-        _ => "tool",
-    };
-    record.insert("failure_domain".into(), json!(failure_domain));
-    record.insert(
-        "severity".into(),
-        json!(if failure_domain == "none" {
-            "info"
-        } else {
-            "error"
-        }),
-    );
     record.insert("request_json_bytes".into(), json!(input.request_json_bytes));
     record.insert("arguments_json_bytes".into(), json!(arguments_bytes.len()));
     record.insert("arguments_sha256".into(), json!(arguments_sha256));
@@ -896,6 +901,8 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
                         );
                     }
                 }
+                insert_structured_metric(&mut record, data, "error_code", "error_code");
+                insert_structured_metric(&mut record, data, "error_category", "error_category");
                 if data.get("reason").and_then(Value::as_str) == Some("unknown_tool") {
                     record.insert("error_code".into(), json!("UNKNOWN_TOOL"));
                     record.insert("error_category".into(), json!("catalog"));
@@ -1016,6 +1023,7 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
                     "scan_completed",
                     "early_stop_reason",
                     "skipped_large_files",
+                    "skipped_binary_files",
                     "bytes_read",
                     "total_bytes",
                     "total_lines",
@@ -1061,6 +1069,9 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
                     "parallelism_observation_truncated",
                     "wait_timeout_ms",
                     "effective_wait_ms",
+                    "transport_safe_wait_ms",
+                    "observation_timed_out",
+                    "observation_state",
                     "heartbeat_ms",
                     "heartbeat",
                     "deduplicated",
@@ -1265,10 +1276,31 @@ fn build_tool_usage_record(input: &ToolUsageInput<'_>) -> Value {
             sanitize_log_value(&Value::String(error.to_string()), Some("error")),
         );
     }
+    let outcome_class = classify_outcome(&record, input.outcome);
+    let failure_domain = match (input.outcome, outcome_class) {
+        ("success", _) => "none",
+        ("rpc_error", "routing_error") => "tool",
+        ("rpc_error", _) => "transport",
+        _ => "tool",
+    };
+    record.insert("failure_domain".into(), json!(failure_domain));
     record.insert(
-        "outcome_class".into(),
-        json!(classify_outcome(&record, input.outcome)),
+        "severity".into(),
+        json!(if failure_domain == "none" {
+            "info"
+        } else {
+            "error"
+        }),
     );
+    record.insert(
+        "event_type".into(),
+        json!(if failure_domain == "transport" {
+            "transport_event"
+        } else {
+            "tool_call"
+        }),
+    );
+    record.insert("outcome_class".into(), json!(outcome_class));
 
     Value::Object(record)
 }
@@ -1310,6 +1342,11 @@ fn classify_outcome(record: &Map<String, Value>, outcome: &str) -> &'static str 
         } else {
             "command_failure"
         }
+    } else if code == "GIT_REPO_TARGET_MISMATCH"
+        || category == "workspace_routing"
+        || code.contains("ROUTING")
+    {
+        "routing_error"
     } else if outcome == "rpc_error" {
         "transport_error"
     } else if outcome == "success" {
@@ -1323,11 +1360,6 @@ fn classify_outcome(record: &Map<String, Value>, outcome: &str) -> &'static str 
         || code.starts_with("PROTECTED_")
     {
         "policy_rejection"
-    } else if code == "GIT_REPO_TARGET_MISMATCH"
-        || category == "workspace_routing"
-        || code.contains("ROUTING")
-    {
-        "routing_error"
     } else if matches!(
         code,
         "EDIT_MATCH_COUNT_MISMATCH"
@@ -1493,6 +1525,12 @@ mod tests {
                 termination_reason: "exited",
                 stdout_bytes: 123,
                 stderr_bytes: 7,
+                stdout: "password=top-secret-value",
+                stderr: "warning",
+                stdout_audit_tail_bytes: 123,
+                stderr_audit_tail_bytes: 7,
+                stdout_audit_tail_truncated: true,
+                stderr_audit_tail_truncated: false,
             },
             6_250,
         );
@@ -1508,6 +1546,14 @@ mod tests {
         assert_eq!(record["child_process_total_ms"], 5_250);
         assert_eq!(record["first_output_ms"], 420);
         assert_eq!(record["termination_reason"], "exited");
+        assert_eq!(record["stdout_audit_tail_bytes"], 123);
+        assert_eq!(record["stderr_audit_tail_bytes"], 7);
+        assert_eq!(record["stdout_audit_tail_truncated"], true);
+        assert_eq!(record["stderr_audit_tail_truncated"], false);
+        assert!(!record["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("top-secret-value"));
     }
 
     #[test]
@@ -1552,6 +1598,59 @@ mod tests {
         assert_eq!(summary["path"], "src/main.rs");
         assert_eq!(summary["sha256"].as_str().expect("digest").len(), 64);
         assert!(logged.len() < 4 * 1024);
+    }
+
+    #[test]
+    fn edit_audit_payloads_up_to_64_kib_remain_in_structured_diagnostics() {
+        let replacement = "x".repeat(8 * 1024);
+        let arguments = json!({
+            "files": [{
+                "path": "src/lib.rs",
+                "edits": [{"type": "replace", "old_text": "old", "new_text": replacement}]
+            }],
+            "reason": "audit regression"
+        });
+        let response = json!({
+            "result": {"structuredContent": {"ok": true, "applied": true}}
+        });
+        let request_timing = ToolRequestTiming {
+            previous_response_completed_ts_ms: None,
+            orchestration_gap_ms: None,
+            activity_burst_id: 1,
+            activity_burst_sequence: 1,
+            concurrent_request: false,
+        };
+
+        let record = build_tool_usage_record(&ToolUsageInput {
+            profile_id: "workspace",
+            transport_mode: "streamable-http",
+            protocol_version: "2025-11-25",
+            request_id: &json!(11),
+            method: "tools/call",
+            tool_name: "edit",
+            arguments: &arguments,
+            request_json_bytes: 9 * 1024,
+            rpc_fast_path: false,
+            request_timing: &request_timing,
+            started_ts_ms: 2_000,
+            duration_ms: 10,
+            outcome: "success",
+            response: Some(&response),
+            worker_error: None,
+            host_session_key: None,
+            redact_telemetry: true,
+        });
+
+        assert_eq!(record["arguments_truncated"], false);
+        assert_eq!(record["arguments"]["files"][0]["path"], "src/lib.rs");
+        assert_eq!(
+            record["arguments"]["files"][0]["edits"][0]["new_text"]
+                .as_str()
+                .expect("new text")
+                .len(),
+            8 * 1024
+        );
+        assert!(record.get("arguments_preview").is_none());
     }
 
     #[test]
@@ -1602,6 +1701,14 @@ mod tests {
     fn rpc_errors_are_classified_as_transport_failures() {
         let record = serde_json::Map::new();
         assert_eq!(classify_outcome(&record, "rpc_error"), "transport_error");
+    }
+
+    #[test]
+    fn workspace_routing_rpc_errors_are_not_transport_failures() {
+        let mut record = serde_json::Map::new();
+        record.insert("error_code".into(), json!("WORKSPACE_FOLDER_NOT_SELECTED"));
+        record.insert("error_category".into(), json!("workspace_routing"));
+        assert_eq!(classify_outcome(&record, "rpc_error"), "routing_error");
     }
 
     #[test]
@@ -1760,6 +1867,51 @@ mod tests {
     }
 
     #[test]
+    fn routing_rpc_tool_usage_is_recorded_as_tool_failure() {
+        let request_timing = ToolRequestTiming::default();
+        let arguments = json!({});
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "error": {
+                "code": -32001,
+                "message": "workspace folder routing failed",
+                "data": {
+                    "reason": "workspace_folder_routing_failed",
+                    "error_code": "WORKSPACE_FOLDER_NOT_SELECTED",
+                    "error_category": "workspace_routing",
+                    "retryable": true
+                }
+            }
+        });
+        let record = build_tool_usage_record(&ToolUsageInput {
+            profile_id: "workspace",
+            transport_mode: "streamable-http",
+            protocol_version: "2026-07-28",
+            request_id: &json!(10),
+            method: "tools/call",
+            tool_name: "server_info",
+            arguments: &arguments,
+            request_json_bytes: 10,
+            rpc_fast_path: false,
+            request_timing: &request_timing,
+            started_ts_ms: 3_000,
+            duration_ms: 2,
+            outcome: "rpc_error",
+            response: Some(&response),
+            worker_error: None,
+            host_session_key: None,
+            redact_telemetry: true,
+        });
+        assert_eq!(record["error_code"], "WORKSPACE_FOLDER_NOT_SELECTED");
+        assert_eq!(record["error_category"], "workspace_routing");
+        assert_eq!(record["outcome_class"], "routing_error");
+        assert_eq!(record["failure_domain"], "tool");
+        assert_eq!(record["event_type"], "tool_call");
+        assert_eq!(record["severity"], "error");
+    }
+
+    #[test]
     fn tool_usage_correlates_system_harness_operation_without_user_operation_id() {
         let request_timing = ToolRequestTiming::default();
         let arguments = json!({ "operation_id": "user-supplied-id" });
@@ -1790,13 +1942,24 @@ mod tests {
             outcome: "success",
             response: Some(&response),
             worker_error: None,
-            host_session_key: None,
+            host_session_key: Some("conversation-session-a"),
             redact_telemetry: true,
         });
         assert_eq!(record["timestamp_ms"], 4_000);
         assert_eq!(record["conversation_operation_id"], "harness-op-1");
         assert_eq!(record["selected_workspace_id"], "folder-a");
         assert_ne!(record["conversation_operation_id"], "user-supplied-id");
+        assert_eq!(
+            record["conversation_context_id_hash"]
+                .as_str()
+                .expect("conversation hash")
+                .len(),
+            64
+        );
+        assert_ne!(
+            record["conversation_context_id_hash"],
+            "conversation-session-a"
+        );
     }
 
     #[test]

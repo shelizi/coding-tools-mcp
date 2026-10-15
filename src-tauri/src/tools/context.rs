@@ -256,8 +256,9 @@ fn shared_execution_resources(
         return resources;
     }
     let resources = Arc::new(SharedExecutionResources {
-        sessions: Arc::new(SessionStore::with_active_session_limit(
+        sessions: Arc::new(SessionStore::with_active_session_limit_and_operation_dir(
             limits.active_sessions,
+            crate::tunnel::log_dir_for_profile(profile_id).join("operations"),
         )),
         pending_operations: Arc::new(PendingOperationStore::new()),
         blocking_admission: Arc::new(Semaphore::new(limits.blocking_admission)),
@@ -324,7 +325,7 @@ impl ToolContext {
             auth,
             PolicySettings::default(),
             "full".into(),
-            "trusted".into(),
+            "safe".into(),
         ))
     }
 
@@ -587,7 +588,7 @@ impl ToolContext {
             },
             PolicySettings::default(),
             "full".into(),
-            "trusted".into(),
+            "safe".into(),
             harness_root,
         ))
     }

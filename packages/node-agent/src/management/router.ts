@@ -5,6 +5,7 @@ import { managementClientAllowed, sameOrigin, validAdminToken } from './http.js'
 import { statusPayload } from './runtime.js';
 import { handleManagementConfigurationRoute } from './routes/configuration.js';
 import { handleManagementObservabilityRoute } from './routes/observability.js';
+import { handleManagementSoftwareRoute } from './routes/software.js';
 import type { ManagementOptions } from './types.js';
 
 export async function handleManagementRequest(
@@ -41,6 +42,7 @@ export async function handleManagementRequest(
     return true;
   }
   if (await handleManagementObservabilityRoute(req, res, pathname, options)) return true;
+  if (await handleManagementSoftwareRoute(req, res, pathname, options)) return true;
   if (await handleManagementConfigurationRoute(req, res, pathname, options)) return true;
   sendJson(res, 405, {
     error: { code: 'METHOD_NOT_ALLOWED', message: 'Method not allowed.' }

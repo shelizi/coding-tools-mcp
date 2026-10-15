@@ -193,6 +193,52 @@ export async function handleManagementConfigurationRoute(
     return true;
   }
 
+  const tunnelStatusRoute = pathname.match(
+    /^\/admin\/api\/workspaces\/([A-Za-z0-9._-]{1,128})\/tunnel\/status$/
+  );
+  if (tunnelStatusRoute && req.method === 'GET') {
+    const workspaceId = tunnelStatusRoute[1]!;
+    const selected = runtimeRecord(options, workspaceId);
+    if (!selected) {
+      sendJson(res, 404, {
+        error: { code: 'WORKSPACE_NOT_FOUND', message: `Workspace was not found: ${workspaceId}` }
+      });
+      return true;
+    }
+    const status = selected.context.tunnelStatus;
+    sendJson(res, 200, {
+      state: status?.state ?? 'stopped',
+      publicUrl: status?.publicUrl ?? selected.context.config.tunnel?.publicUrl ?? '',
+      tunnelPid: null,
+      configuredWorkers: status?.workers ?? null,
+      connectedWorkers: status?.connectedWorkers ?? null,
+      idleWorkers: status?.idleWorkers ?? null,
+      busyWorkers: status?.busyWorkers ?? null,
+      recycledWorkers: status?.recycledWorkers ?? null,
+      policyRevision: status?.policyRevision ?? null,
+      lastError: status?.lastError ?? null,
+      serverOrigin: status?.serverOrigin ?? null,
+      websocketUrl: status?.websocketUrl ?? null,
+      serverId: status?.serverId ?? null,
+      deviceId: status?.deviceId ?? null,
+      transportMode: status?.transportMode ?? null,
+      controlConnected: status?.controlConnected ?? null,
+      sharedSession: status?.sharedSession ?? null,
+      sessionId: status?.sessionId ?? null,
+      routeId: status?.routeId ?? null,
+      streamLimit: status?.streamLimit ?? null,
+      dataConnections: status?.dataConnections ?? null,
+      maxDataConnections: status?.maxDataConnections ?? null,
+      streamsPerConnection: status?.streamsPerConnection ?? null,
+      activeStreams: status?.activeStreams ?? null,
+      streamCapacity: status?.streamCapacity ?? null,
+      availableStreamSlots: status?.availableStreamSlots ?? null,
+      queuedRequests: status?.queuedRequests ?? null,
+      desiredDataConnections: status?.desiredDataConnections ?? null
+    });
+    return true;
+  }
+
   const tunnelRoute = pathname.match(
     /^\/admin\/api\/workspaces\/([A-Za-z0-9._-]{1,128})\/tunnel\/(start|stop|test|restart)$/
   );
@@ -246,7 +292,25 @@ export async function handleManagementConfigurationRoute(
             busyWorkers: status?.busyWorkers ?? null,
             recycledWorkers: status?.recycledWorkers ?? null,
             policyRevision: status?.policyRevision ?? null,
-            lastError: status?.lastError ?? null
+            lastError: status?.lastError ?? null,
+            serverOrigin: status?.serverOrigin ?? null,
+            websocketUrl: status?.websocketUrl ?? null,
+            serverId: status?.serverId ?? null,
+            deviceId: status?.deviceId ?? null,
+            transportMode: status?.transportMode ?? null,
+            controlConnected: status?.controlConnected ?? null,
+            sharedSession: status?.sharedSession ?? null,
+            sessionId: status?.sessionId ?? null,
+            routeId: status?.routeId ?? null,
+            streamLimit: status?.streamLimit ?? null,
+            dataConnections: status?.dataConnections ?? null,
+            maxDataConnections: status?.maxDataConnections ?? null,
+            streamsPerConnection: status?.streamsPerConnection ?? null,
+            activeStreams: status?.activeStreams ?? null,
+            streamCapacity: status?.streamCapacity ?? null,
+            availableStreamSlots: status?.availableStreamSlots ?? null,
+            queuedRequests: status?.queuedRequests ?? null,
+            desiredDataConnections: status?.desiredDataConnections ?? null
           });
     } catch (error) {
       sendManagementError(res, error);

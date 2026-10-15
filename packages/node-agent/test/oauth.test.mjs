@@ -75,6 +75,8 @@ test('OAuth metadata, redirect allowlist and Forwarded base resolution match Rus
   assert.equal(redirectUriAllowed('https://chatgpt.com/connector/oauth/test'), true);
   assert.equal(redirectUriAllowed('https://chat.openai.com/aip/test/oauth/callback?source=connector'), true);
   assert.equal(redirectUriAllowed('https://chatgpt.com:443/connector/oauth/test'), true);
+  assert.equal(redirectUriAllowed('https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-123-example'), true);
+  assert.equal(redirectUriAllowed('https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-115782671353371059086-coding-tools_neo-ai_one'), true);
   for (const value of [
     'http://chatgpt.com/connector/oauth/test',
     'https://attacker.example/callback',
@@ -82,7 +84,13 @@ test('OAuth metadata, redirect allowlist and Forwarded base resolution match Rus
     'https://chatgpt.com@attacker.example/callback',
     'https://chatgpt.com:444/connector/oauth/test',
     'https://chatgpt.com/connector/oauth/test#fragment',
-    ' https://chatgpt.com/connector/oauth/test'
+    ' https://chatgpt.com/connector/oauth/test',
+    'https://oauth-redirect.googleusercontent.com/r/wrong',
+    'https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-',
+    'https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-valid/evil',
+    'https://oauth-redirect.googleusercontent.com.evil.example/r/user_bound_custom-mcp-valid',
+    'https://oauth-redirect.googleusercontent.com:444/r/user_bound_custom-mcp-valid',
+    'http://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-valid'
   ]) assert.equal(redirectUriAllowed(value), false, value);
 
   assert.deepEqual(authorizationMetadata('https://mcp.example/base', runtime).grant_types_supported, ['authorization_code']);

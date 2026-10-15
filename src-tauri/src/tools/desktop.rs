@@ -95,8 +95,15 @@ fn unsupported() -> WorkspaceError {
 
 #[cfg(target_os = "windows")]
 fn run_ps(body: &str) -> Result<String, WorkspaceError> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let script = format!("{PS_PREAMBLE}\n{body}");
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    // Computer-use helpers must not open a console over the user's desktop.
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -494,6 +501,34 @@ mod tests {
         base64_decoded_len, click_input_script, drag_input_script, key_code, map_display_point,
         mouse_button_flags, scroll_input_script, type_input_script, type_payload,
     };
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn desktop_bridge_runs_without_a_visible_console() {
+        let visibility = super::run_ps(
+            r#"
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class DesktopConsoleProbe {
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr handle);
+}
+'@
+$handle = [DesktopConsoleProbe]::GetConsoleWindow()
+if ($handle -eq [IntPtr]::Zero -or -not [DesktopConsoleProbe]::IsWindowVisible($handle)) {
+    'hidden'
+} else {
+    'visible'
+}
+"#,
+        )
+        .expect("PowerShell desktop bridge");
+        assert_eq!(
+            visibility, "hidden",
+            "desktop bridge exposed a console window"
+        );
+    }
 
     #[test]
     fn common_key_codes_are_stable() {

@@ -163,6 +163,44 @@ test('workspace_folder_id routes one call without changing conversation selectio
   assert.deepEqual(selected.folders.map(folder => folder.selected), [true, false]);
 });
 
+test('identity-less MCP calls can create, read, list and delete in an explicit workspace', async t => {
+  const state = await fixture(t);
+  const meta = markMcpConversationMetadata(undefined);
+  const selectedMeta = { 'openai/session': 'existing-chatgpt-binding' };
+  await callTool(state.ctx, 'switch_workspace_folder', { folder_id: 'first' }, selectedMeta);
+  const route = { workspace_folder_id: 'second' };
+  const created = await callTool(state.ctx, 'file_ops', {
+    ...route, operations: [{ type: 'create', path: 'gemini.txt', content: 'Gemini routing' }]
+  }, meta);
+  assert.equal(created.ok, true, JSON.stringify(created));
+  assert.equal(created.workspace_route_source, 'explicit');
+  assert.equal(created.conversation_selection_changed, false);
+  assert.equal(await readFile(path.join(state.second, 'gemini.txt'), 'utf8'), 'Gemini routing');
+  await assert.rejects(readFile(path.join(state.first, 'gemini.txt')), { code: 'ENOENT' });
+  const read = await callTool(state.ctx, 'read_file', { ...route, path: 'gemini.txt' }, meta);
+  assert.equal(read.content, 'Gemini routing');
+  const listed = await callTool(state.ctx, 'list_files', { ...route, path: '.' }, meta);
+  assert.equal(listed.ok, true, JSON.stringify(listed));
+  assert.match(JSON.stringify(listed), /gemini\.txt/);
+  const outside = await callTool(state.ctx, 'file_ops', {
+    ...route, operations: [{ type: 'create', path: '../escape.txt', content: 'blocked' }]
+  }, meta);
+  assert.equal(outside.ok, false);
+  const unknown = await callTool(state.ctx, 'read_file', { path: 'marker.txt', workspace_folder_id: 'unknown' }, meta);
+  assert.equal(unknown.error.code, 'WORKSPACE_FOLDER_NOT_FOUND');
+  const unselected = await callTool(state.ctx, 'read_file', { path: 'marker.txt' }, meta);
+  assert.equal(unselected.error.code, 'WORKSPACE_FOLDER_NOT_SELECTED');
+  const binding = await callTool(state.ctx, 'switch_workspace_folder', { folder_id: 'second', session_key: 'history-key' }, meta);
+  assert.equal(binding.error.code, 'WORKSPACE_FOLDER_NOT_SELECTED');
+  const deleted = await callTool(state.ctx, 'file_ops', {
+    ...route, operations: [{ type: 'delete', path: 'gemini.txt' }], confirm: true
+  }, meta);
+  assert.equal(deleted.ok, true, JSON.stringify(deleted));
+  await assert.rejects(readFile(path.join(state.second, 'gemini.txt')), { code: 'ENOENT' });
+  assert.equal((await callTool(state.ctx, 'list_workspace_folders', {}, meta)).selected_folder_id, null);
+  assert.equal((await callTool(state.ctx, 'list_workspace_folders', {}, selectedMeta)).selected_folder_id, 'first');
+});
+
 test('NOT_FOUND returns a complete one-call retry for a unique alternate workspace match', async t => {
   const state = await fixture(t);
   const meta = { 'openai/session': 'alternate-workspace-recovery' };
@@ -290,6 +328,12 @@ test('conversation_bootstrap returns choices when ambiguous then binds and boots
   assert.equal(bootstrapped.learning.runtime_policy, 'adaptive_rollout_phase_2e');
   assert.equal(bootstrapped.learning.ingestion.failed, 0);
   assert.equal(bootstrapped.learning.ingestion.dropped, 0);
+  assert.equal(bootstrapped.learning.durable_ingestion.ledgerEvents, 0);
+  assert.equal(bootstrapped.learning.durable_ingestion.materializedEvents, 0);
+  assert.equal(bootstrapped.learning.durable_ingestion.replayComplete, true);
+  assert.match(bootstrapped.learning.durable_ingestion.compilerRevision, /^[a-f0-9]{64}$/);
+  assert.match(bootstrapped.learning.durable_ingestion.normalizerRevision, /^[a-f0-9]{64}$/);
+  assert.equal(bootstrapped.learning.counter_scopes.durable_ingestion, 'durable_experience_ledger_and_replay_state');
   assert.equal(bootstrapped.learning.shadow_impact_count, 0);
   assert.equal(bootstrapped.learning.canary_impact_count, 0);
   assert.equal(bootstrapped.learning.canary_promoted_count, 0);
@@ -301,7 +345,7 @@ test('conversation_bootstrap returns choices when ambiguous then binds and boots
   assert.match(bootstrapped.learning.canary_impact_revision, /^[a-f0-9]{64}$/);
   assert.match(bootstrapped.learning.knowledge_revision, /^[a-f0-9]{64}$/);
   assert.match(bootstrapped.learning.tool_strategy_implementation_revision, /^[a-f0-9]{64}$/);
-  assert.equal(bootstrapped.learning.tool_strategy_implementation_count, 1);
+  assert.equal(bootstrapped.learning.tool_strategy_implementation_count, 3);
   assert.equal(bootstrapped.learning.tool_strategy_count, 0);
   assert.equal(bootstrapped.learning.tool_evolution_candidate_count, 0);
   assert.equal(bootstrapped.learning.promoted_evolved_skill_count, 0);

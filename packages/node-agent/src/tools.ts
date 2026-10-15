@@ -29,6 +29,42 @@ const ALTERNATE_WORKSPACE_PATH_RECOVERY_TOOLS = new Set([
   'read_file', 'view_image', 'list_files', 'search_text', 'project_map', 'git_status'
 ]);
 
+function jsonObject(value: unknown): JsonObject | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : undefined;
+}
+
+function applyKnowledgeCanaryRecommendation(
+  decision: KnowledgeCanaryDecision | undefined,
+  result: JsonObject
+): boolean {
+  if (!decision?.applied) return false;
+  if (decision.implementation === 'search_exact_total_fast_tail') return result.exact_total_fast_tail === true;
+  if (decision.implementation === 'apply_patch_prefer_guarded_edit') {
+    const error = jsonObject(result.error);
+    const details = jsonObject(error?.details);
+    if (result.ok !== false || error?.code !== 'PATCH_CHECK_FAILED' || details?.recommended_tool !== 'edit') return false;
+    result.learning_recommendation = {
+      strategy: decision.implementation,
+      recommendation: 'prefer_guarded_edit_for_single_file_replacement',
+      recommended_tool: 'edit',
+      reason: 'single_file_patch_preflight_failed'
+    };
+    return true;
+  }
+  if (decision.implementation === 'wait_command_adaptive_poll') {
+    const eventCount = Array.isArray(result.events) ? result.events.length : Number(result.event_count ?? 0);
+    if (result.request_timed_out !== true || result.process_completed !== false || eventCount !== 0) return false;
+    result.learning_recommendation = {
+      strategy: decision.implementation,
+      recommendation: 'prefer_adaptive_wait',
+      next_wait_ms: result.next_wait_ms ?? null,
+      reason: 'empty_wait_window_process_still_running'
+    };
+    return true;
+  }
+  return false;
+}
+
 function learningTaskKey(key: string, folderId: string | undefined): string {
   return `${key}\u0000${folderId ?? ''}`;
 }
@@ -110,7 +146,7 @@ function recordToolUsageAndLearn(
   folderId: string | undefined,
   input: Parameters<ToolContext['usageStore']['recordToolCall']>[0]
 ): void {
-  const record = ctx.usageStore.recordToolCall(input);
+  const record = ctx.usageStore.recordToolCall({ ...input, conversationContextId: key });
   if (folderId) {
     const runtime = ctx.folderRuntimes.get(folderId);
     if (runtime) {
@@ -726,7 +762,7 @@ async function callToolInScope(
     result = hookBlockResult;
   } else {
     try {
-      if (name === 'search_text' && binding?.runtime) {
+      if (['search_text', 'apply_patch', 'wait_command'].includes(name) && binding?.runtime) {
         try {
           knowledgeCanary = await binding.runtime.canaryStrategyEngine.decide(name, args, key);
         } catch {
@@ -841,15 +877,28 @@ async function callToolInScope(
     }
   }
 
+  const knowledgeCanaryApplied = applyKnowledgeCanaryRecommendation(knowledgeCanary, result);
+
   const knowledgeCanaryTelemetry = knowledgeCanary ? {
     knowledge_canary_id: knowledgeCanary.knowledgeId,
     knowledge_canary_implementation: knowledgeCanary.implementation,
     knowledge_canary_eligible: true,
     knowledge_canary_stage: knowledgeCanary.stage,
     knowledge_canary_selected: knowledgeCanary.applied,
-    knowledge_canary_applied: knowledgeCanary.applied === true && result.exact_total_fast_tail === true,
+    knowledge_canary_applied: knowledgeCanaryApplied,
     knowledge_canary_bucket: knowledgeCanary.bucket
   } : undefined;
+  const knowledgeShadowEquivalenceTelemetry = name === 'search_text'
+    && result.ok === true
+    && result.exact_total_forced_full_scan === true
+    && result.exact_total_fast_tail !== true
+    && result.total_matches_exact === true
+    && result.scan_completed === true
+    ? {
+        knowledge_shadow_equivalence_implementation: 'search_exact_total_fast_tail',
+        knowledge_shadow_equivalence_passed: true
+      }
+    : undefined;
 
   const durationMs = Date.now() - startedAt;
   Object.assign(result, {
@@ -889,6 +938,7 @@ async function callToolInScope(
   const folderId = binding?.folderId ?? selectedFolderId(ctx, key);
   if (requestTiming) {
     if (knowledgeCanaryTelemetry) Object.assign(result, knowledgeCanaryTelemetry);
+    if (knowledgeShadowEquivalenceTelemetry) Object.assign(result, knowledgeShadowEquivalenceTelemetry);
     try {
       recordToolUsageAndLearn(ctx, key, folderId, {
         tool: name,
@@ -903,6 +953,9 @@ async function callToolInScope(
     } finally {
       if (knowledgeCanaryTelemetry) {
         for (const field of Object.keys(knowledgeCanaryTelemetry)) delete result[field];
+      }
+      if (knowledgeShadowEquivalenceTelemetry) {
+        for (const field of Object.keys(knowledgeShadowEquivalenceTelemetry)) delete result[field];
       }
     }
   }
