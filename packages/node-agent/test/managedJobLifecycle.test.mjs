@@ -191,8 +191,11 @@ test('exec_many summary retains managed-job deadline metadata', async t => {
   });
   assert.equal(graph.ok, true, JSON.stringify(graph));
   let snapshot = graph;
-  for (let attempt = 0; attempt < 20 && snapshot.results[0]?.execution_mode !== 'job'; attempt += 1) {
-    await new Promise(resolve => setTimeout(resolve, 25));
+  // Durable worker startup can exceed 500 ms on a loaded Windows runner.
+  const readyDeadline = Date.now() + 20_000;
+  while (snapshot.results[0]?.execution_mode !== 'job' && Date.now() < readyDeadline) {
+    if (!snapshot.ok || snapshot.terminal) break;
+    await new Promise(resolve => setTimeout(resolve, 50));
     snapshot = await invoke('exec_many', { operation_id: 'job-summary-graph', action: 'status', result_mode: 'summary' });
   }
   assert.equal(snapshot.results[0].execution_mode, 'job', JSON.stringify(snapshot));
