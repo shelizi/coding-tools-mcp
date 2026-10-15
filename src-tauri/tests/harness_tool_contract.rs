@@ -112,7 +112,7 @@ fn 无任务时_exec_command不返回任务门禁错误() {
 
     assert_ne!(result["error"]["code"], "TASK_STATE_REQUIRED");
     assert_eq!(result["harness_mode"], "standalone");
-    assert_eq!(result["execution_mode"], "direct");
+    assert_eq!(result["execution_mode"], "command");
     assert_eq!(result["task_required"], false);
     assert_eq!(result["command"], "git status");
     assert_eq!(result["status"], "exited");
@@ -159,7 +159,7 @@ fn workspace_allows_exec_during_transition() {
     let result = call_tool(&ctx, "exec_command", &json!({"cmd": "python --version"}));
 
     assert_ne!(result["error"]["code"], "EXEC_SANDBOX_UNAVAILABLE");
-    assert_eq!(result["execution_mode"], "direct");
+    assert_eq!(result["execution_mode"], "command");
     assert_eq!(result["filesystem_scope"], "workspace");
     assert_eq!(result["sandbox_enforced"], false);
 }

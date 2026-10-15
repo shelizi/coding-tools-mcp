@@ -332,12 +332,16 @@ fn server_info_reports_execution_environment_metadata() {
     let ctx = ctx_for(&fx.root);
     let out = invoke(&ctx, "server_info", json!({}));
     let payload = assert_ok(&out);
-    assert_eq!(payload["permission_mode"], "trusted");
+    assert_eq!(payload["permission_mode"], "safe");
     assert!(payload["environment"]["workspace_exec"]["system_command_allowlist"].is_array());
     assert_eq!(
         payload["environment"]["powershell"]["selection_policy"],
         "pwsh_then_windows_powershell"
     );
+    let runtime = ctx.runtime_config();
+    ctx.update_runtime_config(runtime.policy, runtime.tool_profile, "trusted".into());
+    let updated = invoke(&ctx, "server_info", json!({}));
+    assert_eq!(assert_ok(&updated)["permission_mode"], "trusted");
 }
 
 #[test]
@@ -528,7 +532,9 @@ fn direct_exec_uses_the_same_result_contract() {
     let payload = assert_ok(&result);
 
     assert_eq!(payload["command"], format!("{TEST_PYTHON} --version"));
-    assert_eq!(payload["execution_mode"], "direct");
+    assert_eq!(payload["execution_mode"], "command");
+    assert_eq!(payload["timeout_scope"], "process");
+    assert_eq!(payload["polling_extends_process_deadline"], false);
     assert_eq!(payload["harness_mode"], "standalone");
     assert_eq!(payload["task_required"], false);
     assert_eq!(payload["status"], "exited");

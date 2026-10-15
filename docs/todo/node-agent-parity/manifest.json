@@ -86,7 +86,7 @@
       "file": "TODO-006-gitignore-walking.md",
       "depends_on": [],
       "rust_sources": ["src-tauri/src/tools/file.rs", "src-tauri/src/tools/workspace.rs"],
-      "node_sources": ["packages/node-agent/src/gitignore.ts", "packages/node-agent/src/workspace.ts", "packages/node-agent/src/fileTools.ts", "packages/node-agent/src/formatterTools.ts", "packages/node-agent/test/gitignoreWalking.test.mjs"],
+      "node_sources": ["packages/node-agent/src/gitignore.ts", "packages/node-agent/src/workspace.ts", "packages/node-agent/src/fileTools.ts", "packages/node-agent/src/formatterTools.ts", "packages/node-agent/test/gitignoreWalking.test.mjs", "packages/node-agent/src/searchGrep.ts", "packages/node-agent/test/searchGrep.test.mjs"],
       "assertion_ids": ["PA-006-GITIGNORE-WALK"],
       "acceptance_tests": ["root and nested ignore rules", "anchored and globstar patterns", "negated parent and child rules", "include_ignored override", "independent hidden-file behavior", "permanent .git exclusion", "bounded symlink-safe traversal", "formatter project scope", "git check-ignore differential"]
     },

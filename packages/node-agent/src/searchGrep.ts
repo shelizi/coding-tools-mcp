@@ -2,8 +2,8 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { stat } from 'node:fs/promises';
 import path from 'node:path';
-import { binaryExcludeGlobs, fileLooksBinary, textSearchGlobs } from './textCodec.js';
-import { DEFAULT_EXCLUDED_NAMES, relativeInside, resolveInside } from './workspace.js';
+import { binaryExcludeGlobs, binaryFileExtension, fileLooksBinary, searchableTextPath } from './textCodec.js';
+import { DEFAULT_EXCLUDED_NAMES, globRegex, relativeInside, resolveInside, walk } from './workspace.js';
 
 export type SearchBackend = 'rg' | 'grep';
 
@@ -178,12 +178,6 @@ export function buildRipgrepArgs(
   return args;
 }
 
-function grepIncludeFromGlob(glob: string): string {
-  const normalized = glob.replaceAll('\\', '/');
-  const slash = normalized.lastIndexOf('/');
-  return slash >= 0 ? normalized.slice(slash + 1) : normalized;
-}
-
 export function buildGrepArgs(
   request: ExternalSearchRequest,
   queries: readonly ExternalSearchQuery[]
@@ -201,7 +195,8 @@ export function buildGrepArgs(
   if (request.isDirectory) {
     args.push('-r');
     args.push('--exclude-dir=.git', '--exclude-dir=.GIT');
-    if (!request.includeHidden) args.push('--exclude-dir=.*', '--exclude=.*');
+    // `.*` also matches the search root `.` and suppresses the entire search.
+    if (!request.includeHidden) args.push('--exclude-dir=.?*', '--exclude=.*');
     if (!request.includeGenerated) {
       for (const name of DEFAULT_EXCLUDED_NAMES) {
         if (name.toLowerCase() === '.git') continue;
@@ -209,19 +204,9 @@ export function buildGrepArgs(
       }
     }
   }
-  if (request.includeGlobs.length) {
-    const seen = new Set<string>();
-    for (const glob of request.includeGlobs) {
-      const include = grepIncludeFromGlob(glob);
-      if (!include || seen.has(include)) continue;
-      seen.add(include);
-      args.push(`--include=${include}`);
-    }
-  } else if (request.restrictToText) {
-    for (const glob of textSearchGlobs()) args.push(`--include=${glob}`);
-  }
   for (const glob of binaryExcludeGlobs()) args.push(`--exclude=${glob}`);
-  for (const glob of request.excludeGlobs) args.push(`--exclude=${grepIncludeFromGlob(glob)}`);
+  // GNU grep only supports basename globs and has no gitignore support.
+  // Apply the shared traversal contract to emitted paths instead.
   if (request.contextLines > 0) args.push('-C', String(request.contextLines));
   if (Number.isFinite(request.maxMatchesPerFile) && request.maxMatchesPerFile < Number.MAX_SAFE_INTEGER) {
     args.push('-m', String(request.maxMatchesPerFile));
@@ -444,6 +429,29 @@ export async function runExternalContentSearch(
     skippedLargeFiles: 0
   };
   const inspected = new Map<string, 'ok' | 'binary' | 'large' | 'missing'>();
+  let allowedFiles: Set<string> | undefined;
+  if (resolved.backend === 'grep') {
+    const include = request.includeGlobs.map(globRegex);
+    const exclude = request.excludeGlobs.map(globRegex);
+    const accepted = (relative: string): boolean =>
+      !binaryFileExtension(relative)
+      && (!request.restrictToText || searchableTextPath(relative))
+      && (!include.length || include.some(pattern => pattern.test(relative)))
+      && !exclude.some(pattern => pattern.test(relative))
+      && !request.excludedPrefixes.some(prefix => relative === prefix || relative.startsWith(`${prefix}/`));
+    const entries = await walk(request.root, resolveInside(request.root, request.searchPath), {
+      maxDepth: 20,
+      maxResults: 50_000,
+      includeHidden: request.includeHidden,
+      includeIgnored: request.includeIgnored,
+      includeGenerated: request.includeGenerated,
+      excludedPrefixes: [...request.excludedPrefixes],
+      pathFilter: entry => entry.type === 'file' && accepted(entry.path)
+    });
+    // walk also accepts a single file start, which still needs the path filters.
+    allowedFiles = new Set(entries.filter(entry => entry.type === 'file' && accepted(entry.path)).map(entry => entry.path));
+    if (!allowedFiles.size) return stats;
+  }
   let stop = false;
 
   const inspect = async (relative: string): Promise<'ok' | 'binary' | 'large' | 'missing'> => {
@@ -480,7 +488,7 @@ export async function runExternalContentSearch(
       const item = queued.shift();
       if (!item) continue;
       const relative = normalizeHitPath(request.root, item.path);
-      if (!relative) continue;
+      if (!relative || (allowedFiles && !allowedFiles.has(relative))) continue;
       const verdict = await inspect(relative);
       if (verdict !== 'ok') continue;
       const keepGoing = await onLine({

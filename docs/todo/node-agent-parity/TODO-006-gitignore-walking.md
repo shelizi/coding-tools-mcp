@@ -22,6 +22,8 @@ Resolved in Node Agent 0.15.0. List, search, project inspection, and formatter p
 - `packages/node-agent/src/fileTools.ts`
 - `packages/node-agent/src/formatterTools.ts`
 - `packages/node-agent/test/gitignoreWalking.test.mjs`
+- `packages/node-agent/src/searchGrep.ts`
+- `packages/node-agent/test/searchGrep.test.mjs`
 
 ## Implementation scope
 
@@ -38,3 +40,5 @@ The walker evaluates root, ancestor, and nested ignore files; keeps hidden and i
 ## Verification
 
 Covered by `packages/node-agent/test/gitignoreWalking.test.mjs`, a representative differential against `git check-ignore --no-index`, focused read/formatter regressions, and the full `npm run verify:repo` release check.
+
+The GNU grep fallback uses the shared walker to enforce ignore rules and path-scoped globs, since grep itself only understands basename globs. A real grep regression covers the `.` root, hidden files, ignore overrides, negation and scoped exclusions. Rust already uses its ignore-aware traversal and has no GNU grep backend, so this backend repair requires no Rust implementation change.
