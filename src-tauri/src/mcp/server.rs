@@ -1621,6 +1621,17 @@ mod tests {
         )
         .expect("mcp state");
 
+        assert!(
+            crate::workspace_features::update_runtime_config(
+                &profile_id,
+                crate::workspace_features::FeatureConfig {
+                    skills: Default::default(),
+                    extensions: Default::default(),
+                },
+            ),
+            "enable project Skills for isolated bootstrap fixture"
+        );
+
         let response = handle_request_async(
             state,
             json!({
@@ -1729,6 +1740,17 @@ mod tests {
             crate::tools::ExecutionLimits::default(),
         )
         .expect("mcp state");
+
+        assert!(
+            crate::workspace_features::update_runtime_config(
+                &profile_id,
+                crate::workspace_features::FeatureConfig {
+                    skills: Default::default(),
+                    extensions: Default::default(),
+                },
+            ),
+            "enable project Skills for isolated evolved-skill fixture"
+        );
 
         let bootstrap_before =
             crate::workspace_features::skill_bootstrap_summary(&profile_id, "folder-a")
