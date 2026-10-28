@@ -62,6 +62,7 @@ mod tests {
                 "workspace",
                 &[
                     "list_workspace_folders",
+                    "list_active_workspaces",
                     "conversation_bootstrap",
                     "switch_workspace_folder",
                     "query_tool_usage",
@@ -72,15 +73,7 @@ mod tests {
             ("image", &["view_image"][..]),
             (
                 "desktop",
-                &[
-                    "desktop_displays",
-                    "desktop_screenshot",
-                    "desktop_click",
-                    "desktop_drag",
-                    "desktop_scroll",
-                    "desktop_type",
-                    "desktop_key",
-                ][..],
+                &["desktop_displays", "desktop_screenshot", "desktop_input"][..],
             ),
             (
                 "history",

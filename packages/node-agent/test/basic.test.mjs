@@ -202,6 +202,19 @@ test('portable restart supervision requires both the launcher flag and superviso
   assert.doesNotMatch(portableScript, /& \$tarExecutable -a -c -f \$zipPath -C \$packageParent \$packageName/);
   assert.doesNotMatch(portableScript, /Compress-Archive/);
   assert.match(portableScript, /\[switch\]\$AllowUnreleasedBuild/);
+  // CVE-2026-111497: reject insecure portable runtimes in bundled and system editions.
+  for (const fixedVersion of ['22.23.4', '24.22.1', '26.12.1']) {
+    assert.ok(portableScript.includes(fixedVersion), `missing secure Node threshold ${fixedVersion}`);
+  }
+  assert.match(portableScript, /minimumFixedVersion/);
+  assert.match(portableScript, /Node\.js security update required \(CVE-2026-111497\)/);
+  const nodeDockerfile = await readFile(fileURLToPath(new URL('../Dockerfile', import.meta.url)), 'utf8');
+  const nodeStages = nodeDockerfile.split(/\r?\n/).filter((line) => line.startsWith('FROM node:'));
+  assert.equal(nodeStages.length, 2);
+  for (const line of nodeStages) {
+    assert.match(line, /^FROM node:22\.23\.4-bookworm-slim@sha256:[0-9a-f]{64} AS (build|runtime)$/);
+  }
+
   assert.match(portableScript, /if \(-not \$AllowUnreleasedBuild\) \{/);
   assert.match(portableScript, /switch-node-agent-to-latest\.ps1'\) -Destination \(Join-Path \$editionPackage 'update-handoff\.ps1'\)/);
   assert.doesNotMatch(portableStartTemplate, /EXIT_CODE%"=="76/);

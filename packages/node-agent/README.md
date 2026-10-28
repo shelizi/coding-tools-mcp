@@ -48,7 +48,7 @@ one-call route also works in the Rust Desktop server and does not select a folde
 for later calls. Persistent folder binding still requires conversation identity;
 the history `session_key` is not a substitute for transport conversation identity.
 
-- Node.js 22 or later
+- Node.js 24 LTS (v24.22.1 or later on 24.x)
 
 ### MCP identity diagnostics
 
@@ -88,7 +88,7 @@ pnpm run portable
 ```
 
 - `bundled-node` includes `runtime/node.exe` and needs no system Node.js after extraction.
-- `system-node` omits Node.js and requires Windows x64 Node.js 22 or later as `node.exe` on `PATH`.
+- `system-node` omits Node.js and requires Windows x64 Node.js 24 LTS (v24.22.1 or later on 24.x) as `node.exe` on `PATH`.
 
 Build a single edition with `pnpm run portable:bundled` or `pnpm run portable:system`. Neither edition requires pnpm after extraction.
 

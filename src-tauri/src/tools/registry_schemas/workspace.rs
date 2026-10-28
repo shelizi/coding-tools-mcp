@@ -7,6 +7,19 @@ pub(super) fn input_schema(name: &str) -> Option<Value> {
             "properties": {},
             "additionalProperties": false
         }),
+        "session_status" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        "list_active_workspaces" => json!({
+            "type": "object",
+            "properties": {
+                "active_within_minutes": { "type": "integer", "minimum": 1, "maximum": 60, "default": 3 },
+                "recent_within_minutes": { "type": "integer", "minimum": 1, "maximum": 60, "default": 5 }
+            },
+            "additionalProperties": false
+        }),
         "conversation_bootstrap" => json!({
             "type": "object",
             "properties": {

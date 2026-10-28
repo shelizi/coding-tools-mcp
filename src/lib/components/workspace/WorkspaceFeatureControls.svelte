@@ -132,7 +132,7 @@
       <p class="tx-section-label">{$t("Workspace feature controls")}</p>
       <h3 class="mt-1 text-lg font-semibold">{$t("Skills / Hooks / MCP")}</h3>
       <p class="mt-1 text-sm text-[var(--color-text-muted)]">
-        {$t("Manage discovered Skills, hooks, and MCP servers from Codex and Claude configuration.")}
+        {$t("Manage Coding MCP-owned Skills, hooks, and MCP servers. External Agent configurations are not imported.")}
       </p>
     </div>
     <button type="button" class="tx-btn-ghost" disabled={loading} onclick={() => void refresh()}>

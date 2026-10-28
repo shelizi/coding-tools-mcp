@@ -15,7 +15,7 @@ async function writeJson(file, value) {
   await writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-test('extension discovery keeps Hook and MCP execution opt-in while supporting Claude and Codex sources', async t => {
+test('extension discovery uses only Coding MCP-owned configs and keeps Hook/MCP opt-in', async t => {
   const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-extension-root-'));
   const home = await mkdtemp(path.join(tmpdir(), 'ctmcp-extension-home-'));
   const lifecycleLog = path.join(root, 'hook-lifecycle.jsonl');
@@ -28,7 +28,7 @@ test('extension discovery keeps Hook and MCP execution opt-in while supporting C
     ]);
   });
 
-  await writeJson(path.join(home, '.claude', 'settings.json'), {
+  await writeJson(path.join(home, '.coding-tools-mcp', 'hooks.json'), {
     hooks: {
       SessionStart: [{
         matcher: 'startup|resume',
@@ -46,7 +46,7 @@ test('extension discovery keeps Hook and MCP execution opt-in while supporting C
       }]
     }
   });
-  await writeJson(path.join(root, '.codex', 'hooks.json'), {
+  await writeJson(path.join(root, '.coding-tools-mcp', 'hooks.json'), {
     hooks: {
       PreToolUse: [{
         matcher: 'write_file',
@@ -54,33 +54,43 @@ test('extension discovery keeps Hook and MCP execution opt-in while supporting C
       }]
     }
   });
-  await writeJson(path.join(root, '.mcp.json'), {
+  await writeJson(path.join(root, '.coding-tools-mcp', 'mcp.json'), {
     mcpServers: {
       fixture: { type: 'stdio', command: process.execPath, args: [mcpFixture] }
     }
   });
-  await mkdir(path.join(home, '.codex'), { recursive: true });
-  await writeFile(path.join(home, '.codex', 'config.toml'), [
-    '[mcp_servers.codex-http]',
-    'url = "https://example.invalid/mcp"',
-    'enabled = false',
-    ''
-  ].join('\n'));
+  await writeJson(path.join(home, '.coding-tools-mcp', 'mcp.json'), {
+    mcpServers: { 'user-http': { url: 'https://example.invalid/mcp', enabled: false } }
+  });
+  // Foreign agent files exist, but must never enter Coding MCP discovery.
+  await writeJson(path.join(root, '.mcp.json'), { mcpServers: { 'foreign-project': { command: 'never-run' } } });
+  await writeJson(path.join(home, '.claude', 'settings.json'), {
+    hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: 'foreign-hook' }] }] }
+  });
+  await writeJson(path.join(root, '.codex', 'hooks.json'), {
+    hooks: { PreToolUse: [{ hooks: [{ type: 'command', command: 'foreign-hook' }] }] }
+  });
+  await writeJson(path.join(home, '.claude.json'), {
+    mcpServers: { 'foreign-global': { command: 'never-run' } }
+  });
 
   const folders = [{ id: 'repo', name: 'Repo', path: root }];
   const discovered = await discoverExtensions({ folders, homeDir: home });
-  assert.equal(discovered.hooks.some(hook => hook.provider === 'claude' && hook.scope === 'user'), true);
-  assert.equal(discovered.hooks.some(hook => hook.provider === 'codex' && hook.scope === 'workspace'), true);
+  assert.equal(discovered.hooks.some(hook => hook.provider === 'coding-mcp' && hook.scope === 'user'), true);
+  assert.equal(discovered.hooks.some(hook => hook.provider === 'coding-mcp' && hook.scope === 'workspace'), true);
   assert.equal(discovered.hooks.find(hook => hook.event === 'SessionStart')?.supported, true);
   assert.equal(discovered.hooks.find(hook => hook.event === 'SessionEnd')?.supported, true);
   assert.equal(discovered.hooks.find(hook => hook.event === 'UnsupportedLifecycleEvent')?.supported, false);
   const projectMcp = discovered.mcpServers.find(server => server.name === 'fixture');
   assert.ok(projectMcp);
   assert.equal(projectMcp.transport, 'stdio');
-  const codexMcp = discovered.mcpServers.find(server => server.name === 'codex-http');
-  assert.ok(codexMcp);
-  assert.equal(codexMcp.sourceEnabled, false);
-  assert.equal(codexMcp.sourcePath, '~/.codex/config.toml');
+  const userMcp = discovered.mcpServers.find(server => server.name === 'user-http');
+  assert.ok(userMcp);
+  assert.equal(userMcp.sourceEnabled, false);
+  assert.equal(userMcp.sourcePath, '~/.coding-tools-mcp/mcp.json');
+  assert.equal(discovered.mcpServers.every(server => server.provider === 'coding-mcp'), true);
+  assert.equal(discovered.mcpServers.some(server => server.name.startsWith('foreign-')), false);
+  assert.equal(discovered.hooks.some(hook => hook.command === 'foreign-hook'), false);
   assert.doesNotMatch(JSON.stringify(discovered), new RegExp(home.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 
   registry = new ExtensionRegistry({ folders, homeDir: home });
@@ -102,7 +112,7 @@ test('extension discovery keeps Hook and MCP execution opt-in while supporting C
   assert.equal(lifecycleEvents[0].sessionId, 'lifecycle-session');
   assert.equal(lifecycleEvents[0].source, 'startup');
 
-  const rewriteHook = inventory.hooks.find(item => item.hook.provider === 'claude' && item.hook.event === 'PreToolUse');
+  const rewriteHook = inventory.hooks.find(item => item.hook.scope === 'user' && item.hook.event === 'PreToolUse');
   assert.ok(rewriteHook);
   await registry.setEnabled('hook', [rewriteHook.hook.key]);
   const rewritten = await registry.preToolUse('read_file', { path: 'hello.txt' }, root, 'fixture-session', 'repo');
@@ -120,7 +130,7 @@ test('extension discovery keeps Hook and MCP execution opt-in while supporting C
   await registry.setActive('hook', true);
 
   const refreshed = await registry.inventory(true);
-  const blockHook = refreshed.hooks.find(item => item.hook.provider === 'codex' && item.hook.event === 'PreToolUse');
+  const blockHook = refreshed.hooks.find(item => item.hook.scope === 'workspace' && item.hook.event === 'PreToolUse');
   assert.ok(blockHook);
   await registry.setEnabled('hook', [blockHook.hook.key]);
   const blocked = await registry.preToolUse('write_file', { path: 'blocked.txt' }, root, 'fixture-session', 'repo');
@@ -161,7 +171,7 @@ test('external MCP stdio supports Windows batch launchers', { skip: process.plat
 
   const launcher = path.join(root, 'fixture-mcp.bat');
   await writeFile(launcher, `@echo off\r\n"${process.execPath}" %*\r\n`);
-  await writeJson(path.join(root, '.mcp.json'), {
+  await writeJson(path.join(root, '.coding-tools-mcp', 'mcp.json'), {
     mcpServers: {
       'batch-fixture': { type: 'stdio', command: launcher, args: [mcpFixture] }
     }

@@ -76,7 +76,9 @@ const TOOL_RUNTIME_MODULES: readonly ToolRuntimeModule[] = [
     usageFamily: 'other',
     tools: {
       server_info: { usageFamily: 'runtime' },
+      session_status: { usageFamily: 'runtime' },
       list_workspace_folders: {},
+      list_active_workspaces: { usageFamily: 'runtime' },
       conversation_bootstrap: { lockGroups: ['history'], coalescing: 'never' },
       switch_workspace_folder: { coalescing: 'never' },
       query_tool_usage: { usageFamily: 'runtime' },
@@ -146,11 +148,7 @@ const TOOL_RUNTIME_MODULES: readonly ToolRuntimeModule[] = [
     tools: {
       desktop_displays: {},
       desktop_screenshot: {},
-      desktop_click: { mutation: 'always' },
-      desktop_drag: { mutation: 'always' },
-      desktop_scroll: { mutation: 'always' },
-      desktop_type: { mutation: 'always' },
-      desktop_key: { mutation: 'always' }
+      desktop_input: { mutation: 'always' }
     }
   },
   {

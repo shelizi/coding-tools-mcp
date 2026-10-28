@@ -28,6 +28,8 @@ import {
   readToolEvolutionResource
 } from '../../knowledge/mcp.js';
 import { AGENT_VERSION } from '../../version.js';
+import { trackMcpToolActivity } from '../../sessionActivity.js';
+import { scheduleAutoActivity } from '../../historyAutoPersist.js';
 import type { ToolCatalogSnapshot } from '../catalog.js';
 
 const legacyProtocols = new Set<string>(LEGACY_MCP_PROTOCOL_VERSIONS);
@@ -133,6 +135,23 @@ async function listMcpResources(context: ToolContext): Promise<JsonObject> {
 }
 
 export async function dispatchMcpMethod(options: DispatchOptions): Promise<unknown> {
+  if (options.method !== 'tools/call') return dispatchMcpMethodInner(options);
+  const params = objectValue(options.request.params);
+  const meta = markMcpConversationMetadata(params._meta);
+  const identity = options.context.conversations.identity(meta);
+  // Rust also attributes activity to the native host session rather than to
+  // one shared fallback, so unrelated unscoped requests cannot look active.
+  return trackMcpToolActivity(
+    options.context.conversations,
+    identity.isolated ? identity.key : undefined,
+    String(params.name ?? ''),
+    objectValue(params.arguments),
+    () => dispatchMcpMethodInner(options),
+    () => scheduleAutoActivity(options.context, identity.isolated ? identity.key : undefined),
+  );
+}
+
+async function dispatchMcpMethodInner(options: DispatchOptions): Promise<unknown> {
   const { catalog, context, method, processLifecycle, protocolVersion, req, request, startedAt } = options;
   const modern = protocolVersion === MODERN_MCP_PROTOCOL_VERSION;
 

@@ -109,10 +109,18 @@ export function createTauriBackend(deps: TauriBackendDeps): FrontendBackend {
         invoke("list_history_sessions", { id: workspaceId, folderId }),
       read: (workspaceId, number, folderId) =>
         invoke("read_history_session", { id: workspaceId, number, folderId }),
+      listBackgroundJobs: (workspaceId, number, folderId) =>
+        invoke("list_history_background_jobs", { id: workspaceId, number, folderId }),
+      readBackgroundLog: (workspaceId, number, folderId, jobId) =>
+        invoke("read_history_background_log", { id: workspaceId, number, folderId, jobId }),
     },
 
     health: {
       run: (workspaceId) => invoke("run_health_checks", { id: workspaceId }),
+    },
+
+    sessionExpiry: {
+      read: (workspaceId) => invoke("get_session_expiry", { id: workspaceId }),
     },
 
     logs: {

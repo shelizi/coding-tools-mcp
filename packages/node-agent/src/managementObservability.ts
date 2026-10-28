@@ -1,10 +1,14 @@
 import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { open } from 'node:fs/promises';
 import { toolNamesForProfile, toolsetRevisionForProfile } from './catalog.js';
 import { allFolderRuntimes } from './folderRuntime.js';
+import { recentPersistedActivity } from './historyAutoMarkdown.js';
 import { documentTitle, historySummary, metadata, parseCheckpointRecords, truncateChars } from './historyMarkdown.js';
 import { canonicalPath, DEFAULT_HISTORY_DIR, scanHistory } from './historyStorage.js';
 import { LATEST_LEGACY_MCP_PROTOCOL_VERSION } from './mcpTransport.js';
-import { processStatus } from './processes.js';
+import { processResult, processStatus } from './processes.js';
+import { ACTIVE_WINDOW_MS, sessionActivitySnapshot, sessionBackgroundProcessRefs, sessionRecentActions } from './sessionActivity.js';
 import { redactSensitiveText } from './redaction.js';
 import { harnessWorkspaceId } from './taskTools.js';
 import type { JsonObject, OperationRecord, ToolContext, WorkspaceFolder } from './types.js';
@@ -376,6 +380,92 @@ async function historyLocation(folder: WorkspaceFolder): Promise<{ root: string;
   }
 }
 
+/** Read one numbered history file only, rather than scanning every session on a 3s log poll. */
+async function historySessionKeyForJobs(ctx: ToolContext, number: number, folderId?: string | null) {
+  if (!Number.isSafeInteger(number) || number < 1) {
+    throw new ManagementObservabilityError(400, 'INVALID_HISTORY_SESSION', 'Invalid history session number.');
+  }
+  const folder = configuredFolder(ctx, folderId);
+  const location = await historyLocation(folder);
+  const candidate = path.join(location.dir, `${number}.md`);
+  let resolved: string;
+  try {
+    resolved = await canonicalPath(candidate);
+  } catch (error) {
+    if (filesystemErrorCode(error) === 'ENOENT') {
+      throw new ManagementObservabilityError(404, 'HISTORY_SESSION_NOT_FOUND', 'History session not found.');
+    }
+    throw error;
+  }
+  if (!insidePath(location.dir, resolved) || !insidePath(location.root, resolved)) {
+    throw new ManagementObservabilityError(403, 'HISTORY_PATH_OUTSIDE_WORKSPACE', 'History file is outside the selected folder.');
+  }
+  const file = await open(resolved, 'r');
+  let prefix: string;
+  try {
+    const data = Buffer.alloc(16_384);
+    const { bytesRead } = await file.read(data, 0, data.length, 0);
+    prefix = data.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    await file.close();
+  }
+  return { folder, sessionKey: metadata(prefix, 'Session key') };
+}
+
+function managedSessionForHistory(ctx: ToolContext, folderId: string, processId: string) {
+  return ctx.folderRuntimes?.get(folderId)?.sessions.get(processId);
+}
+
+export async function managementHistoryBackgroundJobsPayload(
+  ctx: ToolContext, number: number, folderId?: string | null,
+): Promise<JsonObject> {
+  const { folder, sessionKey } = await historySessionKeyForJobs(ctx, number, folderId);
+  const jobs = sessionBackgroundProcessRefs(ctx.conversations, sessionKey)
+    .flatMap(ref => {
+      const session = managedSessionForHistory(ctx, folder.id, ref.id);
+      if (!session) return [];
+      const status = processStatus(session);
+      if (status !== 'running' && status !== 'verifying') return [];
+      return [{
+        id: ref.id,
+        tool: ref.tool,
+        action: ref.action,
+        status,
+        startedAtMs: session.startedAt,
+        elapsedMs: Math.max(0, Date.now() - session.startedAt),
+      }];
+    })
+    .sort((a, b) => b.startedAtMs - a.startedAtMs)
+    .slice(0, 64);
+  return {
+    jobs,
+    recentActions: sessionRecentActions(ctx.conversations, sessionKey),
+    capturedAtMs: Date.now(),
+  };
+}
+
+export async function managementHistoryBackgroundLogPayload(
+  ctx: ToolContext, number: number, jobId: string, folderId?: string | null,
+): Promise<JsonObject> {
+  const { folder, sessionKey } = await historySessionKeyForJobs(ctx, number, folderId);
+  const authorized = sessionBackgroundProcessRefs(ctx.conversations, sessionKey)
+    .some(ref => ref.id === jobId);
+  const session = authorized ? managedSessionForHistory(ctx, folder.id, jobId) : undefined;
+  if (!session) {
+    throw new ManagementObservabilityError(404, 'HISTORY_BACKGROUND_JOB_NOT_FOUND', 'Background job not found in this history session.');
+  }
+  const view = processResult(session, { output_mode: 'tail', max_output_bytes: 16_384, tail_lines: 160 });
+  return {
+    jobId,
+    status: processStatus(session),
+    stdout: redactSensitiveText(String(view.stdout ?? '')).value,
+    stderr: redactSensitiveText(String(view.stderr ?? '')).value,
+    stdoutTruncated: view.stdout_truncated === true || session.stdoutStart > 0,
+    stderrTruncated: view.stderr_truncated === true || session.stderrStart > 0,
+    capturedAtMs: Date.now(),
+  };
+}
+
 export async function managementHistoryListPayload(ctx: ToolContext, folderId?: string | null): Promise<JsonObject> {
   const folder = configuredFolder(ctx, folderId);
   const location = await historyLocation(folder);
@@ -384,14 +474,51 @@ export async function managementHistoryListPayload(ctx: ToolContext, folderId?: 
     ok: true,
     folder: { id: folder.id, name: folder.name },
     sessions: [...report.documents].reverse().map(document => {
+      const nowMs = Date.now();
       const records = parseCheckpointRecords(document.content);
+      const status = metadata(document.content, 'Status') ?? 'active';
+      const activity = sessionActivitySnapshot(ctx.conversations, document.session_key, nowMs, sessionId => {
+        const process = ctx.folderRuntimes?.get(folder.id)?.sessions.get(sessionId);
+        if (!process) return undefined;
+        const processState = processStatus(process);
+        return {
+          running: processState === 'running' || processState === 'verifying',
+          endedAtMs: process.endedAt,
+          outcome: process.endedAt === undefined ? undefined : process.exitCode === 0 ? 'success' : 'failed',
+        };
+      });
+      // The original 2-minute in-memory-only window made genuine work from
+      // a few minutes ago show idle, and a restart erased the signal.
+      // Restore only recent redacted MCP-generated events from this exact
+      // session's persisted Markdown. Never infer activity from Updated or
+      // label a historic background-running event as running now.
+      const persistedActions = recentPersistedActivity(document.content, nowMs, ACTIVE_WINDOW_MS);
+      const latestPersisted = persistedActions[0];
+      const runtimeAt = activity?.lastActivityAtMs ?? 0;
+      const persistedAt = latestPersisted?.updatedAtMs ?? 0;
+      const lastAt = Math.max(runtimeAt, persistedAt);
+      const running = activity?.status === 'running';
+      const recentlyActive = lastAt > 0 && nowMs - lastAt <= ACTIVE_WINDOW_MS;
+      const recentActions = sessionRecentActions(ctx.conversations, document.session_key);
       return {
         number: document.number,
         title: documentTitle(document.content, document.number),
-        status: metadata(document.content, 'Status') ?? 'unknown',
+        status,
+        activityStatus: status.toLowerCase() === 'completed' ? 'completed' : running ? 'running'
+          : recentlyActive ? 'active' : 'inactive',
+        activityTool: runtimeAt >= persistedAt ? activity?.tool ?? null : latestPersisted?.tool ?? null,
+        activityDescription: runtimeAt >= persistedAt ? activity?.action ?? null : latestPersisted?.action ?? null,
+        lastActivityAtMs: lastAt || null,
+        activeRequestCount: activity?.activeRequestCount ?? 0,
+        lastActivityOutcome: runtimeAt >= persistedAt ? activity?.lastOutcome ?? null : latestPersisted?.status ?? null,
+        // Node and Rust have independent in-memory timelines; prefer whichever
+        // source actually observed the newest event, not a stale local cache.
+        recentActions: runtimeAt >= persistedAt && recentActions.length
+          ? recentActions : persistedActions,
         createdAt: document.created_at ?? null,
         updatedAt: document.updated_at ?? null,
         checkpointCount: records.length,
+        revision: createHash('sha256').update(document.content).digest('hex'),
         summary: truncateChars(historySummary(document.content), 600),
         path: document.path
       };
@@ -440,7 +567,8 @@ export async function managementHistoryDetailPayload(
       nextActions: record.next_actions,
       notes: record.notes
     })),
-    content: document.content.replace(/^\*\*Session key:\*\*.*$/m, '**Session key:** [REDACTED]')
+    content: document.content.replace(/^\*\*Session key:\*\*.*$/m, '**Session key:** [REDACTED]'),
+    revision: createHash('sha256').update(document.content).digest('hex'),
   };
 }
 

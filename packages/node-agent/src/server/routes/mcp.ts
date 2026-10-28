@@ -1,6 +1,6 @@
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { recordIdentityDiagnostics } from '../mcp/identityDiagnostics.js';
-import { prepareConversationHandle, decorateHandleResult } from '../mcp/conversationHandles.js';
+import { prepareConversationHandle, decorateHandleResult, decorateSessionStatus } from '../mcp/conversationHandles.js';
 import type { AgentConfig, JsonObject, ToolContext } from '../../types.js';
 import type { OAuthRuntime } from '../../oauth.js';
 import { protectedResourceMetadataUrl, sendJson } from '../../oauth.js';
@@ -280,7 +280,10 @@ export async function handleMcpRoute(
         request,
         startedAt
       });
-      const handledResult = decorateHandleResult(result, handleResponse);
+      const statusResult = requestedTool?.name === 'session_status'
+        ? decorateSessionStatus(result, oauth.tokenExpiryFor(credential))
+        : result;
+      const handledResult = decorateHandleResult(statusResult, handleResponse);
       const wireResult = protocolVersion === MODERN_MCP_PROTOCOL_VERSION
         ? decorateModernMcpResult(handledResult, method, {
             name: 'coding-tools-mcp-node',

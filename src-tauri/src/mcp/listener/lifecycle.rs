@@ -95,8 +95,9 @@ pub fn spawn_listener(
     } else {
         None
     };
+    let conversation_handles = Arc::default();
     let state = ListenerState {
-        conversation_handles: Default::default(),
+        conversation_handles,
         mcp,
         auth,
         workspace_id,
@@ -113,6 +114,20 @@ pub fn spawn_listener(
     let listener = bind_listener(&bind_address, port)?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let profile_id = state.workspace_id.clone();
+    let tracked_handles = state.conversation_handles.clone();
+    let auth_type = if state.auth.oauth_enabled() {
+        "oauth"
+    } else if state.auth.bearer_enabled() {
+        "bearer"
+    } else {
+        "noauth"
+    };
+    crate::mcp::session_expiry::register(
+        &profile_id,
+        auth_type,
+        tracked_handles.clone(),
+        state.oauth.clone(),
+    );
     crate::mcp::record_diagnostic_event(
         &profile_id,
         "lifecycle_event",
@@ -123,6 +138,7 @@ pub fn spawn_listener(
     );
     let handle = crate::task_runtime::spawn(async move {
         let result = serve(listener, state, shutdown_rx).await;
+        crate::mcp::session_expiry::unregister(&profile_id, &tracked_handles);
         crate::mcp::record_diagnostic_event(
             &profile_id,
             "service_event",

@@ -15,6 +15,7 @@ import { readAgentSecrets } from '../dist/secrets.js';
 import { createAgentRuntime, createAgentServer } from '../dist/server.js';
 import { startAndYield, waitForSession } from '../dist/processes.js';
 import { AGENT_VERSION } from '../dist/version.js';
+import { toolNamesForProfile } from '../dist/catalog.js';
 
 // Test config documents own their temporary dataDir/port. Do not inherit developer-machine overrides.
 delete process.env.CTMCP_DATA_DIR;
@@ -259,8 +260,28 @@ test('management UI is loopback-only, token protected and never returns configur
   const status = await statusResponse.json();
   assert.equal(status.configuredToolProfile, 'core');
   assert.equal(status.toolProfile, 'trusted-core');
-  assert.equal(status.tools, 38);
+  assert.equal(status.tools, toolNamesForProfile('trusted-core').length);
   assert.match(status.toolsetRevision, /^[0-9a-f]{16}$/);
+
+  const workspaceId = runtime.context.config.workspaceId ?? runtime.context.workspaceProfileId;
+  const expiryUrl = `${runtime.base}/admin/api/workspaces/${encodeURIComponent(workspaceId)}/session-expiry`;
+  const anonymousExpiry = await fetch(expiryUrl);
+  assert.equal(anonymousExpiry.status, 403);
+  const forbiddenOriginExpiry = await fetch(expiryUrl, {
+    headers: { 'x-ctmcp-admin-token': token, origin: 'https://attacker.example' }
+  });
+  assert.equal(forbiddenOriginExpiry.status, 403);
+  const expiryResponse = await fetch(expiryUrl, { headers: { 'x-ctmcp-admin-token': token } });
+  assert.equal(expiryResponse.status, 200);
+  const expiry = await expiryResponse.json();
+  assert.equal(expiry.runtimeActive, true);
+  assert.equal(expiry.authType, 'oauth');
+  assert.equal(expiry.scope, 'current_runtime');
+  assert.equal(expiry.oauthTokenTtlSeconds, runtime.oauth.tokenTtlSeconds);
+  assert.ok(Array.isArray(expiry.oauthTokenExpiresAtMs));
+  assert.ok(Array.isArray(expiry.conversationHandleExpiresAtMs));
+  assert.ok(Number.isFinite(expiry.capturedAtMs));
+  assert.doesNotMatch(JSON.stringify(expiry), /management-test-(password|client-secret|token-secret)/);
 });
 
 test('management folder picker lists directories without exposing files', async t => {
@@ -1209,6 +1230,10 @@ test('management observability routes expose sanitized telemetry, operation logs
   const history = await historyResponse.json();
   assert.equal(history.sessions.length, 1);
   assert.equal(history.sessions[0].checkpointCount, 1);
+  assert.equal(history.sessions[0].activityStatus, 'completed');
+  assert.equal(history.sessions[0].activeRequestCount, 0);
+  assert.equal(history.sessions[0].lastActivityAtMs, null);
+  assert.equal(history.sessions[0].activityDescription, null);
   assert.doesNotMatch(JSON.stringify(history), /HISTORY_SESSION_KEY_SECRET/);
 
   const detailResponse = await fetch(`${runtime.base}/admin/api/workspaces/${workspaceId}/history/1?folderId=repo`, { headers });
@@ -1218,6 +1243,22 @@ test('management observability routes expose sanitized telemetry, operation logs
   assert.equal(detail.records[0].decisions[0], 'Do not add live activity badges');
   assert.doesNotMatch(detail.content, /HISTORY_SESSION_KEY_SECRET/);
   assert.match(detail.content, /\*\*Session key:\*\* \[REDACTED\]/);
+
+  const jobsResponse = await fetch(
+    `${runtime.base}/admin/api/workspaces/${workspaceId}/history/1/jobs?folderId=repo`,
+    { headers }
+  );
+  assert.equal(jobsResponse.status, 200);
+  assert.deepEqual((await jobsResponse.json()).jobs, []);
+  const anonymousJobs = await fetch(
+    `${runtime.base}/admin/api/workspaces/${workspaceId}/history/1/jobs?folderId=repo`
+  );
+  assert.notEqual(anonymousJobs.status, 200);
+  const otherJobLog = await fetch(
+    `${runtime.base}/admin/api/workspaces/${workspaceId}/history/1/jobs/other-session-job/log?folderId=repo`,
+    { headers }
+  );
+  assert.equal(otherJobLog.status, 404);
 
   const externalHistory = await mkdtemp(path.join(tmpdir(), 'ctmcp-management-history-outside-'));
   t.after(() => rm(externalHistory, { recursive: true, force: true }));
@@ -1580,8 +1621,8 @@ test('management Skill inventory hot-applies individual and master Skill toggles
 });
 test('management extension inventory hot-applies individual and master Hook/MCP toggles safely', async t => {
   const runtime = await startManagementServer(t);
-  await mkdir(path.join(runtime.root, '.claude'), { recursive: true });
-  await writeFile(path.join(runtime.root, '.claude', 'settings.json'), JSON.stringify({
+  await mkdir(path.join(runtime.root, '.coding-tools-mcp'), { recursive: true });
+  await writeFile(path.join(runtime.root, '.coding-tools-mcp', 'hooks.json'), JSON.stringify({
     hooks: {
       PreToolUse: [{
         matcher: 'read_file',
@@ -1589,7 +1630,7 @@ test('management extension inventory hot-applies individual and master Hook/MCP 
       }]
     }
   }));
-  await writeFile(path.join(runtime.root, '.mcp.json'), JSON.stringify({
+  await writeFile(path.join(runtime.root, '.coding-tools-mcp', 'mcp.json'), JSON.stringify({
     mcpServers: {
       inventoryFixture: { type: 'stdio', command: process.execPath, args: ['-e', 'process.exit(0)'] }
     }
@@ -1605,7 +1646,7 @@ test('management extension inventory hot-applies individual and master Hook/MCP 
   const inventory = await listed.json();
   assert.equal(inventory.hooksActive, true);
   assert.equal(inventory.mcpActive, true);
-  const hook = inventory.hooks.find(item => item.sourcePath === '.claude/settings.json' && item.event === 'PreToolUse');
+  const hook = inventory.hooks.find(item => item.sourcePath === '.coding-tools-mcp/hooks.json' && item.event === 'PreToolUse');
   assert.ok(hook);
   assert.equal(hook.selected, false);
   assert.equal(hook.enabled, false);

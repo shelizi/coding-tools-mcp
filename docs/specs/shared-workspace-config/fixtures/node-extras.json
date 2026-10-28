@@ -13,7 +13,7 @@
   "auth": { "type": "oauth", "oauthClientId": "chatgpt" },
   "host": {
     "node": {
-      "dataDir": "C:\\Users\\tester\\AppData\\Local\\CodingToolsMCPNode",
+      "dataDir": "C:\\Users\\zex55\\AppData\\Local\\CodingToolsMCPNode",
       "management": { "enabled": true }
     }
   }

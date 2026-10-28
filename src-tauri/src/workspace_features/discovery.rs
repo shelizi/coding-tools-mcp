@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -121,27 +121,6 @@ fn string_record(value: Option<&Value>) -> HashMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn normalize_slashes(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
-fn display_path(actual: &Path, scope: &str, base: &Path) -> String {
-    let relative = actual
-        .strip_prefix(base)
-        .ok()
-        .map(normalize_slashes)
-        .unwrap_or_else(|| normalize_slashes(actual));
-    if scope == "user" {
-        if relative.is_empty() {
-            "~".into()
-        } else {
-            format!("~/{relative}")
-        }
-    } else {
-        relative
-    }
 }
 
 fn sanitize(value: &str) -> String {
@@ -297,44 +276,6 @@ fn read_json(
     }
 }
 
-fn read_toml(
-    file: &Path,
-    containment_root: &Path,
-    display: &str,
-    diagnostics: &mut Vec<ExtensionDiagnostic>,
-    provider: &str,
-    scope: &str,
-) -> Value {
-    let Some(content) = safe_read(
-        file,
-        containment_root,
-        display,
-        diagnostics,
-        provider,
-        scope,
-    ) else {
-        return Value::Object(Map::new());
-    };
-    match toml::from_str::<toml::Value>(&content)
-        .ok()
-        .and_then(|value| serde_json::to_value(value).ok())
-        .filter(Value::is_object)
-    {
-        Some(value) => value,
-        None => {
-            diagnostics.push(ExtensionDiagnostic {
-                code: "EXTENSION_CONFIG_INVALID_TOML".into(),
-                message: "Invalid TOML extension configuration.".into(),
-                provider: Some(provider.into()),
-                scope: Some(scope.into()),
-                path: Some(display.into()),
-                key: None,
-            });
-            Value::Object(Map::new())
-        }
-    }
-}
-
 fn timeout_ms(handler: &Map<String, Value>) -> u64 {
     let explicit = handler
         .get("timeout_ms")
@@ -399,17 +340,12 @@ fn hooks_from_document(
                     .unwrap_or("command")
                     .trim()
                     .to_ascii_lowercase();
-                let command = if cfg!(windows) && provider == "codex" {
-                    handler
-                        .get("commandWindows")
-                        .or_else(|| handler.get("command"))
-                        .and_then(Value::as_str)
-                } else {
-                    handler.get("command").and_then(Value::as_str)
-                }
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string);
+                let command = handler
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
                 let url = handler
                     .get("url")
                     .and_then(Value::as_str)
@@ -646,18 +582,6 @@ fn collect_mcp(
     }
 }
 
-fn same_path(left: &str, right: &Path) -> bool {
-    let left = PathBuf::from(left)
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(left));
-    if cfg!(windows) {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
-    }
-}
-
 fn precedence(scope: &str) -> usize {
     match scope {
         "local" => 0,
@@ -714,77 +638,33 @@ pub async fn discover_extensions(folders: &[WorkspaceFolder]) -> DiscoveredExten
     let mut mcp_candidates = Vec::new();
     let home = dirs::home_dir();
     let home_real = home.as_ref().and_then(|path| path.canonicalize().ok());
+    let mut user_mcp = Value::Object(Map::new());
 
-    let mut claude_user_settings = Value::Object(Map::new());
-    let mut claude_user_root = Value::Object(Map::new());
-    let mut codex_user_config = Value::Object(Map::new());
+    // Only Coding MCP's own configurations are read; other Agents are never scanned.
     if let (Some(home), Some(home_real)) = (&home, &home_real) {
-        let claude_settings_path = home.join(".claude/settings.json");
-        claude_user_settings = read_json(
-            &claude_settings_path,
+        user_mcp = read_json(
+            &home.join(".coding-tools-mcp/mcp.json"),
             home_real,
-            "~/.claude/settings.json",
+            "~/.coding-tools-mcp/mcp.json",
             &mut diagnostics,
-            "claude",
+            "coding-mcp",
             "user",
         );
-        let claude_hooks_enabled = claude_user_settings
-            .get("disableAllHooks")
-            .and_then(Value::as_bool)
-            != Some(true);
+        let user_hooks = read_json(
+            &home.join(".coding-tools-mcp/hooks.json"),
+            home_real,
+            "~/.coding-tools-mcp/hooks.json",
+            &mut diagnostics,
+            "coding-mcp",
+            "user",
+        );
         hooks.extend(hooks_from_document(
-            &claude_user_settings,
-            "claude",
+            &user_hooks,
+            "coding-mcp",
             "user",
             None,
-            "~/.claude/settings.json",
-            claude_hooks_enabled,
-            &mut diagnostics,
-        ));
-        claude_user_root = read_json(
-            &home.join(".claude.json"),
-            home_real,
-            "~/.claude.json",
-            &mut diagnostics,
-            "claude",
-            "user",
-        );
-        let codex_hooks = read_json(
-            &home.join(".codex/hooks.json"),
-            home_real,
-            "~/.codex/hooks.json",
-            &mut diagnostics,
-            "codex",
-            "user",
-        );
-        codex_user_config = read_toml(
-            &home.join(".codex/config.toml"),
-            home_real,
-            "~/.codex/config.toml",
-            &mut diagnostics,
-            "codex",
-            "user",
-        );
-        let codex_hooks_enabled = codex_user_config
-            .pointer("/features/hooks")
-            .and_then(Value::as_bool)
-            != Some(false);
-        hooks.extend(hooks_from_document(
-            &codex_hooks,
-            "codex",
-            "user",
-            None,
-            "~/.codex/hooks.json",
-            codex_hooks_enabled,
-            &mut diagnostics,
-        ));
-        hooks.extend(hooks_from_document(
-            &codex_user_config,
-            "codex",
-            "user",
-            None,
-            "~/.codex/config.toml",
-            codex_hooks_enabled,
+            "~/.coding-tools-mcp/hooks.json",
+            true,
             &mut diagnostics,
         ));
     }
@@ -806,184 +686,55 @@ pub async fn discover_extensions(folders: &[WorkspaceFolder]) -> DiscoveredExten
             }
         };
 
-        if home.is_some() && home_real.is_some() {
+        if home_real.is_some() {
             collect_mcp(
                 &mut mcp_candidates,
-                "claude",
+                "coding-mcp",
                 "user",
                 &folder.id,
-                "~/.claude.json",
-                claude_user_root.get("mcpServers"),
-                true,
-                &mut diagnostics,
-            );
-            if let Some(projects) = claude_user_root.get("projects").and_then(Value::as_object) {
-                if let Some((_, project)) = projects
-                    .iter()
-                    .find(|(project_path, _)| same_path(project_path, &workspace_real))
-                {
-                    collect_mcp(
-                        &mut mcp_candidates,
-                        "claude",
-                        "local",
-                        &folder.id,
-                        "~/.claude.json (project-local)",
-                        project.get("mcpServers"),
-                        true,
-                        &mut diagnostics,
-                    );
-                }
-            }
-            collect_mcp(
-                &mut mcp_candidates,
-                "codex",
-                "user",
-                &folder.id,
-                "~/.codex/config.toml",
-                codex_user_config.get("mcp_servers"),
+                "~/.coding-tools-mcp/mcp.json",
+                user_mcp.get("mcpServers"),
                 true,
                 &mut diagnostics,
             );
         }
 
-        let claude_project_path = workspace.join(".claude/settings.json");
-        let claude_local_path = workspace.join(".claude/settings.local.json");
-        let claude_project = read_json(
-            &claude_project_path,
+        let workspace_mcp = read_json(
+            &workspace.join(".coding-tools-mcp/mcp.json"),
             &workspace_real,
-            &display_path(&claude_project_path, "workspace", &workspace),
+            ".coding-tools-mcp/mcp.json",
             &mut diagnostics,
-            "claude",
+            "coding-mcp",
             "workspace",
         );
-        let claude_local = read_json(
-            &claude_local_path,
-            &workspace_real,
-            &display_path(&claude_local_path, "local", &workspace),
-            &mut diagnostics,
-            "claude",
-            "local",
-        );
-        let user_claude_hooks = claude_user_settings
-            .get("disableAllHooks")
-            .and_then(Value::as_bool)
-            != Some(true);
-        let project_hooks_enabled = user_claude_hooks
-            && claude_project
-                .get("disableAllHooks")
-                .and_then(Value::as_bool)
-                != Some(true);
-        let local_hooks_enabled = user_claude_hooks
-            && claude_local.get("disableAllHooks").and_then(Value::as_bool) != Some(true);
-        hooks.extend(hooks_from_document(
-            &claude_project,
-            "claude",
-            "workspace",
-            Some(&folder.id),
-            ".claude/settings.json",
-            project_hooks_enabled,
-            &mut diagnostics,
-        ));
-        hooks.extend(hooks_from_document(
-            &claude_local,
-            "claude",
-            "local",
-            Some(&folder.id),
-            ".claude/settings.local.json",
-            local_hooks_enabled,
-            &mut diagnostics,
-        ));
-
-        let disabled_project_servers = [
-            claude_user_settings.get("disabledMcpjsonServers"),
-            claude_project.get("disabledMcpjsonServers"),
-            claude_local.get("disabledMcpjsonServers"),
-        ]
-        .into_iter()
-        .flat_map(string_array)
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-        let mcp_json_path = workspace.join(".mcp.json");
-        let mcp_json = read_json(
-            &mcp_json_path,
-            &workspace_real,
-            ".mcp.json",
-            &mut diagnostics,
-            "claude",
-            "workspace",
-        );
-        if let Some(servers) = mcp_json.get("mcpServers").and_then(Value::as_object) {
-            for (name, raw) in servers {
-                let enabled = !disabled_project_servers.contains(&name.to_ascii_lowercase());
-                let mut one = Map::new();
-                one.insert(name.clone(), raw.clone());
-                collect_mcp(
-                    &mut mcp_candidates,
-                    "claude",
-                    "workspace",
-                    &folder.id,
-                    ".mcp.json",
-                    Some(&Value::Object(one)),
-                    enabled,
-                    &mut diagnostics,
-                );
-            }
-        }
-
-        let codex_hooks_path = workspace.join(".codex/hooks.json");
-        let codex_hooks = read_json(
-            &codex_hooks_path,
-            &workspace_real,
-            ".codex/hooks.json",
-            &mut diagnostics,
-            "codex",
-            "workspace",
-        );
-        let codex_config_path = workspace.join(".codex/config.toml");
-        let codex_project_config = read_toml(
-            &codex_config_path,
-            &workspace_real,
-            ".codex/config.toml",
-            &mut diagnostics,
-            "codex",
-            "workspace",
-        );
-        let codex_hooks_enabled = codex_project_config
-            .pointer("/features/hooks")
-            .and_then(Value::as_bool)
-            != Some(false)
-            && codex_user_config
-                .pointer("/features/hooks")
-                .and_then(Value::as_bool)
-                != Some(false);
-        hooks.extend(hooks_from_document(
-            &codex_hooks,
-            "codex",
-            "workspace",
-            Some(&folder.id),
-            ".codex/hooks.json",
-            codex_hooks_enabled,
-            &mut diagnostics,
-        ));
-        hooks.extend(hooks_from_document(
-            &codex_project_config,
-            "codex",
-            "workspace",
-            Some(&folder.id),
-            ".codex/config.toml",
-            codex_hooks_enabled,
-            &mut diagnostics,
-        ));
         collect_mcp(
             &mut mcp_candidates,
-            "codex",
+            "coding-mcp",
             "workspace",
             &folder.id,
-            ".codex/config.toml",
-            codex_project_config.get("mcp_servers"),
+            ".coding-tools-mcp/mcp.json",
+            workspace_mcp.get("mcpServers"),
             true,
             &mut diagnostics,
         );
+
+        let workspace_hooks = read_json(
+            &workspace.join(".coding-tools-mcp/hooks.json"),
+            &workspace_real,
+            ".coding-tools-mcp/hooks.json",
+            &mut diagnostics,
+            "coding-mcp",
+            "workspace",
+        );
+        hooks.extend(hooks_from_document(
+            &workspace_hooks,
+            "coding-mcp",
+            "workspace",
+            Some(&folder.id),
+            ".coding-tools-mcp/hooks.json",
+            true,
+            &mut diagnostics,
+        ));
     }
 
     hooks.sort_by(|left, right| {
@@ -991,10 +742,9 @@ pub async fn discover_extensions(folders: &[WorkspaceFolder]) -> DiscoveredExten
             .cmp(&right.event)
             .then_with(|| left.key.cmp(&right.key))
     });
-    let mcp_servers = dedupe_mcp(mcp_candidates, &mut diagnostics);
     DiscoveredExtensions {
         hooks,
-        mcp_servers,
+        mcp_servers: dedupe_mcp(mcp_candidates, &mut diagnostics),
         diagnostics,
     }
 }
@@ -1028,19 +778,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovers_claude_workspace_mcp_and_codex_hook() {
+    async fn discovers_only_coding_mcp_owned_workspace_servers_and_hooks() {
         let root = tempdir().expect("tempdir");
+        fs::create_dir_all(root.path().join(".coding-tools-mcp")).expect("own config dir");
         fs::write(
-            root.path().join(".mcp.json"),
+            root.path().join(".coding-tools-mcp/mcp.json"),
             r#"{"mcpServers":{"demo":{"command":"demo-server"}}}"#,
         )
         .expect("mcp json");
-        fs::create_dir_all(root.path().join(".codex")).expect("codex dir");
         fs::write(
-            root.path().join(".codex/hooks.json"),
+            root.path().join(".coding-tools-mcp/hooks.json"),
             r#"{"hooks":{"PreToolUse":[{"matcher":"read_file","hooks":[{"type":"command","command":"echo ok"}]}]}}"#,
         )
         .expect("hooks");
+        // Existing configs from other Agents must not be scanned or shadow our own.
+        fs::write(
+            root.path().join(".mcp.json"),
+            r#"{"mcpServers":{"foreign":{"command":"not-ours"}}}"#,
+        )
+        .expect("legacy mcp json");
+        fs::create_dir_all(root.path().join(".codex")).expect("codex dir");
+        fs::write(
+            root.path().join(".codex/hooks.json"),
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"foreign-hook"}]}]}}"#,
+        )
+        .expect("foreign hooks");
         let folder = WorkspaceFolder::new(
             root.path().to_string_lossy().into_owned(),
             Some("root".into()),
@@ -1051,14 +813,22 @@ mod tests {
             .mcp_servers
             .iter()
             .find(|server| server.name == "demo" && server.folder_id == folder_id)
-            .expect("workspace demo MCP server");
-        assert_eq!(demo.provider, "claude");
+            .expect("workspace own MCP server");
+        assert_eq!(demo.provider, "coding-mcp");
         assert_eq!(demo.scope, "workspace");
+        assert!(found
+            .mcp_servers
+            .iter()
+            .all(|server| server.name != "foreign"));
         assert!(found.hooks.iter().any(|hook| {
             hook.event == "PreToolUse"
-                && hook.provider == "codex"
+                && hook.provider == "coding-mcp"
                 && hook.scope == "workspace"
                 && hook.folder_id.as_deref() == Some(folder_id.as_str())
         }));
+        assert!(found
+            .hooks
+            .iter()
+            .all(|hook| hook.command.as_deref() != Some("foreign-hook")));
     }
 }

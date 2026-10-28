@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:22-bookworm-slim AS build
+# CVE-2026-111497: both build and runtime must use the fixed Node.js decoder.
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS build
 
 ENV PNPM_HOME=/pnpm
 ENV PATH=${PNPM_HOME}:${PATH}
@@ -30,11 +31,12 @@ ENV CTMCP_TOOL_EVOLUTION_PROPOSAL_IDS=${TOOL_EVOLUTION_PROPOSAL_IDS}
 RUN pnpm --filter @coding-tools/node-agent run build \
     && pnpm --filter @coding-tools/node-agent --prod deploy /opt/node-agent
 
-FROM node:22-bookworm-slim AS runtime
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d AS runtime
 
 RUN npm install --global @pnpm/exe@12.0.0 \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git gosu openssh-client passwd ripgrep \
+    && apt-get install -y --no-install-recommends ca-certificates curl git gosu openssh-client passwd ripgrep libbrotli1 \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libbrotli1)" ge '1.0.9-2+deb12u1' \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \

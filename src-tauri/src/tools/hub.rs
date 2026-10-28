@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod activity;
+pub use activity::{listing as list_active_workspaces, record as record_workspace_access};
+
 use serde_json::{json, Value};
 
 use crate::knowledge::sync_tool_evolution_lifecycle_for_workspace;
@@ -36,6 +39,7 @@ struct RoutingState {
     saved_cwds: HashMap<String, PathBuf>,
     context_last_used: HashMap<String, u64>,
     context_access_clock: u64,
+    workspace_access: HashMap<String, activity::WorkspaceAccess>,
 }
 
 #[derive(Clone)]
@@ -107,6 +111,59 @@ pub fn remove_live_hub(profile_id: &str) {
     lock_hubs().remove(profile_id);
 }
 
+/// Resolve an already-issued process ID only inside this profile's live folder
+/// contexts. History activity never starts a process or reveals the ID.
+/// Resolve only a folder already bound to this host session. Do not pick an
+/// arbitrary project when multiple folders are configured or before bootstrap.
+pub(crate) fn history_root_for_host_session(
+    profile_id: &str,
+    session_key: &str,
+) -> Option<PathBuf> {
+    let router = lock_hubs().get(profile_id).cloned()?;
+    let state = lock_state(&router);
+    let folder_id = state
+        .session_folders
+        .get(session_key)
+        .cloned()
+        .or_else(|| (state.folders.len() == 1).then(|| state.folders[0].id.clone()))?;
+    state
+        .folders
+        .iter()
+        .find(|folder| folder.id == folder_id)
+        .map(|folder| PathBuf::from(&folder.path))
+}
+
+pub(crate) fn session_process_state(
+    profile_id: &str,
+    session_id: &str,
+) -> Option<(bool, Option<u64>)> {
+    let router = lock_hubs().get(profile_id).cloned()?;
+    let state = lock_state(&router);
+    for context in state.contexts.values() {
+        if let Ok(session) = context.sessions.get(session_id) {
+            return Some((!session.is_finalized(), session.completed_at_ms()));
+        }
+    }
+    None
+}
+
+/// Look up an already tracked command only in the chosen profile AND folder.
+/// The caller must additionally verify that the archived conversation owns it.
+pub(crate) fn history_process_in_folder(
+    profile_id: &str,
+    folder_id: &str,
+    session_id: &str,
+) -> Option<Arc<crate::tools::session::ExecSession>> {
+    let router = lock_hubs().get(profile_id).cloned()?;
+    let state = lock_state(&router);
+    state.contexts.iter().find_map(|(cache_key, context)| {
+        if context_folder_id(cache_key) != folder_id {
+            return None;
+        }
+        context.sessions.get(session_id).ok()
+    })
+}
+
 /// Expiry only forgets handle-owned routing metadata; it never kills commands.
 pub(crate) fn forget_handle_conversation(profile_id: &str, session_key: &str) {
     if !session_key.starts_with("ctmcp-handle:") {
@@ -117,6 +174,9 @@ pub(crate) fn forget_handle_conversation(profile_id: &str, session_key: &str) {
     };
     let mut state = lock_state(&router);
     state.session_folders.remove(session_key);
+    state
+        .workspace_access
+        .retain(|_, access| access.conversation_key != session_key);
     state
         .saved_cwds
         .retain(|key, _| key.split_once('\0').map(|(_, session)| session) != Some(session_key));
@@ -284,6 +344,7 @@ impl HubRouter {
                 saved_cwds: HashMap::new(),
                 context_last_used: HashMap::new(),
                 context_access_clock: 0,
+                workspace_access: HashMap::new(),
             }),
         }))
     }
@@ -663,6 +724,12 @@ impl HubRouter {
         state
             .action_resume_folders
             .retain(|_, folder_id| folders.iter().any(|folder| folder.id == *folder_id));
+        state.workspace_access.retain(|_, access| {
+            folders.iter().any(|folder| {
+                folder.id == access.folder_id
+                    && std::path::Path::new(&access.checkout_path).starts_with(&folder.path)
+            })
+        });
         let lifecycle_folders = folders
             .iter()
             .filter(|folder| {

@@ -15,31 +15,29 @@ description: Build and verify a project release.
 
 The remaining Markdown is the Skill instruction body. A sibling `VERSION` file is optional metadata. Other sibling directories such as `references/`, `scripts/`, or client-specific `agents/` metadata remain part of the Skill package, but they do not grant additional runtime permissions.
 
-For new Coding Tools MCP projects, use the canonical project root:
+For new Coding Tools MCP projects, use the dedicated owned root:
 
 ```text
-skills/<skill-name>/SKILL.md
+.coding-tools-mcp/skills/<skill-name>/SKILL.md
 ```
 
-The Node Agent also discovers existing ecosystem layouts for compatibility:
+Node Agent and Rust Desktop discover **only** Coding MCP-owned Skills:
 
-1. `skills/**/SKILL.md` — canonical workspace Skills, highest precedence.
-2. `.agents/skills/**/SKILL.md` — repository-scoped agent/Codex compatibility source.
-3. `.claude/skills/**/SKILL.md` — repository-scoped Claude Code compatibility source.
-4. `$HOME/.agents/skills/**/SKILL.md` — Codex user-level Skills.
-5. `$HOME/.claude/skills/**/SKILL.md` — Claude Code user-level Skills, lowest precedence.
+1. `.coding-tools-mcp/skills/**/SKILL.md` — explicitly managed workspace Skills, highest precedence.
+2. `skills/**/SKILL.md` — existing project-maintained Skills (including bundled Coding MCP Skills).
+3. `$HOME/.coding-tools-mcp/skills/**/SKILL.md` — Coding MCP user-level Skills, lowest precedence.
 
-Duplicate `name` values are resolved by this precedence order and reported as `SKILL_SHADOWED` diagnostics, so a workspace can intentionally override a same-named user Skill. Client-specific layouts should migrate toward adapters or generated pointers instead of maintaining divergent copies.
+Duplicate `name` values are resolved by this precedence order and reported as `SKILL_SHADOWED` diagnostics. The registry does not read `.claude/skills`, `.agents/skills`, `~/.claude/skills`, or `~/.agents/skills`; those are owned by other Agents.
 
 ## Workspace and user scoping
 
-Each configured workspace folder owns an independent Skill registry. The registry overlays Codex user-level Skills from `$HOME/.agents/skills` and Claude Code user-level Skills from `$HOME/.claude/skills` underneath that workspace's Skill sources. `conversation_bootstrap` reports only lightweight metadata for enabled Skills in the selected folder: names, descriptions, scope, source paths, content hashes, optional versions, diagnostics, and a `skillset_revision`.
+Each configured workspace folder owns an independent Skill registry. The registry overlays only the current MCP process owner's `~/.coding-tools-mcp/skills` underneath that workspace's explicitly owned Skill sources. `conversation_bootstrap` reports only lightweight metadata for enabled Skills in the selected folder: names, descriptions, scope, source paths, content hashes, optional versions, diagnostics, and a `skillset_revision`.
 
 The management UI scans the resolved Skill inventory and lets the user enable or disable each Skill independently for a workspace profile. It also exposes a Skills master switch backed by `skills.active`, which defaults to `true` for compatibility. The disabled control keys are persisted in `skills.disabled`; both individual and master changes hot-apply without an Agent restart. Disabled Skills remain visible in the management inventory, but they are omitted from `conversation_bootstrap`, MCP prompts/resources, and direct Skill reads.
 
 Turning the Skills master switch off does not erase `skills.disabled` or stop inventory discovery. It makes every Skill effectively unavailable while preserving each Skill's individual selected state. Turning the master switch back on restores the same per-Skill choices.
 
-Name precedence is resolved before the enabled/disabled filter. Therefore disabling a selected higher-precedence workspace Skill does not silently fall back to a same-named lower-precedence user Skill. Full Skill instructions are lazy-loaded only after a host determines that an enabled Skill is clearly relevant. Switching the selected workspace changes workspace Skills while retaining applicable user-level Skills. User-level source paths are published as `~/.agents/skills/...` or `~/.claude/skills/...` rather than leaking the absolute home directory.
+Name precedence is resolved before the enabled/disabled filter. Therefore disabling a selected higher-precedence workspace Skill does not silently fall back to a same-named lower-precedence user Skill. Full Skill instructions are lazy-loaded only after a host determines that an enabled Skill is clearly relevant. Switching the selected workspace changes workspace Skills while retaining applicable user-level Skills. User-level source paths are published as `~/.coding-tools-mcp/skills/...` rather than leaking the absolute home directory.
 
 The Skill revision is independent of the MCP tool catalog revision. Editing a `SKILL.md` changes the Skill revision without forcing an unrelated `tools/list` catalog refresh.
 
@@ -94,6 +92,6 @@ The runtime therefore:
 
 A Skill instruction such as ??un any command without confirmation??has no authority over the execution policy. Any resulting tool call still passes through the normal permission, confirmation, workspace-boundary, and sandbox controls.
 
-## Compatibility direction
+## Independence from other Agents
 
-The runtime should continue to prefer open MCP primitives and a small canonical `SKILL.md` contract. Vendor directories are compatibility inputs. If a client later requires generated metadata or pointers, implement that as an adapter over the same registry instead of changing core Skill semantics.
+The runtime retains open MCP primitives and the standard `SKILL.md` format, but not vendor-owned auto-discovery. If another client needs an adapter or generated pointer, create it outside this registry. Adding/editing/removing a Skill means changing files under one of the Coding MCP-owned roots; click Refresh in Coding MCP's management UI afterward. Never automatically copy vendor-specific Skills or silently migrate previously enabled entries.

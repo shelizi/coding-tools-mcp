@@ -18,6 +18,7 @@ export type {
   FrontendCapabilities,
   FrontendHost,
   HealthBackend,
+  SessionExpiryBackend,
   HistoryBackend,
   HookInventoryItem,
   InvokeFn,

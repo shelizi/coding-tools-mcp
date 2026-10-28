@@ -1,9 +1,12 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { conversationHandleExpiryTimes } from '../../server/mcp/conversationHandles.js';
 import { dashboardPayload } from '../../dashboard.js';
 import { managementDirectoryPayload, openManagementDirectory } from '../../managementDirectories.js';
 import {
   managementDiagnosticsPayload,
   managementHealthPayload,
+  managementHistoryBackgroundJobsPayload,
+  managementHistoryBackgroundLogPayload,
   managementHistoryDetailPayload,
   managementHistoryListPayload,
   managementOperationLogPayload,
@@ -77,11 +80,11 @@ export async function handleManagementObservabilityRoute(
   }
 
   const route = pathname.match(
-    /^\/admin\/api\/workspaces\/([A-Za-z0-9._-]{1,128})\/(telemetry|logs|history(?:\/([1-9]\d*))?|health|diagnostics)$/
+    /^\/admin\/api\/workspaces\/([A-Za-z0-9._-]{1,128})\/(telemetry|logs|history(?:\/([1-9]\d*)(?:\/jobs(?:\/([A-Za-z0-9._-]{1,128})\/log)?)?)?|health|diagnostics|session-expiry)$/
   );
   if (!route) return false;
 
-  const [, workspaceId, action, historyNumber] = route;
+  const [, workspaceId, action, historyNumber, historyJobId] = route;
   const selected = runtimeRecord(options, workspaceId);
   if (!selected) {
     sendJson(res, 404, {
@@ -91,6 +94,18 @@ export async function handleManagementObservabilityRoute(
   }
   const requestUrl = new URL(req.url ?? pathname, `http://${req.headers.host ?? '127.0.0.1'}`);
   try {
+    if (action === 'session-expiry' && req.method === 'GET') {
+      sendJson(res, 200, {
+        capturedAtMs: Date.now(),
+        runtimeActive: true,
+        authType: selected.oauth ? 'oauth' : 'unknown',
+        oauthTokenTtlSeconds: selected.oauth?.tokenTtlSeconds ?? null,
+        oauthTokenExpiresAtMs: selected.oauth?.tokenExpiryTimes() ?? [],
+        conversationHandleExpiresAtMs: conversationHandleExpiryTimes(selected.context),
+        scope: 'current_runtime',
+      });
+      return true;
+    }
     if (action === 'telemetry' && req.method === 'GET') {
       sendJson(res, 200, await managementTelemetryPayload(selected.context, requestUrl.searchParams));
       return true;
@@ -107,7 +122,19 @@ export async function handleManagementObservabilityRoute(
       );
       return true;
     }
-    if (historyNumber && req.method === 'GET') {
+    if (historyNumber && req.method === 'GET' && action.endsWith('/jobs')) {
+      sendJson(res, 200, await managementHistoryBackgroundJobsPayload(
+        selected.context, Number(historyNumber), requestUrl.searchParams.get('folderId')
+      ));
+      return true;
+    }
+    if (historyNumber && historyJobId && req.method === 'GET') {
+      sendJson(res, 200, await managementHistoryBackgroundLogPayload(
+        selected.context, Number(historyNumber), historyJobId, requestUrl.searchParams.get('folderId')
+      ));
+      return true;
+    }
+    if (historyNumber && req.method === 'GET' && action === `history/${historyNumber}`) {
       sendJson(res, 200, await managementHistoryDetailPayload(
         selected.context,
         Number(historyNumber),

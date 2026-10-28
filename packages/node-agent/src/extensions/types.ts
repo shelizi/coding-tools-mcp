@@ -1,6 +1,6 @@
 import type { JsonObject, ToolDefinition } from '../types.js';
 
-export type ExtensionProvider = 'codex' | 'claude';
+export type ExtensionProvider = 'coding-mcp';
 export type ExtensionScope = 'workspace' | 'local' | 'user';
 export type ExtensionKind = 'hook' | 'mcp';
 

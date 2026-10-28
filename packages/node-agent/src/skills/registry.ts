@@ -52,13 +52,11 @@ export interface SkillRegistryOptions {
 }
 
 const WORKSPACE_DISCOVERY_ROOTS: readonly WorkspaceDiscoveryRoot[] = [
-  { relative: 'skills', source: 'project', precedence: 0, maxDepth: 3 },
-  { relative: '.agents/skills', source: 'agents', precedence: 10, maxDepth: 5 },
-  { relative: '.claude/skills', source: 'claude', precedence: 20, maxDepth: 7 }
+  { relative: '.coding-tools-mcp/skills', source: 'coding-mcp', precedence: 0, maxDepth: 5 },
+  { relative: 'skills', source: 'project', precedence: 10, maxDepth: 3 }
 ];
 const USER_DISCOVERY_ROOTS: readonly UserDiscoveryRoot[] = [
-  { relative: '.agents/skills', displayPrefix: '~/.agents/skills', source: 'codex-user', precedence: 100, maxDepth: 5 },
-  { relative: '.claude/skills', displayPrefix: '~/.claude/skills', source: 'claude-user', precedence: 110, maxDepth: 7 }
+  { relative: '.coding-tools-mcp/skills', displayPrefix: '~/.coding-tools-mcp/skills', source: 'coding-mcp-user', precedence: 100, maxDepth: 5 }
 ];
 
 function posixRelative(root: string, candidate: string): string {

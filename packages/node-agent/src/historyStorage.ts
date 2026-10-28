@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile
 } from 'node:fs/promises';
+import { hostname } from 'node:os';
 import path from 'node:path';
 import {
   emptyHistoryIndex, HistoryError, latestHistoryNumber,
@@ -14,8 +15,8 @@ export const DEFAULT_HISTORY_DIR = 'docs/history-session';
 export const HISTORY_INDEX_FILE = 'index.json';
 export const HISTORY_RETRIEVAL_INDEX_FILE = 'retrieval-index.json';
 export const HISTORY_LOCK_DIR = '.history.lock.d';
-export const HISTORY_LOCK_TIMEOUT_MS = 5_000;
-export const HISTORY_LOCK_RETRY_MS = 10;
+export const HISTORY_LOCK_TIMEOUT_MS = 15_000;
+export const HISTORY_LOCK_RETRY_MS = 25;
 export const HISTORY_LOCK_STALE_MS = 30_000;
 
 const HISTORY_LOCK_OWNER_FILE = 'owner.json';
@@ -271,10 +272,36 @@ interface HistoryLockOptions {
   staleMs?: number;
 }
 
+function ownerProcessIsAlive(pid: number): boolean | undefined {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // A permission error is not evidence that an owner has exited.
+    return errorCode(error) === 'ESRCH' ? false : undefined;
+  }
+}
+
 async function lockIsStale(lockDir: string, staleMs: number): Promise<boolean> {
   try {
     const info = await stat(lockDir);
-    return Date.now() - info.mtimeMs >= staleMs;
+    const ageMs = Date.now() - info.mtimeMs;
+    if (ageMs < staleMs) return false;
+    let owner: { pid?: unknown; hostname?: unknown };
+    try {
+      owner = JSON.parse(await readFile(path.join(lockDir, HISTORY_LOCK_OWNER_FILE), 'utf8'));
+    } catch {
+      // The creating writer may not have published owner.json yet.
+      return ageMs >= 2 * staleMs;
+    }
+    if (!Number.isSafeInteger(owner?.pid) || Number(owner.pid) <= 0 || Number(owner.pid) > 0x7fffffff) {
+      return ageMs >= 2 * staleMs;
+    }
+    if (typeof owner.hostname === 'string' && owner.hostname.toLowerCase() !== hostname().toLowerCase()) {
+      // A PID on a remote machine is not comparable to a local PID.
+      return false;
+    }
+    return ownerProcessIsAlive(Number(owner.pid)) === false;
   } catch (error) {
     return errorCode(error) === 'ENOENT';
   }
@@ -303,7 +330,7 @@ export async function acquireHistoryLock(historyDir: string, options: HistoryLoc
       await mkdir(lockDir);
       try {
         await writeFile(path.join(lockDir, HISTORY_LOCK_OWNER_FILE), JSON.stringify({
-          version: 1, token, pid: process.pid, created_at_ms: Date.now()
+          version: 1, token, pid: process.pid, hostname: hostname().toLowerCase(), created_at_ms: Date.now()
         }), { flag: 'wx', mode: 0o600 });
       } catch (error) {
         await rm(lockDir, { recursive: true, force: true }).catch(() => undefined);

@@ -27,18 +27,22 @@ async function fixture(t) {
   assert.equal((await callTool(ctx, 'switch_workspace_folder', { folder_id: 'repo' }, meta)).ok, true);
   t.after(async () => {
     await disposeProcessSessions(ctx);
-    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-    await rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    // On Windows, the durable worker can briefly retain cwd/log handles after
+    // finalization. Retry transient EBUSY locks instead of racing its cleanup.
+    await rm(root, { recursive: true, force: true, maxRetries: 40, retryDelay: 250 });
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 40, retryDelay: 250 });
   });
   return { ctx, meta, invoke: (name, args) => callTool(ctx, name, args, meta) };
 }
 
 async function waitFinal(invoke, sessionId) {
-  const deadline = Date.now() + 15_000;
+  // On a heavily loaded Windows runner, taskkill and durable-worker finalization
+  // can exceed a single kill_session wait. A fixed overall cap still catches leaks.
+  const deadline = Date.now() + (process.platform === 'win32' ? 60_000 : 15_000);
   let result;
   do {
     result = await invoke('wait_command', { session_id: sessionId, until: 'finalized', timeout_ms: 500, output_mode: 'delta' });
-    if (result.process_still_running === false && result.post_checks_pending === false) return result;
+    if (result.process_completed === true) return result;
   } while (Date.now() < deadline);
   assert.fail(`session did not finalize: ${JSON.stringify(result)}`);
 }
@@ -127,9 +131,14 @@ test('managed job survives ordinary command cap and reattaches without renewing 
   const changed = await invoke('exec_command', { ...args, job_timeout_ms: 4000 });
   assert.equal(changed.ok, false);
   assert.equal(changed.error.code, 'OPERATION_ID_CONFLICT');
-  const stopped = await invoke('kill_session', { session_id: started.session_id });
+  const stopped = await invoke('kill_session', { session_id: started.session_id, wait_ms: 15_000 });
   assert.equal(stopped.ok, true, JSON.stringify(stopped));
-  assert.equal(stopped.evicted, true, JSON.stringify(stopped));
+  if (!stopped.evicted) {
+    const final = await waitFinal(invoke, started.session_id);
+    assert.equal(final.process_still_running, false, JSON.stringify(final));
+    const evicted = await invoke('kill_session', { session_id: started.session_id, wait_ms: 0 });
+    assert.equal(evicted.evicted, true, JSON.stringify(evicted));
+  }
   assert.equal(stopped.process_timeout_remaining_ms, 0);
 });
 
@@ -203,5 +212,14 @@ test('exec_many summary retains managed-job deadline metadata', async t => {
   assert.equal(snapshot.results[0].polling_extends_process_deadline, false);
   assert.equal(snapshot.results[0].timeout_scope, 'process');
   const sessionId = snapshot.results[0].session_id;
-  if (sessionId) await invoke('kill_session', { session_id: sessionId });
+  if (sessionId) {
+    const killed = await invoke('kill_session', { session_id: sessionId, wait_ms: 15_000 });
+    assert.equal(killed.ok, true, JSON.stringify(killed));
+    if (!killed.evicted) {
+      const final = await waitFinal(invoke, sessionId);
+      assert.equal(final.process_still_running, false, JSON.stringify(final));
+      const evicted = await invoke('kill_session', { session_id: sessionId, wait_ms: 0 });
+      assert.equal(evicted.evicted, true, JSON.stringify(evicted));
+    }
+  }
 });

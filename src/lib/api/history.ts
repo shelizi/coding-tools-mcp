@@ -14,8 +14,20 @@ export interface HistorySessionSummary {
   lastActivityAtMs: number | null;
   activeRequestCount: number;
   lastActivityOutcome: string | null;
+  /** SHA-256 of persisted history, independent of tool activity status. */
+  revision?: string;
+  recentActions?: HistoryRecentToolAction[];
   summary: string;
   checkpointCount: number;
+}
+
+export interface HistoryRecentToolAction {
+  sequence: number;
+  tool: string;
+  action: string;
+  startedAtMs: number;
+  updatedAtMs: number;
+  status: string;
 }
 
 export interface HistoryRecord {
@@ -46,11 +58,37 @@ export interface HistorySessionDetail extends HistorySessionSummary {
   content: string;
 }
 
+export interface HistoryBackgroundJob {
+  id: string;
+  tool: string;
+  action: string;
+  status: "running" | "verifying";
+  startedAtMs: number;
+  elapsedMs: number;
+}
+
+export interface HistoryBackgroundJobsResult {
+  jobs: HistoryBackgroundJob[];
+  recentActions?: HistoryRecentToolAction[];
+  capturedAtMs: number;
+}
+
+export interface HistoryBackgroundLog {
+  jobId: string;
+  status: string;
+  stdout: string;
+  stderr: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  capturedAtMs: number;
+}
+
 export async function listHistorySessions(
   workspaceId: string,
   folderId?: string,
+  signal?: AbortSignal,
 ): Promise<HistorySessionsResult> {
-  return getBackend().history.list(workspaceId, folderId);
+  return getBackend().history.list(workspaceId, folderId, signal);
 }
 
 export async function readHistorySession(
@@ -59,4 +97,21 @@ export async function readHistorySession(
   folderId?: string,
 ): Promise<HistorySessionDetail> {
   return getBackend().history.read(workspaceId, number, folderId);
+}
+
+export async function listHistoryBackgroundJobs(
+  workspaceId: string,
+  number: number,
+  folderId: string,
+): Promise<HistoryBackgroundJobsResult> {
+  return getBackend().history.listBackgroundJobs(workspaceId, number, folderId);
+}
+
+export async function readHistoryBackgroundLog(
+  workspaceId: string,
+  number: number,
+  folderId: string,
+  jobId: string,
+): Promise<HistoryBackgroundLog> {
+  return getBackend().history.readBackgroundLog(workspaceId, number, folderId, jobId);
 }

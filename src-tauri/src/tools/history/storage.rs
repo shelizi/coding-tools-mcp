@@ -16,8 +16,8 @@ pub const DEFAULT_HISTORY_DIR: &str = "docs/history-session";
 
 const HISTORY_LOCK_DIR: &str = ".history.lock.d";
 const HISTORY_LOCK_OWNER_FILE: &str = "owner.json";
-const HISTORY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-const HISTORY_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const HISTORY_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
+const HISTORY_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const HISTORY_LOCK_STALE_AFTER: Duration = Duration::from_secs(30);
 const MAX_INDEX_SUMMARY_CHARS: usize = 3_000;
 const MAX_SUMMARY_PREFIX_BYTES: u64 = 256 * 1024;
@@ -127,6 +127,14 @@ pub fn ensure_directory(path: &Path) -> WorkspaceResult<()> {
 }
 
 pub fn lock_directory(path: &Path) -> WorkspaceResult<HistoryLock> {
+    lock_directory_with_limits(path, HISTORY_LOCK_TIMEOUT, HISTORY_LOCK_STALE_AFTER)
+}
+
+fn lock_directory_with_limits(
+    path: &Path,
+    timeout: Duration,
+    stale_after: Duration,
+) -> WorkspaceResult<HistoryLock> {
     ensure_directory(path)?;
     let lock_path = path.join(HISTORY_LOCK_DIR);
     let token = uuid::Uuid::new_v4().to_string();
@@ -142,6 +150,7 @@ pub fn lock_directory(path: &Path) -> WorkspaceResult<HistoryLock> {
                     "version": 1,
                     "token": token,
                     "pid": std::process::id(),
+                    "hostname": local_hostname(),
                     "created_at_ms": created_at_ms
                 });
                 if let Err(error) = fs::write(
@@ -158,11 +167,11 @@ pub fn lock_directory(path: &Path) -> WorkspaceResult<HistoryLock> {
                 });
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if lock_directory_is_stale(&lock_path) {
+                if lock_directory_is_stale(&lock_path, stale_after) {
                     let _ = fs::remove_dir_all(&lock_path);
                     continue;
                 }
-                if started.elapsed() >= HISTORY_LOCK_TIMEOUT {
+                if started.elapsed() >= timeout {
                     return Err(WorkspaceError::ToolDetails {
                         code: "HISTORY_LOCK_TIMEOUT",
                         message: "Timed out waiting for the history archive lock.".into(),
@@ -170,7 +179,7 @@ pub fn lock_directory(path: &Path) -> WorkspaceResult<HistoryLock> {
                         retryable: true,
                         details: serde_json::json!({
                             "history_lock_wait_ms": started.elapsed().as_millis(),
-                            "timeout_ms": HISTORY_LOCK_TIMEOUT.as_millis(),
+                            "timeout_ms": timeout.as_millis(),
                             "suggestion": "Retry after the current history write completes"
                         }),
                     });
@@ -182,11 +191,156 @@ pub fn lock_directory(path: &Path) -> WorkspaceResult<HistoryLock> {
     }
 }
 
-fn lock_directory_is_stale(path: &Path) -> bool {
-    fs::metadata(path)
+fn local_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
+/// The directory mtime alone is not a lease. A long-running active writer may
+/// hold the lock well beyond the stale threshold, especially on synced disks.
+fn lock_directory_is_stale(path: &Path, stale_after: Duration) -> bool {
+    let age = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .and_then(|modified| modified.elapsed().map_err(io::Error::other))
-        .is_ok_and(|elapsed| elapsed >= HISTORY_LOCK_STALE_AFTER)
+        .ok();
+    let Some(age) = age else { return false };
+    if age < stale_after {
+        return false;
+    }
+    let owner = fs::read_to_string(path.join(HISTORY_LOCK_OWNER_FILE))
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
+    let Some(owner) = owner else {
+        // Allow time for a concurrent creator to write its owner file.
+        return age >= stale_after.saturating_mul(2);
+    };
+    let Some(pid) = owner.get("pid").and_then(serde_json::Value::as_u64) else {
+        return age >= stale_after.saturating_mul(2);
+    };
+    if pid == 0 || pid > u32::MAX as u64 {
+        return age >= stale_after.saturating_mul(2);
+    }
+    if let Some(host) = owner.get("hostname").and_then(serde_json::Value::as_str) {
+        if local_hostname().as_deref() != Some(host.to_ascii_lowercase().as_str()) {
+            // An owner on a different host cannot be probed by local PID.
+            return false;
+        }
+    }
+    matches!(process_is_alive(pid as u32), Some(false))
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> Option<bool> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => {
+            let mut exit_code = 0;
+            let checked = unsafe { GetExitCodeProcess(handle, &mut exit_code) }.is_ok();
+            let _ = unsafe { CloseHandle(handle) };
+            checked.then_some(exit_code == 259) // STILL_ACTIVE
+        }
+        // HRESULT_FROM_WIN32(ERROR_INVALID_PARAMETER): no such process.
+        Err(error) if error.code().0 == 0x8007_0057_u32 as i32 => Some(false),
+        Err(_) => None, // Access denied or transient probe error: do not steal.
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> Option<bool> {
+    if pid > i32::MAX as u32 {
+        return None;
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return Some(true);
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Some(false),
+        _ => None, // EPERM is an alive but inaccessible process.
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn live_owner_is_never_stolen_even_if_the_directory_is_old() {
+        let directory = tempfile::tempdir().expect("history tempdir");
+        let first = lock_directory_with_limits(
+            directory.path(),
+            Duration::from_millis(200),
+            Duration::ZERO,
+        )
+        .expect("acquire first lock");
+        let second =
+            lock_directory_with_limits(directory.path(), Duration::from_millis(70), Duration::ZERO);
+        assert!(matches!(
+            second,
+            Err(WorkspaceError::ToolDetails {
+                code: "HISTORY_LOCK_TIMEOUT",
+                ..
+            })
+        ));
+        drop(first);
+        let third = lock_directory_with_limits(
+            directory.path(),
+            Duration::from_millis(200),
+            Duration::ZERO,
+        )
+        .expect("reacquire after release");
+        drop(third);
+    }
+
+    #[test]
+    fn stale_lock_with_a_dead_owner_is_reclaimed() {
+        let directory = tempfile::tempdir().expect("history tempdir");
+        let lock_dir = directory.path().join(HISTORY_LOCK_DIR);
+        fs::create_dir(&lock_dir).expect("create orphan lock");
+        fs::write(
+            lock_dir.join(HISTORY_LOCK_OWNER_FILE),
+            serde_json::json!({"version": 1, "token": "orphan", "pid": 99999999u32}).to_string(),
+        )
+        .expect("write orphan owner");
+        thread::sleep(Duration::from_millis(15));
+        let recovered = lock_directory_with_limits(
+            directory.path(),
+            Duration::from_millis(200),
+            Duration::ZERO,
+        )
+        .expect("recover dead owner");
+        drop(recovered);
+        assert!(!lock_dir.exists());
+    }
+
+    #[test]
+    fn foreign_host_owner_is_not_reaped_by_local_pid_lookup() {
+        let directory = tempfile::tempdir().expect("history tempdir");
+        let lock_dir = directory.path().join(HISTORY_LOCK_DIR);
+        fs::create_dir(&lock_dir).expect("create lock");
+        fs::write(
+            lock_dir.join(HISTORY_LOCK_OWNER_FILE),
+            serde_json::json!({"version": 1, "token": "remote", "pid": 99999999u32, "hostname": "remote-host.example.invalid"}).to_string(),
+        )
+        .expect("write remote owner");
+        thread::sleep(Duration::from_millis(15));
+        let attempt =
+            lock_directory_with_limits(directory.path(), Duration::from_millis(70), Duration::ZERO);
+        assert!(matches!(
+            attempt,
+            Err(WorkspaceError::ToolDetails {
+                code: "HISTORY_LOCK_TIMEOUT",
+                ..
+            })
+        ));
+        assert!(lock_dir.exists());
+    }
 }
 
 fn indexed_document_path(

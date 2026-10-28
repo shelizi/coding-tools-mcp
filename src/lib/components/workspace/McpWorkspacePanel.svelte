@@ -1,6 +1,7 @@
 <script lang="ts">
   import AuthConfigForm, { type SaveAuthOptions } from "$lib/components/AuthConfigForm.svelte";
   import GptQuickCopy from "$lib/components/GptQuickCopy.svelte";
+  import SessionExpiryPanel from "$lib/components/SessionExpiryPanel.svelte";
   import HealthPanel from "$lib/components/HealthPanel.svelte";
   import LogViewer from "$lib/components/LogViewer.svelte";
   import RuntimePolicyForm, { type RuntimePolicyDraft } from "$lib/components/RuntimePolicyForm.svelte";
@@ -137,6 +138,7 @@
       </div>
     </section>
   {:else if section === "auth"}
+    <SessionExpiryPanel {workspaceId} />
     <section class="tx-card p-5">
       <p class="tx-section-label">{$t("MCP authentication")}</p>
       <div class="mt-3">

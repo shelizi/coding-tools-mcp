@@ -1,5 +1,7 @@
+mod auto_activity;
 mod markdown;
 mod model;
+mod persisted_activity;
 mod storage;
 mod ui;
 
@@ -14,7 +16,8 @@ use crate::tools::workspace::{tool_ok, WorkspaceError, WorkspaceResult};
 
 use self::model::{HistoryDocument, IndexEntry};
 
-pub use ui::{list_for_ui, read_for_ui};
+pub(crate) use auto_activity::{persist as persist_auto_activity, AutoActivityEvent};
+pub use ui::{list_for_ui, read_for_ui, session_key_for_ui};
 
 const HISTORY_SUMMARY_WINDOW: usize = 5;
 const HISTORY_NUMBER_WINDOW: usize = 256;
@@ -429,7 +432,7 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
         "loaded_history_bytes": loaded_history_bytes,
         "full_history_included": false,
         "history_digest": format!("{:x}", digest.finalize()),
-        "persistence_mode": "model_mediated_tool_calls",
+        "persistence_mode": "semantic_checkpoints_plus_observed_tool_activity",
         "assistant_instructions": assistant_instructions,
         "required_next_actions": [
             "read_recent_history_summary",
@@ -446,7 +449,11 @@ pub fn bootstrap(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             "stable_target_required": true,
             "required_before_final_response": true,
             "applies_after_bootstrap": true,
-            "automatic_background_persistence": false
+            "automatic_background_persistence": true,
+            "automatic_activity_persistence": true,
+            "automatic_activity_flush_ms": 5000,
+            "automatic_activity_retained_entries": 48,
+            "semantic_checkpoint_requires_tool_call": true
         },
         "warnings": warnings
     });
@@ -567,7 +574,7 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
             .clone()
             .unwrap_or_else(|| timestamp.clone());
         let inherited_summary = markdown::inherited_summary(&document.content);
-        markdown::attach_inherited_summary(
+        let rendered = markdown::attach_inherited_summary(
             markdown::render_document(
                 document.number,
                 &markdown::document_title(&document.content, document.number),
@@ -578,7 +585,9 @@ pub fn checkpoint(ctx: &ToolContext, args: &Value) -> WorkspaceResult<Value> {
                 &records,
             ),
             inherited_summary.as_deref().unwrap_or_default(),
-        )
+        );
+        auto_activity::preserve(rendered, &document.content)
+            .map_err(WorkspaceError::invalid_argument)?
     };
     if !duplicate_ignored {
         storage::write_markdown(

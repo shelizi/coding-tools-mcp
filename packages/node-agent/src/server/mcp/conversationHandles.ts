@@ -37,6 +37,16 @@ export class ConversationHandleStore {
 
   constructor(private readonly forget: (key: string) => void = () => {}) {}
 
+  /** Return only expiry times for the local management UI, never tokens or owners. */
+  expiryTimes(now = Date.now()): number[] {
+    for (const [id, entry] of this.entries) {
+      if (entry.expiresAt > now) continue;
+      this.entries.delete(id);
+      if (!entry.native) this.forget(entry.key);
+    }
+    return [...this.entries.values()].map(entry => entry.expiresAt).sort((a, b) => a - b);
+  }
+
   prepare(owner: string | undefined, request: JsonObject, now = Date.now()): HandleResponse | undefined {
     const params = object(request.params);
     const originalMeta = object(params._meta);
@@ -104,6 +114,10 @@ export class ConversationHandleStore {
 
 const stores = new WeakMap<ToolContext, ConversationHandleStore>();
 
+export function conversationHandleExpiryTimes(ctx: ToolContext, now = Date.now()): number[] {
+  return stores.get(ctx)?.expiryTimes(now) ?? [];
+}
+
 /** Call only after HTTP verification. Never obtain `credential` from JSON. */
 export function prepareConversationHandle(ctx: ToolContext, credential: string | undefined, request: JsonObject): HandleResponse | undefined {
   let store = stores.get(ctx);
@@ -135,5 +149,23 @@ export function decorateHandleResult(result: unknown, grant: HandleResponse | un
   // Some clients consume only one text block and ignore structuredContent.
   // Keep the complete payload in that block, preserving images/resources.
   output.content = [{ type: 'text', text: JSON.stringify(payload) }, ...content.filter(block => object(block).type !== 'text')];
+  return output;
+}
+
+/** Attach verified caller's OAuth expiry to a session_status result, without the credential. */
+export function decorateSessionStatus(result: unknown, expiresAtMs: number | null): unknown {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+  const output = result as JsonObject;
+  const structured = output.structuredContent;
+  if (!structured || typeof structured !== 'object' || Array.isArray(structured)) return result;
+  if ((structured as JsonObject).ok === false) return result;
+  const payload = { ...(structured as JsonObject), oauth_token_expires_at_ms: expiresAtMs };
+  output.structuredContent = payload;
+  if (Array.isArray(output.content)) {
+    output.content = [
+      { type: 'text', text: JSON.stringify(payload) },
+      ...output.content.filter(block => object(block).type !== 'text')
+    ];
+  }
   return output;
 }

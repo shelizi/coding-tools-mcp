@@ -149,6 +149,21 @@ impl ExecSession {
         self.finalized.load(Ordering::Acquire)
     }
 
+    /// Wall-clock completion timestamp derived from the monotonic elapsed time;
+    /// used by the history viewer to preserve accurate "recently active" state
+    /// after a background process finishes while the UI was not polling.
+    pub(crate) fn completed_at_ms(&self) -> Option<u64> {
+        let finished = self.finalized_at()?;
+        Some(
+            self.started_ts_ms.saturating_add(
+                finished
+                    .saturating_duration_since(self.started_at)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            ),
+        )
+    }
+
     fn finalized_at(&self) -> Option<Instant> {
         *self.finalized_at.lock().expect("finalized_at lock")
     }

@@ -171,6 +171,48 @@ export const rustCatalog: readonly ToolDefinition[] = [
       "idempotentHint": true,
       "openWorldHint": false,
       "readOnlyHint": true,
+      "title": "Session expiry status"
+    },
+    "description": "Return expiry details for the authenticated current MCP request; include OAuth and conversation-handle expiry when available without revealing credentials or other clients.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "session_status",
+    "title": "Session expiry status"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
       "title": "List tool hub folders"
     },
     "description": "List folders configured in this tool hub and show the selected or default routing context.",
@@ -206,6 +248,60 @@ export const rustCatalog: readonly ToolDefinition[] = [
     },
     "name": "list_workspace_folders",
     "title": "List tool hub folders"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "List active workspace access"
+    },
+    "description": "List MCP workspaces and linked Git worktrees with activity in the last 3 minutes (active) or 5 minutes (recent). Shows counts and last access without exposing conversation IDs. Runtime-local and not a heartbeat or lock.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "active_within_minutes": {
+          "default": 3,
+          "maximum": 60,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
+        "recent_within_minutes": {
+          "default": 5,
+          "maximum": 60,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "recovery_action_id": {
+          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "recovery_of_operation_id": {
+          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "retry_of_call_sequence": {
+          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_active_workspaces",
+    "title": "List active workspace access"
   },
   {
     "annotations": {
@@ -5035,9 +5131,9 @@ export const rustCatalog: readonly ToolDefinition[] = [
   {
     "annotations": {
       "destructiveHint": false,
-      "idempotentHint": false,
+      "idempotentHint": true,
       "openWorldHint": false,
-      "readOnlyHint": false,
+      "readOnlyHint": true,
       "title": "List desktop displays"
     },
     "description": "List physical desktop displays with local sizes and global virtual-desktop origins.",
@@ -5077,12 +5173,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
   {
     "annotations": {
       "destructiveHint": false,
-      "idempotentHint": false,
+      "idempotentHint": true,
       "openWorldHint": false,
-      "readOnlyHint": false,
+      "readOnlyHint": true,
       "title": "Capture desktop display"
     },
-    "description": "Capture one display at native pixel dimensions with JPEG quality compression and no resizing.",
+    "description": "Capture a display as JPEG, optionally resize it and return coordinates for safe image-pixel input.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -5095,6 +5191,18 @@ export const rustCatalog: readonly ToolDefinition[] = [
         },
         "display_id": {
           "minimum": 0,
+          "type": "integer"
+        },
+        "max_height": {
+          "description": "Optional JPEG height cap, preserving aspect ratio and never enlarging.",
+          "maximum": 16384,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_width": {
+          "description": "Optional JPEG width cap, preserving aspect ratio and never enlarging.",
+          "maximum": 16384,
+          "minimum": 1,
           "type": "integer"
         },
         "output": {
@@ -5140,310 +5248,325 @@ export const rustCatalog: readonly ToolDefinition[] = [
       "idempotentHint": false,
       "openWorldHint": false,
       "readOnlyHint": false,
-      "title": "Click desktop"
+      "title": "Execute desktop input sequence"
     },
-    "description": "Move to display-local physical pixel coordinates and click a mouse button.",
+    "description": "Execute 1-64 keyboard and mouse actions in one call: click, drag/path, scroll, type, key chord, key_down/up, mouse_down/up, move and wait. Modifier keys may be held during clicks/drag and are released on completion/error. Pass screenshot coordinate_reference for safe image coordinates.",
     "inputSchema": {
       "additionalProperties": false,
+      "description": "Execute all actions in order, in one input session. Use key_down then click/drag/move and key_up for multi-selection; modifiers on click/drag/scroll are temporarily held. All pressed inputs are released in finally, including on error. Coordinates are physical pixels unless paired with desktop_screenshot.coordinate_reference. For cross-display image drag provide the target reference or per-waypoint reference.",
       "properties": {
-        "button": {
-          "default": "left",
-          "enum": [
-            "left",
-            "right",
-            "middle"
-          ],
-          "type": "string"
-        },
-        "clicks": {
-          "default": 1,
-          "maximum": 3,
-          "minimum": 1,
-          "type": "integer"
-        },
-        "conversation_handle": {
-          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
-          "maxLength": 67,
-          "minLength": 67,
-          "pattern": "^ch_[a-f0-9]{64}$",
-          "type": "string"
-        },
-        "display_id": {
-          "minimum": 0,
-          "type": "integer"
-        },
-        "recovery_action_id": {
-          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": "string"
-        },
-        "recovery_of_operation_id": {
-          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": "string"
-        },
-        "retry_of_call_sequence": {
-          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
-          "minimum": 1,
-          "type": "integer"
-        },
-        "x": {
-          "minimum": 0,
-          "type": "integer"
-        },
-        "y": {
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "x",
-        "y"
-      ],
-      "type": "object"
-    },
-    "name": "desktop_click",
-    "title": "Click desktop"
-  },
-  {
-    "annotations": {
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": false,
-      "readOnlyHint": false,
-      "title": "Drag desktop"
-    },
-    "description": "Hold a mouse button and drag between display-local physical pixel coordinates, including across displays.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "button": {
-          "default": "left",
-          "enum": [
-            "left",
-            "right",
-            "middle"
-          ],
-          "type": "string"
-        },
-        "conversation_handle": {
-          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
-          "maxLength": 67,
-          "minLength": 67,
-          "pattern": "^ch_[a-f0-9]{64}$",
-          "type": "string"
-        },
-        "display_id": {
-          "minimum": 0,
-          "type": "integer"
-        },
-        "duration_ms": {
-          "default": 300,
-          "maximum": 5000,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "recovery_action_id": {
-          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": "string"
-        },
-        "recovery_of_operation_id": {
-          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": "string"
-        },
-        "retry_of_call_sequence": {
-          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
-          "minimum": 1,
-          "type": "integer"
-        },
-        "steps": {
-          "default": 12,
-          "maximum": 120,
-          "minimum": 1,
-          "type": "integer"
-        },
-        "to_display_id": {
-          "minimum": 0,
-          "type": "integer"
-        },
-        "to_x": {
-          "minimum": 0,
-          "type": "integer"
-        },
-        "to_y": {
-          "minimum": 0,
-          "type": "integer"
-        },
-        "x": {
-          "minimum": 0,
-          "type": "integer"
-        },
-        "y": {
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "x",
-        "y",
-        "to_x",
-        "to_y"
-      ],
-      "type": "object"
-    },
-    "name": "desktop_drag",
-    "title": "Drag desktop"
-  },
-  {
-    "annotations": {
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": false,
-      "readOnlyHint": false,
-      "title": "Scroll desktop"
-    },
-    "description": "Scroll the desktop, optionally at display-local physical pixel coordinates.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "conversation_handle": {
-          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
-          "maxLength": 67,
-          "minLength": 67,
-          "pattern": "^ch_[a-f0-9]{64}$",
-          "type": "string"
-        },
-        "delta_x": {
-          "default": 0,
-          "maximum": 12000,
-          "minimum": -12000,
-          "type": "integer"
-        },
-        "delta_y": {
-          "maximum": 12000,
-          "minimum": -12000,
-          "type": "integer"
-        },
-        "display_id": {
-          "minimum": 0,
-          "type": "integer"
-        },
-        "recovery_action_id": {
-          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": "string"
-        },
-        "recovery_of_operation_id": {
-          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": "string"
-        },
-        "retry_of_call_sequence": {
-          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
-          "minimum": 1,
-          "type": "integer"
-        },
-        "x": {
-          "minimum": 0,
-          "type": "integer"
-        },
-        "y": {
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "delta_y"
-      ],
-      "type": "object"
-    },
-    "name": "desktop_scroll",
-    "title": "Scroll desktop"
-  },
-  {
-    "annotations": {
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": false,
-      "readOnlyHint": false,
-      "title": "Type desktop text"
-    },
-    "description": "Type Unicode text into the currently focused desktop application.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "conversation_handle": {
-          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
-          "maxLength": 67,
-          "minLength": 67,
-          "pattern": "^ch_[a-f0-9]{64}$",
-          "type": "string"
-        },
-        "recovery_action_id": {
-          "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": "string"
-        },
-        "recovery_of_operation_id": {
-          "description": "Optional recovery-chain correlation to a prior operation_id. The runtime hashes this identifier in telemetry and removes it before tool execution.",
-          "maxLength": 128,
-          "minLength": 1,
-          "type": "string"
-        },
-        "retry_of_call_sequence": {
-          "description": "Optional telemetry correlation to the failed tool call_sequence being retried. Removed before tool execution and does not change tool semantics or dedupe identity.",
-          "minimum": 1,
-          "type": "integer"
-        },
-        "text": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "text"
-      ],
-      "type": "object"
-    },
-    "name": "desktop_type",
-    "title": "Type desktop text"
-  },
-  {
-    "annotations": {
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": false,
-      "readOnlyHint": false,
-      "title": "Press desktop keys"
-    },
-    "description": "Press a key or hotkey chord in the currently focused desktop application.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "properties": {
-        "conversation_handle": {
-          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
-          "maxLength": 67,
-          "minLength": 67,
-          "pattern": "^ch_[a-f0-9]{64}$",
-          "type": "string"
-        },
-        "keys": {
+        "actions": {
+          "description": "A single atomic-like validated sequence. All actions validated before any OS input is sent. Max total wait/drag duration is 20000ms. On bridge errors held keys/buttons are released.",
           "items": {
-            "minLength": 1,
-            "type": "string"
+            "additionalProperties": false,
+            "properties": {
+              "button": {
+                "default": "left",
+                "enum": [
+                  "left",
+                  "right",
+                  "middle"
+                ],
+                "type": "string"
+              },
+              "clicks": {
+                "default": 1,
+                "maximum": 3,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "coordinate_reference": {
+                "additionalProperties": false,
+                "description": "Pass desktop_screenshot.coordinate_reference unchanged. When present x/y use JPEG image pixels and the current display bounds must still match; otherwise x/y are physical display pixels.",
+                "properties": {
+                  "height": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "id": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "image_height": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "image_width": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "name": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "width": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "x": {
+                    "type": "integer"
+                  },
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id",
+                  "name",
+                  "x",
+                  "y",
+                  "width",
+                  "height",
+                  "image_width",
+                  "image_height"
+                ],
+                "type": "object"
+              },
+              "delta_x": {
+                "maximum": 12000,
+                "minimum": -12000,
+                "type": "integer"
+              },
+              "delta_y": {
+                "maximum": 12000,
+                "minimum": -12000,
+                "type": "integer"
+              },
+              "display_id": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "duration_ms": {
+                "maximum": 5000,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "keys": {
+                "description": "Keys for key, key_down or key_up. A key chord presses all keys then releases them in reverse order.",
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 8,
+                "minItems": 1,
+                "type": "array"
+              },
+              "modifiers": {
+                "description": "Temporarily hold modifier keys during click, drag or scroll, e.g. [\"CTRL\",\"SHIFT\"].",
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "maxItems": 8,
+                "minItems": 1,
+                "type": "array"
+              },
+              "path": {
+                "description": "Optional drag waypoints; do not combine with to_x/to_y. Each waypoint can target another display with its own screenshot reference.",
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "coordinate_reference": {
+                      "additionalProperties": false,
+                      "description": "Pass desktop_screenshot.coordinate_reference unchanged. When present x/y use JPEG image pixels and the current display bounds must still match; otherwise x/y are physical display pixels.",
+                      "properties": {
+                        "height": {
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "id": {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "image_height": {
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "image_width": {
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "name": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "width": {
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "x": {
+                          "type": "integer"
+                        },
+                        "y": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "name",
+                        "x",
+                        "y",
+                        "width",
+                        "height",
+                        "image_width",
+                        "image_height"
+                      ],
+                      "type": "object"
+                    },
+                    "display_id": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "x": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "y": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 32,
+                "minItems": 1,
+                "type": "array"
+              },
+              "steps": {
+                "maximum": 120,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "text": {
+                "maxLength": 16384,
+                "type": "string"
+              },
+              "to_coordinate_reference": {
+                "additionalProperties": false,
+                "description": "Pass desktop_screenshot.coordinate_reference unchanged. When present x/y use JPEG image pixels and the current display bounds must still match; otherwise x/y are physical display pixels.",
+                "properties": {
+                  "height": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "id": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "image_height": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "image_width": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "name": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "width": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "x": {
+                    "type": "integer"
+                  },
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id",
+                  "name",
+                  "x",
+                  "y",
+                  "width",
+                  "height",
+                  "image_width",
+                  "image_height"
+                ],
+                "type": "object"
+              },
+              "to_display_id": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "to_x": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "to_y": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "click",
+                  "drag",
+                  "scroll",
+                  "type",
+                  "key",
+                  "key_down",
+                  "key_up",
+                  "mouse_down",
+                  "mouse_up",
+                  "move",
+                  "wait"
+                ],
+                "type": "string"
+              },
+              "x": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "y": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
           },
-          "maxItems": 8,
+          "maxItems": 64,
           "minItems": 1,
           "type": "array"
         },
+        "capture_after": {
+          "default": false,
+          "description": "Return a fresh screenshot in this same MCP result after actions complete, avoiding a second MCP call.",
+          "type": "boolean"
+        },
+        "capture_display_id": {
+          "description": "Display to capture after input; defaults to primary.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capture_max_width": {
+          "default": 1280,
+          "maximum": 16384,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "capture_quality": {
+          "default": 75,
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "conversation_handle": {
+          "description": "Server-issued conversation handle returned by conversation_bootstrap. Pass it unchanged on every built-in MCP tool call to reuse folder selection and cwd when platform conversation metadata is absent. Bound to the authenticated credential and native conversation at issuance; expires after 24 hours and on server restart.",
+          "maxLength": 67,
+          "minLength": 67,
+          "pattern": "^ch_[a-f0-9]{64}$",
+          "type": "string"
+        },
         "recovery_action_id": {
           "description": "Optional stable recovery action identifier selected from a previous error response. Removed before tool execution.",
           "maxLength": 128,
@@ -5463,12 +5586,12 @@ export const rustCatalog: readonly ToolDefinition[] = [
         }
       },
       "required": [
-        "keys"
+        "actions"
       ],
       "type": "object"
     },
-    "name": "desktop_key",
-    "title": "Press desktop keys"
+    "name": "desktop_input",
+    "title": "Execute desktop input sequence"
   }
 ];
 export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly string[]>> = {
@@ -5476,7 +5599,9 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "harness_status",
     "operation_log",
     "server_info",
+    "session_status",
     "list_workspace_folders",
+    "list_active_workspaces",
     "conversation_bootstrap",
     "switch_workspace_folder",
     "query_tool_usage",
@@ -5531,14 +5656,12 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "view_image",
     "desktop_displays",
     "desktop_screenshot",
-    "desktop_click",
-    "desktop_drag",
-    "desktop_scroll",
-    "desktop_type",
-    "desktop_key"
+    "desktop_input"
   ],
   "read-only": [
+    "list_active_workspaces",
     "server_info",
+    "session_status",
     "list_workspace_folders",
     "query_tool_usage",
     "history_search",
@@ -5562,7 +5685,9 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "harness_status",
     "operation_log",
     "server_info",
+    "session_status",
     "list_workspace_folders",
+    "list_active_workspaces",
     "conversation_bootstrap",
     "switch_workspace_folder",
     "query_tool_usage",
@@ -5617,14 +5742,12 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "view_image",
     "desktop_displays",
     "desktop_screenshot",
-    "desktop_click",
-    "desktop_drag",
-    "desktop_scroll",
-    "desktop_type",
-    "desktop_key"
+    "desktop_input"
   ],
   "guarded-core": [
+    "list_active_workspaces",
     "server_info",
+    "session_status",
     "list_workspace_folders",
     "conversation_bootstrap",
     "switch_workspace_folder",
@@ -5665,7 +5788,9 @@ export const rustToolNamesByProfile: Readonly<Record<ToolProfile, readonly strin
     "view_image"
   ],
   "trusted-core": [
+    "list_active_workspaces",
     "server_info",
+    "session_status",
     "list_workspace_folders",
     "conversation_bootstrap",
     "switch_workspace_folder",
@@ -5912,65 +6037,23 @@ export const rustToolAnnotationOverridesByProfile: Readonly<Record<ToolProfile, 
       "readOnlyHint": true,
       "title": "Approve and resume operation"
     },
-    "desktop_displays": {
+    "desktop_input": {
       "destructiveHint": false,
       "idempotentHint": true,
       "openWorldHint": false,
       "readOnlyHint": true,
-      "title": "List desktop displays"
-    },
-    "desktop_screenshot": {
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true,
-      "title": "Capture desktop display"
-    },
-    "desktop_click": {
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true,
-      "title": "Click desktop"
-    },
-    "desktop_drag": {
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true,
-      "title": "Drag desktop"
-    },
-    "desktop_scroll": {
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true,
-      "title": "Scroll desktop"
-    },
-    "desktop_type": {
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true,
-      "title": "Type desktop text"
-    },
-    "desktop_key": {
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true,
-      "title": "Press desktop keys"
+      "title": "Execute desktop input sequence"
     }
   },
   "guarded-core": {},
   "trusted-core": {}
 };
 export const rustToolsetRevisionByProfile: Readonly<Record<ToolProfile, string>> = {
-  "advanced": "94c98e4bb05588e6",
-  "read-only": "56b2840c6f288a72",
-  "compat-readonly-all": "dc3a1b5adc9bccf5",
-  "guarded-core": "091819cfd1fc5780",
-  "trusted-core": "ff629990a6125490"
+  "advanced": "40dcd36db38b6a65",
+  "read-only": "8b12bf29e4f67af2",
+  "compat-readonly-all": "f680484a580fc025",
+  "guarded-core": "5f7eb0b8c1a67fb2",
+  "trusted-core": "b253c41ac7de0112"
 };
 export const rustBehavioralParityFixtures: Readonly<Record<string, unknown>> = {
   "execution_limits": {

@@ -3,6 +3,7 @@ param(
     [string]$PackageZip = '',
     [string]$ExpectedVersion = '',
     [string]$DataFile = '',
+    [string]$PublishRoot = '',
     [string]$StagedExe = '',
     [int]$DelaySeconds = 2,
     [int]$HealthTimeoutSeconds = 90,
@@ -279,6 +280,7 @@ if (-not $Worker) {
         '-LogPath', (Quote-CommandLineArg $LogPath),
         '-ResultPath', (Quote-CommandLineArg $ResultPath)
     )
+    if ($PublishRoot) { $args += @('-PublishRoot', (Quote-CommandLineArg $PublishRoot)) }
     $commandLine = 'powershell.exe ' + ($args -join ' ')
     $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $commandLine }
     if ($created.ReturnValue -ne 0) { throw "Failed to start detached Rust handoff worker: $($created.ReturnValue)" }
@@ -338,51 +340,16 @@ try {
         throw "Replacement Rust desktop did not restore all previously enabled services as version $ExpectedVersion."
     }
 
-    # Keep the stable portable entry point current, but only after the new
-    # process is healthy. Directory replacement therefore does not lengthen the
-    # service interruption window or compromise rollback during handoff.
-    $canonicalDir = Join-Path $stableWorkspace 'dist-portable\ctmcp-win64'
-    $canonicalNext = "$canonicalDir.next-$([guid]::NewGuid().ToString('N'))"
-    $canonicalPrevious = "$canonicalDir.previous-$([guid]::NewGuid().ToString('N'))"
-    $canonicalMovedAside = $false
+    # Only publish a verified archive after the new runtime is healthy.
+    $publisher = Join-Path $PSScriptRoot 'promote-portable-release.ps1'
+    $destination = if ($PublishRoot) { $PublishRoot } else { Join-Path $stableWorkspace 'dist-portable' }
+    $exeHash = (Get-FileHash -LiteralPath $StagedExe -Algorithm SHA256).Hash
     try {
-        Copy-Item -LiteralPath (Split-Path -Parent $StagedExe) -Destination $canonicalNext -Recurse
-        if (Test-Path -LiteralPath $canonicalDir) {
-            Move-Item -LiteralPath $canonicalDir -Destination $canonicalPrevious
-            $canonicalMovedAside = $true
-        }
-        try {
-            Move-Item -LiteralPath $canonicalNext -Destination $canonicalDir
-        } catch {
-            if ($canonicalMovedAside -and (Test-Path -LiteralPath $canonicalPrevious) -and -not (Test-Path -LiteralPath $canonicalDir)) {
-                Move-Item -LiteralPath $canonicalPrevious -Destination $canonicalDir
-                $canonicalMovedAside = $false
-            }
-            throw
-        }
-        if ($canonicalMovedAside -and (Test-Path -LiteralPath $canonicalPrevious)) {
-            Remove-Item -LiteralPath $canonicalPrevious -Recurse -Force -ErrorAction SilentlyContinue
-            $canonicalMovedAside = Test-Path -LiteralPath $canonicalPrevious
-        }
-        Write-Log "Canonical portable folder updated: $canonicalDir"
+        $published = & $publisher -Edition 'ctmcp-win64' -Archive $PackageZip -Destination $destination -ExpectedExeHash $exeHash
+        if (-not $published.ok) { throw 'Rust release artifact promotion failed' }
+        Write-Log "Rust artifacts published: $($published.canonical)"
     } catch {
-        if ($canonicalMovedAside -and (Test-Path -LiteralPath $canonicalPrevious) -and -not (Test-Path -LiteralPath $canonicalDir)) {
-            try {
-                Move-Item -LiteralPath $canonicalPrevious -Destination $canonicalDir
-                $canonicalMovedAside = $false
-                Write-Log "Canonical portable folder restored after refresh failure: $canonicalDir"
-            } catch {
-                Write-Log "Warning: canonical portable restore failed; previous folder retained at $canonicalPrevious"
-            }
-        }
-        Write-Log "Warning: replacement is healthy, but canonical portable folder could not be refreshed: $($_.Exception.Message)"
-    } finally {
-        if (Test-Path -LiteralPath $canonicalNext) {
-            Remove-Item -LiteralPath $canonicalNext -Recurse -Force -ErrorAction SilentlyContinue
-        }
-        if (-not $canonicalMovedAside -and (Test-Path -LiteralPath $canonicalPrevious)) {
-            Remove-Item -LiteralPath $canonicalPrevious -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        Write-Log "WARNING: Rust runtime healthy, but release publication failed: $($_.Exception.Message)"
     }
 
     $result.ok = $true

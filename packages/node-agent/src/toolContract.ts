@@ -275,6 +275,9 @@ export function mcpResultSummary(toolName: string, structured: JsonObject): stri
   if (commandsExecuted !== undefined) {
     return truncateUtf8(`${toolName} completed after executing ${commandsExecuted} commands.`);
   }
+  if (toolName === 'desktop_input' && typeof structured.screenshot_error === 'string') {
+    return truncateUtf8(`desktop_input actions succeeded, but automatic screenshot failed: ${structured.screenshot_error}`);
+  }
   const status = stringValue(structured.status);
   if (status) return truncateUtf8(`${toolName} status: ${status}.`);
   return truncateUtf8(toolName ? `${toolName} completed successfully.` : 'Tool call completed successfully.');
@@ -302,6 +305,20 @@ export function wrapMcpToolResult(
   const normalized = normalizeToolResult(structured);
   const isError = normalized.ok === false;
   const suppliedImages = imageContent(normalized.content) ?? topLevelImageContent(normalized);
+  const captured = toolName === 'desktop_input' && args.capture_after === true && !isError &&
+    normalized.screenshot && typeof normalized.screenshot === 'object' && !Array.isArray(normalized.screenshot)
+    ? normalized.screenshot as JsonObject : undefined;
+  const capturedImages = captured ? topLevelImageContent(captured) : undefined;
+  if (capturedImages) {
+    const screenshot = { ...captured };
+    delete screenshot.base64;
+    delete screenshot.data_url;
+    return {
+      content: [{ type: 'text', text: mcpResultSummary(toolName, normalized) }, ...capturedImages],
+      structuredContent: { ...normalized, screenshot },
+      isError: false
+    };
+  }
   const useImage = (toolName === 'view_image' || toolName === 'desktop_screenshot')
     && String(args.output ?? 'mcp_image') === 'mcp_image'
     && !isError

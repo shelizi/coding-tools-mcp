@@ -250,6 +250,16 @@ async fn mcp_post(
         } else {
             None
         };
+    let is_session_status =
+        body.pointer("/params/name").and_then(Value::as_str) == Some("session_status");
+    let caller_token_expiry = if is_session_status {
+        state
+            .oauth
+            .as_ref()
+            .and_then(|oauth| credential.and_then(|raw| oauth.token_expiry_for(raw)))
+    } else {
+        None
+    };
     let mut body = body;
     let handle_response = match super::conversation_handles::prepare(
         &state.conversation_handles,
@@ -302,6 +312,9 @@ async fn mcp_post(
         &argument_value,
         started_ts_ms,
     );
+    if session_activity.is_some() {
+        super::auto_activity::schedule(&state.workspace_id, host_session_key);
+    }
     session_activity::record_workspace_access(&state.workspace_id, started_ts_ms);
     let request_timing =
         (!tool_name.is_empty()).then(|| begin_tool_request(&state.workspace_id, started_ts_ms));
@@ -411,7 +424,7 @@ async fn mcp_post(
     let diagnostic_method_name = method.clone();
     let missing_elicitation_tool = tool_name.clone();
     let execution = async move {
-        let response = execute_rpc(
+        let mut response = execute_rpc(
             RpcExecutionContext {
                 state,
                 method,
@@ -430,6 +443,9 @@ async fn mcp_post(
             fast_path,
         )
         .await;
+        if is_session_status {
+            super::session_expiry::decorate_caller_status(&mut response, caller_token_expiry);
+        }
         match handle_response {
             Some(grant) => grant.decorate(response),
             None => response,
@@ -529,6 +545,20 @@ async fn execute_rpc(mut context: RpcExecutionContext, body: Value, fast_path: b
                 if let Some(activity) = context.session_activity.as_mut() {
                     activity.complete(outcome, context.started_ts_ms.saturating_add(duration_ms));
                 }
+                if context.session_activity.is_some() {
+                    super::auto_activity::schedule(
+                        &profile_id,
+                        context.host_session_key.as_deref(),
+                    );
+                }
+                if outcome == "success" {
+                    session_activity::observe_background_processes(
+                        &profile_id,
+                        context.host_session_key.as_deref(),
+                        &context.tool_name,
+                        &response,
+                    );
+                }
                 record_tool_usage(ToolUsageInput {
                     profile_id: &profile_id,
                     transport_mode: &context.state.transport_mode,
@@ -605,6 +635,12 @@ async fn execute_rpc(mut context: RpcExecutionContext, body: Value, fast_path: b
                     activity.complete(
                         "worker_failed",
                         context.started_ts_ms.saturating_add(duration_ms),
+                    );
+                }
+                if context.session_activity.is_some() {
+                    super::auto_activity::schedule(
+                        &profile_id,
+                        context.host_session_key.as_deref(),
                     );
                 }
                 record_tool_usage(ToolUsageInput {

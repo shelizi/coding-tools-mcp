@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
-import { desktopKeyCode, desktopScrollScript, desktopTypePayload, mapDisplayPoint } from '../dist/desktopTools.js';
+import { desktopKeyCode, desktopScrollScript, desktopTypePayload, mapDisplayPoint, planScreenshotSize } from '../dist/desktopTools.js';
 
 const require = createRequire(import.meta.url);
 
@@ -38,6 +38,29 @@ test('desktop coordinate and text planning is side-effect free', () => {
   assert.equal(scrollScript.includes('[uint32]'), false);
 });
 
+test('screenshot scaling maps image pixels and rejects a stale display configuration', () => {
+  assert.deepEqual(planScreenshotSize(3840, 2160), { width: 3840, height: 2160 });
+  assert.deepEqual(planScreenshotSize(3840, 2160, 1920), { width: 1920, height: 1080 });
+  assert.deepEqual(planScreenshotSize(3840, 2160, 1920, 720), { width: 1280, height: 720 });
+  assert.deepEqual(planScreenshotSize(1024, 768, 4096, 4096), { width: 1024, height: 768 });
+  for (const width of [0, -1, 16385, 1.5, NaN]) {
+    assert.throws(() => planScreenshotSize(1920, 1080, width));
+  }
+  const display = { id: 1, name: 'DISPLAY2', x: -2560, y: 180, width: 2560, height: 1440 };
+  const reference = { ...display, image_width: 1280, image_height: 720 };
+  assert.deepEqual(mapDisplayPoint(display, 500, 300, reference),
+    { x: 1000, y: 600, gx: -1560, gy: 780 });
+  assert.deepEqual(mapDisplayPoint(display, 1279, 719, reference),
+    { x: 2559, y: 1439, gx: -1, gy: 1619 });
+  assert.deepEqual(mapDisplayPoint(display, 0, 0, { ...display, image_width: 1, image_height: 1 }),
+    { x: 1280, y: 720, gx: -1280, gy: 900 });
+  assert.throws(() => mapDisplayPoint(display, 1280, 0, reference), /outside screenshot bounds/);
+  assert.throws(() => mapDisplayPoint(display, 10, 10, { ...reference, width: 1920 }), /Display changed since screenshot/);
+  assert.throws(() => mapDisplayPoint(display, 10, 10, { ...reference, x: 0 }), /Display changed since screenshot/);
+  assert.throws(() => mapDisplayPoint(display, 10, 10, { ...reference, name: 'DISPLAY3' }), /Display changed since screenshot/);
+  assert.throws(() => mapDisplayPoint(display, 10, 10, { ...reference, image_width: 0 }), /coordinate_reference/);
+});
+
 test('desktop click/drag/type/key production bridge can be verified without real input', { skip: process.platform !== 'win32' }, async () => {
   const childProcess = require('node:child_process');
   const originalSpawnSync = childProcess.spawnSync;
@@ -53,7 +76,7 @@ test('desktop click/drag/type/key production bridge can be verified without real
         stderr: ''
       };
     }
-    return { status: 0, stdout: '', stderr: '' };
+    return { status: 0, stdout: script.includes('CopyFromScreen') ? '/9j/' : '', stderr: '' };
   };
   syncBuiltinESMExports();
 
@@ -64,8 +87,20 @@ test('desktop click/drag/type/key production bridge can be verified without real
 
     const screenshot = desktop.desktopScreenshot({ display_id: 1, quality: 100 });
     assert.equal(screenshot.quality, 100);
-    assert.equal(screenshot.bytes, 0);
+    assert.equal(screenshot.bytes, 3);
     assert.equal(screenshot.resized, false);
+    assert.equal(screenshot.image_width, 2560);
+    assert.equal(screenshot.image_height, 1440);
+    assert.deepEqual(screenshot.coordinate_reference, {
+      id: 1, name: 'DISPLAY2', x: -2560, y: 180,
+      width: 2560, height: 1440, image_width: 2560, image_height: 1440
+    });
+    const resized = desktop.desktopScreenshot({ display_id: 1, max_width: 1280, max_height: 900 });
+    assert.equal(resized.width, 2560);
+    assert.equal(resized.image_width, 1280);
+    assert.equal(resized.image_height, 720);
+    assert.equal(resized.resized, true);
+    assert.match(calls.at(-1).script, /DrawImage\(\$bmp,0,0,\$iw,\$ih\)/);
     const screenshotBridgeCalls = calls.filter(call => call.script.includes('CopyFromScreen')).length;
     assert.throws(() => desktop.desktopScreenshot({ display_id: 1, quality: 0 }), /quality must be between 1 and 100/);
     assert.throws(() => desktop.desktopScreenshot({ display_id: 1, quality: 101 }), /quality must be between 1 and 100/);
@@ -80,6 +115,19 @@ test('desktop click/drag/type/key production bridge can be verified without real
     assert.match(clickScript, /\[void\]\[ComputerUseNative\]::SetCursorPos\(-2435,255\);1\.\.2/);
     assert.match(clickScript, /mouse_event\(8,0,0,0/);
     assert.match(clickScript, /mouse_event\(16,0,0,0/);
+    const resizedClick = desktop.desktopClick({
+      display_id: 1, x: 500, y: 300, coordinate_reference: resized.coordinate_reference
+    });
+    assert.equal(resizedClick.global_x, -1560);
+    assert.equal(resizedClick.global_y, 780);
+    assert.equal(resizedClick.input_x, 500);
+    assert.equal(resizedClick.x, 1000);
+    assert.match(calls.at(-1).script, /SetCursorPos\(-1560,780\)/);
+    const inputBeforeStale = calls.filter(call => call.script.includes('[void][ComputerUseNative]::SetCursorPos(')).length;
+    assert.throws(() => desktop.desktopClick({
+      display_id: 1, x: 500, y: 300, coordinate_reference: { ...resized.coordinate_reference, height: 1080 }
+    }), /Display changed since screenshot/);
+    assert.equal(calls.filter(call => call.script.includes('[void][ComputerUseNative]::SetCursorPos(')).length, inputBeforeStale);
 
     const tripleClick = desktop.desktopClick({ display_id: 1, x: 0, y: 0, clicks: 3 });
     assert.equal(tripleClick.clicks, 3);
@@ -109,6 +157,13 @@ test('desktop click/drag/type/key production bridge can be verified without real
     assert.equal(drag.steps, 18);
     const dragScript = calls.at(-1).script;
     assert.match(dragScript, /Drag\(-2435,255,-1760,680,2,4,450,18\)/);
+    const imageDrag = desktop.desktopDrag({
+      display_id: 1, x: 500, y: 300, to_x: 1279, to_y: 719,
+      coordinate_reference: resized.coordinate_reference
+    });
+    assert.equal(imageDrag.global_x, -1560);
+    assert.equal(imageDrag.to_global_x, -1);
+    assert.equal(imageDrag.to_global_y, 1619);
     const dragBridgeCalls = calls.filter(call => call.script.includes('[ComputerUseNative]::Drag(')).length;
     assert.throws(() => desktop.desktopDrag({ display_id: 1, x: 1, y: 1, to_x: 2, to_y: 2, duration_ms: 5001 }), /duration_ms must be between 0 and 5000/);
     assert.throws(() => desktop.desktopDrag({ display_id: 1, x: 1, y: 1, to_x: 2, to_y: 2, steps: 121 }), /steps must be between 1 and 120/);
@@ -146,6 +201,12 @@ test('desktop click/drag/type/key production bridge can be verified without real
     assert.match(scrollBridgeScript, /Wheel\(2048,-1200\)/);
     assert.match(scrollBridgeScript, /Wheel\(4096,-240\)/);
     assert.equal(scrollBridgeScript.includes('[uint32]([int32]-1200)'), false);
+    const scrollFromImage = desktop.desktopScroll({
+      display_id: 1, x: 500, y: 300,
+      coordinate_reference: resized.coordinate_reference, delta_y: -120
+    });
+    assert.equal(scrollFromImage.delta_y, -120);
+    assert.match(calls.at(-1).script, /SetCursorPos\(-1560,780\)/);
 
     const eightKeyChord = ['CTRL', 'SHIFT', 'ALT', 'WIN', 'A', 'B', 'C', 'D'];
     assert.deepEqual(desktop.desktopKey({ keys: eightKeyChord }).keys, eightKeyChord);

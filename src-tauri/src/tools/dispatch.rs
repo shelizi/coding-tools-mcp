@@ -796,6 +796,14 @@ fn call_tool_inner(
         "history_search" => history::search(ctx, &effective_args),
         "history_session_validate" => history::validate(ctx, &effective_args),
         "server_info" => server_info(ctx),
+        "session_status" => Ok(tool_ok(json!({
+            "auth_type": ctx.auth.auth_type,
+            "scope": "current_request",
+            "oauth_token_ttl_seconds": crate::mcp::session_expiry::snapshot(&ctx.profile_id).oauth_token_ttl_seconds,
+            "oauth_token_expires_at_ms": null,
+            "conversation_handle_expires_at_ms": null,
+            "note": "Expiry of caller credentials only; null means unavailable, not expired."
+        }))),
         "query_tool_usage" => crate::tools::tool_usage::query_tool_usage(ctx, &effective_args),
         "exec_health_check" => exec::exec_health_check(ctx),
         "set_default_cwd" => set_default_cwd(ctx, &effective_args),
@@ -838,11 +846,7 @@ fn call_tool_inner(
         "view_image" => image_tool::view_image(ws, &effective_args),
         "desktop_displays" => desktop::displays(&effective_args),
         "desktop_screenshot" => desktop::screenshot(&effective_args),
-        "desktop_click" => desktop::click(&effective_args),
-        "desktop_drag" => desktop::drag(&effective_args),
-        "desktop_scroll" => desktop::scroll(&effective_args),
-        "desktop_type" => desktop::type_text(&effective_args),
-        "desktop_key" => desktop::key(&effective_args),
+        "desktop_input" => desktop::input(&effective_args),
         _ => {
             return tool_err_code(
                 "INVALID_ARGUMENT",

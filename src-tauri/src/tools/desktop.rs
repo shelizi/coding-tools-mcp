@@ -5,6 +5,16 @@ use serde_json::{json, Value};
 
 use crate::tools::workspace::{tool_ok, WorkspaceError};
 
+#[cfg(target_os = "windows")]
+mod batch;
+#[cfg(target_os = "windows")]
+pub use batch::input;
+
+#[cfg(not(target_os = "windows"))]
+pub fn input(_args: &Value) -> Result<Value, WorkspaceError> {
+    Err(unsupported())
+}
+
 const PS_PREAMBLE: &str = r#"
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Windows.Forms
@@ -17,6 +27,7 @@ using System.Threading;
 public static class ComputerUseNative {
   [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value);
   [DllImport("user32.dll", SetLastError=true)] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll", SetLastError=true)] public static extern bool SetPhysicalCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
   [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public InputUnion U; }
   [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public UIntPtr dwExtraInfo; }
@@ -34,8 +45,29 @@ public static class ComputerUseNative {
     uint sent = SendInput((uint)inputs.Length, inputs, InputSize());
     if (sent != inputs.Length) throw new InvalidOperationException("SendInput failed with Win32 error " + Marshal.GetLastWin32Error());
   }
-  static void Move(int x, int y) {
-    if (!SetCursorPos(x, y)) throw new InvalidOperationException("SetCursorPos failed with Win32 error " + Marshal.GetLastWin32Error());
+  public static void Move(int x, int y) {
+    if (!SetPhysicalCursorPos(x, y)) throw new InvalidOperationException("SetPhysicalCursorPos failed with Win32 error " + Marshal.GetLastWin32Error());
+  }
+  public static void KeyDown(ushort key) {
+    Send(new INPUT[] { new INPUT { type=1, U=new InputUnion { ki=new KEYBDINPUT { wVk=key } } } });
+  }
+  public static void KeyUp(ushort key) {
+    Send(new INPUT[] { new INPUT { type=1, U=new InputUnion { ki=new KEYBDINPUT { wVk=key, dwFlags=2 } } } });
+  }
+  public static void MouseDown(uint flag) { mouse_event(flag,0,0,0,UIntPtr.Zero); }
+  public static void MouseUp(uint flag) { mouse_event(flag,0,0,0,UIntPtr.Zero); }
+  public static void MovePath(int[] points,int durationMs,int steps) {
+    int segments=points.Length/2-1;
+    int total=Math.Max(steps,segments);
+    for(int i=1;i<=total;i++) {
+      double progress=(double)i*segments/total;
+      int segment=Math.Min(segments-1,(int)Math.Floor(progress));
+      double part=progress-segment;
+      int j=2*segment;
+      Move(points[j]+(int)Math.Round((points[j+2]-points[j])*part),
+           points[j+1]+(int)Math.Round((points[j+3]-points[j+1])*part));
+      if(durationMs>0) Thread.Sleep(durationMs/total);
+    }
   }
   public static void TypeUnicode(string text) {
     foreach (char ch in text) {
@@ -99,9 +131,13 @@ fn run_ps(body: &str) -> Result<String, WorkspaceError> {
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    let script = format!("{PS_PREAMBLE}\n{body}");
+    // PowerShell -Command - reads stdin line-by-line: the operation body
+    // must be a single complete statement for try/finally to execute.
+    let script = format!(
+        "{PS_PREAMBLE}\n{}\n",
+        body.lines().collect::<Vec<_>>().join(";")
+    );
     let mut command = Command::new("powershell.exe");
-    // Computer-use helpers must not open a console over the user's desktop.
     command.creation_flags(CREATE_NO_WINDOW);
     let output = command
         .args([
@@ -184,30 +220,100 @@ pub fn screenshot(args: &Value) -> Result<Value, WorkspaceError> {
                 "quality must be between 1 and 100",
             ));
         }
+        let (image_width, image_height) = screenshot_dimensions(&display, args)?;
         let body = format!(
             r#"
-$x={x};$y={y};$w={w};$h={h};$quality={quality}
+$x={x};$y={y};$w={w};$h={h};$iw={image_width};$ih={image_height};$quality={quality}
 $bmp=New-Object System.Drawing.Bitmap($w,$h,[System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
 $g=[System.Drawing.Graphics]::FromImage($bmp)
-try {{ $g.CopyFromScreen($x,$y,0,0,(New-Object System.Drawing.Size($w,$h)),[System.Drawing.CopyPixelOperation]::SourceCopy); $ms=New-Object System.IO.MemoryStream; $codec=[System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object MimeType -eq 'image/jpeg'; $ep=New-Object System.Drawing.Imaging.EncoderParameters(1); $ep.Param[0]=New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality,[long]$quality); $bmp.Save($ms,$codec,$ep); [Convert]::ToBase64String($ms.ToArray()) }} finally {{ $g.Dispose();$bmp.Dispose();if($ms){{$ms.Dispose()}} }}
+$out=$bmp;$draw=$null;$ms=$null
+try {{
+  $g.CopyFromScreen($x,$y,0,0,(New-Object System.Drawing.Size($w,$h)),[System.Drawing.CopyPixelOperation]::SourceCopy)
+  if($iw -ne $w -or $ih -ne $h) {{
+    $out=New-Object System.Drawing.Bitmap($iw,$ih,[System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    $draw=[System.Drawing.Graphics]::FromImage($out)
+    $draw.InterpolationMode=[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+    $draw.DrawImage($bmp,0,0,$iw,$ih)
+  }}
+  $ms=New-Object System.IO.MemoryStream
+  $codec=[System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object MimeType -eq 'image/jpeg'
+  $ep=New-Object System.Drawing.Imaging.EncoderParameters(1)
+  $ep.Param[0]=New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality,[long]$quality)
+  $out.Save($ms,$codec,$ep)
+  [Convert]::ToBase64String($ms.ToArray())
+}} finally {{
+  if($draw){{$draw.Dispose()}}
+  if($out -ne $bmp){{$out.Dispose()}}
+  $g.Dispose();$bmp.Dispose()
+  if($ms){{$ms.Dispose()}}
+}}
 "#,
             x = display["x"],
             y = display["y"],
             w = display["width"],
-            h = display["height"]
+            h = display["height"],
         );
         let encoded = run_ps(&body)?;
+        if encoded.is_empty() {
+            return Err(runtime_error(
+                "Desktop screenshot bridge returned an empty JPEG",
+            ));
+        }
         let bytes = base64_decoded_len(&encoded)?;
+        let reference = json!({
+            "id": display["id"], "name": display["name"],
+            "x": display["x"], "y": display["y"],
+            "width": display["width"], "height": display["height"],
+            "image_width": image_width, "image_height": image_height
+        });
         return Ok(tool_ok(json!({
             "display_id": display["id"], "display_name": display["name"],
             "x": display["x"], "y": display["y"], "width": display["width"], "height": display["height"], "primary": display["primary"],
-            "coordinate_space": "display_local_physical_pixels", "resized": false, "quality": quality,
+            "image_width": image_width, "image_height": image_height,
+            "coordinate_reference": reference,
+            "coordinate_space": "display_local_physical_pixels", "image_coordinate_space": "image_pixels",
+            "resized": image_width != display["width"].as_i64().unwrap_or(0) ||
+                image_height != display["height"].as_i64().unwrap_or(0),
+            "quality": quality,
             "mime_type": "image/jpeg", "bytes": bytes, "base64": encoded,
             "data_url": format!("data:image/jpeg;base64,{encoded}")
         })));
     }
     #[allow(unreachable_code)]
     Err(unsupported())
+}
+
+fn screenshot_dimensions(display: &Value, args: &Value) -> Result<(i64, i64), WorkspaceError> {
+    let width = display["width"].as_i64().unwrap_or(0);
+    let height = display["height"].as_i64().unwrap_or(0);
+    if width < 1 || height < 1 {
+        return Err(WorkspaceError::invalid_argument(
+            "invalid physical display dimensions",
+        ));
+    }
+    let limit = |field: &str| -> Result<Option<i64>, WorkspaceError> {
+        let Some(value) = args.get(field) else {
+            return Ok(None);
+        };
+        let value = value.as_i64().ok_or_else(|| {
+            WorkspaceError::invalid_argument(format!("{field} must be between 1 and 16384"))
+        })?;
+        if !(1..=16384).contains(&value) {
+            return Err(WorkspaceError::invalid_argument(format!(
+                "{field} must be between 1 and 16384"
+            )));
+        }
+        Ok(Some(value))
+    };
+    let max_width = limit("max_width")?;
+    let max_height = limit("max_height")?;
+    let scale = 1.0_f64
+        .min(max_width.map_or(1.0, |v| v as f64 / width as f64))
+        .min(max_height.map_or(1.0, |v| v as f64 / height as f64));
+    Ok((
+        (width as f64 * scale).round().max(1.0) as i64,
+        (height as f64 * scale).round().max(1.0) as i64,
+    ))
 }
 
 fn required_i32(args: &Value, name: &str) -> Result<i32, WorkspaceError> {
@@ -220,8 +326,72 @@ fn required_i32(args: &Value, name: &str) -> Result<i32, WorkspaceError> {
 }
 
 fn map_display_point(display: &Value, x: i32, y: i32) -> Result<(i32, i32), WorkspaceError> {
+    map_display_point_with_reference(display, x, y, None)
+}
+
+fn map_display_point_with_reference(
+    display: &Value,
+    mut x: i32,
+    mut y: i32,
+    reference: Option<&Value>,
+) -> Result<(i32, i32), WorkspaceError> {
     let w = display["width"].as_i64().unwrap_or(0) as i32;
     let h = display["height"].as_i64().unwrap_or(0) as i32;
+    if let Some(reference) = reference {
+        let required = |field: &str| -> Result<i64, WorkspaceError> {
+            reference.get(field).and_then(Value::as_i64).ok_or_else(|| {
+                WorkspaceError::invalid_argument(
+                    "coordinate_reference must be copied from desktop_screenshot",
+                )
+            })
+        };
+        let iw = required("image_width")?;
+        let ih = required("image_height")?;
+        let id = required("id")?;
+        let rx = required("x")?;
+        let ry = required("y")?;
+        let rw = required("width")?;
+        let rh = required("height")?;
+        let name = reference
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                WorkspaceError::invalid_argument(
+                    "coordinate_reference must be copied from desktop_screenshot",
+                )
+            })?;
+        if iw < 1 || ih < 1 || id < 0 || rw < 1 || rh < 1 {
+            return Err(WorkspaceError::invalid_argument(
+                "coordinate_reference must be copied from desktop_screenshot",
+            ));
+        }
+        if display["id"].as_i64() != Some(id)
+            || display["name"].as_str() != Some(name)
+            || display["x"].as_i64() != Some(rx)
+            || display["y"].as_i64() != Some(ry)
+            || display["width"].as_i64() != Some(rw)
+            || display["height"].as_i64() != Some(rh)
+        {
+            return Err(WorkspaceError::invalid_argument(
+                "Display changed since screenshot; take a new screenshot before using image coordinates"
+            ));
+        }
+        if x < 0 || y < 0 || x as i64 >= iw || y as i64 >= ih {
+            return Err(WorkspaceError::invalid_argument(format!(
+                "Point ({x}, {y}) is outside screenshot bounds {iw}x{ih}"
+            )));
+        }
+        x = if iw == 1 {
+            w / 2
+        } else {
+            ((x as f64 * (w - 1) as f64) / (iw - 1) as f64).round() as i32
+        };
+        y = if ih == 1 {
+            h / 2
+        } else {
+            ((y as f64 * (h - 1) as f64) / (ih - 1) as f64).round() as i32
+        };
+    }
     if x < 0 || y < 0 || x >= w || y >= h {
         return Err(WorkspaceError::invalid_argument(format!(
             "Point ({x}, {y}) is outside display bounds {w}x{h}"
@@ -303,7 +473,8 @@ fn global_point(args: &Value) -> Result<(Value, i32, i32), WorkspaceError> {
     let display = display_json(args.get("display_id").and_then(Value::as_u64))?;
     let x = required_i32(args, "x")?;
     let y = required_i32(args, "y")?;
-    let (gx, gy) = map_display_point(&display, x, y)?;
+    let (gx, gy) =
+        map_display_point_with_reference(&display, x, y, args.get("coordinate_reference"))?;
     Ok((display, gx, gy))
 }
 
@@ -320,9 +491,18 @@ pub fn click(args: &Value) -> Result<Value, WorkspaceError> {
         }
         let (down, up) = mouse_button_flags(button)?;
         run_ps(&click_input_script(gx, gy, down, up, clicks))?;
-        return Ok(tool_ok(
-            json!({"display_id":display["id"],"x":required_i32(args,"x")?,"y":required_i32(args,"y")?,"global_x":gx,"global_y":gy,"button":button,"clicks":clicks}),
-        ));
+        let mut result = json!({
+            "display_id":display["id"],
+            "x": gx - display["x"].as_i64().unwrap_or(0) as i32,
+            "y": gy - display["y"].as_i64().unwrap_or(0) as i32,
+            "global_x":gx,"global_y":gy,"button":button,"clicks":clicks
+        });
+        if args.get("coordinate_reference").is_some() {
+            result["input_x"] = json!(required_i32(args, "x")?);
+            result["input_y"] = json!(required_i32(args, "y")?);
+            result["coordinate_space"] = json!("image_pixels");
+        }
+        return Ok(tool_ok(result));
     }
     #[allow(unreachable_code)]
     Err(unsupported())
@@ -339,7 +519,23 @@ pub fn drag(args: &Value) -> Result<Value, WorkspaceError> {
         let to_display = display_json(to_display_id)?;
         let to_x = required_i32(args, "to_x")?;
         let to_y = required_i32(args, "to_y")?;
-        let (to_gx, to_gy) = map_display_point(&to_display, to_x, to_y)?;
+        let to_reference = args.get("to_coordinate_reference").or_else(|| {
+            if to_display["id"] == display["id"] {
+                args.get("coordinate_reference")
+            } else {
+                None
+            }
+        });
+        if args.get("coordinate_reference").is_some()
+            && to_display["id"] != display["id"]
+            && to_reference.is_none()
+        {
+            return Err(WorkspaceError::invalid_argument(
+                "to_coordinate_reference is required when dragging image coordinates across displays"
+            ));
+        }
+        let (to_gx, to_gy) =
+            map_display_point_with_reference(&to_display, to_x, to_y, to_reference)?;
         let button = args.get("button").and_then(Value::as_str).unwrap_or("left");
         let duration_ms = args
             .get("duration_ms")
@@ -367,21 +563,30 @@ pub fn drag(args: &Value) -> Result<Value, WorkspaceError> {
             duration_ms,
             steps,
         ))?;
-        return Ok(tool_ok(json!({
+        let mut result = json!({
             "display_id": display["id"],
-            "x": required_i32(args, "x")?,
-            "y": required_i32(args, "y")?,
+            "x": from_gx - display["x"].as_i64().unwrap_or(0) as i32,
+            "y": from_gy - display["y"].as_i64().unwrap_or(0) as i32,
             "global_x": from_gx,
             "global_y": from_gy,
             "to_display_id": to_display["id"],
-            "to_x": to_x,
-            "to_y": to_y,
+            "to_x": to_gx - to_display["x"].as_i64().unwrap_or(0) as i32,
+            "to_y": to_gy - to_display["y"].as_i64().unwrap_or(0) as i32,
             "to_global_x": to_gx,
             "to_global_y": to_gy,
             "button": button,
             "duration_ms": duration_ms,
             "steps": steps
-        })));
+        });
+        if args.get("coordinate_reference").is_some() {
+            result["input_x"] = json!(required_i32(args, "x")?);
+            result["input_y"] = json!(required_i32(args, "y")?);
+        }
+        if to_reference.is_some() {
+            result["input_to_x"] = json!(to_x);
+            result["input_to_y"] = json!(to_y);
+        }
+        return Ok(tool_ok(result));
     }
     #[allow(unreachable_code)]
     Err(unsupported())
@@ -390,6 +595,13 @@ pub fn drag(args: &Value) -> Result<Value, WorkspaceError> {
 pub fn scroll(args: &Value) -> Result<Value, WorkspaceError> {
     #[cfg(target_os = "windows")]
     {
+        if args.get("coordinate_reference").is_some()
+            && (args.get("x").is_none() || args.get("y").is_none())
+        {
+            return Err(WorkspaceError::invalid_argument(
+                "x and y are required with coordinate_reference",
+            ));
+        }
         let dy = required_i32(args, "delta_y")?;
         let dx = args.get("delta_x").and_then(Value::as_i64).unwrap_or(0) as i32;
         let mut prefix = String::new();
@@ -499,29 +711,17 @@ mod tests {
 
     use super::{
         base64_decoded_len, click_input_script, drag_input_script, key_code, map_display_point,
-        mouse_button_flags, scroll_input_script, type_input_script, type_payload,
+        map_display_point_with_reference, mouse_button_flags, screenshot_dimensions,
+        scroll_input_script, type_input_script, type_payload,
     };
 
     #[cfg(target_os = "windows")]
     #[test]
     fn desktop_bridge_runs_without_a_visible_console() {
         let visibility = super::run_ps(
-            r#"
-Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class DesktopConsoleProbe {
-    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr handle);
-}
-'@
+            r#"Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class DesktopConsoleProbe { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr handle); }'
 $handle = [DesktopConsoleProbe]::GetConsoleWindow()
-if ($handle -eq [IntPtr]::Zero -or -not [DesktopConsoleProbe]::IsWindowVisible($handle)) {
-    'hidden'
-} else {
-    'visible'
-}
-"#,
+if ($handle -eq [IntPtr]::Zero -or -not [DesktopConsoleProbe]::IsWindowVisible($handle)) { 'hidden' } else { 'visible' }"#,
         )
         .expect("PowerShell desktop bridge");
         assert_eq!(
@@ -569,6 +769,68 @@ if ($handle -eq [IntPtr]::Zero -or -not [DesktopConsoleProbe]::IsWindowVisible($
     }
 
     #[test]
+    fn downscaled_screenshot_coordinates_map_to_screen_edges_and_reject_stale_displays() {
+        let display = json!({
+            "id": 1, "name": "DISPLAY2", "x": -2560, "y": 180,
+            "width": 2560, "height": 1440
+        });
+        assert_eq!(
+            screenshot_dimensions(&display, &json!({})).unwrap(),
+            (2560, 1440)
+        );
+        assert_eq!(
+            screenshot_dimensions(&display, &json!({"max_width":1280})).unwrap(),
+            (1280, 720)
+        );
+        assert_eq!(
+            screenshot_dimensions(&display, &json!({"max_width":1280, "max_height":360})).unwrap(),
+            (640, 360)
+        );
+        for bad in [
+            json!({"max_width":0}),
+            json!({"max_width":-1}),
+            json!({"max_height":16385}),
+        ] {
+            assert!(screenshot_dimensions(&display, &bad).is_err());
+        }
+        let reference = json!({
+            "id": 1, "name": "DISPLAY2", "x": -2560, "y": 180,
+            "width": 2560, "height": 1440, "image_width": 1280, "image_height": 720
+        });
+        assert_eq!(
+            map_display_point_with_reference(&display, 500, 300, Some(&reference)).unwrap(),
+            (-1560, 780)
+        );
+        assert_eq!(
+            map_display_point_with_reference(&display, 1279, 719, Some(&reference)).unwrap(),
+            (-1, 1619)
+        );
+        assert!(map_display_point_with_reference(&display, 1280, 0, Some(&reference)).is_err());
+        let changed = json!({
+            "id": 1, "name": "DISPLAY2", "x": -2560, "y": 180,
+            "width": 1920, "height": 1080
+        });
+        assert!(
+            map_display_point_with_reference(&changed, 500, 300, Some(&reference))
+                .unwrap_err()
+                .message()
+                .contains("Display changed since screenshot")
+        );
+        let moved = json!({
+            "id": 1, "name": "DISPLAY2", "x": 0, "y": 180,
+            "width": 2560, "height": 1440
+        });
+        assert!(map_display_point_with_reference(&moved, 500, 300, Some(&reference)).is_err());
+        assert!(map_display_point_with_reference(
+            &display,
+            500,
+            300,
+            Some(&json!({"image_width":0}))
+        )
+        .is_err());
+    }
+
+    #[test]
     fn click_input_mapping_is_stable_without_calling_user32() {
         assert_eq!(mouse_button_flags("left").expect("left"), (2, 4));
         assert_eq!(mouse_button_flags("right").expect("right"), (8, 16));
@@ -601,6 +863,19 @@ if ($handle -eq [IntPtr]::Zero -or -not [DesktopConsoleProbe]::IsWindowVisible($
         assert!(script.contains("Wheel(2048,-1200)"));
         assert!(script.contains("Wheel(4096,-240)"));
         assert!(!script.contains("[uint32]"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn screenshot_bridge_returns_real_jpeg_when_opted_in() {
+        if std::env::var("CTMCP_DESKTOP_SCREENSHOT_SMOKE").as_deref() != Ok("1") {
+            return;
+        }
+        let capture = super::screenshot(&json!({"max_width": 640, "quality": 65}))
+            .expect("Windows screenshot must produce a non-empty JPEG");
+        assert_eq!(capture["ok"], true);
+        assert!(capture["bytes"].as_u64().unwrap_or(0) > 100);
+        assert!(capture["base64"].as_str().unwrap_or("").starts_with("/9j/"));
     }
 
     #[test]

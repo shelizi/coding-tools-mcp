@@ -2,6 +2,8 @@
 param(
     [string]$PackageRoot,
     [string]$DataDir,
+    [string]$ReleaseArchive = '',
+    [string]$PublishRoot = '',
     [string]$FallbackPackageRoot,
     [int]$HealthTimeoutSeconds = 90,
     [int]$DelaySeconds = 5,
@@ -296,6 +298,17 @@ if (-not (Test-Path -LiteralPath $script:ResolvedPackageRoot -PathType Container
 }
 $manifest = Get-PortableManifest -Root $script:ResolvedPackageRoot
 Assert-CriticalPortableFiles -Root $script:ResolvedPackageRoot -Manifest $manifest
+# Publish verified local ZIPs to the stable source release directory by default.
+if (-not $ReleaseArchive) {
+    $candidateArchive = Join-Path (Split-Path -Parent $script:ResolvedPackageRoot) ([string]$manifest.archiveName)
+    if (Test-Path -LiteralPath $candidateArchive -PathType Leaf) { $ReleaseArchive = $candidateArchive }
+}
+if ($ReleaseArchive -and -not $PublishRoot) {
+    $common = (& git -C $repoRoot rev-parse --path-format=absolute --git-common-dir 2>$null | Select-Object -First 1)
+    $stable = if ($LASTEXITCODE -eq 0 -and $common -and (Split-Path -Leaf $common.Trim()) -eq '.git') { Split-Path -Parent $common.Trim() } else { $repoRoot }
+    $PublishRoot = Join-Path $stable 'dist-node-portable'
+}
+
 $fallbackManifest = $null
 if (-not [string]::IsNullOrWhiteSpace($script:ResolvedFallbackPackageRoot)) {
     if (-not (Test-Path -LiteralPath $script:ResolvedFallbackPackageRoot -PathType Container)) {
@@ -339,6 +352,8 @@ if (-not $Worker) {
     if (Test-Path -LiteralPath $script:ResolvedResultPath) {
         Remove-Item -LiteralPath $script:ResolvedResultPath -Force -ErrorAction SilentlyContinue
     }
+    if ($ReleaseArchive) { $workerArgs += @('-ReleaseArchive', ('"' + $ReleaseArchive + '"')) }
+    if ($PublishRoot) { $workerArgs += @('-PublishRoot', ('"' + $PublishRoot + '"')) }
     $workerCommandLine = 'powershell.exe ' + ($workerArgs -join ' ')
     $workerPid = Start-DetachedProcess -CommandLine $workerCommandLine
     [pscustomobject]@{
@@ -365,6 +380,11 @@ try {
     Assert-PortableSupervisorRunning -ProcessId $supervisorPid -Root $script:ResolvedPackageRoot
     Wait-NewAgentHealthy -Endpoints $endpoints -ExpectedVersion $version -ExpectedGitCommit ([string]$manifest.gitCommit) -TimeoutSeconds $HealthTimeoutSeconds
     Assert-PortableSupervisorRunning -ProcessId $supervisorPid -Root $script:ResolvedPackageRoot
+    if ($ReleaseArchive -and $PublishRoot) {
+        $promoted = & (Join-Path $PSScriptRoot 'promote-portable-release.ps1') -Edition 'ctnode-win64' -Archive $ReleaseArchive -Destination $PublishRoot -ExpectedCommit ([string]$manifest.gitCommit)
+        if (-not $promoted.ok) { throw 'Node release artifact promotion failed' }
+        Write-HandoffLog "Node artifacts published: $($promoted.canonical)"
+    }
     Write-Result -Ok $true -Version $version -Endpoints $endpoints
     Write-HandoffLog "Node Agent handoff completed successfully. version=$version"
     exit 0

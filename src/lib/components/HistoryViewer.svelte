@@ -5,14 +5,24 @@
   import History from "@lucide/svelte/icons/history";
   import MessageSquare from "@lucide/svelte/icons/message-square";
   import RefreshCw from "@lucide/svelte/icons/refresh-cw";
+  import HistoryBackgroundJobs from "./HistoryBackgroundJobs.svelte";
   import {
     listHistorySessions,
     readHistorySession,
     type HistoryRecord,
     type HistorySessionDetail,
-    type HistorySessionSummary,
   } from "$lib/api/history";
-  import type { WorkspaceFolder } from "$lib/types";
+  import { listWorkspaces } from "$lib/api/workspaces";
+  import {
+    collectHistory,
+    historyLocationKey,
+    uniqueHistoryLocations,
+    type HistoryLocation,
+    type LocatedHistorySession,
+  } from "$lib/history/all-projects";
+  import { historyDetailNeedsRefresh } from "$lib/history/live-detail";
+  import { historyPollCadenceMs } from "$lib/history/polling";
+  import { workspaceFolders, type WorkspaceFolder } from "$lib/types";
   import { t } from "$lib/i18n";
 
   interface Props {
@@ -22,23 +32,38 @@
   }
 
   let { workspaceId, folders, activeFolderId = "" }: Props = $props();
-  let selectedFolderId = $state("");
-  let sessions = $state<HistorySessionSummary[]>([]);
-  let selectedNumber = $state<number | null>(null);
+  let selectedScope = $state("all");
+  let sources = $state<HistoryLocation[]>([]);
+  let sessions = $state<LocatedHistorySession[]>([]);
+  let selectedKey = $state<string | null>(null);
   let detail = $state<HistorySessionDetail | null>(null);
   let busy = $state(false);
   let detailBusy = $state(false);
+  let detailSyncing = $state(false);
+  let detailSyncError = $state("");
+  let detailSyncedAt = $state<number | null>(null);
   let error = $state("");
+  let failedCount = $state(0);
+  let visibleCount = $state(60);
   let lastLoadKey = "";
   let showRaw = $state(false);
+  let refreshSequence = 0;
+  let detailSequence = 0;
+  let detailRefreshInFlightFor: string | null = null;
+  let activeRefreshes = 0;
+  let activeRequest: AbortController | null = null;
+  let lastPollAt = 0;
 
   const selectedSession = $derived(
-    sessions.find((session) => session.number === selectedNumber) ?? null,
+    sessions.find((session) => session.key === selectedKey) ?? null,
   );
-
-  const selectedFolder = $derived(
-    folders.find((folder) => folder.id === selectedFolderId) ?? folders[0],
+  const selectedSource = $derived(
+    sources.find((source) => source.key === selectedScope) ?? null,
   );
+  const displayedSessions = $derived(sessions.slice(0, visibleCount));
+  // Checkpoints are appended chronologically to the archive; present the
+  // newest first without rewriting their persisted Markdown order.
+  const displayedRecords = $derived(detail ? [...detail.records].reverse() : []);
 
   function formatDate(value: string | null | undefined): string {
     if (!value) return $t("Unknown");
@@ -50,97 +75,186 @@
     return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString();
   }
 
-  function sessionTimestamp(session: HistorySessionSummary): number {
-    if (session.lastActivityAtMs !== null) return session.lastActivityAtMs;
-    if (!session.updatedAt) return 0;
-    if (session.updatedAt.startsWith("unix:")) {
-      return Number(session.updatedAt.slice(5)) * 1000 || 0;
-    }
-    return Date.parse(session.updatedAt) || 0;
-  }
-
-  function sortSessions(items: HistorySessionSummary[]): HistorySessionSummary[] {
-    const priority = { running: 0, active: 1, inactive: 2, completed: 3 } as const;
-    return [...items].sort((left, right) => {
-      const statusOrder = priority[left.activityStatus] - priority[right.activityStatus];
-      return statusOrder || sessionTimestamp(right) - sessionTimestamp(left) || right.number - left.number;
-    });
-  }
-
-  function activityLabel(status: HistorySessionSummary["activityStatus"]): string {
+  function activityLabel(status: LocatedHistorySession["activityStatus"]): string {
     if (status === "running") return $t("Running now");
     if (status === "active") return $t("Active recently");
     if (status === "completed") return $t("Completed");
     return $t("Inactive");
   }
 
-  function activityDotClass(status: HistorySessionSummary["activityStatus"]): string {
+  function activityDotClass(status: LocatedHistorySession["activityStatus"]): string {
     if (status === "running") return "bg-[var(--color-success)] animate-pulse";
     if (status === "active") return "bg-[var(--color-accent)]";
     if (status === "completed") return "bg-[var(--color-success)]";
     return "bg-[var(--color-text-muted)]";
   }
 
+  function sourceLabel(source: HistoryLocation): string {
+    return source.workspaceName === source.folderName
+      ? source.workspaceName
+      : `${source.workspaceName} / ${source.folderName}`;
+  }
+
+  async function getLocations(reload: boolean): Promise<HistoryLocation[]> {
+    if (!reload && sources.length > 0) return sources;
+    const profiles = await listWorkspaces();
+    return uniqueHistoryLocations(
+      profiles.flatMap((profile) =>
+        workspaceFolders(profile).map((folder) => ({
+          key: historyLocationKey(profile.id, folder.id),
+          workspaceId: profile.id,
+          workspaceName: profile.name,
+          folderId: folder.id,
+          folderName: folder.name,
+          folderPath: folder.path,
+        })),
+      ),
+    );
+  }
+
   async function refresh(
-    folderId = selectedFolderId,
+    scope = selectedScope,
     preserveSelection = false,
     silent = false,
   ) {
-    if (!workspaceId || !folderId || busy) return;
+    if (!workspaceId || (silent && (busy || activeRefreshes > 0))) return;
+    const requestId = ++refreshSequence;
+    activeRequest?.abort();
+    const request = new AbortController();
+    activeRequest = request;
+    activeRefreshes++;
     if (!silent) {
       busy = true;
       error = "";
     }
     try {
-      const result = await listHistorySessions(workspaceId, folderId);
-      sessions = sortSessions(result.sessions);
-      if (!preserveSelection || !sessions.some((item) => item.number === selectedNumber)) {
-        selectedNumber = sessions[0]?.number ?? null;
-        detail = null;
+      const locations = await getLocations(!silent);
+      if (requestId !== refreshSequence) return;
+      sources = locations;
+      // A workspace/folder might have been removed while the view was open.
+      if (scope !== "all" && !locations.some((source) => source.key === scope)) {
+        scope = "all";
+        selectedScope = "all";
       }
-      if (!silent && selectedNumber !== null) {
-        await loadDetail(selectedNumber, folderId);
+      const targets = scope === "all"
+        ? locations
+        : locations.filter((source) => source.key === scope);
+      const result = await collectHistory(
+        targets,
+        (id, folderId) => listHistorySessions(id, folderId, request.signal),
+        4,
+        request.signal,
+      );
+      if (requestId !== refreshSequence) return;
+      if (targets.length > 0 && result.succeeded === 0) {
+        throw new Error($t("Unable to load history sessions from any project."));
+      }
+      failedCount = result.failed.length;
+      sessions = result.sessions;
+      if (!preserveSelection || !sessions.some((item) => item.key === selectedKey)) {
+        selectedKey = sessions[0]?.key ?? null;
+        detail = null;
+        detailSyncedAt = null;
+        detailSyncError = "";
+        detailSequence++;
+        if (!silent) visibleCount = 60;
+      }
+      lastPollAt = Date.now();
+      const current = sessions.find((item) => item.key === selectedKey);
+      if (!silent) {
+        if (current) await loadDetail(current);
+      } else if (current && detail) {
+        // Re-read persisted contents only after the revision changes.
+        void refreshSelectedDetail(current);
+      } else if (current && !detailBusy) {
+        // Silent polls also recover when a selected session disappears.
+        void loadDetail(current);
       }
     } catch (reason) {
-      if (!silent) {
+      // A failed silent poll must not retry every 3 seconds across all projects.
+      if (requestId === refreshSequence) lastPollAt = Date.now();
+      if (!silent && requestId === refreshSequence) {
         error = String(reason);
+        failedCount = 0;
         sessions = [];
-        selectedNumber = null;
+        selectedKey = null;
         detail = null;
+        detailSequence++;
       }
     } finally {
-      if (!silent) busy = false;
+      activeRefreshes--;
+      if (activeRequest === request) activeRequest = null;
+      if (!silent && requestId === refreshSequence) busy = false;
     }
   }
 
-  async function loadDetail(number: number, folderId = selectedFolderId) {
-    if (!workspaceId || !folderId) return;
+  async function loadDetail(session: LocatedHistorySession) {
+    const requestId = ++detailSequence;
+    detailRefreshInFlightFor = null;
+    detailSyncing = false;
     detailBusy = true;
     error = "";
+    detailSyncError = "";
     try {
-      detail = await readHistorySession(workspaceId, number, folderId);
-      selectedNumber = number;
+      const result = await readHistorySession(session.workspaceId, session.number, session.folderId);
+      if (requestId !== detailSequence || session.key !== selectedKey) return;
+      detail = result;
       showRaw = false;
+      detailSyncedAt = Date.now();
     } catch (reason) {
+      if (requestId !== detailSequence) return;
       error = String(reason);
       detail = null;
     } finally {
-      detailBusy = false;
+      if (requestId === detailSequence) detailBusy = false;
     }
   }
 
-  async function selectFolder(folderId: string) {
-    if (!folderId || folderId === selectedFolderId) return;
-    selectedFolderId = folderId;
-    selectedNumber = null;
-    detail = null;
-    await refresh(folderId);
+  async function refreshSelectedDetail(session: LocatedHistorySession) {
+    if (!detail || !historyDetailNeedsRefresh(detail, session)) return;
+    if (detailRefreshInFlightFor === session.key) return;
+    const selectedSequence = detailSequence;
+    detailRefreshInFlightFor = session.key;
+    detailSyncing = true;
+    try {
+      const latest = await readHistorySession(session.workspaceId, session.number, session.folderId);
+      if (selectedSequence !== detailSequence || session.key !== selectedKey) return;
+      detail = latest;
+      detailSyncedAt = Date.now();
+      detailSyncError = "";
+      // Leave raw-view and scroll untouched: existing turnId keys remain stable.
+    } catch {
+      if (selectedSequence === detailSequence && session.key === selectedKey) {
+        detailSyncError = $t("Could not synchronize the latest session checkpoints.");
+      }
+    } finally {
+      if (detailRefreshInFlightFor === session.key) {
+        detailRefreshInFlightFor = null;
+        detailSyncing = false;
+      }
+    }
   }
 
-  async function selectSession(number: number) {
-    if (number === selectedNumber && detail) return;
-    selectedNumber = number;
-    await loadDetail(number);
+  async function selectScope(scope: string) {
+    if (scope === selectedScope) return;
+    selectedScope = scope;
+    selectedKey = null;
+    detail = null;
+    detailSyncedAt = null;
+    detailSyncError = "";
+    failedCount = 0;
+    detailSequence++;
+    visibleCount = 60;
+    await refresh(scope);
+  }
+
+  async function selectSession(session: LocatedHistorySession) {
+    if (session.key === selectedKey && detail) return;
+    selectedKey = session.key;
+    detail = null;
+    detailSyncedAt = null;
+    detailSyncError = "";
+    await loadDetail(session);
   }
 
   function recordHasContent(record: HistoryRecord): boolean {
@@ -159,20 +273,32 @@
 
   $effect(() => {
     const targetFolderId = activeFolderId || folders[0]?.id || "";
-    const loadKey = `${workspaceId}:${targetFolderId}`;
-    if (!workspaceId || !targetFolderId || loadKey === lastLoadKey) return;
+    const loadKey = JSON.stringify([workspaceId, targetFolderId]);
+    if (!workspaceId || loadKey === lastLoadKey) return;
     lastLoadKey = loadKey;
-    selectedFolderId = targetFolderId;
-    void refresh(targetFolderId);
+    sources = [];
+    selectedScope = "all";
+    selectedKey = null;
+    detail = null;
+    detailSyncedAt = null;
+    detailSyncError = "";
+    detailSequence++;
+    visibleCount = 60;
+    void refresh("all");
   });
 
   onMount(() => {
     const interval = window.setInterval(() => {
-      if (selectedFolderId && !document.hidden) {
-        void refresh(selectedFolderId, true, true);
-      }
+      const cadence = historyPollCadenceMs(selectedScope, sources.length);
+      if (document.hidden || Date.now() - lastPollAt < cadence) return;
+      void refresh(selectedScope, true, true);
     }, 3_000);
-    return () => window.clearInterval(interval);
+    return () => {
+      window.clearInterval(interval);
+      activeRequest?.abort();
+      refreshSequence++;
+      detailSequence++;
+    };
   });
 </script>
 
@@ -184,28 +310,27 @@
         <h3 class="font-semibold">{$t("History sessions")}</h3>
       </div>
       <p class="mt-1 max-w-2xl text-sm text-[var(--color-text-muted)]">
-        {$t("Browse saved development sessions and the checkpoint conversation records for this workspace folder.")}
+        {$t("Browse saved development sessions from all configured projects or filter by project folder.")}
       </p>
     </div>
     <div class="flex flex-wrap items-center gap-2">
-      {#if folders.length > 1}
-        <label class="sr-only" for="history-folder">{$t("History folder")}</label>
-        <select
-          id="history-folder"
-          class="tx-input max-w-56"
-          value={selectedFolderId}
-          onchange={(event) => void selectFolder(event.currentTarget.value)}
-        >
-          {#each folders as folder (folder.id)}
-            <option value={folder.id}>{folder.name}</option>
-          {/each}
-        </select>
-      {/if}
+      <label class="sr-only" for="history-folder">{$t("History project filter")}</label>
+      <select
+        id="history-folder"
+        class="tx-input max-w-64"
+        value={selectedScope}
+        onchange={(event) => void selectScope(event.currentTarget.value)}
+      >
+        <option value="all">{$t("All projects")}</option>
+        {#each sources as source (source.key)}
+          <option value={source.key}>{sourceLabel(source)}</option>
+        {/each}
+      </select>
       <button
         type="button"
         class="tx-btn-ghost"
-        disabled={busy || !selectedFolder}
-        onclick={() => void refresh(selectedFolderId, true)}
+        disabled={busy || !workspaceId}
+        onclick={() => void refresh(selectedScope, true)}
       >
         <RefreshCw size={14} class={busy ? "inline-block animate-spin" : "inline-block"} />
         <span class="ml-1">{$t("Refresh")}</span>
@@ -213,9 +338,13 @@
     </div>
   </div>
 
-  {#if selectedFolder}
-    <p class="tx-mono mt-3 truncate text-xs text-[var(--color-text-muted)]" title={selectedFolder.path}>
-      {selectedFolder.path} · docs/history-session
+  {#if selectedScope === "all"}
+    <p class="mt-3 text-xs text-[var(--color-text-muted)]">
+      {$t("Showing history from {count} project folders", { count: sources.length })}
+    </p>
+  {:else if selectedSource}
+    <p class="tx-mono mt-3 truncate text-xs text-[var(--color-text-muted)]" title={selectedSource.folderPath}>
+      {selectedSource.folderPath} · docs/history-session
     </p>
   {/if}
 
@@ -225,7 +354,15 @@
     </p>
   {/if}
 
-  {#if !busy && !error && sessions.length === 0}
+  {#if failedCount > 0}
+    <p class="mt-3 text-xs text-[var(--color-text-muted)]" role="status">
+      {$t("History from {count} project folders could not be loaded.", { count: failedCount })}
+    </p>
+  {/if}
+
+  {#if busy && sessions.length === 0}
+    <p class="mt-5 text-sm text-[var(--color-text-muted)]" role="status">{$t("Loading history…")}</p>
+  {:else if !error && sessions.length === 0}
     <div class="mt-5 rounded-lg border border-dashed border-[var(--color-border)] px-4 py-8 text-center">
       <FileText size={24} class="mx-auto text-[var(--color-text-muted)]" />
       <p class="mt-2 text-sm font-medium">{$t("No history sessions yet")}</p>
@@ -233,19 +370,19 @@
         {$t("A session appears here after ChatGPT completes its first history checkpoint.")}
       </p>
     </div>
-  {:else}
+  {:else if sessions.length > 0}
     <div class="mt-5 grid gap-4 lg:grid-cols-[minmax(13rem,0.34fr)_minmax(0,1fr)]">
       <nav aria-label={$t("History sessions")} class="space-y-2">
-        {#each sessions as session (session.number)}
+        {#each displayedSessions as session (session.key)}
           <button
             type="button"
             class={`w-full rounded-lg border px-3 py-3 text-left transition-colors ${
-              selectedNumber === session.number
+              selectedKey === session.key
                 ? "border-[var(--color-accent)] bg-[var(--color-accent)]/10"
                 : "border-[var(--color-border)] hover:border-[var(--color-accent)]/60"
             }`}
-            aria-current={selectedNumber === session.number ? "page" : undefined}
-            onclick={() => void selectSession(session.number)}
+            aria-current={selectedKey === session.key ? "page" : undefined}
+            onclick={() => void selectSession(session)}
           >
             <div class="flex items-start justify-between gap-2">
               <span class="min-w-0 truncate text-sm font-medium">{session.title}</span>
@@ -256,6 +393,11 @@
             </div>
             <p class="mt-1 text-xs text-[var(--color-text-muted)]">
               #{session.number} · {formatDate(session.updatedAt)}
+            </p>
+            <p class="mt-1 truncate text-[11px] text-[var(--color-text-secondary)]" title={session.folderPath}>
+              {session.workspaceName === session.folderName
+                ? session.workspaceName
+                : `${session.workspaceName} / ${session.folderName}`}
             </p>
             {#if session.activityDescription}
               <p class="tx-mono mt-2 truncate text-[11px] text-[var(--color-text-secondary)]" title={session.activityDescription}>
@@ -278,6 +420,11 @@
             </div>
           </button>
         {/each}
+        {#if sessions.length > visibleCount}
+          <button type="button" class="tx-btn-ghost w-full" onclick={() => (visibleCount += 60)}>
+            {$t("Show more sessions")}
+          </button>
+        {/if}
       </nav>
 
       <div class="min-w-0">
@@ -291,6 +438,13 @@
               <div class="flex flex-wrap items-start justify-between gap-3">
                 <div class="min-w-0">
                   <p class="tx-section-label">{$t("Session {number}", { number: detail.number })}</p>
+                  {#if selectedSession}
+                    <p class="mt-1 text-xs text-[var(--color-text-secondary)]" title={selectedSession.folderPath}>
+                      {selectedSession.workspaceName === selectedSession.folderName
+                        ? selectedSession.workspaceName
+                        : `${selectedSession.workspaceName} / ${selectedSession.folderName}`}
+                    </p>
+                  {/if}
                   <h4 class="mt-1 truncate text-base font-semibold">{detail.title}</h4>
                   <p class="tx-mono mt-1 truncate text-xs text-[var(--color-text-muted)]" title={detail.path}>
                     {detail.path}
@@ -308,7 +462,19 @@
               <div class="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-[var(--color-text-muted)]">
                 <span class="inline-flex items-center gap-1"><Clock3 size={12} /> {formatDate(detail.updatedAt)}</span>
                 <span class="inline-flex items-center gap-1"><MessageSquare size={12} /> {$t("{count} checkpoints", { count: detail.records.length })}</span>
+                <span class="inline-flex items-center gap-1">
+                  <RefreshCw size={12} class={detailSyncing ? "animate-spin" : ""} />
+                  {detailSyncing
+                    ? $t("Synchronizing session updates…")
+                    : $t("Session updates automatically")}
+                  {#if detailSyncedAt !== null}
+                    · {new Date(detailSyncedAt).toLocaleTimeString()}
+                  {/if}
+                </span>
               </div>
+              {#if detailSyncError}
+                <p class="mt-2 text-xs text-[var(--color-error)]" role="status">{detailSyncError}</p>
+              {/if}
               {#if selectedSession?.activityDescription}
                 <p class="tx-mono mt-3 truncate text-xs text-[var(--color-text-secondary)]" title={selectedSession.activityDescription}>
                   {selectedSession.activityStatus === "running"
@@ -318,9 +484,20 @@
               {/if}
             </header>
 
+            {#if selectedSession}
+              {#key selectedSession.key}
+                <HistoryBackgroundJobs
+                  workspaceId={selectedSession.workspaceId}
+                  folderId={selectedSession.folderId}
+                  sessionNumber={selectedSession.number}
+                  fallbackRecentActions={selectedSession.recentActions ?? []}
+                />
+              {/key}
+            {/if}
+
             {#if detail.records.length > 0}
               <div class="divide-y divide-[var(--color-border)]">
-                {#each detail.records as record (record.turnId)}
+                {#each displayedRecords as record (record.turnId)}
                   {#if recordHasContent(record)}
                     <section class="px-4 py-4">
                       <div class="flex flex-wrap items-center justify-between gap-2">

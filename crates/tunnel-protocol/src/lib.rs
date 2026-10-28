@@ -23,9 +23,11 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// permission, or history state must never be added here.
 pub const MCP_READ_ONLY_TOOL_NAMES: &[&str] = &[
     "list_workspace_folders",
+    "list_active_workspaces",
     "harness_status",
     "operation_log",
     "server_info",
+    "session_status",
     "query_tool_usage",
     "history_search",
     "exec_health_check",
@@ -44,6 +46,8 @@ pub const MCP_READ_ONLY_TOOL_NAMES: &[&str] = &[
     "git_show",
     "git_blame",
     "view_image",
+    "desktop_displays",
+    "desktop_screenshot",
     "patch_check",
     "project_state",
     "task_context",

@@ -17,6 +17,7 @@ import {
   scanHistory, writeHistoryIndex, writeHistoryMarkdown, writeHistoryRetrievalIndex
 } from './historyStorage.js';
 import { buildHistoryRetrievalIndex, searchHistoryRetrievalIndex } from './historyRetrieval.js';
+import { preserveAutoActivity } from './historyAutoMarkdown.js';
 
 const HISTORY_SUMMARY_WINDOW = 5;
 const HISTORY_NUMBER_WINDOW = 256;
@@ -457,7 +458,7 @@ export async function bootstrapHistory(ctx: ToolContext, key: string, args: Json
       loaded_history_bytes: digest.bytes,
       full_history_included: false,
       history_digest: digest.digest,
-      persistence_mode: 'model_mediated_tool_calls',
+      persistence_mode: 'semantic_checkpoints_plus_observed_tool_activity',
       assistant_instructions: responseMode === 'full'
         ? 'Read recent_history_summary, relevant_history_summaries, latest_handoff, and inherited_summary before continuing the project. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.'
         : 'Use recent_history_summary and relevant_history_summaries to restore context, plus latest_handoff for immediate continuity. Request history_session_bootstrap again with response_mode="full" only when deeper prior-session detail is materially needed. Preserve the session_key and current_path returned by bootstrap, then pass them unchanged as session_key and expected_path to every history_session_checkpoint call. After completing each user-requested task, call history_session_checkpoint before the final response. Only state that progress was saved after checkpoint returns ok=true with the same session_key and path.',
@@ -468,7 +469,10 @@ export async function bootstrapHistory(ctx: ToolContext, key: string, args: Json
       checkpoint_policy: {
         tool: 'history_session_checkpoint', session_key: sessionKey, expected_path: currentPath,
         stable_target_required: true, required_before_final_response: true,
-        applies_after_bootstrap: true, automatic_background_persistence: false
+        applies_after_bootstrap: true, automatic_background_persistence: true,
+        automatic_activity_persistence: true, automatic_activity_flush_ms: 5_000,
+        automatic_activity_retained_entries: 48,
+        semantic_checkpoint_requires_tool_call: true
       },
       warnings
     };
@@ -548,7 +552,7 @@ export async function checkpointHistory(ctx: ToolContext, key: string, args: Jso
       updated = true;
     }
 
-    const finalContent = duplicateIgnored ? document.content : attachInheritedSummary(
+    const finalContent = duplicateIgnored ? document.content : preserveAutoActivity(attachInheritedSummary(
       renderDocument(
         document.number,
         documentTitle(document.content, document.number),
@@ -559,7 +563,7 @@ export async function checkpointHistory(ctx: ToolContext, key: string, args: Jso
         records
       ),
       inheritedSummary(document.content) ?? ''
-    );
+    ), document.content);
     if (!duplicateIgnored) await writeHistoryMarkdown(path.join(location.dir, `${document.number}.md`), finalContent);
     index.latest_number = Math.max(index.latest_number, document.number);
     const entry = index.sessions[sessionKey] ?? {

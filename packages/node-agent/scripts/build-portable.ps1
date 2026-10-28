@@ -213,6 +213,18 @@ if ([int]$nodeInfo.major -lt $minimumNodeMajor) {
     throw "Node.js $minimumNodeMajor or later is required; selected runtime is $($nodeInfo.version)."
 }
 
+# Do not ship a portable binary with a known vulnerable bundled Node decoder.
+# Node.js EOL release lines (20/23/25) do not receive CVE-2026-111497 fixes.
+$fixedNodeVersions = @{
+    22 = [version]'22.23.4'
+    24 = [version]'24.22.1'
+    26 = [version]'26.12.1'
+}
+$minimumFixedVersion = $fixedNodeVersions[[int]$nodeInfo.major]
+if (-not $minimumFixedVersion -or [version]([string]$nodeInfo.version).TrimStart('v') -lt $minimumFixedVersion) {
+    throw "Node.js $($nodeInfo.version) is not supported for secure portable builds. Use Node 22.23.4+, 24.22.1+ or 26.12.1+."
+}
+
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $repositoryRoot 'dist-node-portable'
 } elseif (-not [System.IO.Path]::IsPathRooted($OutputDirectory)) {
@@ -429,7 +441,7 @@ if not defined NODE_EXE (
   echo ERROR: Node.js $minimumNodeMajor or later for Windows x64 was not found on PATH.
   goto :failed
 )
-"%NODE_EXE%" -e "const major=Number(process.versions.node.split('.')[0]); if (process.platform !== 'win32' || process.arch !== 'x64' || major < $minimumNodeMajor) { console.error('Node.js $minimumNodeMajor or later for win32 x64 is required; found ' + process.version + ' ' + process.platform + ' ' + process.arch); process.exit(1); }"
+"%NODE_EXE%" -e "const v=process.versions.node.split('.').map(Number); const m={22:[22,23,4],24:[24,22,1],26:[26,12,1]}[v[0]]; if (process.platform !== 'win32' || process.arch !== 'x64' || !m || v[1]<m[1] || (v[1]===m[1] && v[2]<m[2])) { console.error('Node.js security update required (CVE-2026-111497): found ' + process.version + '. Use Node 22.23.4+, 24.22.1+ or 26.12.1+ for win32 x64.'); process.exit(1); }"
 if errorlevel 1 goto :failed
 "@
 

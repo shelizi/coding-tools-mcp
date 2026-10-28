@@ -125,11 +125,11 @@ async function authorize(localBase) {
 
 test('generated profile catalogs match Rust counts, membership and revisions', () => {
   const expectedCounts = {
-    advanced: 63,
-    'read-only': 19,
-    'compat-readonly-all': 63,
-    'guarded-core': 39,
-    'trusted-core': 38
+    advanced: 61,
+    'read-only': 21,
+    'compat-readonly-all': 61,
+    'guarded-core': 41,
+    'trusted-core': 40
   };
   for (const [profile, count] of Object.entries(expectedCounts)) {
     const tools = toolsForProfile(profile);
@@ -153,9 +153,18 @@ test('generated profile catalogs match Rust counts, membership and revisions', (
   assert.equal(advanced.has('fail_task'), true);
   assert.equal(advanced.has('close_failed_task'), true);
   assert.equal(advanced.has('rollback_task'), true);
+  assert.equal(advanced.has('desktop_input'), true);
+  for (const retiredName of ['desktop_click', 'desktop_drag', 'desktop_scroll', 'desktop_type', 'desktop_key']) {
+    assert.equal(advanced.has(retiredName), false, `retired duplicate ${retiredName} must not be exposed`);
+  }
   assert.equal(trusted.has('fail_task'), false);
   assert.equal(readOnly.has('switch_workspace_folder'), false);
   assert.equal(readOnly.has('read_file'), true);
+  for (const profile of ['advanced', 'read-only', 'compat-readonly-all', 'guarded-core', 'trusted-core']) {
+    const statusTool = toolsForProfile(profile).find(tool => tool.name === 'session_status');
+    assert.ok(statusTool, `missing session_status in ${profile}`);
+    assert.equal(statusTool.annotations.readOnlyHint, true);
+  }
 });
 
 test('compat-readonly-all keeps all tools while rewriting annotations', () => {
@@ -228,14 +237,14 @@ test('direct callTool rejects hidden tools before workspace side effects', async
   assert.equal(hidden.error.code, 'UNKNOWN_TOOL');
   assert.equal(hidden.error.category, 'catalog');
   assert.equal(hidden.error.details.tool_profile, 'read-only');
-  assert.equal(hidden.error.details.available_tools.length, 19);
+  assert.equal(hidden.error.details.available_tools.length, toolNamesForProfile('read-only').length);
   await assert.rejects(access(target));
 
   const info = await callTool(ctx, 'server_info', {}, meta);
   assert.equal(info.ok, true);
   assert.equal(info.tool_profile, 'read-only');
   assert.equal(info.configured_tool_profile, 'read-only');
-  assert.equal(info.tool_count, 19);
+  assert.equal(info.tool_count, toolNamesForProfile('read-only').length);
   assert.deepEqual(info.tools, toolNamesForProfile('read-only'));
   assert.equal(info.toolset_revision, toolsetRevisionForProfile('read-only'));
 });

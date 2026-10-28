@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { noteWorkspaceToolAccess } from './activeWorkspaceAccess.js';
+import { applyDefaultCwdArgs } from './toolDispatch/defaultCwd.js';
 import type { JsonObject, ToolContext } from './types.js';
 import { toolNamesForProfile, toolsetRevisionForProfile } from './catalog.js';
 import { editTool } from './fileTools.js';
@@ -359,7 +361,7 @@ function executionBindingFor(
       selectedWorkspaceId, routeSource: 'permission_resume' as const
     };
   }
-  if (name === 'list_workspace_folders' || name === 'switch_workspace_folder' || name === 'conversation_bootstrap') return { ctx, key };
+  if (name === 'list_workspace_folders' || name === 'list_active_workspaces' || name === 'switch_workspace_folder' || name === 'conversation_bootstrap') return { ctx, key };
   if (requestedWorkspaceId) {
     const runtime = ctx.folderRuntimes.get(requestedWorkspaceId);
     if (!runtime) {
@@ -928,6 +930,13 @@ async function callToolInScope(
   result = normalizeToolResult(result);
   result = redaction.redact(result);
   recordConversationSessionRoutes(ctx, key, binding?.folderId, result);
+  if (result.ok === true) {
+    const workspaceRoot = binding?.folderId
+      ? ctx.config.folders.find(folder => folder.id === binding.folderId)?.path
+      : undefined;
+    const accessArgs = applyDefaultCwdArgs(name, args, binding?.defaultCwd ?? '.', workspaceRoot);
+    noteWorkspaceToolAccess(ctx, key, binding?.folderId, name, accessArgs);
+  }
   addPhaseDuration(result, 'serialization_ms', 0);
   const serializationStartedAt = performance.now();
   const serializedResult = JSON.stringify(result);

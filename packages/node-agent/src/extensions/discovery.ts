@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { parse as parseToml } from 'smol-toml';
 import type { JsonObject, WorkspaceFolder } from '../types.js';
 import type {
   ExtensionDiagnostic,
@@ -53,14 +52,6 @@ function stringRecord(value: unknown): Record<string, string> {
 function inside(root: string, candidate: string): boolean {
   const relative = path.relative(root, candidate);
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
-}
-
-function displayPath(actual: string, scope: ExtensionScope, base: string): string {
-  if (scope === 'user') {
-    const relative = path.relative(base, actual).split(path.sep).join('/');
-    return relative ? `~/${relative}` : '~';
-  }
-  return path.relative(base, actual).split(path.sep).join('/');
 }
 
 function key(parts: readonly unknown[]): string {
@@ -121,23 +112,6 @@ async function readJson(
   }
 }
 
-async function readToml(
-  file: string,
-  containmentRoot: string,
-  display: string,
-  diagnostics: ExtensionDiagnostic[],
-  provider: ExtensionProvider,
-  scope: ExtensionScope
-): Promise<JsonObject | undefined> {
-  const content = await safeRead(file, containmentRoot, display, diagnostics, provider, scope);
-  if (content === undefined) return undefined;
-  try { return object(parseToml(content)); }
-  catch (error) {
-    diagnostics.push({ code: 'EXTENSION_CONFIG_INVALID_TOML', message: 'Invalid TOML extension configuration.', provider, scope, path: display });
-    return undefined;
-  }
-}
-
 function timeoutMs(handler: JsonObject): number {
   const explicit = Number(handler.timeout_ms ?? handler.timeoutMs);
   if (Number.isFinite(explicit) && explicit > 0) return Math.min(Math.round(explicit), 120_000);
@@ -158,9 +132,7 @@ function hookHandler(
   handlerIndex: number
 ): HookDescriptor {
   const handlerType = String(handler.type ?? 'command').trim().toLowerCase();
-  const command = process.platform === 'win32' && provider === 'codex'
-    ? String(handler.commandWindows ?? handler.command ?? '').trim()
-    : String(handler.command ?? '').trim();
+  const command = String(handler.command ?? '').trim();
   const url = String(handler.url ?? '').trim() || undefined;
   const handlerSupported = handlerType === 'command' ? Boolean(command) : handlerType === 'http' ? Boolean(url) : false;
   const supported = handlerSupported && SUPPORTED_HOOK_EVENTS.has(event);
@@ -282,12 +254,6 @@ function collectMcp(
   }
 }
 
-function samePath(left: string, right: string): boolean {
-  const a = path.resolve(left);
-  const b = path.resolve(right);
-  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
-}
-
 function precedence(scope: ExtensionScope): number {
   return scope === 'local' ? 0 : scope === 'workspace' ? 10 : 20;
 }
@@ -317,29 +283,21 @@ export async function discoverExtensions(options: ExtensionDiscoveryOptions): Pr
   if (home) {
     try { homeReal = await realpath(home); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') diagnostics.push({ code: 'EXTENSION_USER_HOME_FAILED', message: 'Failed to resolve the user home for extension discovery.', scope: 'user', path: '~' });
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') diagnostics.push({
+        code: 'EXTENSION_USER_HOME_FAILED', message: 'Failed to resolve Coding MCP user home.', scope: 'user', path: '~'
+      });
     }
   }
-
-  let claudeUserSettings: JsonObject = {};
-  let claudeUserRoot: JsonObject = {};
-  let codexUserConfig: JsonObject = {};
+  // Exclusive ownership: NEVER read .claude, .codex, .agents or generic .mcp.json.
+  let userMcp: JsonObject = {};
   if (home && homeReal) {
-    const claudeSettingsPath = path.join(home, '.claude', 'settings.json');
-    claudeUserSettings = await readJson(claudeSettingsPath, homeReal, '~/.claude/settings.json', diagnostics, 'claude', 'user') ?? {};
-    hooks.push(...hooksFromDocument(claudeUserSettings, 'claude', 'user', undefined, '~/.claude/settings.json', claudeUserSettings.disableAllHooks !== true, diagnostics));
-    const claudeRootPath = path.join(home, '.claude.json');
-    claudeUserRoot = await readJson(claudeRootPath, homeReal, '~/.claude.json', diagnostics, 'claude', 'user') ?? {};
-
-    const codexHooksPath = path.join(home, '.codex', 'hooks.json');
-    const codexHooks = await readJson(codexHooksPath, homeReal, '~/.codex/hooks.json', diagnostics, 'codex', 'user') ?? {};
-    const codexConfigPath = path.join(home, '.codex', 'config.toml');
-    codexUserConfig = await readToml(codexConfigPath, homeReal, '~/.codex/config.toml', diagnostics, 'codex', 'user') ?? {};
-    const codexHooksEnabled = object(codexUserConfig.features).hooks !== false;
-    hooks.push(...hooksFromDocument(codexHooks, 'codex', 'user', undefined, '~/.codex/hooks.json', codexHooksEnabled, diagnostics));
-    hooks.push(...hooksFromDocument(codexUserConfig, 'codex', 'user', undefined, '~/.codex/config.toml', codexHooksEnabled, diagnostics));
+    userMcp = await readJson(path.join(home, '.coding-tools-mcp', 'mcp.json'), homeReal,
+      '~/.coding-tools-mcp/mcp.json', diagnostics, 'coding-mcp', 'user') ?? {};
+    const userHooks = await readJson(path.join(home, '.coding-tools-mcp', 'hooks.json'), homeReal,
+      '~/.coding-tools-mcp/hooks.json', diagnostics, 'coding-mcp', 'user') ?? {};
+    hooks.push(...hooksFromDocument(userHooks, 'coding-mcp', 'user', undefined,
+      '~/.coding-tools-mcp/hooks.json', true, diagnostics));
   }
-
   for (const folder of options.folders) {
     let workspaceReal: string;
     try { workspaceReal = await realpath(folder.path); }
@@ -347,45 +305,17 @@ export async function discoverExtensions(options: ExtensionDiscoveryOptions): Pr
       diagnostics.push({ code: 'EXTENSION_WORKSPACE_FAILED', message: error instanceof Error ? error.message : String(error), scope: 'workspace', path: folder.path });
       continue;
     }
-
-    if (home && homeReal) {
-      collectMcp(mcpCandidates, 'claude', 'user', folder.id, '~/.claude.json', claudeUserRoot.mcpServers, true, diagnostics);
-      const projects = object(claudeUserRoot.projects);
-      const localProject = Object.entries(projects).find(([projectPath]) => samePath(projectPath, workspaceReal));
-      if (localProject) {
-        collectMcp(mcpCandidates, 'claude', 'local', folder.id, '~/.claude.json (project-local)', object(localProject[1]).mcpServers, true, diagnostics);
-      }
-      collectMcp(mcpCandidates, 'codex', 'user', folder.id, '~/.codex/config.toml', codexUserConfig.mcp_servers, true, diagnostics);
-    }
-
-    const claudeProjectSettingsPath = path.join(folder.path, '.claude', 'settings.json');
-    const claudeLocalSettingsPath = path.join(folder.path, '.claude', 'settings.local.json');
-    const claudeProjectSettings = await readJson(claudeProjectSettingsPath, workspaceReal, displayPath(claudeProjectSettingsPath, 'workspace', folder.path), diagnostics, 'claude', 'workspace') ?? {};
-    const claudeLocalSettings = await readJson(claudeLocalSettingsPath, workspaceReal, displayPath(claudeLocalSettingsPath, 'local', folder.path), diagnostics, 'claude', 'local') ?? {};
-    hooks.push(...hooksFromDocument(claudeProjectSettings, 'claude', 'workspace', folder.id, '.claude/settings.json', claudeProjectSettings.disableAllHooks !== true && claudeUserSettings.disableAllHooks !== true, diagnostics));
-    hooks.push(...hooksFromDocument(claudeLocalSettings, 'claude', 'local', folder.id, '.claude/settings.local.json', claudeLocalSettings.disableAllHooks !== true && claudeUserSettings.disableAllHooks !== true, diagnostics));
-
-    const disabledProjectServers = new Set([
-      ...stringArray(claudeUserSettings.disabledMcpjsonServers),
-      ...stringArray(claudeProjectSettings.disabledMcpjsonServers),
-      ...stringArray(claudeLocalSettings.disabledMcpjsonServers)
-    ].map(value => value.toLocaleLowerCase('en-US')));
-    const mcpJsonPath = path.join(folder.path, '.mcp.json');
-    const mcpJson = await readJson(mcpJsonPath, workspaceReal, '.mcp.json', diagnostics, 'claude', 'workspace') ?? {};
-    for (const [name, raw] of Object.entries(object(mcpJson.mcpServers))) {
-      collectMcp(mcpCandidates, 'claude', 'workspace', folder.id, '.mcp.json', { [name]: raw }, !disabledProjectServers.has(name.toLocaleLowerCase('en-US')), diagnostics);
-    }
-
-    const codexHooksPath = path.join(folder.path, '.codex', 'hooks.json');
-    const codexHooks = await readJson(codexHooksPath, workspaceReal, '.codex/hooks.json', diagnostics, 'codex', 'workspace') ?? {};
-    const codexConfigPath = path.join(folder.path, '.codex', 'config.toml');
-    const codexProjectConfig = await readToml(codexConfigPath, workspaceReal, '.codex/config.toml', diagnostics, 'codex', 'workspace') ?? {};
-    const codexHooksEnabled = object(codexProjectConfig.features).hooks !== false && object(codexUserConfig.features).hooks !== false;
-    hooks.push(...hooksFromDocument(codexHooks, 'codex', 'workspace', folder.id, '.codex/hooks.json', codexHooksEnabled, diagnostics));
-    hooks.push(...hooksFromDocument(codexProjectConfig, 'codex', 'workspace', folder.id, '.codex/config.toml', codexHooksEnabled, diagnostics));
-    collectMcp(mcpCandidates, 'codex', 'workspace', folder.id, '.codex/config.toml', codexProjectConfig.mcp_servers, true, diagnostics);
+    if (homeReal) collectMcp(mcpCandidates, 'coding-mcp', 'user', folder.id,
+      '~/.coding-tools-mcp/mcp.json', userMcp.mcpServers, true, diagnostics);
+    const workspaceMcp = await readJson(path.join(folder.path, '.coding-tools-mcp', 'mcp.json'), workspaceReal,
+      '.coding-tools-mcp/mcp.json', diagnostics, 'coding-mcp', 'workspace') ?? {};
+    collectMcp(mcpCandidates, 'coding-mcp', 'workspace', folder.id,
+      '.coding-tools-mcp/mcp.json', workspaceMcp.mcpServers, true, diagnostics);
+    const workspaceHooks = await readJson(path.join(folder.path, '.coding-tools-mcp', 'hooks.json'), workspaceReal,
+      '.coding-tools-mcp/hooks.json', diagnostics, 'coding-mcp', 'workspace') ?? {};
+    hooks.push(...hooksFromDocument(workspaceHooks, 'coding-mcp', 'workspace', folder.id,
+      '.coding-tools-mcp/hooks.json', true, diagnostics));
   }
-
   return {
     hooks: hooks.sort((left, right) => left.event.localeCompare(right.event) || left.key.localeCompare(right.key)),
     mcpServers: dedupeMcp(mcpCandidates, diagnostics),

@@ -177,6 +177,10 @@ test('OAuthRuntime applies configurable access-token TTL with a 30-day cap', asy
   const [, payloadPart] = exchanged.body.access_token.split('.');
   const payload = JSON.parse(Buffer.from(payloadPart, 'base64url').toString('utf8'));
   assert.equal(payload.exp - payload.iat, 60 * 60);
+  assert.deepEqual(runtime.tokenExpiryTimes(), [payload.exp * 1000]);
+  assert.equal(runtime.tokenExpiryFor(exchanged.body.access_token), payload.exp * 1000);
+  runtime.dispose();
+  assert.deepEqual(runtime.tokenExpiryTimes(), []);
 
   const capped = new OAuthRuntime(oauthConfig({ tokenTtlSeconds: 365 * 24 * 60 * 60 }));
   assert.equal(capped.tokenTtlSeconds, 30 * 24 * 60 * 60);

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
   access, mkdir, mkdtemp, readFile, rm, utimes, writeFile
 } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import path from 'node:path';
 import { createToolContext } from '../dist/server.js';
 import { callTool } from '../dist/tools.js';
@@ -301,6 +301,50 @@ test('directory lock times out under contention and recovers a stale owner', asy
   const recovered = await acquireHistoryLock(dir, { timeoutMs: 200, retryMs: 5, staleMs: 500 });
   await recovered.release();
   assert.equal(await pathExists(staleDir), false);
+});
+
+test('live history lock cannot be stolen after its directory timestamp expires', async t => {
+  const { root } = await fixture(t, 'ctmcp-history-live-lock-');
+  const dir = path.join(root, 'docs/history-session');
+  const first = await acquireHistoryLock(dir, { timeoutMs: 250, retryMs: 5, staleMs: 10 });
+  const lockDir = path.join(dir, HISTORY_LOCK_DIR);
+  const old = new Date(Date.now() - 10_000);
+  await utimes(lockDir, old, old);
+  await assert.rejects(
+    acquireHistoryLock(dir, { timeoutMs: 55, retryMs: 5, staleMs: 10 }),
+    error => error instanceof HistoryError && error.code === 'HISTORY_LOCK_TIMEOUT'
+  );
+  assert.equal(await pathExists(path.join(lockDir, 'owner.json')), true);
+  await first.release();
+  const next = await acquireHistoryLock(dir, { timeoutMs: 250, retryMs: 5, staleMs: 10 });
+  await next.release();
+});
+
+test('crashed history owner recovers but a remote hostname never authorizes PID-based stealing', async t => {
+  const { root } = await fixture(t, 'ctmcp-history-dead-lock-');
+  const dir = path.join(root, 'docs/history-session');
+  const lockDir = path.join(dir, HISTORY_LOCK_DIR);
+  await mkdir(dir, { recursive: true });
+  await mkdir(lockDir);
+  await writeFile(path.join(lockDir, 'owner.json'), JSON.stringify({
+    version: 1, token: 'dead', pid: 99999999, hostname: hostname().toLowerCase()
+  }));
+  const old = new Date(Date.now() - 10_000);
+  await utimes(lockDir, old, old);
+  const recovered = await acquireHistoryLock(dir, { timeoutMs: 250, retryMs: 5, staleMs: 10 });
+  await recovered.release();
+
+  await mkdir(lockDir);
+  await writeFile(path.join(lockDir, 'owner.json'), JSON.stringify({
+    version: 1, token: 'remote', pid: 99999999, hostname: 'remote-host.example.invalid'
+  }));
+  await utimes(lockDir, old, old);
+  await assert.rejects(
+    acquireHistoryLock(dir, { timeoutMs: 55, retryMs: 5, staleMs: 10 }),
+    error => error instanceof HistoryError && error.code === 'HISTORY_LOCK_TIMEOUT'
+  );
+  assert.equal(await pathExists(lockDir), true);
+  await rm(lockDir, { recursive: true, force: true });
 });
 
 test('bootstrap bounds summaries and inherited history without recursive growth', async t => {

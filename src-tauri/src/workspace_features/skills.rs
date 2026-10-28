@@ -429,70 +429,44 @@ fn roots_for_folder(folder: &WorkspaceFolder) -> Result<Vec<RootSpec>, SkillDiag
     })?;
     let mut roots = vec![
         RootSpec {
+            root: workspace.join(".coding-tools-mcp").join("skills"),
+            containment: workspace_real.clone(),
+            display_base: workspace.clone(),
+            display_prefix: None,
+            source: "coding-mcp",
+            scope: "workspace",
+            precedence: 0,
+            max_depth: 5,
+            folder_id: Some(folder.id.clone()),
+            folder_name: Some(folder.name.clone()),
+        },
+        RootSpec {
             root: workspace.join("skills"),
             containment: workspace_real.clone(),
             display_base: workspace.clone(),
             display_prefix: None,
             source: "project",
             scope: "workspace",
-            precedence: 0,
-            max_depth: 3,
-            folder_id: Some(folder.id.clone()),
-            folder_name: Some(folder.name.clone()),
-        },
-        RootSpec {
-            root: workspace.join(".agents").join("skills"),
-            containment: workspace_real.clone(),
-            display_base: workspace.clone(),
-            display_prefix: None,
-            source: "agents",
-            scope: "workspace",
             precedence: 10,
-            max_depth: 5,
-            folder_id: Some(folder.id.clone()),
-            folder_name: Some(folder.name.clone()),
-        },
-        RootSpec {
-            root: workspace.join(".claude").join("skills"),
-            containment: workspace_real,
-            display_base: workspace.clone(),
-            display_prefix: None,
-            source: "claude",
-            scope: "workspace",
-            precedence: 20,
-            max_depth: 7,
+            max_depth: 3,
             folder_id: Some(folder.id.clone()),
             folder_name: Some(folder.name.clone()),
         },
     ];
     if let Some(home) = dirs::home_dir() {
         if let Ok(home_real) = home.canonicalize() {
-            roots.extend([
-                RootSpec {
-                    root: home.join(".agents").join("skills"),
-                    containment: home_real.clone(),
-                    display_base: home.join(".agents").join("skills"),
-                    display_prefix: Some("~/.agents/skills".into()),
-                    source: "codex-user",
-                    scope: "user",
-                    precedence: 100,
-                    max_depth: 5,
-                    folder_id: None,
-                    folder_name: None,
-                },
-                RootSpec {
-                    root: home.join(".claude").join("skills"),
-                    containment: home_real,
-                    display_base: home.join(".claude").join("skills"),
-                    display_prefix: Some("~/.claude/skills".into()),
-                    source: "claude-user",
-                    scope: "user",
-                    precedence: 110,
-                    max_depth: 7,
-                    folder_id: None,
-                    folder_name: None,
-                },
-            ]);
+            roots.extend([RootSpec {
+                root: home.join(".coding-tools-mcp").join("skills"),
+                containment: home_real.clone(),
+                display_base: home.join(".coding-tools-mcp").join("skills"),
+                display_prefix: Some("~/.coding-tools-mcp/skills".into()),
+                source: "coding-mcp-user",
+                scope: "user",
+                precedence: 100,
+                max_depth: 5,
+                folder_id: None,
+                folder_name: None,
+            }]);
         }
     }
     Ok(roots)
@@ -566,7 +540,7 @@ mod tests {
     #[test]
     fn discovers_workspace_skill_with_node_compatible_key() {
         let root = tempdir().expect("tempdir");
-        let skill = root.path().join(".agents/skills/example");
+        let skill = root.path().join(".coding-tools-mcp/skills/example");
         fs::create_dir_all(&skill).expect("mkdir");
         fs::write(
             skill.join("SKILL.md"),
@@ -586,11 +560,11 @@ mod tests {
             })
             .expect("workspace example skill");
         assert_eq!(example.scope, "workspace");
-        assert_eq!(example.source, "agents");
+        assert_eq!(example.source, "coding-mcp");
         assert_eq!(
             example.key,
             format!(
-                "workspace:{}:agents:.agents/skills/example/SKILL.md",
+                "workspace:{}:coding-mcp:.coding-tools-mcp/skills/example/SKILL.md",
                 folder.id
             )
         );

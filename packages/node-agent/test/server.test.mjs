@@ -57,13 +57,13 @@ test('scoped OAuth PKCE and MCP workspace flow', async t => {
   await writeFile(path.join(root, 'pixel.bin'), PNG.sync.write(image));
   const externalMcpFixture = fileURLToPath(new URL('./fixtures/mcp-extension-fixture.mjs', import.meta.url));
   const externalHookFixture = fileURLToPath(new URL('./fixtures/hook-extension-fixture.mjs', import.meta.url));
-  await writeFile(path.join(root, '.mcp.json'), JSON.stringify({
+  await mkdir(path.join(root, '.coding-tools-mcp'), { recursive: true });
+  await writeFile(path.join(root, '.coding-tools-mcp', 'mcp.json'), JSON.stringify({
     mcpServers: {
       fixture: { type: 'stdio', command: process.execPath, args: [externalMcpFixture] }
     }
   }));
-  await mkdir(path.join(root, '.claude'), { recursive: true });
-  await writeFile(path.join(root, '.claude', 'settings.json'), JSON.stringify({
+  await writeFile(path.join(root, '.coding-tools-mcp', 'hooks.json'), JSON.stringify({
     hooks: {
       PreToolUse: [{
         matcher: 'set_default_cwd',
@@ -77,7 +77,7 @@ test('scoped OAuth PKCE and MCP workspace flow', async t => {
   const extensionDiscovery = await discoverExtensions({ folders, homeDir: null });
   const externalServer = extensionDiscovery.mcpServers.find(server => server.name === 'fixture');
   assert.ok(externalServer);
-  const externalHook = extensionDiscovery.hooks.find(hook => hook.provider === 'claude' && hook.event === 'PreToolUse');
+  const externalHook = extensionDiscovery.hooks.find(hook => hook.provider === 'coding-mcp' && hook.event === 'PreToolUse');
   assert.ok(externalHook);
   const config = {
     host: '127.0.0.1', port: 0, publicBaseUrl, dataDir, permissionMode: 'trusted',

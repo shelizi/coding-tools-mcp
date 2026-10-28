@@ -23,46 +23,43 @@ test('SKILL.md parser accepts quoted metadata and requires name and description'
   assert.throws(() => parseSkillMarkdown('---\nname: demo\n---\n'), /requires description/);
 });
 
-test('project Skill registry discovers compatibility roots with deterministic precedence', async () => {
+test('Skill discovery reads Coding MCP-owned and project roots, never foreign agent roots', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-skills-'));
-  await writeSkill(root, path.join('.claude', 'skills', 'shared'), 'shared', 'Claude compatibility copy');
-  await writeSkill(root, path.join('.agents', 'skills', 'shared'), 'shared', 'Agents compatibility copy');
-  await writeSkill(root, path.join('skills', 'shared'), 'shared', 'Canonical project copy');
-  await writeSkill(root, path.join('.claude', 'skills', 'gitnexus', 'debugging'), 'gitnexus-debugging', 'Debug with GitNexus');
-  await writeFile(path.join(root, 'skills', 'shared', 'VERSION'), '2.3.4\n');
+  await writeSkill(root, path.join('.claude', 'skills', 'foreign-claude'), 'foreign-claude', 'Should be ignored');
+  await writeSkill(root, path.join('.agents', 'skills', 'foreign-agents'), 'foreign-agents', 'Should be ignored');
+  await writeSkill(root, path.join('skills', 'shared'), 'shared', 'Project copy');
+  await writeSkill(root, path.join('.coding-tools-mcp', 'skills', 'shared'), 'shared', 'Coding MCP-owned copy');
+  await writeSkill(root, path.join('.coding-tools-mcp', 'skills', 'owned-only'), 'owned-only', 'Dedicated Coding MCP skill');
+  await writeFile(path.join(root, '.coding-tools-mcp', 'skills', 'shared', 'VERSION'), '2.3.4\n');
 
   const snapshot = await new SkillRegistry(root, { homeDir: null }).snapshot();
-  assert.deepEqual(snapshot.skills.map(skill => skill.name), ['gitnexus-debugging', 'shared']);
+  assert.deepEqual(snapshot.skills.map(skill => skill.name), ['owned-only', 'shared']);
   const shared = snapshot.skills.find(skill => skill.name === 'shared');
-  assert.equal(shared.source, 'project');
+  assert.equal(shared.source, 'coding-mcp');
   assert.equal(shared.scope, 'workspace');
-  assert.equal(shared.description, 'Canonical project copy');
+  assert.equal(shared.description, 'Coding MCP-owned copy');
   assert.equal(shared.version, '2.3.4');
-  assert.equal(snapshot.diagnostics.filter(item => item.code === 'SKILL_SHADOWED').length, 2);
+  assert.equal(snapshot.diagnostics.filter(item => item.code === 'SKILL_SHADOWED').length, 1);
   assert.match(snapshot.revision, /^[a-f0-9]{64}$/);
 });
 
-test('Skill registry discovers Codex and Claude Code user Skills and filters controls after shadowing', async () => {
+test('own user Skill roots and workspace toggle take precedence without reading other Agents', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'ctmcp-skills-workspace-'));
   const home = await mkdtemp(path.join(tmpdir(), 'ctmcp-skills-home-'));
-  await writeSkill(home, path.join('.agents', 'skills', 'user-only'), 'user-only', 'Personal Codex workflow');
-  await writeSkill(home, path.join('.agents', 'skills', 'shared'), 'shared', 'Personal shared workflow');
-  await writeSkill(home, path.join('.claude', 'skills', 'claude-only'), 'claude-only', 'Personal Claude workflow');
+  await writeSkill(home, path.join('.coding-tools-mcp', 'skills', 'user-only'), 'user-only', 'Personal Coding MCP workflow');
+  await writeSkill(home, path.join('.coding-tools-mcp', 'skills', 'shared'), 'shared', 'Personal shared workflow');
+  await writeSkill(home, path.join('.agents', 'skills', 'foreign-codex'), 'foreign-codex', 'Must be ignored');
+  await writeSkill(home, path.join('.claude', 'skills', 'foreign-claude'), 'foreign-claude', 'Must be ignored');
   await writeSkill(root, path.join('skills', 'shared'), 'shared', 'Workspace shared workflow');
 
   const registry = new SkillRegistry(root, { homeDir: home, workspaceKey: 'repo' });
   const inventory = await registry.inventory();
-  assert.deepEqual(inventory.skills.map(item => item.skill.name), ['claude-only', 'shared', 'user-only']);
+  assert.deepEqual(inventory.skills.map(item => item.skill.name), ['shared', 'user-only']);
   const userOnly = inventory.skills.find(item => item.skill.name === 'user-only').skill;
-  assert.equal(userOnly.source, 'codex-user');
+  assert.equal(userOnly.source, 'coding-mcp-user');
   assert.equal(userOnly.scope, 'user');
-  assert.equal(userOnly.relativePath, '~/.agents/skills/user-only/SKILL.md');
+  assert.equal(userOnly.relativePath, '~/.coding-tools-mcp/skills/user-only/SKILL.md');
   assert.equal(userOnly.relativePath.includes(home), false);
-  const claudeOnly = inventory.skills.find(item => item.skill.name === 'claude-only').skill;
-  assert.equal(claudeOnly.source, 'claude-user');
-  assert.equal(claudeOnly.scope, 'user');
-  assert.equal(claudeOnly.relativePath, '~/.claude/skills/claude-only/SKILL.md');
-  assert.equal(claudeOnly.relativePath.includes(home), false);
 
   const sharedItem = inventory.skills.find(item => item.skill.name === 'shared');
   assert.equal(sharedItem.skill.source, 'project');
@@ -74,8 +71,7 @@ test('Skill registry discovers Codex and Claude Code user Skills and filters con
   const disabledInventory = await registry.inventory();
   assert.equal(disabledInventory.skills.find(item => item.skill.name === 'shared').enabled, false);
   const after = await registry.snapshot();
-  assert.deepEqual(after.skills.map(skill => skill.name), ['claude-only', 'user-only']);
-  assert.equal(after.skills.some(skill => skill.name === 'shared'), false);
+  assert.deepEqual(after.skills.map(skill => skill.name), ['user-only']);
   assert.notEqual(after.revision, before.revision);
 
   registry.setActive(false);
@@ -83,17 +79,14 @@ test('Skill registry discovers Codex and Claude Code user Skills and filters con
   assert.equal(masterDisabledInventory.skills.find(item => item.skill.name === 'user-only').selected, true);
   assert.equal(masterDisabledInventory.skills.find(item => item.skill.name === 'user-only').enabled, false);
   assert.equal(masterDisabledInventory.skills.find(item => item.skill.name === 'shared').selected, false);
-  const masterDisabled = await registry.snapshot();
-  assert.deepEqual(masterDisabled.skills, []);
+  assert.deepEqual((await registry.snapshot()).skills, []);
 
   registry.setActive(true);
-  const restored = await registry.snapshot();
-  assert.deepEqual(restored.skills.map(skill => skill.name), ['claude-only', 'user-only']);
-
+  assert.deepEqual((await registry.snapshot()).skills.map(skill => skill.name), ['user-only']);
   const shadowed = after.diagnostics.find(item => item.code === 'SKILL_SHADOWED' && item.name === 'shared');
-  assert.equal(shadowed.source, 'codex-user');
+  assert.equal(shadowed.source, 'coding-mcp-user');
   assert.equal(shadowed.scope, 'user');
-  assert.equal(shadowed.path, '~/.agents/skills/shared/SKILL.md');
+  assert.equal(shadowed.path, '~/.coding-tools-mcp/skills/shared/SKILL.md');
 });
 
 test('promoted evolved Skill guidance is hash-bound, fail-closed, and preserves base controls', async () => {

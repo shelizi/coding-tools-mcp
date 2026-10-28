@@ -308,13 +308,17 @@ test('durable managed job keeps its fixed timeout across Agent restart', async t
       } catch { /* best effort */ }
     }
     await disposeProcessSessions(ctx2);
-    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
-    await rm(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    // Windows durable worker handles can outlive result finalization briefly.
+    await rm(root, { recursive: true, force: true, maxRetries: 40, retryDelay: 250 });
+    await rm(dataDir, { recursive: true, force: true, maxRetries: 40, retryDelay: 250 });
   });
   assert.equal((await callTool(ctx1, 'switch_workspace_folder', { folder_id: 'repo' }, meta1)).ok, true);
   const started = await callTool(ctx1, 'exec_command', {
     program: nodeProgram,
-    args: ['-e', `console.log('timeout-start'); setTimeout(() => console.log('too-late'), 5000);`],
+    // The worker can start several seconds late on a loaded Windows runner.
+    // Keep the natural-exit sentinel safely beyond that scheduling jitter,
+    // while still proving the original 800 ms deadline survives the restart.
+    args: ['-e', `console.log('timeout-start'); setTimeout(() => console.log('too-late'), 30000);`],
     operation_id: `durable-timeout-${Date.now()}`,
     job_timeout_ms: 800,
     yield_time_ms: 50
@@ -330,6 +334,7 @@ test('durable managed job keeps its fixed timeout across Agent restart', async t
   assert.equal(final.process_completed, true);
   assert.equal(final.process_timed_out, true);
   assert.equal(final.termination_reason, 'process_timeout');
+  assert.equal(final.process_deadline_ts_ms, started.process_deadline_ts_ms);
   assert.equal(final.restart_recoverable, true);
   assert.match(final.stdout, /timeout-start/);
   assert.doesNotMatch(final.stdout, /too-late/);

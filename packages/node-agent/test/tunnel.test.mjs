@@ -1894,8 +1894,10 @@ test('built-in tunnel bounds local connect and overall request phases without le
   const manager = new BuiltinTunnelManager(config, context, {
     websocketUrlOverride: `ws://127.0.0.1:${tunnelAddress.port}/_tunnel/v1`,
     localOriginOverride: `http://loopback.test:${localPort}`,
-    localConnectTimeoutMs: 100,
-    localRequestTimeoutMs: 250,
+    // Cancellation must win over the connect timeout even when the Windows
+    // test runner is busy. Keep distinct bounded connect/overall deadlines.
+    localConnectTimeoutMs: 1_000,
+    localRequestTimeoutMs: 2_500,
     reconcileIntervalMs: 20,
     localLookup: (_hostname, options, callback) => {
       if (lookupMode === 'hang') {

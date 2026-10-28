@@ -591,6 +591,7 @@ fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value
         "list_workspace_folders" => {
             crate::tools::hub::list_workspace_folders(state, host_session_key)
         }
+        "list_active_workspaces" => crate::tools::hub::list_active_workspaces(state, &args),
         "conversation_bootstrap" => conversation_bootstrap(state, &args, host_session_key)?,
         "switch_workspace_folder" => {
             let folder_id = args
@@ -640,6 +641,15 @@ fn handle_tools_call(state: &SharedState, params: &Value) -> Result<Value, Value
                 &routed,
                 structured,
             );
+            if structured.get("ok").and_then(Value::as_bool) == Some(true) {
+                crate::tools::hub::record_workspace_access(
+                    &state,
+                    host_session_key,
+                    &routed.folder_id,
+                    &canonical_name,
+                    &args,
+                );
+            }
             attach_workspace_routing(structured, requested_folder_id.as_deref(), &routed)
         }
     };
@@ -693,7 +703,10 @@ async fn handle_tools_call_async(state: SharedState, params: Value) -> Result<Va
     let mut task_context = None;
     let is_control_tool = matches!(
         canonical_name.as_str(),
-        "list_workspace_folders" | "conversation_bootstrap" | "switch_workspace_folder"
+        "list_workspace_folders"
+            | "list_active_workspaces"
+            | "conversation_bootstrap"
+            | "switch_workspace_folder"
     );
     let structured = if is_control_tool {
         let listing = crate::tools::hub::list_workspace_folders(&state, host_session_key);
@@ -733,6 +746,9 @@ async fn handle_tools_call_async(state: SharedState, params: Value) -> Result<Va
             let mut structured = match canonical_name.as_str() {
                 "list_workspace_folders" => {
                     crate::tools::hub::list_workspace_folders(&state, host_session_key)
+                }
+                "list_active_workspaces" => {
+                    crate::tools::hub::list_active_workspaces(&state, &args)
                 }
                 "conversation_bootstrap" => {
                     conversation_bootstrap(&state, &args, host_session_key)?
@@ -833,6 +849,15 @@ async fn handle_tools_call_async(state: SharedState, params: Value) -> Result<Va
             )
             .await;
             attach_hook_metadata(&mut structured, pre.context, post.feedback);
+            if structured.get("ok").and_then(Value::as_bool) == Some(true) {
+                crate::tools::hub::record_workspace_access(
+                    &state,
+                    host_session_key,
+                    &routed.folder_id,
+                    &canonical_name,
+                    &args,
+                );
+            }
             attach_workspace_routing(structured, requested_folder_id.as_deref(), &routed)
         }
     };

@@ -30,6 +30,7 @@ pub struct OAuthRuntime {
     pub token_secret: String,
     token_ttl_seconds: i64,
     pending: Arc<Mutex<HashMap<String, PendingCode>>>,
+    observed_token_expiries: Arc<Mutex<HashMap<String, u64>>>,
     password_persister: Option<PasswordPersister>,
     authorization_lock: Arc<Mutex<()>>,
 }
@@ -94,6 +95,7 @@ impl OAuthRuntime {
             token_secret,
             token_ttl_seconds: OAUTH_TOKEN_TTL_SECONDS,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            observed_token_expiries: Arc::new(Mutex::new(HashMap::new())),
             password_persister,
             authorization_lock: Arc::new(Mutex::new(())),
         })
@@ -105,6 +107,56 @@ impl OAuthRuntime {
         }
         self.token_ttl_seconds = token_ttl_seconds.min(OAUTH_TOKEN_TTL_MAX_SECONDS as u64) as i64;
         Ok(self)
+    }
+
+    pub fn token_ttl_seconds(&self) -> u64 {
+        self.token_ttl_seconds as u64
+    }
+
+    fn observe_token(&self, token: &str, expires_at: i64) {
+        let now = unix_now();
+        let mut entries = self
+            .observed_token_expiries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|_, expiry| *expiry > now);
+        if expires_at <= now as i64 {
+            return;
+        }
+        let fingerprint = format!("{:x}", Sha256::digest(token.as_bytes()));
+        if !entries.contains_key(&fingerprint) && entries.len() >= 1024 {
+            if let Some(oldest) = entries.keys().next().cloned() {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(fingerprint, expires_at as u64);
+    }
+
+    /// Known valid OAuth tokens in this runtime; no bearer string or owner is exposed.
+    pub fn token_expiry_times(&self) -> Vec<u64> {
+        let now = unix_now();
+        let mut entries = self
+            .observed_token_expiries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries.retain(|_, expiry| *expiry > now);
+        let mut times: Vec<_> = entries
+            .values()
+            .map(|expiry| expiry.saturating_mul(1000))
+            .collect();
+        times.sort_unstable();
+        times
+    }
+
+    /// Expiry of a credential already verified by the authenticated HTTP boundary.
+    pub fn token_expiry_for(&self, token: &str) -> Option<u64> {
+        let fingerprint = format!("{:x}", Sha256::digest(token.as_bytes()));
+        self.observed_token_expiries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&fingerprint)
+            .filter(|expiry| **expiry > unix_now())
+            .map(|expiry| expiry.saturating_mul(1000))
     }
 
     pub fn client_id_allowed(&self, client_id: &str) -> bool {
@@ -123,12 +175,17 @@ impl OAuthRuntime {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.set_audience(&[resource.as_str(), issuer]);
         validation.set_issuer(&[issuer]);
-        decode::<TokenClaims>(
+        match decode::<TokenClaims>(
             token,
             &DecodingKey::from_secret(self.token_secret.as_bytes()),
             &validation,
-        )
-        .is_ok()
+        ) {
+            Ok(decoded) => {
+                self.observe_token(token, decoded.claims.exp);
+                true
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -431,15 +488,18 @@ pub fn token_exchange(
         &oauth.token_secret,
         oauth.token_ttl_seconds,
     ) {
-        Ok(access_token) => (
-            StatusCode::OK,
-            axum::Json(json!({
-                "access_token": access_token,
-                "token_type": "Bearer",
-                "expires_in": oauth.token_ttl_seconds
-            })),
-        )
-            .into_response(),
+        Ok(access_token) => {
+            oauth.observe_token(&access_token, unix_now() as i64 + oauth.token_ttl_seconds);
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "access_token": access_token,
+                    "token_type": "Bearer",
+                    "expires_in": oauth.token_ttl_seconds
+                })),
+            )
+                .into_response()
+        }
         Err(_) => token_error("server_error", "Failed to issue access token"),
     }
 }

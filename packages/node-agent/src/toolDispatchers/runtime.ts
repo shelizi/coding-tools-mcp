@@ -1,4 +1,5 @@
 import { stat } from 'node:fs/promises';
+import { listActiveWorkspaces } from '../activeWorkspaceAccess.js';
 import { toolNamesForProfile, toolsetRevisionForProfile } from '../catalog.js';
 import type { ConversationIdentity } from '../conversation/contract.js';
 import { ConversationRoutingError } from '../conversation.js';
@@ -438,7 +439,16 @@ async function setDefaultCwd({ ctx, key, args }: ToolDispatchRequest): Promise<J
 
 export const runtimeToolHandlers = {
   server_info: serverInfo,
+  session_status: ({ ctx }) => ok({
+    auth_type: 'oauth',
+    scope: 'current_request',
+    oauth_token_ttl_seconds: ctx.config.oauth?.tokenTtlSeconds ?? null,
+    oauth_token_expires_at_ms: null,
+    conversation_handle_expires_at_ms: null,
+    note: 'Expiry of caller credentials only; null means unavailable, not expired.'
+  }),
   list_workspace_folders: ({ ctx, key, identity }) => ok(workspaceFolderListing(ctx, key, identity)),
+  list_active_workspaces: ({ ctx, args }) => listActiveWorkspaces(ctx, args),
   switch_workspace_folder: switchWorkspaceFolder,
   conversation_bootstrap: conversationBootstrap,
   query_tool_usage: ({ ctx, args }) => ctx.usageStore.query(args),

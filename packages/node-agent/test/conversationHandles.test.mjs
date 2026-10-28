@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { ConversationHandleStore, CONVERSATION_HANDLE_TTL_MS, MAX_CONVERSATION_HANDLES, decorateHandleResult } from '../dist/server/mcp/conversationHandles.js';
+import { ConversationHandleStore, CONVERSATION_HANDLE_TTL_MS, MAX_CONVERSATION_HANDLES, decorateHandleResult, decorateSessionStatus } from '../dist/server/mcp/conversationHandles.js';
 import { createMcpFixture, mcpRequest } from './mcpTestHelpers.mjs';
 import { redactSensitiveText, isSensitiveKey } from '../dist/redaction.js';
 
@@ -36,6 +36,15 @@ test('handle responses expose full data in one text block and preserve non-text 
   assert.equal(decorateHandleResult(ordinary, undefined), ordinary);
 });
 
+test('session_status keeps expiry consistent between structured and text results', () => {
+  const input = { structuredContent: { ok: true, oauth_token_expires_at_ms: null },
+    content: [{ type: 'text', text: 'status' }, { type: 'resource_link', uri: 'output://sample' }] };
+  const result = decorateSessionStatus(input, 54321);
+  assert.equal(result.structuredContent.oauth_token_expires_at_ms, 54321);
+  assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+  assert.equal(result.content[1].type, 'resource_link');
+});
+
 test('handle store enforces ownership, native identity, absolute TTL, restart and capacity', () => {
   const forgotten = [];
   const store = new ConversationHandleStore(key => forgotten.push(key));
@@ -43,6 +52,7 @@ test('handle store enforces ownership, native identity, absolute TTL, restart an
   const issued = store.prepare('owner', body, 100);
   assert.match(issued.token, /^ch_[a-f0-9]{64}$/);
   assert.equal(issued.expiresAt, 100 + CONVERSATION_HANDLE_TTL_MS);
+  assert.deepEqual(store.expiryTimes(200), [issued.expiresAt]);
   const key = body.params._meta['openai/session'];
   const request = () => ({ method: 'tools/call', params: { name: 'list_workspace_folders', arguments: { conversation_handle: issued.token } } });
   const resumed = request();
@@ -55,6 +65,7 @@ test('handle store enforces ownership, native identity, absolute TTL, restart an
   conflict.params._meta = { 'openai/session': 'different-platform-chat' };
   assert.throws(() => store.prepare('owner', conflict, 200), /platform conversation/);
   assert.throws(() => store.prepare('owner', request(), issued.expiresAt), /expired/);
+  assert.deepEqual(store.expiryTimes(issued.expiresAt), []);
   assert.deepEqual(forgotten, [key]);
   const capped = new ConversationHandleStore();
   for (let index = 0; index < MAX_CONVERSATION_HANDLES; index++) capped.prepare('owner', bootstrap(), 0);
@@ -82,6 +93,20 @@ function alternateCredential(authorization) {
   const signed = `${header}.${encoded}`;
   return `Bearer ${signed}.${createHmac('sha256', 'mcp-http-parity-token-secret').update(signed).digest('base64url')}`;
 }
+
+test('session_status shows authenticated caller token and handle expiry without exposing secrets', async t => {
+  const state = await createMcpFixture(t);
+  const first = await call(state, 'conversation_bootstrap', { folder_id: 'repo' });
+  const handle = first.result.structuredContent.conversation_handle;
+  const response = await call(state, 'session_status', { conversation_handle: handle });
+  const result = response.result?.structuredContent;
+  assert.equal(result?.ok, true, JSON.stringify(response));
+  assert.equal(result.auth_type, 'oauth');
+  assert.ok(result.oauth_token_expires_at_ms > Date.now());
+  assert.equal(result.conversation_handle_expires_at_ms, first.result.structuredContent.conversation_handle_expires_at_ms);
+  assert.deepEqual(JSON.parse(response.result.content[0].text), result);
+  assert.equal(JSON.stringify(result).includes(handle), false);
+});
 
 test('authenticated HTTP handles preserve cwd, isolate new chats, strip secrets and reject fallback', async t => {
   const state = await createMcpFixture(t);

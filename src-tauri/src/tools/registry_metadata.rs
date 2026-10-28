@@ -24,9 +24,25 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         false,
     ),
     (
+        "session_status",
+        "Session expiry status",
+        "Return expiry details for the authenticated current MCP request; include OAuth and conversation-handle expiry when available without revealing credentials or other clients.",
+        true,
+        false,
+        false,
+    ),
+    (
         "list_workspace_folders",
         "List tool hub folders",
         "List folders configured in this tool hub and show the selected or default routing context.",
+        true,
+        false,
+        false,
+    ),
+    (
+        "list_active_workspaces",
+        "List active workspace access",
+        "List MCP workspaces and linked Git worktrees with activity in the last 3 minutes (active) or 5 minutes (recent). Shows counts and last access without exposing conversation IDs. Runtime-local and not a heartbeat or lock.",
         true,
         false,
         false,
@@ -451,54 +467,22 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
         "desktop_displays",
         "List desktop displays",
         "List physical desktop displays with local sizes and global virtual-desktop origins.",
-        false,
+        true,
         false,
         false,
     ),
     (
         "desktop_screenshot",
         "Capture desktop display",
-        "Capture one display at native pixel dimensions with JPEG quality compression and no resizing.",
-        false,
-        false,
-        false,
-    ),
-    (
-        "desktop_click",
-        "Click desktop",
-        "Move to display-local physical pixel coordinates and click a mouse button.",
-        false,
+        "Capture a display as JPEG, optionally resize it and return coordinates for safe image-pixel input.",
         true,
         false,
-    ),
-    (
-        "desktop_drag",
-        "Drag desktop",
-        "Hold a mouse button and drag between display-local physical pixel coordinates, including across displays.",
-        false,
-        true,
         false,
     ),
     (
-        "desktop_scroll",
-        "Scroll desktop",
-        "Scroll the desktop, optionally at display-local physical pixel coordinates.",
-        false,
-        true,
-        false,
-    ),
-    (
-        "desktop_type",
-        "Type desktop text",
-        "Type Unicode text into the currently focused desktop application.",
-        false,
-        true,
-        false,
-    ),
-    (
-        "desktop_key",
-        "Press desktop keys",
-        "Press a key or hotkey chord in the currently focused desktop application.",
+        "desktop_input",
+        "Execute desktop input sequence",
+        "Execute 1-64 keyboard and mouse actions in one call: click, drag/path, scroll, type, key chord, key_down/up, mouse_down/up, move and wait. Modifier keys may be held during clicks/drag and are released on completion/error. Pass screenshot coordinate_reference for safe image coordinates.",
         false,
         true,
         false,
@@ -507,7 +491,9 @@ pub const P0_TOOLS: &[(&str, &str, &str, bool, bool, bool)] = &[
 
 /// old Python 版本默认提供的核心工具集。默认 MCP 只暴露这一组，保持 Agent 的工具面稳定。
 pub const CORE_TOOLS: &[&str] = &[
+    "list_active_workspaces",
     "server_info",
+    "session_status",
     "list_workspace_folders",
     "conversation_bootstrap",
     "switch_workspace_folder",
@@ -548,7 +534,9 @@ pub const CORE_TOOLS: &[&str] = &[
 ];
 
 pub const GUARDED_CORE_TOOLS: &[&str] = &[
+    "list_active_workspaces",
     "server_info",
+    "session_status",
     "list_workspace_folders",
     "conversation_bootstrap",
     "switch_workspace_folder",
@@ -590,7 +578,9 @@ pub const GUARDED_CORE_TOOLS: &[&str] = &[
 ];
 
 pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
+    "list_active_workspaces",
     "server_info",
+    "session_status",
     "list_workspace_folders",
     "query_tool_usage",
     "history_search",
@@ -612,9 +602,11 @@ pub const CORE_READ_ONLY_TOOLS: &[&str] = &[
 ];
 
 pub const ALLOWED_TOOLS: &[&str] = &[
+    "list_active_workspaces",
     "harness_status",
     "operation_log",
     "server_info",
+    "session_status",
     "list_workspace_folders",
     "conversation_bootstrap",
     "switch_workspace_folder",
@@ -670,11 +662,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "view_image",
     "desktop_displays",
     "desktop_screenshot",
-    "desktop_click",
-    "desktop_drag",
-    "desktop_scroll",
-    "desktop_type",
-    "desktop_key",
+    "desktop_input",
 ];
 
 pub const READ_ONLY_TOOLS: &[&str] = coding_tools_tunnel_protocol::MCP_READ_ONLY_TOOL_NAMES;

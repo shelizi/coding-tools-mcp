@@ -1,6 +1,9 @@
 import type { RuntimeStatus, SandboxBackendDescriptor, WorkspaceProfile } from "../types";
 import type { HealthItem } from "../api/health";
+import type { SessionExpirySnapshot } from "../api/session-expiry";
 import type {
+  HistoryBackgroundJobsResult,
+  HistoryBackgroundLog,
   HistorySessionDetail,
   HistorySessionsResult,
 } from "../api/history";
@@ -19,6 +22,9 @@ export type {
 } from "./capabilities";
 export type { HealthItem } from "../api/health";
 export type {
+  HistoryBackgroundJob,
+  HistoryBackgroundJobsResult,
+  HistoryBackgroundLog,
   HistoryRecord,
   HistorySessionDetail,
   HistorySessionSummary,
@@ -129,10 +135,16 @@ export interface HistoryBackend {
     folderId?: string,
     signal?: AbortSignal,
   ): Promise<HistorySessionDetail>;
+  listBackgroundJobs(workspaceId: string, number: number, folderId: string): Promise<HistoryBackgroundJobsResult>;
+  readBackgroundLog(workspaceId: string, number: number, folderId: string, jobId: string): Promise<HistoryBackgroundLog>;
 }
 
 export interface HealthBackend {
   run(workspaceId: string, signal?: AbortSignal): Promise<HealthItem[]>;
+}
+
+export interface SessionExpiryBackend {
+  read(workspaceId: string, signal?: AbortSignal): Promise<SessionExpirySnapshot>;
 }
 
 export interface LogsBackend {
@@ -394,6 +406,7 @@ export interface FrontendBackend {
   readonly telemetry: TelemetryBackend;
   readonly history: HistoryBackend;
   readonly health: HealthBackend;
+  readonly sessionExpiry: SessionExpiryBackend;
   readonly logs: LogsBackend;
   readonly secrets: SecretsBackend;
   readonly software: SoftwareBackend;

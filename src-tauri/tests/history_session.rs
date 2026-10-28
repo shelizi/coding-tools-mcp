@@ -401,7 +401,10 @@ fn bootstrap_creates_next_file_returns_all_summaries_and_is_idempotent() {
     assert_eq!(first["full_history_included"], false);
     assert!(first["total_history_bytes"].as_u64().unwrap_or(0) > 0);
     assert_eq!(first["history_digest"].as_str().unwrap_or("").len(), 64);
-    assert_eq!(first["persistence_mode"], "model_mediated_tool_calls");
+    assert_eq!(
+        first["persistence_mode"],
+        "semantic_checkpoints_plus_observed_tool_activity"
+    );
     assert!(first["assistant_instructions"]
         .as_str()
         .unwrap_or("")

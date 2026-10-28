@@ -1,4 +1,4 @@
-export type SkillSource = 'project' | 'agents' | 'claude' | 'codex-user' | 'claude-user';
+export type SkillSource = 'project' | 'coding-mcp' | 'coding-mcp-user';
 export type SkillScope = 'workspace' | 'user';
 
 export interface SkillDescriptor {

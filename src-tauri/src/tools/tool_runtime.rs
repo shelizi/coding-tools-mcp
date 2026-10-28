@@ -124,17 +124,19 @@ pub(crate) fn descriptor(name: &str) -> ToolRuntimeDescriptor {
             | "list_sessions" | "send_input" | "kill_session" | "read_output" => {
                 ToolUsageFamily::Process
             }
-            "server_info" | "query_tool_usage" | "set_default_cwd" | "request_permissions" => {
-                ToolUsageFamily::Runtime
-            }
-            "desktop_displays" | "desktop_screenshot" | "desktop_click" | "desktop_drag"
-            | "desktop_scroll" | "desktop_type" | "desktop_key" => ToolUsageFamily::Runtime,
+            "server_info"
+            | "session_status"
+            | "list_active_workspaces"
+            | "query_tool_usage"
+            | "set_default_cwd"
+            | "request_permissions" => ToolUsageFamily::Runtime,
+            "desktop_displays" | "desktop_screenshot" | "desktop_input" => ToolUsageFamily::Runtime,
             _ => ToolUsageFamily::Other,
         }
     };
 
     runtime.lane = match canonical {
-        "server_info" => ToolExecutionLane::Fast,
+        "server_info" | "session_status" | "list_active_workspaces" => ToolExecutionLane::Fast,
         "wait_command" | "resolve_operation" | "list_sessions" | "send_input" | "kill_session"
         | "read_output" => ToolExecutionLane::Control,
         "exec_command" | "exec_many" | "exec_health_check" | "request_permissions" => {
@@ -188,9 +190,7 @@ pub(crate) fn descriptor(name: &str) -> ToolRuntimeDescriptor {
         | "close_failed_task"
         | "rollback_task"
         | "finish_task" => ToolMutationPolicy::Always,
-        "desktop_click" | "desktop_drag" | "desktop_scroll" | "desktop_type" | "desktop_key" => {
-            ToolMutationPolicy::Always
-        }
+        "desktop_input" => ToolMutationPolicy::Always,
         _ => ToolMutationPolicy::Never,
     };
 

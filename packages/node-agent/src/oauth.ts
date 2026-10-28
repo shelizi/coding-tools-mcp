@@ -197,6 +197,8 @@ export class OAuthRuntime {
   tokenSecret: string;
   tokenTtlSeconds: number;
   readonly #pending = new Map<string, PendingCode>();
+  // Fingerprints only; never retain bearer token strings or disclose identifiers to the UI.
+  readonly #observedTokenExpiries = new Map<string, number>();
   readonly #now: () => number;
   readonly #persistPassword?: (password: string) => Promise<void>;
   #authorizationQueue: Promise<void> = Promise.resolve();
@@ -230,7 +232,37 @@ export class OAuthRuntime {
     this.tokenSecret = replacement.tokenSecret;
     this.tokenTtlSeconds = replacement.tokenTtlSeconds;
     this.#pending.clear();
+    this.#observedTokenExpiries.clear();
     this.#resetLoginFailures();
+  }
+
+  private rememberToken(token: string, expiresAtMs: number): void {
+    const now = this.#now();
+    for (const [id, expiry] of this.#observedTokenExpiries) {
+      if (expiry <= now) this.#observedTokenExpiries.delete(id);
+    }
+    const id = createHash('sha256').update(token).digest('hex');
+    if (!this.#observedTokenExpiries.has(id) && this.#observedTokenExpiries.size >= 1024) {
+      const oldest = this.#observedTokenExpiries.keys().next().value;
+      if (oldest) this.#observedTokenExpiries.delete(oldest);
+    }
+    if (expiresAtMs > now) this.#observedTokenExpiries.set(id, expiresAtMs);
+  }
+
+  /** Valid signed tokens seen or issued by this process (not a global client inventory). */
+  tokenExpiryTimes(): number[] {
+    const now = this.#now();
+    for (const [id, expiry] of this.#observedTokenExpiries) {
+      if (expiry <= now) this.#observedTokenExpiries.delete(id);
+    }
+    return [...this.#observedTokenExpiries.values()].sort((a, b) => a - b);
+  }
+
+  /** Call only after successful HTTP bearer verification. */
+  tokenExpiryFor(token: string): number | null {
+    const fingerprint = createHash('sha256').update(token).digest('hex');
+    const expiry = this.#observedTokenExpiries.get(fingerprint);
+    return expiry !== undefined && expiry > this.#now() ? expiry : null;
   }
 
   clientIdAllowed(clientId: string): boolean {
@@ -390,10 +422,13 @@ export class OAuthRuntime {
 
     const issuer = (data.issuer || base).replace(/\/$/, '');
     const issuedAt = Math.floor(this.#now() / 1000);
+    const expiresAtMs = (issuedAt + this.tokenTtlSeconds) * 1000;
+    const accessToken = signJwt({ iss: issuer, aud: `${issuer}/mcp`, iat: issuedAt, exp: issuedAt + this.tokenTtlSeconds, scope: 'mcp' }, this.tokenSecret);
+    this.rememberToken(accessToken, expiresAtMs);
     return {
       status: 200,
       body: {
-        access_token: signJwt({ iss: issuer, aud: `${issuer}/mcp`, iat: issuedAt, exp: issuedAt + this.tokenTtlSeconds, scope: 'mcp' }, this.tokenSecret),
+        access_token: accessToken,
         token_type: 'Bearer',
         expires_in: this.tokenTtlSeconds
       }
@@ -413,7 +448,7 @@ export class OAuthRuntime {
         iss?: unknown; aud?: unknown; iat?: unknown; exp?: unknown; scope?: unknown;
       };
       const issuer = base.replace(/\/$/, '');
-      return header.alg === 'HS256'
+      const valid = header.alg === 'HS256'
         && payload.iss === issuer
         && typeof payload.aud === 'string'
         && (payload.aud === `${issuer}/mcp` || payload.aud === issuer)
@@ -421,11 +456,14 @@ export class OAuthRuntime {
         && typeof payload.exp === 'number'
         && payload.exp >= this.#now() / 1000
         && typeof payload.scope === 'string';
+      if (valid) this.rememberToken(authorization.slice(7).trim(), (payload.exp as number) * 1000);
+      return valid;
     } catch { return false; }
   }
 
   dispose(): void {
     this.#pending.clear();
+    this.#observedTokenExpiries.clear();
   }
 
   #loginRateLimited(): boolean {

@@ -19,6 +19,8 @@ import type {
   ExtensionToggleResult,
   FrontendBackend,
   HealthItem,
+  HistoryBackgroundJobsResult,
+  HistoryBackgroundLog,
   HistorySessionDetail,
   HistorySessionsResult,
   NativeUi,
@@ -65,6 +67,14 @@ interface NodeHistoryListPayload {
     createdAt?: string | null;
     updatedAt?: string | null;
     status?: string;
+    activityStatus?: "running" | "active" | "inactive" | "completed";
+    activityTool?: string | null;
+    activityDescription?: string | null;
+    lastActivityAtMs?: number | null;
+    activeRequestCount?: number;
+    lastActivityOutcome?: string | null;
+    revision?: string;
+    recentActions?: HistorySessionDetail["recentActions"];
     summary?: string;
     checkpointCount?: number;
   }>;
@@ -86,6 +96,7 @@ interface NodeHistoryDetailPayload {
   checkpointCount?: number;
   records?: HistorySessionDetail["records"];
   content?: string;
+  revision?: string;
 }
 
 interface NodeHealthPayload {
@@ -227,12 +238,14 @@ function mapHistoryList(payload: NodeHistoryListPayload): HistorySessionsResult 
     createdAt: session.createdAt ?? null,
     updatedAt: session.updatedAt ?? null,
     status: session.status ?? "",
-    activityStatus: "completed" as const,
-    activityTool: null,
-    activityDescription: null,
-    lastActivityAtMs: null,
-    activeRequestCount: 0,
-    lastActivityOutcome: null,
+    activityStatus: session.activityStatus ?? (session.status?.toLowerCase() === "completed" ? "completed" as const : "inactive" as const),
+    activityTool: session.activityTool ?? null,
+    activityDescription: session.activityDescription ?? null,
+    lastActivityAtMs: session.lastActivityAtMs ?? null,
+    activeRequestCount: session.activeRequestCount ?? 0,
+    lastActivityOutcome: session.lastActivityOutcome ?? null,
+    revision: session.revision ?? "",
+    recentActions: session.recentActions ?? [],
     summary: session.summary ?? "",
     checkpointCount: session.checkpointCount ?? 0,
   }));
@@ -255,12 +268,14 @@ function mapHistoryDetail(payload: NodeHistoryDetailPayload): HistorySessionDeta
     createdAt: payload.createdAt ?? null,
     updatedAt: payload.updatedAt ?? null,
     status: payload.status ?? "",
-    activityStatus: "completed",
+    activityStatus: payload.status?.toLowerCase() === "completed" ? "completed" : "inactive",
     activityTool: null,
     activityDescription: null,
     lastActivityAtMs: null,
     activeRequestCount: 0,
     lastActivityOutcome: null,
+    revision: payload.revision ?? "",
+    recentActions: [],
     summary: payload.summary ?? "",
     checkpointCount: payload.checkpointCount ?? 0,
     records: payload.records ?? [],
@@ -460,6 +475,18 @@ export function createNodeBackend(deps: NodeBackendDeps = {}): FrontendBackend {
         );
         return mapHistoryDetail(payload);
       },
+      async listBackgroundJobs(workspaceId, number, folderId) {
+        const query = new URLSearchParams({ folderId });
+        return request<HistoryBackgroundJobsResult>(
+          `${workspaceRoute(workspaceId, `history/${number}/jobs`)}?${query}`,
+        );
+      },
+      async readBackgroundLog(workspaceId, number, folderId, jobId) {
+        const query = new URLSearchParams({ folderId });
+        return request<HistoryBackgroundLog>(
+          `${workspaceRoute(workspaceId, `history/${number}/jobs/${encodeURIComponent(jobId)}/log`)}?${query}`,
+        );
+      },
     },
 
     health: {
@@ -471,6 +498,11 @@ export function createNodeBackend(deps: NodeBackendDeps = {}): FrontendBackend {
         );
         return mapHealth(payload);
       },
+    },
+
+    sessionExpiry: {
+      read: (workspaceId, signal) =>
+        request(workspaceRoute(workspaceId, "session-expiry"), {}, signal),
     },
 
     logs: {

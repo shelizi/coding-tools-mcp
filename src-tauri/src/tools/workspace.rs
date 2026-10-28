@@ -507,7 +507,25 @@ pub fn wrap_tool_result(structured: Value) -> Value {
 
 pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) -> Value {
     let is_error = structured.get("ok").and_then(Value::as_bool) == Some(false);
-    let content = if matches!(tool_name, "view_image" | "desktop_screenshot")
+    let post_image = if tool_name == "desktop_input"
+        && args.get("capture_after").and_then(Value::as_bool) == Some(true)
+        && !is_error
+    {
+        structured.get("screenshot").and_then(|v| v.get("base64"))
+            .and_then(Value::as_str).filter(|data| !data.is_empty())
+            .map(|data| json!({
+                "type":"image", "data":data,
+                "mimeType":structured.pointer("/screenshot/mime_type").and_then(Value::as_str).unwrap_or("image/jpeg")
+            }))
+    } else {
+        None
+    };
+    let content = if let Some(image) = post_image {
+        vec![
+            json!({"type":"text", "text":mcp_result_summary(tool_name, &structured, is_error)}),
+            image,
+        ]
+    } else if matches!(tool_name, "view_image" | "desktop_screenshot")
         && args
             .get("output")
             .and_then(Value::as_str)
@@ -529,11 +547,45 @@ pub fn wrap_mcp_tool_result(tool_name: &str, args: &Value, structured: Value) ->
             "text": mcp_result_summary(tool_name, &structured, is_error)
         })]
     };
+    let mut metadata = structured;
+    if tool_name == "desktop_input" {
+        if let Some(screenshot) = metadata
+            .get_mut("screenshot")
+            .and_then(Value::as_object_mut)
+        {
+            screenshot.remove("base64");
+            screenshot.remove("data_url");
+        }
+    }
     json!({
         "content": content,
-        "structuredContent": structured,
+        "structuredContent": metadata,
         "isError": is_error
     })
+}
+
+#[cfg(test)]
+#[test]
+fn desktop_input_capture_after_wraps_real_mcp_image_and_compact_metadata() {
+    let output = wrap_mcp_tool_result(
+        "desktop_input",
+        &json!({"capture_after":true}),
+        json!({
+            "ok":true, "status":"ok", "action_count":1,
+            "screenshot":{"mime_type":"image/jpeg", "base64":"/9j/", "data_url":"data:image/jpeg;base64,/9j/",
+                "coordinate_reference":{"id":0,"image_width":960,"image_height":540}}
+        }),
+    );
+    assert_eq!(output["content"][1]["type"], "image");
+    assert_eq!(output["content"][1]["data"], "/9j/");
+    assert_eq!(
+        output["structuredContent"]["screenshot"]["base64"],
+        Value::Null
+    );
+    assert_eq!(
+        output["structuredContent"]["screenshot"]["coordinate_reference"]["image_width"],
+        960
+    );
 }
 
 fn mcp_result_summary(tool_name: &str, structured: &Value, is_error: bool) -> String {

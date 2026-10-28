@@ -50,6 +50,26 @@ fn invalid() -> Value {
 }
 
 impl HandleStore {
+    /// Expiry timestamps for the local management UI. Never expose handles or owners.
+    pub(crate) fn expiry_times(&mut self, profile_id: &str, now: u64) -> Vec<u64> {
+        self.entries.retain(|_, entry| {
+            if entry.expires_at > now {
+                return true;
+            }
+            if entry.native.is_none() {
+                crate::tools::hub::forget_handle_conversation(profile_id, &entry.key);
+            }
+            false
+        });
+        let mut times: Vec<_> = self
+            .entries
+            .values()
+            .map(|entry| entry.expires_at)
+            .collect();
+        times.sort_unstable();
+        times
+    }
+
     fn prepare(
         &mut self,
         profile_id: &str,

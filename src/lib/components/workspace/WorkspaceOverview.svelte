@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import StatusOrb from "$lib/components/StatusOrb.svelte";
+  import SessionExpiryPanel from "$lib/components/SessionExpiryPanel.svelte";
+  import ActiveProjectsOverview from "./ActiveProjectsOverview.svelte";
   import { t } from "$lib/i18n";
   import {
     actionsLocalEndpoint,
@@ -182,6 +184,10 @@
   {/if}
 </div>
 
+<div class="mt-4">
+  <SessionExpiryPanel workspaceId={profile.id} />
+</div>
+
 <div class="tx-card mt-4 flex flex-wrap items-center justify-between gap-4 p-5">
   <div>
     <p class="tx-section-label">{$t("Current working directory")}</p>
@@ -193,4 +199,8 @@
   <button type="button" class="tx-btn-secondary" onclick={() => onNavigate("settings")}>
     {$t("Open workspace settings")}
   </button>
+</div>
+
+<div class="mt-4">
+  <ActiveProjectsOverview />
 </div>

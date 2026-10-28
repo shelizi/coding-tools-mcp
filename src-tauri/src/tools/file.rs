@@ -1011,13 +1011,21 @@ fn build_matcher(
 
 fn binary_file_extension(path: &str) -> bool {
     const EXTENSIONS: &[&str] = &[
-        "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "heic", "avif", "mp4",
-        "m4v", "mov", "mkv", "webm", "avi", "wmv", "mp3", "wav", "flac", "aac", "ogg", "m4a",
-        "opus", "zip", "tar", "gz", "tgz", "7z", "rar", "bz2", "xz", "zst", "pdf", "doc", "docx",
-        "xls", "xlsx", "ppt", "pptx", "ttf", "otf", "woff", "woff2", "eot", "exe", "dll", "so",
-        "dylib", "o", "obj", "a", "lib", "wasm", "class", "jar", "war", "pyc", "pyo", "sqlite",
-        "sqlite3", "bin", "iso", "dmg", "pt", "pth", "onnx", "gguf", "parquet", "ibd", "frm",
-        "myd", "myi", "mdb", "ldb", "sst", "wal", "apk", "deb", "rpm", "img", "qcow2", "vmdk",
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "heic", "avif",
+        "mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv",
+        "mp3", "wav", "flac", "aac", "ogg", "m4a", "opus",
+        "zip", "tar", "gz", "tgz", "7z", "rar", "bz2", "xz", "zst",
+        "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+        "ttf", "otf", "woff", "woff2", "eot",
+        "exe", "dll", "so", "dylib", "o", "obj", "a", "lib", "wasm",
+        "class", "jar", "war",
+        "pyc", "pyo",
+        "sqlite", "sqlite3",
+        "bin", "iso", "dmg",
+        "pt", "pth", "onnx", "gguf",
+        "parquet",
+        "ibd", "frm", "myd", "myi", "mdb", "ldb", "sst", "wal",
+        "apk", "deb", "rpm", "img", "qcow2", "vmdk",
     ];
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let dot = match name.rfind('.') {
@@ -1031,128 +1039,25 @@ fn binary_file_extension(path: &str) -> bool {
 
 fn searchable_text_path(path: &str) -> bool {
     const EXTENSIONS: &[&str] = &[
-        "ts",
-        "tsx",
-        "js",
-        "jsx",
-        "mjs",
-        "cjs",
-        "mts",
-        "cts",
-        "json",
-        "jsonc",
-        "json5",
-        "md",
-        "markdown",
-        "mdx",
-        "rst",
-        "txt",
-        "text",
-        "log",
-        "tmp",
-        "py",
-        "pyi",
-        "rb",
-        "php",
-        "go",
-        "rs",
-        "java",
-        "kt",
-        "kts",
-        "scala",
-        "c",
-        "h",
-        "cc",
-        "cpp",
-        "cxx",
-        "hpp",
-        "hxx",
-        "cs",
-        "fs",
-        "swift",
-        "sh",
-        "bash",
-        "zsh",
-        "fish",
-        "ps1",
-        "psm1",
-        "bat",
-        "cmd",
-        "yml",
-        "yaml",
-        "toml",
-        "ini",
-        "cfg",
-        "conf",
-        "cnf",
-        "env",
-        "xml",
-        "html",
-        "htm",
-        "xhtml",
-        "css",
-        "scss",
-        "sass",
-        "less",
-        "vue",
-        "svelte",
-        "astro",
-        "graphql",
-        "gql",
-        "sql",
-        "prisma",
-        "svg",
-        "csv",
-        "tsv",
-        "properties",
-        "gradle",
-        "r",
-        "lua",
-        "pl",
-        "pm",
-        "ex",
-        "exs",
-        "erl",
-        "hrl",
-        "hs",
-        "elm",
-        "clj",
-        "cljs",
-        "edn",
-        "nim",
-        "zig",
-        "proto",
-        "thrift",
-        "gitignore",
-        "gitattributes",
-        "dockerignore",
-        "editorconfig",
-        "npmrc",
-        "nvmrc",
-        "tf",
-        "tfvars",
-        "hcl",
-        "lock",
+        "ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts",
+        "json", "jsonc", "json5", "md", "markdown", "mdx", "rst", "txt", "text", "log", "tmp",
+        "py", "pyi", "rb", "php", "go", "rs", "java", "kt", "kts", "scala",
+        "c", "h", "cc", "cpp", "cxx", "hpp", "hxx", "cs", "fs", "swift",
+        "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd",
+        "yml", "yaml", "toml", "ini", "cfg", "conf", "cnf", "env",
+        "xml", "html", "htm", "xhtml", "css", "scss", "sass", "less",
+        "vue", "svelte", "astro", "graphql", "gql", "sql", "prisma",
+        "svg", "csv", "tsv", "properties", "gradle",
+        "r", "lua", "pl", "pm", "ex", "exs", "erl", "hrl",
+        "hs", "elm", "clj", "cljs", "edn", "nim", "zig",
+        "proto", "thrift",
+        "gitignore", "gitattributes", "dockerignore", "editorconfig",
+        "npmrc", "nvmrc", "tf", "tfvars", "hcl", "lock",
     ];
     const BASENAMES: &[&str] = &[
-        "dockerfile",
-        "makefile",
-        "gnumakefile",
-        "license",
-        "copying",
-        "authors",
-        "notice",
-        "changelog",
-        "gemfile",
-        "procfile",
-        "jenkinsfile",
-        "vagrantfile",
-        "rakefile",
-        "brewfile",
-        "caddyfile",
-        "justfile",
-        "taskfile",
-        "readme",
+        "dockerfile", "makefile", "gnumakefile", "license", "copying", "authors",
+        "notice", "changelog", "gemfile", "procfile", "jenkinsfile", "vagrantfile",
+        "rakefile", "brewfile", "caddyfile", "justfile", "taskfile", "readme",
     ];
     if binary_file_extension(path) {
         return false;
@@ -1168,8 +1073,7 @@ fn searchable_text_path(path: &str) -> bool {
 }
 
 fn has_prefix(data: &[u8], prefix: &[u8], offset: usize) -> bool {
-    data.get(offset..)
-        .is_some_and(|slice| slice.starts_with(prefix))
+    data.get(offset..).is_some_and(|slice| slice.starts_with(prefix))
 }
 
 fn binary_magic_bytes(data: &[u8]) -> bool {
@@ -1185,7 +1089,9 @@ fn binary_magic_bytes(data: &[u8]) -> bool {
         || has_prefix(data, &[0x00, 0x00, 0x01, 0x00], 0)
         || has_prefix(data, &[0x49, 0x49, 0x2A, 0x00], 0)
         || has_prefix(data, &[0x4D, 0x4D, 0x00, 0x2A], 0)
-        || (has_prefix(data, b"PK", 0) && data.len() >= 4 && matches!(data[2], 0x03 | 0x05 | 0x07))
+        || (has_prefix(data, b"PK", 0)
+            && data.len() >= 4
+            && matches!(data[2], 0x03 | 0x05 | 0x07))
         || has_prefix(data, &[0x1F, 0x8B], 0)
         || has_prefix(data, &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C], 0)
         || has_prefix(data, b"Rar!", 0)
@@ -1303,10 +1209,7 @@ fn search_file_paths(
         .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
         .map(|entry| entry.into_path())
         .filter(|path| {
-            let name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("");
+            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
             if binary_file_extension(name) {
                 return false;
             }
