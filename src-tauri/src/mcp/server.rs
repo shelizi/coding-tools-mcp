@@ -1593,7 +1593,7 @@ mod tests {
     async fn conversation_bootstrap_returns_enabled_project_skill_summaries() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let skill_name = format!("rust-parity-{}", uuid::Uuid::new_v4());
-        let skill_dir = workspace.path().join(".agents/skills").join(&skill_name);
+        let skill_dir = workspace.path().join(".coding-tools-mcp/skills").join(&skill_name);
         fs::create_dir_all(&skill_dir).expect("create skill dir");
         fs::write(
             skill_dir.join("SKILL.md"),
@@ -1669,11 +1669,11 @@ mod tests {
             .find(|skill| skill["name"] == skill_name)
             .expect("workspace skill summary");
         assert_eq!(summary["description"], "Rust parity bootstrap skill");
-        assert_eq!(summary["source"], "agents");
+        assert_eq!(summary["source"], "coding-mcp");
         assert_eq!(summary["scope"], "workspace");
         assert_eq!(
             summary["relative_path"],
-            format!(".agents/skills/{skill_name}/SKILL.md")
+            format!(".coding-tools-mcp/skills/{skill_name}/SKILL.md")
         );
         assert_eq!(
             summary["content_sha256"]
@@ -1713,7 +1713,7 @@ mod tests {
     fn validated_evolved_skill_is_only_consumed_by_session_canary_surfaces() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let skill_name = format!("evolved-canary-{}", uuid::Uuid::new_v4());
-        let skill_dir = workspace.path().join(".agents/skills").join(&skill_name);
+        let skill_dir = workspace.path().join(".coding-tools-mcp/skills").join(&skill_name);
         fs::create_dir_all(&skill_dir).expect("create skill dir");
         fs::write(
             skill_dir.join("SKILL.md"),
